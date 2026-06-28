@@ -233,14 +233,18 @@ function nodeEndpointOptions(node: NodeItem): string[] {
 function buildAgentCommand(node: NodeItem, controllerUrl: string = DEFAULT_CONTROLLER_URL): string {
   if (!node.agent_token_value) return "";
   return [
-    `LINK42_SERVER_URL=${controllerUrl}`,
-    `LINK42_NODE_ID=${node.id}`,
-    `LINK42_AGENT_TOKEN=${node.agent_token_value}`,
-    "LINK42_WIREGUARD_DIR=/etc/wireguard",
-    "LINK42_AGENT_DRY_RUN=0",
-    "LINK42_POLL_INTERVAL=2",
-    ".venv/bin/python -m link42_agent.main",
+    "curl -fsSL https://get.pmman.tech/sh/link42-agent.sh",
+    "|",
+    "sudo env",
+    `LINK42_SERVER_URL=${shellArg(controllerUrl)}`,
+    `LINK42_NODE_ID=${shellArg(String(node.id))}`,
+    `LINK42_AGENT_TOKEN=${shellArg(node.agent_token_value)}`,
+    "sh",
   ].join(" ");
+}
+
+function shellArg(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function Field({
