@@ -1,0 +1,12 @@
+[Interface]
+PrivateKey = demo-private-key
+Address = 10.42.0.1/24
+ListenPort = 51820
+MTU = 1420
+
+[Peer]
+PublicKey = demo-peer-public-key
+AllowedIPs = 10.42.0.2/32
+Endpoint = 198.51.100.10:51820
+PersistentKeepalive = 25
+

@@ -1,0 +1,16 @@
+[Unit]
+Description=Link42 API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/link42
+Environment=LINK42_DATABASE_URL=sqlite:////opt/link42/link42.db
+ExecStart=/opt/link42/.venv/bin/uvicorn link42_api.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

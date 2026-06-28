@@ -1,0 +1,18 @@
+services:
+  api:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ..:/app
+      - link42-data:/data
+    environment:
+      LINK42_DATABASE_URL: sqlite:////data/link42.db
+    command: >
+      sh -c "pip install -e . &&
+             uvicorn link42_api.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+
+volumes:
+  link42-data:
+

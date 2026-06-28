@@ -1,0 +1,24 @@
+# Python 虚拟环境和缓存目录。
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# 本地 SQLite 数据库和运行时文件。
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# 前端依赖与构建产物。
+apps/web/node_modules/
+apps/web/dist/
+
+# Agent 二进制构建产物。
+build/
+dist/
+*.spec
+
+# 环境变量文件通常包含 token 或密码。
+.env

@@ -1,0 +1,1420 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+import subprocess
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from link42_common.security import generate_token, hash_token, verify_token
+
+from . import models, schemas
+from .config import settings
+from .database import get_db, init_db
+from .wireguard_service import (
+    build_apply_plan,
+    build_apply_payload_from_config,
+    build_diff,
+    count_enabled_peers,
+    render_interface_config,
+    split_endpoint,
+)
+
+
+# FastAPI 应用实例，所有 API 路由都挂载在这里。
+app = FastAPI(title="Link42 API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    # 第一版定位小型内网系统，允许前端预览服务跨端口访问 API。
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    """应用启动时初始化数据库。"""
+    init_db()
+
+
+def require_agent(db: Session, node_id: int, token: str) -> models.Node:
+    """校验 Agent 身份，并返回对应节点。"""
+    node = db.get(models.Node, node_id)
+    if node is None or not verify_token(token, node.agent_token_hash):
+        raise HTTPException(status_code=401, detail="invalid agent credentials")
+    return node
+
+
+def is_node_online(node: models.Node, now: datetime | None = None) -> bool:
+    """根据状态和最近心跳判断节点是否在线。"""
+
+    if node.status != "online" or node.last_seen_at is None:
+        return False
+    current_time = now or datetime.utcnow()
+    return current_time - node.last_seen_at <= timedelta(seconds=settings.agent_offline_after_seconds)
+
+
+def refresh_node_runtime_status(node: models.Node, now: datetime | None = None) -> models.Node:
+    """把心跳超时的节点标记为离线，避免前端看到过期在线状态。"""
+
+    if node.status == "online" and not is_node_online(node, now=now):
+        node.status = "offline"
+    return node
+
+
+def require_online_node(db: Session, node_id: int) -> models.Node:
+    """读取节点并要求 Agent 当前在线，否则返回可展示的业务错误。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    refresh_node_runtime_status(node)
+    if node.status != "online":
+        db.commit()
+        raise HTTPException(status_code=409, detail="agent is offline")
+    return node
+
+
+def imported_secret_ref(value: str | None) -> str | None:
+    """为导入配置生成密钥引用。"""
+
+    if not value:
+        return None
+    return "imported-local-db"
+
+
+def set_extra_value(model: models.WireGuardInterface | models.WireGuardPeer, key: str, value: str | None) -> None:
+    """在 JSON extras 中保存可选扩展字段，空值会清理旧值。"""
+
+    extras = dict(model.extras or {})
+    cleaned = value.strip() if value else None
+    if cleaned:
+        extras[key] = cleaned
+    else:
+        extras.pop(key, None)
+    model.extras = extras
+
+
+def get_wireguard_config_or_404(config_id: int, db: Session) -> models.WireGuardInterface:
+    """按配置 ID 读取 WireGuard 配置，不存在时返回 404。"""
+
+    config = db.get(models.WireGuardInterface, config_id)
+    if config is None:
+        raise HTTPException(status_code=404, detail="wireguard config not found")
+    return config
+
+
+def ensure_unique_interface_name(
+    db: Session,
+    node_id: int,
+    name: str,
+    exclude_interface_id: int | None = None,
+) -> None:
+    """确保同一节点下 WireGuard 配置名唯一。"""
+
+    query = select(models.WireGuardInterface).where(
+        models.WireGuardInterface.node_id == node_id,
+        models.WireGuardInterface.name == name,
+    )
+    if exclude_interface_id is not None:
+        query = query.where(models.WireGuardInterface.id != exclude_interface_id)
+    duplicate = db.scalar(query)
+    if duplicate:
+        raise HTTPException(status_code=409, detail="interface name already exists on node")
+
+
+def set_unique_peer(
+    config_id: int,
+    payload: schemas.PeerCreate,
+    db: Session,
+) -> models.WireGuardPeer:
+    """创建或更新某个 WireGuard 配置的唯一对端。
+
+    第一版产品规则是“一份 wg-quick 配置只连接一个对端”。如果旧数据里
+    已经存在多条对端记录，这里会保留第一条并删除其余记录。
+    """
+
+    config = get_wireguard_config_or_404(config_id, db)
+    require_online_node(db, config.node_id)
+    existing_peers = list(
+        db.scalars(
+            select(models.WireGuardPeer)
+            .where(models.WireGuardPeer.interface_id == config_id)
+            .order_by(models.WireGuardPeer.id)
+        )
+    )
+    if existing_peers:
+        existing_peer = existing_peers[0]
+        existing_peer.name = payload.name
+        existing_peer.public_key = payload.public_key
+        existing_peer.preshared_key_ref = "local-db" if payload.preshared_key else None
+        existing_peer.preshared_key_value = payload.preshared_key
+        existing_peer.endpoint_host = payload.endpoint_host
+        existing_peer.endpoint_port = payload.endpoint_port
+        existing_peer.allowed_ips = payload.allowed_ips
+        existing_peer.persistent_keepalive = payload.persistent_keepalive
+        existing_peer.enabled = True
+        set_extra_value(existing_peer, "custom_config", payload.peer_custom_config)
+        for extra_peer in existing_peers[1:]:
+            db.delete(extra_peer)
+        db.commit()
+        db.refresh(existing_peer)
+        return existing_peer
+
+    peer = models.WireGuardPeer(
+        interface_id=config_id,
+        name=payload.name,
+        public_key=payload.public_key,
+        preshared_key_ref="local-db" if payload.preshared_key else None,
+        preshared_key_value=payload.preshared_key,
+        endpoint_host=payload.endpoint_host,
+        endpoint_port=payload.endpoint_port,
+        allowed_ips=payload.allowed_ips,
+        persistent_keepalive=payload.persistent_keepalive,
+    )
+    set_extra_value(peer, "custom_config", payload.peer_custom_config)
+    db.add(peer)
+    db.commit()
+    db.refresh(peer)
+    return peer
+
+
+def get_unique_peer(config_id: int, db: Session) -> models.WireGuardPeer | None:
+    """读取某个 WireGuard 配置的唯一对端，并清理历史重复记录。"""
+
+    get_wireguard_config_or_404(config_id, db)
+    peers = list(
+        db.scalars(
+            select(models.WireGuardPeer)
+            .where(models.WireGuardPeer.interface_id == config_id)
+            .order_by(models.WireGuardPeer.id)
+        )
+    )
+    if len(peers) > 1:
+        for extra_peer in peers[1:]:
+            db.delete(extra_peer)
+        db.commit()
+    return peers[0] if peers else None
+
+
+def create_interface_task(
+    interface: models.WireGuardInterface,
+    task_type: str,
+    payload_extra: dict | None = None,
+    change_plan_id: int | None = None,
+) -> models.AgentTask:
+    """为单个 WireGuard 配置创建 Agent 任务。"""
+
+    payload = {
+        "node_id": interface.node_id,
+        "interface_id": interface.id,
+        "interface_name": interface.name,
+    }
+    if payload_extra:
+        payload.update(payload_extra)
+    return models.AgentTask(
+        node_id=interface.node_id,
+        change_plan_id=change_plan_id,
+        type=task_type,
+        payload=payload,
+    )
+
+
+def has_active_interface_task(db: Session, interface_id: int, task_type: str) -> bool:
+    """判断某接口是否已有同类型待执行任务，保证用户重复点击时幂等。"""
+
+    existing = db.scalar(
+        select(models.AgentTask).where(
+            models.AgentTask.type == task_type,
+            models.AgentTask.status.in_(["pending", "running"]),
+            models.AgentTask.payload["interface_id"].as_integer() == interface_id,
+        )
+    )
+    return existing is not None
+
+
+def enqueue_interface_task_once(
+    db: Session,
+    interface: models.WireGuardInterface,
+    task_type: str,
+    payload_extra: dict | None = None,
+) -> bool:
+    """幂等创建接口任务；已存在待执行任务时不重复入队。"""
+
+    if has_active_interface_task(db, interface.id, task_type):
+        return False
+    db.add(create_interface_task(interface, task_type, payload_extra=payload_extra))
+    return True
+
+
+def mark_import_candidate_available_for_interface(
+    db: Session,
+    interface: models.WireGuardInterface,
+) -> bool:
+    """删除导入配置时释放原扫描候选，允许用户再次导入同一 wg-quick 文件。"""
+
+    if interface.source != "imported" or not interface.import_path:
+        return False
+    candidate = db.scalar(
+        select(models.ImportCandidate).where(
+            models.ImportCandidate.node_id == interface.node_id,
+            models.ImportCandidate.path == interface.import_path,
+            models.ImportCandidate.imported.is_(True),
+        )
+    )
+    if candidate is None:
+        return False
+    candidate.imported = False
+    return True
+
+
+def should_delete_node_config_file(interface: models.WireGuardInterface) -> bool:
+    """判断删除 Link42 配置时是否应同步删除节点上的 wg-quick 文件。"""
+
+    return interface.managed or interface.source != "imported"
+
+
+def get_managed_link_bundle(
+    db: Session,
+    interface_id: int,
+) -> tuple[models.WireGuardInterface, models.WireGuardInterface, models.WireGuardPeer, models.WireGuardPeer]:
+    """读取受管节点连接的双端接口和互指 peer。"""
+
+    interface = db.scalar(
+        select(models.WireGuardInterface)
+        .options(selectinload(models.WireGuardInterface.peers))
+        .where(models.WireGuardInterface.id == interface_id)
+    )
+    if interface is None:
+        raise HTTPException(status_code=404, detail="interface not found")
+    local_peer = next(
+        (peer for peer in interface.peers if peer.peer_interface_id and peer.source == "managed-node"),
+        None,
+    )
+    if local_peer is None:
+        raise HTTPException(status_code=400, detail="wireguard config is not a managed node link")
+
+    peer_interface = db.scalar(
+        select(models.WireGuardInterface)
+        .options(selectinload(models.WireGuardInterface.peers))
+        .where(models.WireGuardInterface.id == local_peer.peer_interface_id)
+    )
+    if peer_interface is None:
+        raise HTTPException(status_code=404, detail="peer interface not found")
+    peer_peer = next(
+        (peer for peer in peer_interface.peers if peer.peer_interface_id == interface.id and peer.source == "managed-node"),
+        None,
+    )
+    if peer_peer is None:
+        raise HTTPException(status_code=400, detail="managed node link is incomplete")
+    return interface, peer_interface, local_peer, peer_peer
+
+
+def enqueue_apply_config(
+    db: Session,
+    interface: models.WireGuardInterface,
+    enable_on_boot: bool = True,
+) -> bool:
+    """幂等下发某个受管接口配置。"""
+
+    return enqueue_interface_task_once(
+        db,
+        interface,
+        "wireguard.apply_config",
+        payload_extra={
+            "config": render_interface_config(interface),
+            "managed": True,
+            "enable_on_boot": enable_on_boot,
+            "auto_start": True,
+        },
+    )
+
+
+def get_replace_interface(
+    db: Session,
+    interface_id: int | None,
+    node_id: int,
+) -> models.WireGuardInterface | None:
+    """读取准备被受管连接替换的旧接口。"""
+
+    if interface_id is None:
+        return None
+    interface = db.get(models.WireGuardInterface, interface_id)
+    if interface is None or interface.node_id != node_id:
+        raise HTTPException(status_code=404, detail="replace interface not found")
+    return interface
+
+
+def endpoint_points_to_node(endpoint_host: str | None, node: models.Node) -> bool:
+    """判断旧导入配置中的 Endpoint 是否指向目标节点地址。"""
+
+    return bool(endpoint_host and endpoint_host in node_endpoint_hosts(node))
+
+
+def queue_replace_interface(db: Session, interface: models.WireGuardInterface) -> None:
+    """替换旧配置时先请求 Agent 停止并删除节点文件，再删除数据库记录。"""
+
+    enqueue_interface_task_once(db, interface, "wireguard.stop_interface")
+    if should_delete_node_config_file(interface):
+        enqueue_interface_task_once(db, interface, "wireguard.delete_config")
+    mark_import_candidate_available_for_interface(db, interface)
+    db.delete(interface)
+
+
+def node_endpoint_hosts(node: models.Node) -> list[str]:
+    """返回节点可被对端访问的地址列表，兼容旧数据中的单地址字段。"""
+
+    values = [
+        *(node.endpoint_ips or []),
+        node.public_ip,
+        node.management_ip,
+        node.hostname,
+    ]
+    hosts: list[str] = []
+    for value in values:
+        if value and value not in hosts:
+            hosts.append(value)
+    return hosts
+
+
+def require_node_endpoint(node: models.Node, host: str, detail: str) -> str:
+    """校验用户选择的入口地址属于对应节点。"""
+
+    if host not in node_endpoint_hosts(node):
+        raise HTTPException(status_code=400, detail=detail)
+    return host
+
+
+def run_wg_text(args: list[str], input_text: str | None = None) -> str:
+    """调用系统 wg 工具生成 WireGuard 密钥材料。"""
+
+    try:
+        completed = subprocess.run(
+            ["wg", *args],
+            input=input_text,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="wireguard tool is not installed") from exc
+    if completed.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"wireguard tool failed: {completed.stderr.strip()}")
+    return completed.stdout.strip()
+
+
+def generate_wireguard_keypair() -> tuple[str, str]:
+    """生成 WireGuard 私钥和公钥。"""
+
+    private_key = run_wg_text(["genkey"])
+    public_key = run_wg_text(["pubkey"], input_text=f"{private_key}\n")
+    return private_key, public_key
+
+
+def generate_preshared_key() -> str:
+    """生成 WireGuard 预共享密钥。"""
+
+    return run_wg_text(["genpsk"])
+
+
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    """健康检查接口，用于确认 API 进程可响应。"""
+    return {"status": "ok"}
+
+
+@app.post("/api/nodes", response_model=schemas.NodeCreateResult)
+def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> schemas.NodeCreateResult:
+    """创建节点，并返回仅展示一次的 Agent token。"""
+    existing = db.scalar(select(models.Node).where(models.Node.name == payload.name))
+    if existing:
+        raise HTTPException(status_code=409, detail="node name already exists")
+
+    token = generate_token("l42agent")
+    node = models.Node(
+        name=payload.name,
+        hostname=payload.hostname,
+        management_ip=payload.management_ip,
+        public_ip=payload.public_ip,
+        endpoint_ips=payload.endpoint_ips,
+        status="offline",
+        agent_token_hash=hash_token(token),
+        agent_token_value=token,
+    )
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+    return schemas.NodeCreateResult(node=node, agent_token=token)
+
+
+@app.patch("/api/nodes/{node_id}", response_model=schemas.NodeRead)
+def update_node(
+    node_id: int,
+    payload: schemas.NodeUpdate,
+    db: Session = Depends(get_db),
+) -> models.Node:
+    """修改节点基础信息和入口地址。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    duplicate = db.scalar(
+        select(models.Node).where(models.Node.name == payload.name, models.Node.id != node_id)
+    )
+    if duplicate:
+        raise HTTPException(status_code=409, detail="node name already exists")
+
+    node.name = payload.name
+    node.hostname = payload.hostname
+    node.management_ip = payload.management_ip
+    node.public_ip = payload.public_ip
+    node.endpoint_ips = payload.endpoint_ips
+    db.commit()
+    db.refresh(node)
+    return node
+
+
+@app.get("/api/nodes", response_model=list[schemas.NodeRead])
+def list_nodes(db: Session = Depends(get_db)) -> list[models.Node]:
+    """列出所有节点。"""
+    nodes = list(db.scalars(select(models.Node).order_by(models.Node.id)))
+    changed = False
+    for node in nodes:
+        old_status = node.status
+        refresh_node_runtime_status(node)
+        changed = changed or node.status != old_status
+    if changed:
+        db.commit()
+    return nodes
+
+
+@app.get("/api/nodes/{node_id}", response_model=schemas.NodeRead)
+def get_node(node_id: int, db: Session = Depends(get_db)) -> models.Node:
+    """读取单个节点详情。"""
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    old_status = node.status
+    refresh_node_runtime_status(node)
+    if node.status != old_status:
+        db.commit()
+        db.refresh(node)
+    return node
+
+
+@app.delete("/api/nodes/{node_id}")
+def delete_node(node_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+    """删除节点；节点下存在 WireGuard 配置时必须先清空配置。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    interface_count = db.scalar(
+        select(models.WireGuardInterface).where(models.WireGuardInterface.node_id == node_id).limit(1)
+    )
+    if interface_count is not None:
+        raise HTTPException(status_code=409, detail="node has wireguard configs")
+    for candidate in db.scalars(select(models.ImportCandidate).where(models.ImportCandidate.node_id == node_id)):
+        db.delete(candidate)
+    for task in db.scalars(select(models.AgentTask).where(models.AgentTask.node_id == node_id)):
+        db.delete(task)
+    db.delete(node)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.post("/api/nodes/{node_id}/rotate-agent-token", response_model=schemas.NodeCreateResult)
+def rotate_agent_token(node_id: int, db: Session = Depends(get_db)) -> schemas.NodeCreateResult:
+    """轮换节点 Agent token，旧 token 会立即失效。"""
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    token = generate_token("l42agent")
+    node.agent_token_hash = hash_token(token)
+    node.agent_token_value = token
+    db.commit()
+    db.refresh(node)
+    return schemas.NodeCreateResult(node=node, agent_token=token)
+
+
+@app.post("/api/nodes/{node_id}/wireguard/interfaces", response_model=schemas.InterfaceRead)
+@app.post("/api/nodes/{node_id}/wireguard/configs", response_model=schemas.InterfaceRead)
+def create_interface(
+    node_id: int,
+    payload: schemas.InterfaceCreate,
+    db: Session = Depends(get_db),
+) -> models.WireGuardInterface:
+    """在指定节点上创建 WireGuard 点对点配置期望状态。"""
+    require_online_node(db, node_id)
+
+    ensure_unique_interface_name(db, node_id, payload.name)
+
+    interface = models.WireGuardInterface(
+        node_id=node_id,
+        name=payload.name,
+        tunnel_ips=payload.tunnel_ips,
+        listen_port=payload.listen_port,
+        private_key_ref="local-db" if payload.private_key else None,
+        private_key_value=payload.private_key,
+        public_key=payload.public_key,
+        mtu=payload.mtu,
+        table_name=payload.table_name,
+        dns=payload.dns,
+        source="created",
+        managed=True,
+    )
+    set_extra_value(interface, "custom_config", payload.interface_custom_config)
+    db.add(interface)
+    db.commit()
+    db.refresh(interface)
+    return interface
+
+
+@app.post("/api/nodes/{node_id}/wireguard/managed-links", response_model=schemas.ManagedLinkCreateResult)
+def create_managed_link(
+    node_id: int,
+    payload: schemas.ManagedLinkCreate,
+    db: Session = Depends(get_db),
+) -> schemas.ManagedLinkCreateResult:
+    """在两个受管节点之间创建点对点 WireGuard 连接期望状态。"""
+
+    if node_id == payload.peer_node_id:
+        raise HTTPException(status_code=400, detail="peer node must be different")
+
+    local_node = require_online_node(db, node_id)
+    peer_node = require_online_node(db, payload.peer_node_id)
+    replace_local = get_replace_interface(db, payload.replace_local_interface_id, node_id)
+    replace_peer = get_replace_interface(db, payload.replace_peer_interface_id, payload.peer_node_id)
+    replace_local_peer = get_unique_peer(replace_local.id, db) if replace_local else None
+    replace_peer_peer = get_unique_peer(replace_peer.id, db) if replace_peer else None
+    if replace_local_peer and not endpoint_points_to_node(replace_local_peer.endpoint_host, peer_node) and not payload.force_endpoint_mismatch:
+        raise HTTPException(status_code=409, detail="local imported endpoint does not point to peer node")
+    if replace_peer_peer and not endpoint_points_to_node(replace_peer_peer.endpoint_host, local_node) and not payload.force_endpoint_mismatch:
+        raise HTTPException(status_code=409, detail="peer imported endpoint does not point to local node")
+    local_endpoint = require_node_endpoint(
+        local_node,
+        payload.local_endpoint_host,
+        "local endpoint address is not registered on node",
+    )
+    peer_endpoint = require_node_endpoint(
+        peer_node,
+        payload.peer_endpoint_host,
+        "peer endpoint address is not registered on node",
+    )
+
+    peer_interface_name = payload.peer_interface_name or payload.local_interface_name
+    ensure_unique_interface_name(
+        db,
+        node_id,
+        payload.local_interface_name,
+        exclude_interface_id=replace_local.id if replace_local else None,
+    )
+    ensure_unique_interface_name(
+        db,
+        payload.peer_node_id,
+        peer_interface_name,
+        exclude_interface_id=replace_peer.id if replace_peer else None,
+    )
+
+    local_private_key, local_public_key = generate_wireguard_keypair()
+    peer_private_key, peer_public_key = generate_wireguard_keypair()
+    preshared_key = generate_preshared_key()
+
+    local_interface = models.WireGuardInterface(
+        node_id=node_id,
+        name=payload.local_interface_name,
+        tunnel_ips=payload.local_tunnel_ips,
+        listen_port=payload.local_listen_port,
+        private_key_ref="local-db",
+        private_key_value=local_private_key,
+        public_key=local_public_key,
+        mtu=payload.mtu,
+        table_name=payload.table_name,
+        source="managed-node",
+        managed=True,
+        runtime_status="starting",
+    )
+    peer_interface = models.WireGuardInterface(
+        node_id=payload.peer_node_id,
+        name=peer_interface_name,
+        tunnel_ips=payload.peer_tunnel_ips,
+        listen_port=payload.peer_listen_port,
+        private_key_ref="local-db",
+        private_key_value=peer_private_key,
+        public_key=peer_public_key,
+        mtu=payload.mtu,
+        table_name=payload.table_name,
+        source="managed-node",
+        managed=True,
+        runtime_status="starting",
+    )
+    db.add_all([local_interface, peer_interface])
+    db.flush()
+    local_peer = models.WireGuardPeer(
+        interface=local_interface,
+        peer_node_id=payload.peer_node_id,
+        peer_interface_id=peer_interface.id,
+        name=peer_node.name,
+        public_key=peer_public_key,
+        preshared_key_ref="local-db",
+        preshared_key_value=preshared_key,
+        endpoint_host=peer_endpoint,
+        endpoint_port=payload.peer_listen_port,
+        allowed_ips=payload.peer_tunnel_ips,
+        persistent_keepalive=payload.persistent_keepalive,
+        source="managed-node",
+    )
+    peer_peer = models.WireGuardPeer(
+        interface=peer_interface,
+        peer_node_id=node_id,
+        peer_interface_id=local_interface.id,
+        name=local_node.name,
+        public_key=local_public_key,
+        preshared_key_ref="local-db",
+        preshared_key_value=preshared_key,
+        endpoint_host=local_endpoint,
+        endpoint_port=payload.local_listen_port,
+        allowed_ips=payload.local_tunnel_ips,
+        persistent_keepalive=payload.persistent_keepalive,
+        source="managed-node",
+    )
+    set_extra_value(local_interface, "custom_config", payload.local_interface_custom_config)
+    set_extra_value(peer_interface, "custom_config", payload.peer_interface_custom_config)
+    set_extra_value(local_peer, "custom_config", payload.local_peer_custom_config)
+    set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
+    db.add_all([local_peer, peer_peer])
+    db.flush()
+    if replace_local:
+        queue_replace_interface(db, replace_local)
+    if replace_peer:
+        queue_replace_interface(db, replace_peer)
+    enqueue_apply_config(db, local_interface)
+    enqueue_apply_config(db, peer_interface)
+    db.commit()
+    db.refresh(local_interface)
+    db.refresh(peer_interface)
+    return schemas.ManagedLinkCreateResult(local_interface=local_interface, peer_interface=peer_interface)
+
+
+@app.get("/api/nodes/{node_id}/wireguard/interfaces", response_model=list[schemas.InterfaceRead])
+@app.get("/api/nodes/{node_id}/wireguard/configs", response_model=list[schemas.InterfaceRead])
+def list_interfaces(node_id: int, db: Session = Depends(get_db)) -> list[models.WireGuardInterface]:
+    """列出指定节点上的 WireGuard 点对点配置。"""
+    return list(
+        db.scalars(
+            select(models.WireGuardInterface)
+            .where(models.WireGuardInterface.node_id == node_id)
+            .order_by(models.WireGuardInterface.name)
+        )
+    )
+
+
+@app.get("/api/wireguard/interfaces/{interface_id}", response_model=schemas.InterfaceRead)
+@app.get("/api/wireguard/configs/{interface_id}", response_model=schemas.InterfaceRead)
+def get_interface(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
+    """读取单个 WireGuard 点对点配置。"""
+    interface = db.get(models.WireGuardInterface, interface_id)
+    if interface is None:
+        raise HTTPException(status_code=404, detail="interface not found")
+    return interface
+
+
+@app.get("/api/wireguard/configs/{interface_id}/managed-link", response_model=schemas.ManagedLinkRead)
+def get_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
+    """读取受管节点连接的双端配置。"""
+
+    local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
+    return {
+        "local_interface": local_interface,
+        "peer_interface": peer_interface,
+        "local_peer": local_peer,
+        "peer_peer": peer_peer,
+    }
+
+
+@app.patch("/api/wireguard/configs/{interface_id}/managed-link", response_model=schemas.ManagedLinkRead)
+def update_managed_link(
+    interface_id: int,
+    payload: schemas.ManagedLinkUpdate,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """编辑受管节点连接，并直接下发双方配置。"""
+
+    local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
+    local_node = require_online_node(db, local_interface.node_id)
+    peer_node = require_online_node(db, peer_interface.node_id)
+    local_endpoint = require_node_endpoint(
+        local_node,
+        payload.local_endpoint_host,
+        "local endpoint address is not registered on node",
+    )
+    peer_endpoint = require_node_endpoint(
+        peer_node,
+        payload.peer_endpoint_host,
+        "peer endpoint address is not registered on node",
+    )
+    ensure_unique_interface_name(db, local_interface.node_id, payload.local_interface_name, local_interface.id)
+    ensure_unique_interface_name(db, peer_interface.node_id, payload.peer_interface_name, peer_interface.id)
+
+    local_interface.name = payload.local_interface_name
+    local_interface.tunnel_ips = payload.local_tunnel_ips
+    local_interface.listen_port = payload.local_listen_port
+    local_interface.mtu = payload.mtu
+    local_interface.table_name = payload.table_name
+    local_interface.managed = True
+    local_interface.source = "managed-node"
+    peer_interface.name = payload.peer_interface_name
+    peer_interface.tunnel_ips = payload.peer_tunnel_ips
+    peer_interface.listen_port = payload.peer_listen_port
+    peer_interface.mtu = payload.mtu
+    peer_interface.table_name = payload.table_name
+    peer_interface.managed = True
+    peer_interface.source = "managed-node"
+
+    local_peer.endpoint_host = peer_endpoint
+    local_peer.endpoint_port = payload.peer_listen_port
+    local_peer.allowed_ips = payload.peer_tunnel_ips
+    local_peer.persistent_keepalive = payload.persistent_keepalive
+    local_peer.source = "managed-node"
+    peer_peer.endpoint_host = local_endpoint
+    peer_peer.endpoint_port = payload.local_listen_port
+    peer_peer.allowed_ips = payload.local_tunnel_ips
+    peer_peer.persistent_keepalive = payload.persistent_keepalive
+    peer_peer.source = "managed-node"
+    set_extra_value(local_interface, "custom_config", payload.local_interface_custom_config)
+    set_extra_value(peer_interface, "custom_config", payload.peer_interface_custom_config)
+    set_extra_value(local_peer, "custom_config", payload.local_peer_custom_config)
+    set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
+
+    if enqueue_apply_config(db, local_interface):
+        local_interface.runtime_status = "starting"
+    if enqueue_apply_config(db, peer_interface):
+        peer_interface.runtime_status = "starting"
+    db.commit()
+    db.refresh(local_interface)
+    db.refresh(peer_interface)
+    db.refresh(local_peer)
+    db.refresh(peer_peer)
+    return {
+        "local_interface": local_interface,
+        "peer_interface": peer_interface,
+        "local_peer": local_peer,
+        "peer_peer": peer_peer,
+    }
+
+
+@app.post("/api/wireguard/configs/{interface_id}/managed-link/start", response_model=schemas.ManagedLinkRead)
+def start_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
+    """同时启动受管连接双方。"""
+
+    local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
+    require_online_node(db, local_interface.node_id)
+    require_online_node(db, peer_interface.node_id)
+    for interface in [local_interface, peer_interface]:
+        if interface.runtime_status not in ["running", "starting"]:
+            if enqueue_interface_task_once(db, interface, "wireguard.start_interface"):
+                interface.runtime_status = "starting"
+    db.commit()
+    return {
+        "local_interface": local_interface,
+        "peer_interface": peer_interface,
+        "local_peer": local_peer,
+        "peer_peer": peer_peer,
+    }
+
+
+@app.post("/api/wireguard/configs/{interface_id}/managed-link/stop", response_model=schemas.ManagedLinkRead)
+def stop_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
+    """同时断开受管连接双方。"""
+
+    local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
+    require_online_node(db, local_interface.node_id)
+    require_online_node(db, peer_interface.node_id)
+    for interface in [local_interface, peer_interface]:
+        if interface.runtime_status not in ["stopped", "stopping"]:
+            if enqueue_interface_task_once(db, interface, "wireguard.stop_interface"):
+                interface.runtime_status = "stopping"
+    db.commit()
+    return {
+        "local_interface": local_interface,
+        "peer_interface": peer_interface,
+        "local_peer": local_peer,
+        "peer_peer": peer_peer,
+    }
+
+
+@app.delete("/api/wireguard/configs/{interface_id}/managed-link")
+def delete_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+    """同时删除受管连接双方；必须先断开双方接口。"""
+
+    local_interface, peer_interface, _, _ = get_managed_link_bundle(db, interface_id)
+    require_online_node(db, local_interface.node_id)
+    require_online_node(db, peer_interface.node_id)
+    if any(interface.runtime_status in ["running", "starting", "stopping"] for interface in [local_interface, peer_interface]):
+        raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
+    for interface in [local_interface, peer_interface]:
+        mark_import_candidate_available_for_interface(db, interface)
+        if should_delete_node_config_file(interface):
+            enqueue_interface_task_once(db, interface, "wireguard.delete_config")
+        db.delete(interface)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.patch("/api/wireguard/interfaces/{interface_id}", response_model=schemas.InterfaceRead)
+@app.patch("/api/wireguard/configs/{interface_id}", response_model=schemas.InterfaceRead)
+def update_interface(
+    interface_id: int,
+    payload: schemas.InterfaceUpdate,
+    db: Session = Depends(get_db),
+) -> models.WireGuardInterface:
+    """修改已有 WireGuard 点对点配置的期望状态。"""
+
+    interface = db.get(models.WireGuardInterface, interface_id)
+    if interface is None:
+        raise HTTPException(status_code=404, detail="interface not found")
+    require_online_node(db, interface.node_id)
+    ensure_unique_interface_name(db, interface.node_id, payload.name, exclude_interface_id=interface.id)
+
+    interface.name = payload.name
+    interface.tunnel_ips = payload.tunnel_ips
+    interface.listen_port = payload.listen_port
+    interface.private_key_ref = "local-db" if payload.private_key else None
+    interface.private_key_value = payload.private_key
+    interface.public_key = payload.public_key
+    interface.mtu = payload.mtu
+    interface.table_name = payload.table_name
+    interface.dns = payload.dns
+    set_extra_value(interface, "custom_config", payload.interface_custom_config)
+    db.commit()
+    db.refresh(interface)
+    return interface
+
+
+@app.post("/api/wireguard/interfaces/{interface_id}/peers", response_model=schemas.PeerRead)
+def create_peer(
+    interface_id: int,
+    payload: schemas.PeerCreate,
+    db: Session = Depends(get_db),
+) -> models.WireGuardPeer:
+    """兼容旧接口：设置 WireGuard 配置的唯一对端。"""
+
+    return set_unique_peer(interface_id, payload, db)
+
+
+@app.put("/api/wireguard/configs/{config_id}/peer", response_model=schemas.PeerRead)
+def put_config_peer(
+    config_id: int,
+    payload: schemas.PeerCreate,
+    db: Session = Depends(get_db),
+) -> models.WireGuardPeer:
+    """设置 WireGuard 点对点配置的唯一对端。"""
+
+    return set_unique_peer(config_id, payload, db)
+
+
+@app.get("/api/wireguard/configs/{config_id}/peer", response_model=schemas.PeerRead | None)
+def get_config_peer(config_id: int, db: Session = Depends(get_db)) -> models.WireGuardPeer | None:
+    """读取 WireGuard 点对点配置的唯一对端。"""
+
+    return get_unique_peer(config_id, db)
+
+
+@app.delete("/api/wireguard/configs/{config_id}/peer")
+def delete_config_peer(config_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+    """删除 WireGuard 点对点配置的唯一对端。"""
+
+    peer = get_unique_peer(config_id, db)
+    if peer is not None:
+        db.delete(peer)
+        db.commit()
+    return {"status": "deleted"}
+
+
+@app.get("/api/wireguard/interfaces/{interface_id}/peers", response_model=list[schemas.PeerRead])
+def list_peers(interface_id: int, db: Session = Depends(get_db)) -> list[models.WireGuardPeer]:
+    """列出指定 WireGuard 配置下的对端；第一版最多返回一条。"""
+    peer = get_unique_peer(interface_id, db)
+    return [peer] if peer is not None else []
+
+
+@app.post("/api/wireguard/interfaces/{interface_id}/plan-apply", response_model=schemas.ChangePlanRead)
+@app.post("/api/wireguard/configs/{interface_id}/plan-apply", response_model=schemas.ChangePlanRead)
+def plan_apply(interface_id: int, db: Session = Depends(get_db)) -> models.ChangePlan:
+    """为 WireGuard 配置生成部署计划，但不立即下发到 Agent。"""
+    interface = db.scalar(
+        select(models.WireGuardInterface)
+        .options(selectinload(models.WireGuardInterface.peers))
+        .where(models.WireGuardInterface.id == interface_id)
+    )
+    if interface is None:
+        raise HTTPException(status_code=404, detail="interface not found")
+    require_online_node(db, interface.node_id)
+    if interface.source == "managed-node":
+        raise HTTPException(status_code=400, detail="managed node links are deployed directly")
+    enabled_peer_count = count_enabled_peers(interface)
+    if enabled_peer_count != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="deployable wireguard config must have exactly one enabled peer",
+        )
+
+    if interface.source == "imported" and not interface.managed and interface.deployed_config:
+        # 未接管的导入配置表示“观察现有 wg-quick 文件”，直接使用现有文件作为目标。
+        # 否则脱敏密钥会被错误渲染进 diff。
+        new_config = interface.deployed_config
+    else:
+        new_config = render_interface_config(interface)
+    old_config = interface.deployed_config or ""
+    diff = build_diff(old_config, new_config, fromfile=f"{interface.name}.current", tofile=f"{interface.name}.link42")
+    plan = models.ChangePlan(
+        title=f"Apply WireGuard interface {interface.name}",
+        summary=f"Deploy WireGuard config for node {interface.node_id} interface {interface.name}",
+        affected_node_ids=[interface.node_id],
+        diff=diff,
+        payload={"task_type": "wireguard.apply_config", "task_payload": build_apply_plan(interface)},
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+@app.post("/api/wireguard/configs/{interface_id}/refresh-deployed", response_model=schemas.InterfaceRead)
+def refresh_deployed_config(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
+    """请求 Agent 读取节点上的当前配置，供下一次部署计划生成真实 diff。"""
+
+    interface = get_wireguard_config_or_404(interface_id, db)
+    require_online_node(db, interface.node_id)
+    enqueue_interface_task_once(db, interface, "wireguard.read_config")
+    db.commit()
+    db.refresh(interface)
+    return interface
+
+
+@app.post("/api/wireguard/configs/{interface_id}/refresh-status", response_model=schemas.InterfaceRead)
+def refresh_interface_status(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
+    """请求 Agent 刷新 WireGuard 接口运行状态。"""
+
+    interface = get_wireguard_config_or_404(interface_id, db)
+    require_online_node(db, interface.node_id)
+    enqueue_interface_task_once(db, interface, "wireguard.status")
+    db.commit()
+    db.refresh(interface)
+    return interface
+
+
+@app.post("/api/wireguard/configs/{interface_id}/start", response_model=schemas.InterfaceRead)
+def start_interface(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
+    """创建启动 WireGuard 接口的 Agent 任务。"""
+
+    interface = get_wireguard_config_or_404(interface_id, db)
+    require_online_node(db, interface.node_id)
+    if interface.source == "managed-node":
+        raise HTTPException(status_code=400, detail="use managed link operation")
+    if not interface.deployed_config:
+        raise HTTPException(status_code=400, detail="wireguard config must be deployed before start")
+    if interface.runtime_status in ["running", "starting"]:
+        return interface
+    if enqueue_interface_task_once(db, interface, "wireguard.start_interface"):
+        interface.runtime_status = "starting"
+    db.commit()
+    db.refresh(interface)
+    return interface
+
+
+@app.post("/api/wireguard/configs/{interface_id}/stop", response_model=schemas.InterfaceRead)
+def stop_interface(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
+    """创建关闭 WireGuard 接口的 Agent 任务。"""
+
+    interface = get_wireguard_config_or_404(interface_id, db)
+    require_online_node(db, interface.node_id)
+    if interface.source == "managed-node":
+        raise HTTPException(status_code=400, detail="use managed link operation")
+    if interface.runtime_status in ["stopped", "stopping"]:
+        return interface
+    if enqueue_interface_task_once(db, interface, "wireguard.stop_interface"):
+        interface.runtime_status = "stopping"
+    db.commit()
+    db.refresh(interface)
+    return interface
+
+
+@app.delete("/api/wireguard/configs/{interface_id}")
+def delete_interface(interface_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+    """删除 WireGuard 配置；运行中的配置必须先关闭。"""
+
+    interface = get_wireguard_config_or_404(interface_id, db)
+    require_online_node(db, interface.node_id)
+    if interface.runtime_status in ["running", "starting", "stopping"]:
+        raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
+    mark_import_candidate_available_for_interface(db, interface)
+    if should_delete_node_config_file(interface):
+        enqueue_interface_task_once(db, interface, "wireguard.delete_config")
+    db.delete(interface)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.post("/api/change-plans/{plan_id}/confirm", response_model=schemas.ChangePlanRead)
+def confirm_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.ChangePlan:
+    """确认部署计划，并创建等待 Agent 拉取的任务。"""
+    plan = db.get(models.ChangePlan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="change plan not found")
+    if plan.status != "draft":
+        raise HTTPException(status_code=409, detail="change plan is not draft")
+    if not plan.diff.strip():
+        raise HTTPException(status_code=400, detail="change plan has no diff")
+
+    task_payload = plan.payload.get("task_payload")
+    task_type = plan.payload.get("task_type")
+    if not task_payload or not task_type:
+        raise HTTPException(status_code=400, detail="change plan has no task payload")
+    require_online_node(db, task_payload["node_id"])
+
+    plan.status = "confirmed"
+    plan.confirmed_at = datetime.utcnow()
+    post_confirm = plan.payload.get("post_confirm") or {}
+    managed_interface_id = post_confirm.get("set_interface_managed")
+    if managed_interface_id:
+        # 接管导入配置必须等用户确认后才改变归属，避免草稿计划影响真实状态。
+        interface = db.get(models.WireGuardInterface, managed_interface_id)
+        if interface is not None:
+            interface.managed = True
+    task = models.AgentTask(
+        node_id=task_payload["node_id"],
+        change_plan_id=plan.id,
+        type=task_type,
+        payload=task_payload,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+@app.get("/api/change-plans/{plan_id}", response_model=schemas.ChangePlanRead)
+def get_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.ChangePlan:
+    """读取部署计划状态，供前端确认 Agent 是否执行完成。"""
+
+    plan = db.get(models.ChangePlan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="change plan not found")
+    return plan
+
+
+@app.post("/api/nodes/{node_id}/wireguard/import-scan", response_model=schemas.TaskRequestResult)
+def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.TaskRequestResult:
+    """直接创建扫描现有 wg-quick 配置的 Agent 任务。"""
+
+    require_online_node(db, node_id)
+
+    existing = db.scalar(
+        select(models.AgentTask).where(
+            models.AgentTask.node_id == node_id,
+            models.AgentTask.type == "wireguard.import_scan",
+            models.AgentTask.status.in_(["pending", "running"]),
+        )
+    )
+    if existing is not None:
+        return schemas.TaskRequestResult(
+            task_id=existing.id,
+            status=existing.status,
+            message="scan task already queued",
+        )
+
+    task = models.AgentTask(
+        node_id=node_id,
+        type="wireguard.import_scan",
+        payload={"node_id": node_id},
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return schemas.TaskRequestResult(
+        task_id=task.id,
+        status=task.status,
+        message="scan task queued",
+    )
+
+
+@app.get("/api/agent/tasks/{task_id}", response_model=schemas.AgentTaskStatusRead)
+def get_agent_task(task_id: int, db: Session = Depends(get_db)) -> models.AgentTask:
+    """读取 Agent 任务状态，供前端轮询直接任务。"""
+
+    task = db.get(models.AgentTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
+@app.get("/api/nodes/{node_id}/wireguard/import-candidates", response_model=list[schemas.ImportCandidateRead])
+def list_import_candidates(node_id: int, db: Session = Depends(get_db)) -> list[models.ImportCandidate]:
+    """列出 Agent 扫描回来的 wg-quick 导入候选。"""
+    return list(
+        db.scalars(
+            select(models.ImportCandidate)
+            .where(models.ImportCandidate.node_id == node_id)
+            .order_by(models.ImportCandidate.id.desc())
+        )
+    )
+
+
+@app.post("/api/nodes/{node_id}/wireguard/import", response_model=schemas.InterfaceRead)
+def import_candidate(
+    node_id: int,
+    payload: schemas.ImportRequest,
+    db: Session = Depends(get_db),
+) -> models.WireGuardInterface:
+    """把某个导入候选保存为 Link42 中的未接管接口。"""
+    candidate = db.get(models.ImportCandidate, payload.candidate_id)
+    if candidate is None or candidate.node_id != node_id:
+        raise HTTPException(status_code=404, detail="import candidate not found")
+    if candidate.imported:
+        raise HTTPException(status_code=409, detail="candidate already imported")
+
+    parsed = candidate.parsed
+    import_warnings = list(parsed.get("warnings", []))
+    if len(parsed.get("peers", [])) > 1:
+        import_warnings.append(
+            "此配置包含多个 Peer，已按观察模式导入；请拆分为单对端配置后再接管管理。"
+        )
+    interface = models.WireGuardInterface(
+        node_id=node_id,
+        name=parsed["name"],
+        tunnel_ips=parsed.get("addresses", []),
+        listen_port=parsed.get("listen_port"),
+        private_key_ref=imported_secret_ref(parsed.get("private_key")),
+        private_key_value=parsed.get("private_key"),
+        mtu=parsed.get("mtu"),
+        fwmark=parsed.get("fwmark"),
+        table_name=parsed.get("table"),
+        dns=parsed.get("dns", []),
+        pre_up=parsed.get("pre_up", []),
+        post_up=parsed.get("post_up", []),
+        pre_down=parsed.get("pre_down", []),
+        post_down=parsed.get("post_down", []),
+        source="imported",
+        managed=False,
+        deployed_config=candidate.parsed.get("raw_config"),
+        import_path=candidate.path,
+        extras=parsed.get("extras", {}),
+        warnings=import_warnings,
+    )
+    db.add(interface)
+    db.flush()
+    for peer_data in parsed.get("peers", [])[:1]:
+        # 第一版只管理点对点配置；多 Peer 导入时只保留第一条用于观察，接管会被校验拦住。
+        endpoint_host, endpoint_port = split_endpoint(peer_data.get("endpoint"))
+        db.add(
+            models.WireGuardPeer(
+                interface_id=interface.id,
+                public_key=peer_data.get("public_key") or "",
+                preshared_key_ref=imported_secret_ref(peer_data.get("preshared_key")),
+                preshared_key_value=peer_data.get("preshared_key"),
+                endpoint_host=endpoint_host,
+                endpoint_port=endpoint_port,
+                allowed_ips=peer_data.get("allowed_ips", []),
+                persistent_keepalive=peer_data.get("persistent_keepalive"),
+                source="imported",
+                extras=peer_data.get("extras", {}),
+                warnings=peer_data.get("warnings", []),
+            )
+        )
+    candidate.imported = True
+    db.commit()
+    db.refresh(interface)
+    return interface
+
+
+@app.post("/api/wireguard/interfaces/{interface_id}/take-over", response_model=schemas.ChangePlanRead)
+@app.post("/api/wireguard/configs/{interface_id}/take-over", response_model=schemas.ChangePlanRead)
+def take_over_imported_interface(interface_id: int, db: Session = Depends(get_db)) -> models.ChangePlan:
+    """为导入配置生成接管计划，确认后才会覆盖节点配置。"""
+    interface = db.scalar(
+        select(models.WireGuardInterface)
+        .options(selectinload(models.WireGuardInterface.peers))
+        .where(models.WireGuardInterface.id == interface_id)
+    )
+    if interface is None:
+        raise HTTPException(status_code=404, detail="interface not found")
+    require_online_node(db, interface.node_id)
+    if interface.source != "imported":
+        raise HTTPException(status_code=400, detail="only imported interfaces need takeover")
+    if any("多个 Peer" in warning for warning in interface.warnings):
+        raise HTTPException(
+            status_code=400,
+            detail="imported config contains multiple peers and must be split before takeover",
+        )
+    enabled_peer_count = count_enabled_peers(interface)
+    if enabled_peer_count != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="imported config must have exactly one enabled peer before takeover",
+        )
+
+    if interface.deployed_config:
+        # 已导入的 wg-quick 文件本来就在节点上；接管只是改变 Link42 管理状态，不应重写文件。
+        interface.managed = True
+        plan = models.ChangePlan(
+            title=f"Take over WireGuard interface {interface.name}",
+            summary=(
+                f"Use existing wg-quick config for node {interface.node_id} interface {interface.name}"
+            ),
+            status="succeeded",
+            affected_node_ids=[interface.node_id],
+            diff="",
+            payload={},
+            confirmed_at=datetime.utcnow(),
+        )
+        db.add(plan)
+        db.commit()
+        db.refresh(plan)
+        return plan
+
+    new_config = render_interface_config(interface)
+    diff = build_diff("", new_config, fromfile=f"{interface.name}.imported", tofile=f"{interface.name}.link42")
+    plan = models.ChangePlan(
+        title=f"Take over WireGuard interface {interface.name}",
+        summary=f"Back up and replace imported config for node {interface.node_id} interface {interface.name}",
+        affected_node_ids=[interface.node_id],
+        diff=diff,
+        payload={
+            "task_type": "wireguard.apply_config",
+            "task_payload": build_apply_payload_from_config(interface, new_config),
+            "post_confirm": {"set_interface_managed": interface.id},
+        },
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+@app.post("/api/agent/register")
+def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+    """Agent 首次注册或重新注册节点信息。"""
+    node = require_agent(db, payload.node_id, payload.token)
+    node.hostname = payload.hostname or node.hostname
+    node.management_ip = payload.management_ip or node.management_ip
+    node.public_ip = payload.public_ip or node.public_ip
+    node.status = "online"
+    node.last_seen_at = datetime.utcnow()
+    db.commit()
+    return {"status": "registered"}
+
+
+@app.post("/api/agent/heartbeat")
+def agent_heartbeat(payload: schemas.AgentHeartbeatRequest, db: Session = Depends(get_db)) -> dict[str, str]:
+    """Agent 心跳，用于更新节点在线状态。"""
+    node = require_agent(db, payload.node_id, payload.token)
+    node.status = "online"
+    node.last_seen_at = datetime.utcnow()
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.post("/api/agent/tasks/poll", response_model=schemas.AgentPollResponse)
+def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db)) -> schemas.AgentPollResponse:
+    """Agent 轮询待执行任务，并把任务标记为 running。"""
+    require_agent(db, payload.node_id, payload.token)
+    tasks = list(
+        db.scalars(
+            select(models.AgentTask)
+            .where(models.AgentTask.node_id == payload.node_id, models.AgentTask.status == "pending")
+            .order_by(models.AgentTask.id)
+            .limit(5)
+        )
+    )
+    for task in tasks:
+        task.status = "running"
+        task.started_at = datetime.utcnow()
+    db.commit()
+    return schemas.AgentPollResponse(tasks=[schemas.AgentTaskRead(id=t.id, type=t.type, payload=t.payload) for t in tasks])
+
+
+@app.post("/api/agent/tasks/{task_id}/result")
+def agent_task_result(
+    task_id: int,
+    payload: schemas.AgentTaskResultRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    """Agent 上报任务执行结果，并更新相关 Change Plan 状态。"""
+    require_agent(db, payload.node_id, payload.token)
+    task = db.get(models.AgentTask, task_id)
+    if task is None or task.node_id != payload.node_id:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    task.status = payload.status
+    task.result = payload.result
+    task.finished_at = datetime.utcnow()
+
+    if task.change_plan_id:
+        plan = db.get(models.ChangePlan, task.change_plan_id)
+        if plan is not None:
+            plan.status = "succeeded" if payload.status == "succeeded" else "failed"
+
+    # import_scan 的结果由 Agent 返回候选配置，API 在这里转存为 ImportCandidate。
+    if task.type == "wireguard.import_scan" and payload.status == "succeeded":
+        candidates = payload.result.get("candidates", [])
+        scanned_paths = {candidate["path"] for candidate in candidates if candidate.get("path")}
+        stale_candidates = db.scalars(
+            select(models.ImportCandidate).where(
+                models.ImportCandidate.node_id == payload.node_id,
+                models.ImportCandidate.imported.is_(False),
+                models.ImportCandidate.path.not_in(scanned_paths),
+            )
+        )
+        for stale_candidate in stale_candidates:
+            db.delete(stale_candidate)
+        for candidate in candidates:
+            parsed = candidate.get("parsed")
+            if parsed is None or not candidate.get("path"):
+                continue
+            parsed["raw_config"] = candidate.get("content") or parsed.get("raw_config") or ""
+            existing_candidate = db.scalar(
+                select(models.ImportCandidate).where(
+                    models.ImportCandidate.node_id == payload.node_id,
+                    models.ImportCandidate.path == candidate["path"],
+                    models.ImportCandidate.imported.is_(False),
+                )
+            )
+            if existing_candidate:
+                # 重复扫描同一路径时更新候选，避免前端出现多条相同导入项。
+                existing_candidate.interface_name = parsed["name"]
+                existing_candidate.parsed = parsed
+                existing_candidate.warnings = candidate.get("warnings", [])
+                continue
+            db.add(
+                models.ImportCandidate(
+                    node_id=payload.node_id,
+                    path=candidate["path"],
+                    interface_name=parsed["name"],
+                    parsed=parsed,
+                    warnings=candidate.get("warnings", []),
+                )
+            )
+
+    interface_id = task.payload.get("interface_id")
+    if interface_id and payload.status == "succeeded":
+        interface = db.get(models.WireGuardInterface, interface_id)
+        if interface is not None:
+            if task.type == "wireguard.apply_config":
+                # 部署成功后记录节点上的已部署配置，后续 Change Plan diff 才能对比真实基线。
+                interface.deployed_config = task.payload.get("config")
+                interface.runtime_status = "running"
+            elif task.type == "wireguard.read_config":
+                interface.deployed_config = payload.result.get("config") or ""
+            elif task.type == "wireguard.start_interface":
+                interface.runtime_status = "running"
+            elif task.type == "wireguard.stop_interface":
+                interface.runtime_status = "stopped"
+            elif task.type == "wireguard.status":
+                interface.runtime_status = payload.result.get("runtime_status") or interface.runtime_status
+
+    db.commit()
+    return {"status": "recorded"}
