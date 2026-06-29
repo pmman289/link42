@@ -107,6 +107,20 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                     """
                 )
             )
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM import_candidates
+                    WHERE imported = 0
+                      AND EXISTS (
+                          SELECT 1
+                          FROM wg_interfaces
+                          WHERE wg_interfaces.node_id = import_candidates.node_id
+                            AND wg_interfaces.name = import_candidates.interface_name
+                      )
+                    """
+                )
+            )
         connection.execute(
             text(
                 """

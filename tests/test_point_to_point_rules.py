@@ -13,6 +13,7 @@ from link42_api.main import (
     ADMIN_USERNAME,
     SETTING_ADMIN_PASSWORD_HASH,
     SETTING_ADMIN_SESSION_HASH,
+    SETTING_ADMIN_USERNAME,
     SETTING_CONTROLLER_URL,
     create_managed_link,
     create_node,
@@ -238,21 +239,52 @@ def test_web_login_rejects_wrong_password() -> None:
 
 
 def test_controller_settings_round_trip() -> None:
-    """验证设置页保存的主控访问地址会进入系统设置。"""
+    """验证设置页保存的主控访问地址和用户名会进入系统设置。"""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
         updated = update_controller_settings(
-            ControllerSettingsUpdate(controller_url=" http://10.0.0.1:8000 "),
+            ControllerSettingsUpdate(controller_url=" http://10.0.0.1:8000 ", username="admin"),
             session,
         )
         loaded = get_controller_settings(session)
         stored = get_setting(session, SETTING_CONTROLLER_URL)
+        username = get_setting(session, SETTING_ADMIN_USERNAME)
 
     assert updated.controller_url == "http://10.0.0.1:8000"
+    assert updated.username == "admin"
     assert loaded.controller_url == "http://10.0.0.1:8000"
+    assert loaded.username == "admin"
     assert stored == "http://10.0.0.1:8000"
+    assert username == "admin"
+
+
+def test_controller_settings_can_change_username_and_password() -> None:
+    """验证设置页可修改用户名和密码，并使旧会话失效。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        set_setting(session, SETTING_ADMIN_USERNAME, ADMIN_USERNAME)
+        set_setting(session, SETTING_ADMIN_PASSWORD_HASH, hash_token("old-pass"))
+        set_setting(session, SETTING_ADMIN_SESSION_HASH, hash_token("old-session"))
+        session.commit()
+
+        update_controller_settings(
+            ControllerSettingsUpdate(
+                controller_url="http://10.0.0.1:8000",
+                username="new-admin",
+                new_password="new-pass",
+            ),
+            session,
+        )
+        result = login(LoginRequest(username="new-admin", password="new-pass"), session)
+        old_session_hash = get_setting(session, SETTING_ADMIN_SESSION_HASH)
+
+    assert result.username == "new-admin"
+    assert old_session_hash is not None
+    assert not verify_token("old-session", old_session_hash)
 
 
 def test_api_auth_exemptions_only_cover_login_and_agent() -> None:
@@ -609,6 +641,50 @@ def test_import_scan_does_not_reoffer_already_imported_path(monkeypatch) -> None
     assert len(all_candidates) == 1
     assert all_candidates[0].imported is True
     assert all_candidates[0].interface_name == "imported"
+    assert visible_candidates == []
+
+
+def test_import_scan_does_not_offer_existing_interface_name(monkeypatch) -> None:
+    """验证节点已有同名接口时，不再按 wg-quick 文件名重复提供导入。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", endpoint_ips=["10.0.0.1"])
+        session.add(node)
+        session.flush()
+        session.add(models.WireGuardInterface(node_id=node.id, name="wg-a", source="managed-node", managed=True))
+        task = models.AgentTask(node_id=node.id, type="wireguard.import_scan", status="running", payload={})
+        session.add(task)
+        session.commit()
+
+        agent_task_result(
+            task.id,
+            AgentTaskResultRequest(
+                node_id=node.id,
+                token="token",
+                status="succeeded",
+                result={
+                    "candidates": [
+                        {
+                            "path": "/etc/wireguard/wg-a.conf",
+                            "content": "[Interface]\nPrivateKey = new\n",
+                            "parsed": {"name": "wg-a", "warnings": []},
+                            "warnings": [],
+                        }
+                    ]
+                },
+            ),
+            session,
+        )
+        all_candidates = list(session.scalars(select(models.ImportCandidate)))
+        visible_candidates = list_import_candidates(node.id, session)
+
+    assert all_candidates == []
     assert visible_candidates == []
 
 

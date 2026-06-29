@@ -33,4 +33,4 @@ RUN mkdir -p /link42/data /link42/config
 VOLUME ["/link42"]
 EXPOSE 8000
 
-CMD ["sh", "-c", "mkdir -p /link42/data /link42/config && uvicorn link42_api.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "mkdir -p /link42/data /link42/config && uvicorn link42_api.main:app --host 0.0.0.0 --port 8000 --no-access-log"]

@@ -38,7 +38,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ADMIN_USERNAME = "pmman"
+DEFAULT_ADMIN_USERNAME = "pmman"
+ADMIN_USERNAME = DEFAULT_ADMIN_USERNAME
+SETTING_ADMIN_USERNAME = "admin_username"
 SETTING_ADMIN_PASSWORD_HASH = "admin_password_hash"
 SETTING_ADMIN_SESSION_HASH = "admin_session_hash"
 SETTING_CONTROLLER_URL = "controller_url"
@@ -95,14 +97,24 @@ def ensure_admin_credentials() -> None:
     db = next(get_db())
     try:
         if get_setting(db, SETTING_ADMIN_PASSWORD_HASH):
+            if not get_setting(db, SETTING_ADMIN_USERNAME):
+                set_setting(db, SETTING_ADMIN_USERNAME, DEFAULT_ADMIN_USERNAME)
+                db.commit()
             return
         password = secrets.token_urlsafe(18)
+        set_setting(db, SETTING_ADMIN_USERNAME, DEFAULT_ADMIN_USERNAME)
         set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_token(password))
         set_setting(db, SETTING_CONTROLLER_URL, get_setting(db, SETTING_CONTROLLER_URL) or "")
         db.commit()
     finally:
         db.close()
-    print(f"Link42 initial login: username={ADMIN_USERNAME} password={password}", flush=True)
+    print(f"Link42 initial login: username={DEFAULT_ADMIN_USERNAME} password={password}", flush=True)
+
+
+def admin_username(db: Session) -> str:
+    """读取当前管理员用户名，旧库默认 pmman。"""
+
+    return get_setting(db, SETTING_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME
 
 
 def bearer_token_from_request(request: Request) -> str | None:
@@ -383,6 +395,25 @@ def mark_import_candidate_available_for_interface(
     return True
 
 
+def existing_interface_names(db: Session, node_id: int) -> set[str]:
+    """返回节点下已存在的 WireGuard 接口名，用于排除重复导入候选。"""
+
+    return set(
+        db.scalars(
+            select(models.WireGuardInterface.name).where(models.WireGuardInterface.node_id == node_id)
+        )
+    )
+
+
+def should_offer_import_candidate(
+    candidate: models.ImportCandidate,
+    existing_names: set[str],
+) -> bool:
+    """判断扫描候选是否仍应展示给用户导入。"""
+
+    return not candidate.imported and candidate.interface_name not in existing_names
+
+
 def should_delete_node_config_file(interface: models.WireGuardInterface) -> bool:
     """判断删除 Link42 配置时是否应同步删除节点上的 wg-quick 文件。"""
 
@@ -550,12 +581,13 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)) -> schem
     """单用户登录，成功后返回 Web 管理端 Bearer token。"""
 
     password_hash = get_setting(db, SETTING_ADMIN_PASSWORD_HASH)
-    if payload.username != ADMIN_USERNAME or not password_hash or not verify_token(payload.password, password_hash):
+    username = admin_username(db)
+    if payload.username != username or not password_hash or not verify_token(payload.password, password_hash):
         raise HTTPException(status_code=401, detail="invalid username or password")
     token = generate_token("l42web")
     set_setting(db, SETTING_ADMIN_SESSION_HASH, hash_token(token))
     db.commit()
-    return schemas.LoginResult(token=token, username=ADMIN_USERNAME)
+    return schemas.LoginResult(token=token, username=username)
 
 
 @app.post("/api/auth/logout")
@@ -568,17 +600,20 @@ def logout(db: Session = Depends(get_db)) -> dict[str, str]:
 
 
 @app.get("/api/auth/me", response_model=schemas.AuthStatus)
-def auth_me() -> schemas.AuthStatus:
+def auth_me(db: Session = Depends(get_db)) -> schemas.AuthStatus:
     """返回当前登录用户。"""
 
-    return schemas.AuthStatus(authenticated=True, username=ADMIN_USERNAME)
+    return schemas.AuthStatus(authenticated=True, username=admin_username(db))
 
 
 @app.get("/api/settings", response_model=schemas.ControllerSettingsRead)
 def get_controller_settings(db: Session = Depends(get_db)) -> schemas.ControllerSettingsRead:
     """读取主控 Web 设置。"""
 
-    return schemas.ControllerSettingsRead(controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "")
+    return schemas.ControllerSettingsRead(
+        controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "",
+        username=admin_username(db),
+    )
 
 
 @app.patch("/api/settings", response_model=schemas.ControllerSettingsRead)
@@ -586,14 +621,21 @@ def update_controller_settings(
     payload: schemas.ControllerSettingsUpdate,
     db: Session = Depends(get_db),
 ) -> schemas.ControllerSettingsRead:
-    """保存主控访问地址，用于生成 Agent 安装命令。"""
+    """保存主控访问地址和管理员凭据。"""
 
     controller_url = payload.controller_url.strip()
     if not controller_url:
         raise HTTPException(status_code=400, detail="controller url is required")
+    username = payload.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
     set_setting(db, SETTING_CONTROLLER_URL, controller_url)
+    set_setting(db, SETTING_ADMIN_USERNAME, username)
+    if payload.new_password:
+        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_token(payload.new_password))
+        set_setting(db, SETTING_ADMIN_SESSION_HASH, "")
     db.commit()
-    return schemas.ControllerSettingsRead(controller_url=controller_url)
+    return schemas.ControllerSettingsRead(controller_url=controller_url, username=username)
 
 
 @app.post("/api/nodes", response_model=schemas.NodeCreateResult)
@@ -1336,7 +1378,8 @@ def get_agent_task(task_id: int, db: Session = Depends(get_db)) -> models.AgentT
 @app.get("/api/nodes/{node_id}/wireguard/import-candidates", response_model=list[schemas.ImportCandidateRead])
 def list_import_candidates(node_id: int, db: Session = Depends(get_db)) -> list[models.ImportCandidate]:
     """列出 Agent 扫描回来的 wg-quick 导入候选。"""
-    return list(
+    existing_names = existing_interface_names(db, node_id)
+    candidates = list(
         db.scalars(
             select(models.ImportCandidate)
             .where(
@@ -1346,6 +1389,7 @@ def list_import_candidates(node_id: int, db: Session = Depends(get_db)) -> list[
             .order_by(models.ImportCandidate.id.desc())
         )
     )
+    return [candidate for candidate in candidates if should_offer_import_candidate(candidate, existing_names)]
 
 
 @app.post("/api/nodes/{node_id}/wireguard/import", response_model=schemas.InterfaceRead)
@@ -1546,6 +1590,7 @@ def agent_task_result(
     if task.type == "wireguard.import_scan" and payload.status == "succeeded":
         candidates = payload.result.get("candidates", [])
         scanned_paths = {candidate["path"] for candidate in candidates if candidate.get("path")}
+        imported_interface_names = existing_interface_names(db, payload.node_id)
         stale_candidates = db.scalars(
             select(models.ImportCandidate).where(
                 models.ImportCandidate.node_id == payload.node_id,
@@ -1560,17 +1605,22 @@ def agent_task_result(
             if parsed is None or not candidate.get("path"):
                 continue
             parsed["raw_config"] = candidate.get("content") or parsed.get("raw_config") or ""
+            interface_name = parsed["name"]
             existing_candidate = db.scalar(
                 select(models.ImportCandidate).where(
                     models.ImportCandidate.node_id == payload.node_id,
                     models.ImportCandidate.path == candidate["path"],
                 )
             )
+            if interface_name in imported_interface_names:
+                if existing_candidate and not existing_candidate.imported:
+                    db.delete(existing_candidate)
+                continue
             if existing_candidate:
                 if existing_candidate.imported:
                     continue
                 # 重复扫描同一路径时更新候选，避免前端出现多条相同导入项。
-                existing_candidate.interface_name = parsed["name"]
+                existing_candidate.interface_name = interface_name
                 existing_candidate.parsed = parsed
                 existing_candidate.warnings = candidate.get("warnings", [])
                 continue
@@ -1578,7 +1628,7 @@ def agent_task_result(
                 models.ImportCandidate(
                     node_id=payload.node_id,
                     path=candidate["path"],
-                    interface_name=parsed["name"],
+                    interface_name=interface_name,
                     parsed=parsed,
                     warnings=candidate.get("warnings", []),
                 )

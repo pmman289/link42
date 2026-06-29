@@ -105,6 +105,7 @@ type LoginResult = {
 
 type ControllerSettings = {
   controller_url: string;
+  username: string;
 };
 
 type Toast = {
@@ -435,6 +436,7 @@ function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [controllerUrl, setControllerUrl] = useState(DEFAULT_CONTROLLER_URL);
+  const [settingsUsername, setSettingsUsername] = useState("pmman");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
@@ -568,17 +570,32 @@ function App() {
   async function refreshSettings() {
     const data = await api<ControllerSettings>("/api/settings");
     setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
+    setSettingsUsername(data.username || "pmman");
   }
 
   async function saveSettings(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const newPassword = String(form.get("new_password") || "");
     const data = await api<ControllerSettings>("/api/settings", {
       method: "PATCH",
-      body: JSON.stringify({ controller_url: String(form.get("controller_url") || "").trim() }),
+      body: JSON.stringify({
+        controller_url: String(form.get("controller_url") || "").trim(),
+        username: String(form.get("username") || "").trim(),
+        new_password: newPassword || null,
+      }),
     });
     setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
+    setSettingsUsername(data.username || "pmman");
     setSettingsOpen(false);
+    if (newPassword) {
+      window.localStorage.removeItem(AUTH_TOKEN_KEY);
+      setAuthToken("");
+      setCurrentUser(null);
+      notify("success", "账号已更新，请使用新凭据重新登录。");
+      return;
+    }
+    setCurrentUser(data.username || currentUser);
     notify("success", "设置已保存。");
   }
 
@@ -1259,7 +1276,7 @@ function App() {
           <p className="muted">主控访问登录</p>
           <form className="stack" onSubmit={(event) => void runAction(() => login(event))}>
             <Field label="用户名">
-              <input name="username" defaultValue="pmman" autoComplete="username" required />
+              <input name="username" defaultValue={settingsUsername} autoComplete="username" required />
             </Field>
             <Field label="密码">
               <input name="password" type="password" autoComplete="current-password" required />
@@ -1312,7 +1329,7 @@ function App() {
             <header className="modalHeader">
               <div>
                 <h2 id="settings-title"><Settings size={18} /> 系统设置</h2>
-                <p className="muted">主控访问地址用于生成 Agent 安装命令。</p>
+                <p className="muted">主控访问地址用于生成 Agent 安装命令；账号用于登录面板。</p>
               </div>
               <button className="iconButton" onClick={() => setSettingsOpen(false)}>
                 <X size={18} />
@@ -1321,6 +1338,12 @@ function App() {
             <form className="stack" onSubmit={(event) => void runAction(() => saveSettings(event))}>
               <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.168.123.20:8000。">
                 <input name="controller_url" defaultValue={controllerUrl} placeholder={DEFAULT_CONTROLLER_URL} required />
+              </Field>
+              <Field label="用户名">
+                <input name="username" defaultValue={settingsUsername} required />
+              </Field>
+              <Field label="新密码" hint="留空表示不修改密码。">
+                <input name="new_password" type="password" autoComplete="new-password" />
               </Field>
               <button type="submit"><Check size={16} /> 保存设置</button>
             </form>

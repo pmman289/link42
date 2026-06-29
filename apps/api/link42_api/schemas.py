@@ -75,10 +75,13 @@ class AuthStatus(BaseModel):
 
 class ControllerSettingsRead(BaseModel):
     controller_url: str
+    username: str
 
 
 class ControllerSettingsUpdate(BaseModel):
     controller_url: str = Field(min_length=1, max_length=255)
+    username: str = Field(min_length=1, max_length=80)
+    new_password: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class InterfaceCreate(BaseModel):
