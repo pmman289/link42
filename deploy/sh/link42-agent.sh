@@ -12,6 +12,7 @@ SERVICE_NAME="link42-agent"
 POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"
 WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"
 DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"
+ACTION="${1:-install}"
 
 log() {
   printf '%s\n' "[link42-agent] $*"
@@ -39,6 +40,8 @@ Usage:
     LINK42_NODE_ID=1 \\
     LINK42_AGENT_TOKEN=token \\
     sh
+
+  curl -fsSL $SCRIPT_URL | sudo sh -s -- uninstall
 EOF
 }
 
@@ -46,6 +49,64 @@ if [ "$(id -u)" -ne 0 ]; then
   run_as_root_hint
   fail "please run as root"
 fi
+
+detect_service_backend() {
+  if command -v systemctl >/dev/null 2>&1; then
+    SERVICE_BACKEND="systemd"
+  elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+    SERVICE_BACKEND="openrc"
+  else
+    SERVICE_BACKEND="none"
+  fi
+}
+
+uninstall_systemd_service() {
+  if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ] || systemctl list-unit-files "$SERVICE_NAME.service" >/dev/null 2>&1; then
+    systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+  fi
+}
+
+uninstall_openrc_service() {
+  if [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+    rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    rm -f "/etc/init.d/$SERVICE_NAME"
+  fi
+}
+
+uninstall_agent() {
+  detect_service_backend
+  if [ "$SERVICE_BACKEND" = "systemd" ]; then
+    uninstall_systemd_service
+  elif [ "$SERVICE_BACKEND" = "openrc" ]; then
+    uninstall_openrc_service
+  else
+    log "service manager not found; removing files only"
+  fi
+
+  rm -f "$BIN_PATH"
+  rm -f "$ENV_FILE"
+  rmdir "$ENV_DIR" >/dev/null 2>&1 || true
+  rm -rf "$INSTALL_DIR"
+  log "uninstalled $SERVICE_NAME"
+  log "wireguard configs were not removed: $WIREGUARD_DIR"
+}
+
+case "$ACTION" in
+  install)
+    ;;
+  uninstall|remove)
+    uninstall_agent
+    exit 0
+    ;;
+  *)
+    run_as_root_hint
+    fail "unknown action: $ACTION"
+    ;;
+esac
 
 need_env LINK42_SERVER_URL
 need_env LINK42_NODE_ID
@@ -61,11 +122,8 @@ case "$ARCH" in
     ;;
 esac
 
-if command -v systemctl >/dev/null 2>&1; then
-  SERVICE_BACKEND="systemd"
-elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
-  SERVICE_BACKEND="openrc"
-else
+detect_service_backend
+if [ "$SERVICE_BACKEND" = "none" ]; then
   fail "no supported service manager found; install systemd or OpenRC first"
 fi
 

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Check, GitBranch, Pencil, Plus, RefreshCw, Server, Upload, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, GitBranch, Pencil, Plus, RefreshCw, Server, Upload, X } from "lucide-react";
 import "./styles.css";
 
 type NodeItem = {
@@ -100,10 +100,14 @@ type Toast = {
   text: string;
 };
 
-// API 基础路径；生产预览从当前访问主机自动推断 FastAPI 的 8000 端口。
+// API 基础路径；同端口托管时使用当前 origin，Vite 预览时推断 FastAPI 的 8000 端口。
+const INFERRED_API_BASE =
+  window.location.port === "5173"
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
+    : window.location.origin;
 const API_BASE =
   import.meta.env.VITE_LINK42_API_BASE ||
-  `${window.location.protocol}//${window.location.hostname}:8000`;
+  INFERRED_API_BASE;
 
 // 默认主控地址；节点 Agent 从本机访问时通常使用 127.0.0.1。
 const DEFAULT_CONTROLLER_URL =
@@ -302,6 +306,7 @@ function App() {
   const [replacePeerConfigId, setReplacePeerConfigId] = useState<number | null>(null);
   const [forceEndpointMismatch, setForceEndpointMismatch] = useState(false);
   const [peerNodeConfigs, setPeerNodeConfigs] = useState<ConfigItem[]>([]);
+  const [importCandidatesExpanded, setImportCandidatesExpanded] = useState(false);
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) || null,
     [nodes, selectedNodeId],
@@ -319,6 +324,7 @@ function App() {
   const isConfigStopped = !selectedConfig || ["stopped", "unknown"].includes(selectedConfig.runtime_status);
   const isConfigBusy = selectedConfig ? ["starting", "stopping"].includes(selectedConfig.runtime_status) : false;
   const selectedConfigIsManagedLink = selectedConfig?.source === "managed-node";
+  const selectedConfigIsUnmanagedImport = selectedConfig?.source === "imported" && !selectedConfig.managed;
   const hasDeployDiff = Boolean(plan?.diff.trim());
   const selectedPeerNodeOptions = selectedNode
     ? nodes.filter((item) => item.id !== selectedNode.id && isNodeSelectable(item))
@@ -419,6 +425,7 @@ function App() {
   }, [managedPeerNodeId]);
 
   useEffect(() => {
+    setImportCandidatesExpanded(false);
     if (selectedNodeId) {
       setSelectedConfigId(null);
       setPlan(null);
@@ -652,8 +659,8 @@ function App() {
     const peerNodeId = Number(form.get("peer_node_id"));
     const localTunnelIps = splitList(String(form.get("local_tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
-    const localEndpointHost = String(form.get("local_endpoint_host") || "");
-    const peerEndpointHost = String(form.get("peer_endpoint_host") || "");
+    const localEndpointHost = String(form.get("local_endpoint_host") || "").trim();
+    const peerEndpointHost = String(form.get("peer_endpoint_host") || "").trim();
     const localListenPort = Number(form.get("local_listen_port"));
     const peerListenPort = Number(form.get("peer_listen_port"));
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
@@ -670,7 +677,10 @@ function App() {
       throw new Error("MTU 必须是 576-9000 之间的整数");
     }
     if (!localEndpointHost || !peerEndpointHost) {
-      throw new Error("请选择双方用于互联的入口地址");
+      throw new Error("请填写双方用于互联的入口地址");
+    }
+    if (replaceLocalConfigId && !replacePeerConfigId) {
+      throw new Error("请选择对端的导入配置覆盖项");
     }
     const result = await api<{ local_interface: ConfigItem; peer_interface: ConfigItem }>(
       `/api/nodes/${selectedNodeId}/wireguard/managed-links`,
@@ -795,8 +805,8 @@ function App() {
         peer_interface_name: form.get("peer_interface_name"),
         local_tunnel_ips: localTunnelIps,
         peer_tunnel_ips: peerTunnelIps,
-        local_endpoint_host: form.get("local_endpoint_host"),
-        peer_endpoint_host: form.get("peer_endpoint_host"),
+        local_endpoint_host: String(form.get("local_endpoint_host") || "").trim(),
+        peer_endpoint_host: String(form.get("peer_endpoint_host") || "").trim(),
         local_listen_port: localListenPort,
         peer_listen_port: peerListenPort,
         mtu,
@@ -879,15 +889,18 @@ function App() {
   async function deleteSelectedConfig() {
     // 删除配置前做前端确认；后端仍会强制要求接口不是 running。
     if (!selectedConfigId || !selectedNodeId || !selectedConfig) return;
-    if (!selectedNodeOnline) {
+    if (!selectedConfigIsUnmanagedImport && !selectedNodeOnline) {
       throw new Error("Agent 离线，不能删除 WireGuard 配置");
     }
-    if (!isConfigStopped) {
+    if (!selectedConfigIsUnmanagedImport && !isConfigStopped) {
       throw new Error("删除前必须先断开对应 WireGuard 连接");
     }
-    if (!window.confirm(selectedConfigIsManagedLink
+    const confirmText = selectedConfigIsManagedLink
       ? `确认删除受管连接 ${selectedConfig.name} 及其对端配置？`
-      : `确认删除 WireGuard 配置 ${selectedConfig.name}？`)) return;
+      : selectedConfigIsUnmanagedImport
+        ? `确认删除导入观察记录 ${selectedConfig.name}？这不会删除节点上的 wg-quick 文件。`
+        : `确认删除 WireGuard 配置 ${selectedConfig.name}？`;
+    if (!window.confirm(confirmText)) return;
     if (selectedConfigIsManagedLink) {
       await api<{ status: string }>(`/api/wireguard/configs/${selectedConfigId}/managed-link`, { method: "DELETE" });
     } else {
@@ -897,7 +910,11 @@ function App() {
     setPlan(null);
     await refreshConfigs(selectedNodeId, null);
     await refreshImportCandidates(selectedNodeId);
-    notify("success", selectedConfigIsManagedLink ? "受管连接双方配置已删除。" : "WireGuard 配置已删除。");
+    notify("success", selectedConfigIsManagedLink
+      ? "受管连接双方配置已删除。"
+      : selectedConfigIsUnmanagedImport
+        ? "导入观察记录已删除，节点原始配置文件未改动。"
+        : "WireGuard 配置已删除。");
   }
 
   async function confirmPlan() {
@@ -930,6 +947,7 @@ function App() {
     await refreshNodes();
     await refreshConfigs(selectedNodeId, selectedConfigId);
     await refreshImportCandidates(selectedNodeId);
+    setImportCandidatesExpanded(true);
     if (data.task_id) {
       void pollImportScanTask(data.task_id, selectedNodeId);
     }
@@ -1186,9 +1204,13 @@ function App() {
                   ))}
                 </select>
               </Field>
-              <Field label="替换对端导入配置" hint="可选；选择后创建时会停用并删除旧配置文件。">
+              <Field
+                label="替换对端导入配置"
+                hint={replaceLocalConfigId ? "必选；本端导入配置转受管时必须指定对端要覆盖的导入配置。" : "可选；选择后创建时会停用并删除旧配置文件。"}
+              >
                 <select
                   value={replacePeerConfigId || ""}
+                  required={Boolean(replaceLocalConfigId)}
                   disabled={!selectedNodeOnline || !managedPeerNodeId}
                   onChange={(event) => setReplacePeerConfigId(Number(event.currentTarget.value) || null)}
                 >
@@ -1205,20 +1227,34 @@ function App() {
                 <input name="peer_interface_name" placeholder="wg-node-b" defaultValue={replacePeerConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
               <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址。">
-                <select name="local_endpoint_host" required disabled={!selectedNodeOnline || selectedLocalEndpoints.length === 0}>
-                  <option value="">选择入口地址</option>
+                <input
+                  name="local_endpoint_host"
+                  list={`local-endpoint-options-${selectedNode.id}`}
+                  placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
+                  defaultValue={selectedLocalEndpoints[0] || ""}
+                  required
+                  disabled={!selectedNodeOnline}
+                />
+                <datalist id={`local-endpoint-options-${selectedNode.id}`}>
                   {selectedLocalEndpoints.map((endpoint) => (
-                    <option key={endpoint} value={endpoint}>{endpoint}</option>
+                    <option key={endpoint} value={endpoint} />
                   ))}
-                </select>
+                </datalist>
               </Field>
               <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址。">
-                <select name="peer_endpoint_host" required disabled={!selectedNodeOnline || selectedPeerEndpoints.length === 0}>
-                  <option value="">选择入口地址</option>
+                <input
+                  name="peer_endpoint_host"
+                  list={`peer-endpoint-options-${selectedManagedPeerNode?.id || "none"}`}
+                  placeholder={selectedPeerEndpoints[0] || "203.0.113.20"}
+                  defaultValue={selectedPeerEndpoints[0] || ""}
+                  required
+                  disabled={!selectedNodeOnline}
+                />
+                <datalist id={`peer-endpoint-options-${selectedManagedPeerNode?.id || "none"}`}>
                   {selectedPeerEndpoints.map((endpoint) => (
-                    <option key={endpoint} value={endpoint}>{endpoint}</option>
+                    <option key={endpoint} value={endpoint} />
                   ))}
-                </select>
+                </datalist>
               </Field>
               <Field label="本端隧道 IP" hint="CIDR 格式，例如 10.42.0.1/32。">
                 <input name="local_tunnel_ips" placeholder="10.42.0.1/32, fd42::1/64" defaultValue={replaceLocalConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
@@ -1262,7 +1298,7 @@ function App() {
               )}
               <button
                 type="submit"
-                disabled={!selectedNodeOnline || selectedPeerNodeOptions.length === 0 || selectedLocalEndpoints.length === 0}
+                disabled={!selectedNodeOnline || selectedPeerNodeOptions.length === 0 || Boolean(replaceLocalConfigId && !replacePeerConfigId)}
               >
                 <GitBranch size={16} /> 创建并启动双方连接
               </button>
@@ -1294,6 +1330,7 @@ function App() {
                       setSelectedNodeId(expanded ? null : node.id);
                       setSelectedConfigId(null);
                       setPlan(null);
+                      setImportCandidatesExpanded(false);
                     }}
                   >
                     <span>
@@ -1355,7 +1392,18 @@ function App() {
 
                     {importCandidates.length > 0 && (
                       <div className="candidateList">
-                        {importCandidates.map((candidate) => (
+                        <button
+                          type="button"
+                          className="candidateToggle"
+                          onClick={() => setImportCandidatesExpanded((value) => !value)}
+                        >
+                          <span>
+                            {importCandidatesExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                            <strong>扫描到的 wg-quick 配置</strong>
+                          </span>
+                          <small>{importCandidates.length} 个</small>
+                        </button>
+                        {importCandidatesExpanded && importCandidates.map((candidate) => (
                           <div key={candidate.id} className="candidate">
                             <div>
                               <strong>{candidate.interface_name}</strong>
@@ -1426,7 +1474,12 @@ function App() {
 
             {!selectedNodeOnline && <div className="empty">Agent 已离线，提交时后端会拒绝部署相关操作。</div>}
 
-            {selectedConfigIsManagedLink && managedLink ? (
+            {selectedConfigIsUnmanagedImport ? (
+              <section className="modalSection">
+                <h3>导入观察记录</h3>
+                <div className="empty">该配置来自节点现有 wg-quick 文件，尚未归属 Link42 管理。接管或导入为受管连接前，系统不会修改、启停或删除节点上的原始配置文件。</div>
+              </section>
+            ) : selectedConfigIsManagedLink && managedLink ? (
               <section className="modalSection">
                 <h3>受管连接</h3>
                 <form
@@ -1447,20 +1500,34 @@ function App() {
                     <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
                   </Field>
                   <Field label="本端入口地址" hint="对端连接本节点时使用。">
-                    <select name="local_endpoint_host" defaultValue={managedLink.peer_peer.endpoint_host || ""} required disabled={!selectedNodeOnline}>
-                      <option value="">选择入口地址</option>
+                    <input
+                      name="local_endpoint_host"
+                      list={`edit-local-endpoint-options-${selectedNode.id}`}
+                      defaultValue={managedLink.peer_peer.endpoint_host || ""}
+                      placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
+                      required
+                      disabled={!selectedNodeOnline}
+                    />
+                    <datalist id={`edit-local-endpoint-options-${selectedNode.id}`}>
                       {selectedLocalEndpoints.map((endpoint) => (
-                        <option key={endpoint} value={endpoint}>{endpoint}</option>
+                        <option key={endpoint} value={endpoint} />
                       ))}
-                    </select>
+                    </datalist>
                   </Field>
                   <Field label="对端入口地址" hint="本端连接对端节点时使用。">
-                    <select name="peer_endpoint_host" defaultValue={managedLink.local_peer.endpoint_host || ""} required disabled={!selectedNodeOnline}>
-                      <option value="">选择入口地址</option>
+                    <input
+                      name="peer_endpoint_host"
+                      list={`edit-peer-endpoint-options-${selectedManagedLinkPeerNode?.id || "none"}`}
+                      defaultValue={managedLink.local_peer.endpoint_host || ""}
+                      placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
+                      required
+                      disabled={!selectedNodeOnline}
+                    />
+                    <datalist id={`edit-peer-endpoint-options-${selectedManagedLinkPeerNode?.id || "none"}`}>
                       {selectedManagedLinkPeerEndpoints.map((endpoint) => (
-                        <option key={endpoint} value={endpoint}>{endpoint}</option>
+                        <option key={endpoint} value={endpoint} />
                       ))}
-                    </select>
+                    </datalist>
                   </Field>
                   <Field label="本端监听端口" hint="当前节点 ListenPort。">
                     <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} required disabled={!selectedNodeOnline} />
@@ -1580,7 +1647,7 @@ function App() {
               <h3>部署与连接</h3>
               {!selectedConfigIsManagedLink && (
                 <>
-                  {selectedConfig.source === "imported" && !selectedConfig.managed && (
+                  {selectedConfigIsUnmanagedImport && (
                     <>
                       <button className="secondary" disabled={!selectedNodeOnline} onClick={() => void runAction(takeOverConfig)}>
                         <Upload size={16} /> 接管导入配置
@@ -1593,6 +1660,8 @@ function App() {
                           setReplacePeerConfigId(null);
                           setManagedPeerNodeId(null);
                           setForceEndpointMismatch(false);
+                          setSelectedConfigId(null);
+                          setPlan(null);
                           setCreateDialog("managed");
                         }}
                       >
@@ -1600,28 +1669,34 @@ function App() {
                       </button>
                     </>
                   )}
-                  <button disabled={!selectedNodeOnline} onClick={() => void runAction(createApplyPlan)}>
-                    <GitBranch size={16} /> 生成部署计划
-                  </button>
+                  {!selectedConfigIsUnmanagedImport && (
+                    <button disabled={!selectedNodeOnline} onClick={() => void runAction(createApplyPlan)}>
+                      <GitBranch size={16} /> 生成部署计划
+                    </button>
+                  )}
                 </>
               )}
               {selectedConfigIsManagedLink && (
                 <div className="empty">受管连接由系统直接管理，保存修改会立即下发双方配置，不需要生成部署计划。</div>
               )}
               <div className="actionRow">
-                {!selectedConfigIsManagedLink && (
+                {!selectedConfigIsManagedLink && !selectedConfigIsUnmanagedImport && (
                   <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy} onClick={() => void runAction(refreshDeployedConfig)}>
                     <RefreshCw size={16} /> 同步节点配置
                   </button>
                 )}
-                <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigRunning} onClick={() => void runAction(startSelectedConfig)}>
-                  {selectedConfig.runtime_status === "starting" ? "启动中" : selectedConfigIsManagedLink ? "启动双方连接" : "启动连接"}
-                </button>
-                <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigStopped} onClick={() => void runAction(stopSelectedConfig)}>
-                  {selectedConfig.runtime_status === "stopping" ? "断开中" : selectedConfigIsManagedLink ? "断开双方连接" : "断开连接"}
-                </button>
-                <button className="danger" disabled={!selectedNodeOnline || isConfigBusy || !isConfigStopped} onClick={() => void runAction(deleteSelectedConfig)}>
-                  {selectedConfigIsManagedLink ? "删除双方配置" : "删除配置"}
+                {!selectedConfigIsUnmanagedImport && (
+                  <>
+                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigRunning} onClick={() => void runAction(startSelectedConfig)}>
+                      {selectedConfig.runtime_status === "starting" ? "启动中" : selectedConfigIsManagedLink ? "启动双方连接" : "启动连接"}
+                    </button>
+                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigStopped} onClick={() => void runAction(stopSelectedConfig)}>
+                      {selectedConfig.runtime_status === "stopping" ? "断开中" : selectedConfigIsManagedLink ? "断开双方连接" : "断开连接"}
+                    </button>
+                  </>
+                )}
+                <button className="danger" disabled={selectedConfigIsUnmanagedImport ? false : (!selectedNodeOnline || isConfigBusy || !isConfigStopped)} onClick={() => void runAction(deleteSelectedConfig)}>
+                  {selectedConfigIsManagedLink ? "删除双方配置" : selectedConfigIsUnmanagedImport ? "删除观察记录" : "删除配置"}
                 </button>
               </div>
               {!selectedConfigIsManagedLink && plan && (

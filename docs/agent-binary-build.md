@@ -2,22 +2,44 @@
 
 当前只支持在 Linux x86_64 主机上构建 x64 Agent 单文件二进制。
 
+Linux 单文件二进制仍会受 glibc 版本影响。不要在过新的发行版上直接用本机
+Python 构建后发给旧系统运行，否则可能出现类似下面的错误：
+
+```text
+Failed to load Python shared library ... GLIBC_2.38 not found
+```
+
+默认构建脚本会使用 `python:3.11-slim-bullseye` 容器构建，让产物依赖更老的
+glibc，适合 Debian 11/12 等常见服务器。
+
 ## 准备
 
 ```bash
-.venv/bin/python -m pip install pyinstaller
+docker version
 ```
 
 ## 构建
 
 ```bash
-scripts/build-agent-x64.sh
+scripts/agent/build-x64.sh
 ```
 
 产物：
 
 ```bash
 dist/agent/link42-agent-linux-x64
+```
+
+如果明确只想使用本机 Python 构建，可以执行：
+
+```bash
+LINK42_AGENT_BUILD_MODE=local scripts/agent/build-x64.sh
+```
+
+本机构建需要先安装 PyInstaller：
+
+```bash
+.venv/bin/python -m pip install pyinstaller
 ```
 
 ## 运行
@@ -59,3 +81,12 @@ https://get.pmman.tech/res/link42/link42-agent-linux-x64
 ```bash
 curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_SERVER_URL='http://controller:8000' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh
 ```
+
+一键卸载：
+
+```bash
+curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall
+```
+
+卸载会停止并删除 Agent 服务、二进制和 `/etc/link42/agent.env`，不会删除
+`/etc/wireguard` 下的 WireGuard 配置。

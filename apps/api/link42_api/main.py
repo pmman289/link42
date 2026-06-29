@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 import subprocess
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -32,6 +35,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def mount_web_panel() -> None:
+    """按配置挂载前端静态文件，让主控镜像可以单端口运行。"""
+
+    if not settings.web_dist_dir:
+        return
+    web_dist_dir = Path(settings.web_dist_dir)
+    index_file = web_dist_dir / "index.html"
+    assets_dir = web_dist_dir / "assets"
+    if not index_file.exists():
+        return
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
+
+    @app.get("/", include_in_schema=False)
+    def serve_web_index() -> FileResponse:
+        """返回前端入口页面。"""
+
+        return FileResponse(index_file)
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def serve_web_fallback(path: str) -> FileResponse:
+        """为前端路由提供 index.html 兜底，同时不接管 API 路径。"""
+
+        if path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(index_file)
+
 
 
 @app.on_event("startup")
@@ -345,6 +377,8 @@ def get_replace_interface(
     interface = db.get(models.WireGuardInterface, interface_id)
     if interface is None or interface.node_id != node_id:
         raise HTTPException(status_code=404, detail="replace interface not found")
+    if interface.source != "imported" or interface.managed:
+        raise HTTPException(status_code=400, detail="replace interface must be unmanaged imported config")
     return interface
 
 
@@ -381,11 +415,16 @@ def node_endpoint_hosts(node: models.Node) -> list[str]:
 
 
 def require_node_endpoint(node: models.Node, host: str, detail: str) -> str:
-    """校验用户选择的入口地址属于对应节点。"""
+    """校验并返回用户填写的入口地址。
 
-    if host not in node_endpoint_hosts(node):
+    节点保存的入口地址用于下拉选项，但实机部署时常会临时填写内网地址、
+    NAT 地址或域名，因此这里不强制要求 host 已登记到节点。
+    """
+
+    cleaned = host.strip()
+    if not cleaned:
         raise HTTPException(status_code=400, detail=detail)
-    return host
+    return cleaned
 
 
 def run_wg_text(args: list[str], input_text: str | None = None) -> str:
@@ -1048,6 +1087,12 @@ def delete_interface(interface_id: int, db: Session = Depends(get_db)) -> dict[s
     """删除 WireGuard 配置；运行中的配置必须先关闭。"""
 
     interface = get_wireguard_config_or_404(interface_id, db)
+    if interface.source == "imported" and not interface.managed:
+        mark_import_candidate_available_for_interface(db, interface)
+        db.delete(interface)
+        db.commit()
+        return {"status": "deleted"}
+
     require_online_node(db, interface.node_id)
     if interface.runtime_status in ["running", "starting", "stopping"]:
         raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
@@ -1418,3 +1463,6 @@ def agent_task_result(
 
     db.commit()
     return {"status": "recorded"}
+
+
+mount_web_panel()

@@ -1,18 +1,17 @@
 services:
-  api:
-    image: python:3.12-slim
-    working_dir: /app
+  controller:
+    image: pmman/link42:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile.controller
     volumes:
-      - ..:/app
-      - link42-data:/data
+      - link42-runtime:/link42
     environment:
-      LINK42_DATABASE_URL: sqlite:////data/link42.db
-    command: >
-      sh -c "pip install -e . &&
-             uvicorn link42_api.main:app --host 0.0.0.0 --port 8000"
+      LINK42_DATABASE_URL: sqlite:////link42/data/link42.db
+      LINK42_CONFIG_DIR: /link42/config
+      LINK42_WEB_DIST_DIR: /opt/link42/web
     ports:
       - "8000:8000"
 
 volumes:
-  link42-data:
-
+  link42-runtime:

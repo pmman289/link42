@@ -13,6 +13,7 @@ from link42_api.main import (
     create_managed_link,
     create_node,
     confirm_change_plan,
+    delete_interface,
     delete_node,
     agent_task_result,
     enqueue_interface_task_once,
@@ -430,6 +431,47 @@ def test_unmanaged_imported_config_delete_keeps_node_file() -> None:
     )
 
     assert should_delete_node_config_file(interface) is False
+
+
+def test_delete_unmanaged_imported_observation_without_agent() -> None:
+    """验证删除未接管导入记录只移除观察记录，不要求 Agent 在线或接口停止。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="offline")
+        session.add(node)
+        session.flush()
+        candidate = models.ImportCandidate(
+            node_id=node.id,
+            path="/etc/wireguard/wg0.conf",
+            interface_name="wg0",
+            parsed={"name": "wg0"},
+            imported=True,
+        )
+        interface = models.WireGuardInterface(
+            name="wg0",
+            node_id=node.id,
+            source="imported",
+            managed=False,
+            import_path="/etc/wireguard/wg0.conf",
+            runtime_status="running",
+        )
+        session.add_all([candidate, interface])
+        session.commit()
+        interface_id = interface.id
+        candidate_id = candidate.id
+
+        result = delete_interface(interface_id, session)
+        remaining_interface = session.get(models.WireGuardInterface, interface_id)
+        refreshed_candidate = session.get(models.ImportCandidate, candidate_id)
+        tasks = list(session.scalars(select(models.AgentTask)))
+
+    assert result == {"status": "deleted"}
+    assert remaining_interface is None
+    assert refreshed_candidate is not None
+    assert refreshed_candidate.imported is False
+    assert tasks == []
 
 
 def test_managed_imported_config_delete_removes_node_file() -> None:

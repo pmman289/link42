@@ -419,6 +419,23 @@ textarea {
   margin-top: 12px;
 }
 
+.candidateToggle {
+  justify-content: space-between;
+  border-color: #dbe3e7;
+  background: #f8fbfc;
+  color: #172026;
+}
+
+.candidateToggle span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.candidateToggle small {
+  color: #60717b;
+}
+
 .candidate {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

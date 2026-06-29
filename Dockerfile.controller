@@ -1,0 +1,32 @@
+FROM node:20-bookworm-slim AS web-build
+
+WORKDIR /src/apps/web
+COPY apps/web/package*.json ./
+RUN npm ci
+COPY apps/web/ ./
+RUN npm run build
+
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LINK42_DATABASE_URL=sqlite:////link42/data/link42.db \
+    LINK42_WEB_DIST_DIR=/opt/link42/web \
+    LINK42_CONFIG_DIR=/link42/config
+
+WORKDIR /opt/link42
+
+COPY pyproject.toml README.md ./
+COPY apps/api ./apps/api
+COPY apps/agent ./apps/agent
+COPY packages ./packages
+RUN pip install --no-cache-dir .
+
+COPY --from=web-build /src/apps/web/dist ./web
+
+RUN mkdir -p /link42/data /link42/config
+
+VOLUME ["/link42"]
+EXPOSE 8000
+
+CMD ["sh", "-c", "mkdir -p /link42/data /link42/config && uvicorn link42_api.main:app --host 0.0.0.0 --port 8000"]

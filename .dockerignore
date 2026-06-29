@@ -1,0 +1,12 @@
+.git
+.agents
+.codex
+.pytest_cache
+.venv
+apps/web/node_modules
+apps/web/dist
+build
+dist
+link42.db
+*.pyc
+__pycache__

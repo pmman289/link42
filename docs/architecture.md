@@ -11,6 +11,8 @@ The first release only covers:
 - Managing point-to-point WireGuard link configs.
 - Deploying WireGuard configuration through node agents after user confirmation.
 - Importing existing `wg-quick` configurations into Link42 as managed links.
+- Creating fully managed node-to-node WireGuard links where Link42 generates
+  both key pairs and keeps both endpoints consistent.
 
 The first release does not cover:
 
@@ -33,6 +35,9 @@ Product concept clarification:
 - A managed WireGuard config should contain exactly one `[Peer]`.
 - Multi-peer WireGuard configs may be imported for observation, but they are not
   the first-release management target.
+- A manually managed config connects to a non-Link42 peer and uses change plans.
+- A Link42-managed node-to-node link owns two configs, one on each node, and
+  direct operations must update both sides together.
 
 ## 2. Architecture
 
@@ -157,8 +162,10 @@ name
 hostname
 management_ip
 public_ip
+endpoint_ips            # JSON array of selectable endpoint addresses
 status
 agent_token_hash
+agent_token_value       # stored so trusted admins can view install token again
 last_seen_at
 created_at
 updated_at
@@ -200,6 +207,7 @@ persistent_keepalive
 mtu
 fwmark
 table_name
+interface_custom_config # text inserted after [Interface]
 pre_up
 post_up
 pre_down
@@ -244,6 +252,7 @@ endpoint_host
 endpoint_port
 allowed_ips             # JSON array
 persistent_keepalive
+peer_custom_config      # text inserted after [Peer]
 source                  # created, imported
 enabled
 created_at
@@ -317,9 +326,10 @@ Task types for the first release:
 ```text
 wireguard.import_scan
 wireguard.apply_config
+wireguard.read_config
 wireguard.start_interface
 wireguard.stop_interface
-wireguard.reload_interface
+wireguard.delete_config
 wireguard.status
 ```
 
@@ -436,7 +446,8 @@ The panel should show the install command or config snippet after node creation.
 
 ```text
 User selects node
-  -> Creates config/interface name, address, listen port
+  -> Chooses manual connection to a non-managed peer
+  -> Creates config/interface name, addresses, listen port
   -> Adds exactly one remote peer
   -> API validates state
   -> API generates change plan
@@ -446,6 +457,25 @@ User selects node
   -> Agent applies config
   -> Agent reports result
 ```
+
+### 7.2.1 Create Managed Node-To-Node Link
+
+```text
+User selects node
+  -> Chooses connect to another Link42 node
+  -> Selects peer node
+  -> Enters interface name, both side addresses, both listen ports
+  -> Selects both endpoint addresses from node endpoint address lists
+  -> Optionally sets MTU, Table policy, and per-side advanced config
+  -> API generates both key pairs and preshared key
+  -> API creates both configs and peers
+  -> API directly dispatches apply/start/enable tasks for both nodes
+  -> UI shows the pair as one managed link
+```
+
+Managed node-to-node links do not use the manual change-plan confirmation
+model. Link42 owns both sides and must keep them consistent. Edit, start, stop,
+and delete actions operate on both endpoint configs as one logical link.
 
 ### 7.3 Edit Peer on Existing Link Config
 
@@ -501,13 +531,21 @@ GET    /api/nodes
 POST   /api/nodes
 GET    /api/nodes/{node_id}
 PATCH  /api/nodes/{node_id}
+DELETE /api/nodes/{node_id}
 POST   /api/nodes/{node_id}/rotate-agent-token
 
 GET    /api/nodes/{node_id}/wireguard/configs
 POST   /api/nodes/{node_id}/wireguard/configs
+POST   /api/nodes/{node_id}/wireguard/managed-links
 GET    /api/wireguard/configs/{config_id}
 PATCH  /api/wireguard/configs/{config_id}
 DELETE /api/wireguard/configs/{config_id}
+
+GET    /api/wireguard/configs/{config_id}/managed-link
+PATCH  /api/wireguard/configs/{config_id}/managed-link
+POST   /api/wireguard/configs/{config_id}/managed-link/start
+POST   /api/wireguard/configs/{config_id}/managed-link/stop
+DELETE /api/wireguard/configs/{config_id}/managed-link
 
 PUT    /api/wireguard/configs/{config_id}/peer
 GET    /api/wireguard/configs/{config_id}/peer
@@ -594,8 +632,12 @@ First release security requirements:
 - Agent endpoints must require node identity plus token authentication.
 - Private keys and preshared keys must not appear in frontend logs.
 - Task results must redact private keys before persistence.
-- Config previews may show public keys and allowed IPs.
-- Any action that writes or reloads WireGuard config requires user confirmation.
+- Config previews may show private keys for trusted administrators, but logs and
+  task errors should still avoid unnecessary secret exposure.
+- Any manual config action that writes or reloads WireGuard config requires user
+  confirmation. Link42-managed node-to-node links are the exception: the create,
+  edit, start, stop, or delete operation is itself the confirmation to apply
+  both sides.
 
 For small internal use, a single admin user is acceptable in the first release,
 but authentication should still exist from the start.
@@ -612,6 +654,8 @@ Minimum validation:
 - Endpoint ports must be valid UDP ports.
 - Allowed IPs must be valid CIDR values.
 - Tunnel IPs must be valid CIDR values.
+- MTU must be a valid positive interface MTU.
+- `Table = off` means wg-quick should not automatically create routes.
 - A managed WireGuard config must have at most one peer.
 - A deployable WireGuard config must have exactly one peer.
 - Imported configs with multiple peers should be flagged as observation-only
