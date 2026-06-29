@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import ipaddress
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -280,6 +281,7 @@ class Udp2RawMiddlewareConfig(BaseModel):
     enabled: bool = False
     server_side: str = "peer"
     server_listen_host: str = "0.0.0.0"
+    server_connect_host: str | None = None
     server_listen_port: int | None = None
     client_listen_host: str = "127.0.0.1"
     client_listen_port: int | None = None
@@ -299,6 +301,17 @@ class Udp2RawMiddlewareConfig(BaseModel):
     @classmethod
     def validate_udp2raw_ports(cls, value: int | None) -> int | None:
         return _validate_port(value)
+
+    @field_validator("server_listen_host", "server_connect_host", "client_listen_host")
+    @classmethod
+    def validate_udp2raw_ip(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return value
+        try:
+            ipaddress.ip_address(value.strip())
+        except ValueError as exc:
+            raise ValueError("udp2raw ip fields must be IPv4 or IPv6 addresses, not domain names") from exc
+        return value.strip()
 
     @field_validator("raw_mode")
     @classmethod

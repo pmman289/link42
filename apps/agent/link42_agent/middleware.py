@@ -57,21 +57,22 @@ def stop_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, An
 
 def delete_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     instance = payload["instance"]
+    modes = payload_modes(payload)
     if dry_run:
-        return {"changed": False, "dry_run": True, "instance": instance}
+        return {"changed": False, "dry_run": True, "instance": instance, "modes": modes}
     results: list[dict[str, Any]] = []
-    for mode in ["client", "server"]:
+    for mode in modes:
         results.append(run_command(["systemctl", "disable", "--now", unit_name(mode, instance)], True))
         remove_instance(config_file_for_mode(mode), instance)
     results.append(run_command(["systemctl", "daemon-reload"], False))
-    return {"changed": True, "instance": instance, "commands": results}
+    return {"changed": True, "instance": instance, "modes": modes, "commands": results}
 
 
 def status_udp2raw(payload: dict[str, Any]) -> dict[str, Any]:
     instance = payload["instance"]
     return {
         mode: run_command(["systemctl", "is-active", unit_name(mode, instance)], True)
-        for mode in ["server", "client"]
+        for mode in payload_modes(payload)
     }
 
 
@@ -237,19 +238,50 @@ def remove_instance(path: Path, instance: str) -> None:
         key = parts[0].removesuffix("=") if parts else ""
         if key != instance:
             lines.append(line)
-    path.write_text("\n".join(lines).rstrip() + ("\n" if lines else ""), encoding="utf-8")
+    if lines:
+        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    else:
+        path.unlink()
 
 
 def service_action(payload: dict[str, Any], action: str, dry_run: bool = False) -> dict[str, Any]:
     instance = payload["instance"]
     changed = False
     commands = []
-    for mode in ["server", "client"]:
+    modes = payload_modes(payload)
+    for mode in modes:
         if dry_run:
             commands.append({"command": ["systemctl", action, unit_name(mode, instance)], "dry_run": True})
             continue
         result = run_command(["systemctl", action, unit_name(mode, instance)], True)
         commands.append(result)
         changed = changed or result["returncode"] == 0
-    return {"changed": changed, "instance": instance, "commands": commands}
+    return {"changed": changed, "instance": instance, "modes": modes, "commands": commands}
 
+
+def payload_modes(payload: dict[str, Any]) -> list[str]:
+    """按任务 payload 判断本节点实际 udp2raw 角色；旧任务缺少 mode 时才回退扫描配置。"""
+
+    mode = payload.get("mode")
+    if mode:
+        return [validate_mode(str(mode))]
+    instance = payload["instance"]
+    modes = [mode for mode in ["server", "client"] if instance_exists(config_file_for_mode(mode), instance)]
+    return modes or ["server", "client"]
+
+
+def validate_mode(mode: str) -> str:
+    if mode not in ["server", "client"]:
+        raise ValueError("udp2raw mode must be server or client")
+    return mode
+
+
+def instance_exists(path: Path, instance: str) -> bool:
+    if not path.exists():
+        return False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        key = parts[0].removesuffix("=") if parts else ""
+        if key == instance:
+            return True
+    return False

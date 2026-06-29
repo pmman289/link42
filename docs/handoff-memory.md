@@ -20,6 +20,14 @@
 - 前端地址通常为：`http://192.168.123.20:5173/`
 - API 地址通常为：`http://192.168.123.20:8000`
 - API 健康检查：`http://192.168.123.20:8000/api/health`
+- 用户已授权测试/修复 Agent 在本机搭建真实开发测试环境：可以启动最新开发主控、使用临时测试数据库、安装/运行本机 Agent，并直接使用真实 `/etc/wireguard` 做测试；必须只操作测试专用接口名前缀如 `l42smoke*`，不能连接外部节点，结束后清理测试接口、配置和数据库。推荐执行 `scripts/smoke-real-local.sh` 做真实冒烟。
+- 已创建持久 Docker 双节点测试环境用于 udp2raw/跨节点 E2E：
+  - 镜像：`link42-node-smoke:latest`
+  - 网络：`link42-smoke-net`，网段 `172.31.42.0/24`
+  - 容器：`link42-node-a=172.31.42.11`，`link42-node-b=172.31.42.12`
+  - 容器内工作区：`/workspace/link42` 挂载宿主 `/root/repo/link42`
+  - 宿主主控建议监听：`0.0.0.0:18046`；容器访问主控用 `http://172.31.42.1:18046`
+  - 容器支持 systemd、WireGuard、tcpdump，可真实启动 Agent 和 udp2raw systemd service；默认保留容器，不要随手删除。
 - 用户可能会要求清空数据库从头测，此时可以删除 `link42.db` 后重启 API。
 - 最近创建过两个本机测试节点，token 如下；如果数据库已清空则这些 token 已失效：
   - `node1=l42agent_dWpxQBthT_4drtsuK_EDWEbtKXVl937RUchLawszIII`
@@ -94,9 +102,11 @@
 
 ## 当前验证结果
 
-- `.venv/bin/python -m pytest -q` 已通过，最近结果为 `13 passed`。
+- `.venv/bin/python -m pytest -q` 已通过，最近结果为 `56 passed`。
 - `.venv/bin/python -m compileall apps/api apps/agent packages tests` 已通过。
 - `npm run build` 已通过。
+- 2026-06-30 做过一次隔离 smoke test：`LINK42_DATABASE_URL=sqlite:////tmp/link42-smoke.db` 启动 API 到 `127.0.0.1:18000`，用临时节点 token 启动 `LINK42_AGENT_DRY_RUN=1` Agent 和 `/tmp/link42-smoke-wg`，验证健康检查、登录、节点创建、Agent 注册/心跳/能力上报、导入扫描任务、手动 WireGuard 配置生成计划和 dry-run apply_config 全链路均通过。
+- 2026-06-30 新增并跑通真实本机冒烟脚本 `scripts/smoke-real-local.sh`：开发主控监听 `127.0.0.1:18042`，两个本机 Agent 使用 `127.0.10.1` 和 `127.0.10.2`，真实写入 `/etc/wireguard/l42smokea.conf`、`/etc/wireguard/l42smokeb.conf`，真实执行 `wg-quick up/down`，验证本机双 WireGuard 接口连通后清理配置、接口、进程和临时数据库。
 
 ## 常用命令
 

@@ -72,6 +72,7 @@ type Udp2RawMiddleware = {
   enabled: boolean;
   server_side: "local" | "peer";
   server_listen_host: string;
+  server_connect_host: string | null;
   server_listen_port: number;
   client_listen_host: string;
   client_listen_port: number;
@@ -276,6 +277,14 @@ function isValidMtu(value: number | null): boolean {
   return value === null || (Number.isInteger(value) && value >= 576 && value <= 9000);
 }
 
+function isProbablyIpAddress(value: string): boolean {
+  const cleaned = value.trim();
+  if (!cleaned) return false;
+  const ipv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+  const ipv6 = /^[0-9a-fA-F:]+$/;
+  return ipv4.test(cleaned) || (cleaned.includes(":") && ipv6.test(cleaned));
+}
+
 function isValidCidrs(values: string[]): boolean {
   // 用浏览器内置 URL/IP 能力不足，这里做轻量 CIDR 形态校验，后续可替换为严格解析器。
   return values.every((value) => /^([0-9a-fA-F:.]+)\/\d{1,3}$/.test(value));
@@ -373,12 +382,14 @@ function EndpointSelect({
   placeholder,
   options,
   disabled = false,
+  locked = false,
 }: {
   name: string;
   defaultValue: string;
   placeholder: string;
   options: EndpointOption[];
   disabled?: boolean;
+  locked?: boolean;
 }) {
   const [value, setValue] = useState(defaultValue);
   const [inputValue, setInputValue] = useState("");
@@ -420,7 +431,7 @@ function EndpointSelect({
         classNamePrefix="endpointSelect"
         value={selectedOption}
         options={options}
-        isDisabled={disabled}
+        isDisabled={disabled || locked}
         isClearable={false}
         inputValue={inputValue}
         placeholder={placeholder}
@@ -449,6 +460,7 @@ function EndpointSelect({
         value={value}
         disabled={disabled}
       />
+      {locked && <small>由 udp2raw 接管</small>}
     </div>
   );
 }
@@ -497,27 +509,30 @@ function Udp2RawFields({
       </label>
       {enabled && (
         <>
-          <Field label="udp2raw 服务端" hint="只有服务端侧要求 WireGuard ListenPort；另一端可被动运行 WireGuard。">
+          <Field label="udp2raw server 所在节点" hint="server 接收 raw TCP/faketcp/icmp，再转回本机 WireGuard UDP。">
             <select
               name="udp2raw_server_side"
               value={serverSide}
               disabled={disabled}
               onChange={(event) => onServerSideChange(event.currentTarget.value as "local" | "peer")}
             >
-              <option value="peer">对端作为 udp2raw server</option>
-              <option value="local">本端作为 udp2raw server</option>
+              <option value="peer">对端运行 udp2raw server，本端运行 client</option>
+              <option value="local">本端运行 udp2raw server，对端运行 client</option>
             </select>
           </Field>
-          <Field label="server 监听地址">
+          <Field label="server 监听 IP" hint="udp2raw -l 使用的本机 IP；必须是 IP，不能填域名。">
             <input name="udp2raw_server_listen_host" defaultValue={defaults?.server_listen_host || "0.0.0.0"} disabled={disabled} />
           </Field>
-          <Field label="server 监听端口" hint="对外暴露的 udp2raw faketcp/udp/icmp 端口。">
+          <Field label="server 对外 IP" hint="client 连接 udp2raw server 的 IP；必须是 IP，不能填域名。">
+            <input name="udp2raw_server_connect_host" defaultValue={defaults?.server_connect_host || ""} placeholder="203.0.113.20" disabled={disabled} />
+          </Field>
+          <Field label="server 监听端口" hint="client 要连接的 udp2raw raw 端口。">
             <input name="udp2raw_server_listen_port" defaultValue={defaults?.server_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
-          <Field label="client 本地监听地址">
+          <Field label="client 本地 UDP 监听 IP" hint="WireGuard Endpoint 会指向这个本地 UDP 地址；通常是 127.0.0.1。">
             <input name="udp2raw_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} />
           </Field>
-          <Field label="client 本地监听端口" hint="WireGuard Peer Endpoint 会指向这里。">
+          <Field label="client 本地 UDP 监听端口" hint="client 从这里接收 WireGuard UDP 包，再封装发往 server。">
             <input name="udp2raw_client_listen_port" defaultValue={defaults?.client_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
           <Field label="raw mode">
@@ -542,7 +557,9 @@ function Udp2RawFields({
             <span>允许 udp2raw 自动添加 iptables 规则（-a）</span>
           </label>
           <div className="empty wideField">
-            {serverSide === "peer" ? "本端 WireGuard Endpoint 将由 udp2raw client 接管；对端作为服务端被动接收。" : "对端 WireGuard Endpoint 将由 udp2raw client 接管；本端作为服务端被动接收。"}
+            {serverSide === "peer"
+              ? "本端 WireGuard Endpoint 由 udp2raw client 接管，指向本端 127.0.0.1；对端 udp2raw server 转发到对端 WireGuard ListenPort。"
+              : "对端 WireGuard Endpoint 由 udp2raw client 接管，指向对端 127.0.0.1；本端 udp2raw server 转发到本端 WireGuard ListenPort。"}
           </div>
         </>
       )}
@@ -557,6 +574,7 @@ function readUdp2RawForm(form: FormData): Record<string, unknown> | null {
     enabled: true,
     server_side: String(form.get("udp2raw_server_side") || "peer"),
     server_listen_host: String(form.get("udp2raw_server_listen_host") || "0.0.0.0").trim(),
+    server_connect_host: String(form.get("udp2raw_server_connect_host") || "").trim() || null,
     server_listen_port: optionalInt(form.get("udp2raw_server_listen_port")),
     client_listen_host: String(form.get("udp2raw_client_listen_host") || "127.0.0.1").trim(),
     client_listen_port: optionalInt(form.get("udp2raw_client_listen_port")),
@@ -565,6 +583,29 @@ function readUdp2RawForm(form: FormData): Record<string, unknown> | null {
     password: String(form.get("udp2raw_password") || "").trim() || null,
     auto_rule: form.get("udp2raw_auto_rule") === "on",
   };
+}
+
+function validateUdp2RawForm(udp2raw: Record<string, unknown> | null, localListenPort: number | null, peerListenPort: number | null) {
+  if (!udp2raw) return;
+  const serverSide = String(udp2raw.server_side);
+  const serverListenHost = String(udp2raw.server_listen_host || "");
+  const serverConnectHost = String(udp2raw.server_connect_host || "");
+  const clientListenHost = String(udp2raw.client_listen_host || "");
+  if (!isValidPort(Number(udp2raw.server_listen_port) || null) || !isValidPort(Number(udp2raw.client_listen_port) || null)) {
+    throw new Error("udp2raw server 端口和 client 本地 UDP 监听端口必须填写 1-65535 之间的整数");
+  }
+  if (!isProbablyIpAddress(serverListenHost) || !isProbablyIpAddress(clientListenHost)) {
+    throw new Error("udp2raw 监听地址必须填写 IP，不能填写域名");
+  }
+  if (!isProbablyIpAddress(serverConnectHost)) {
+    throw new Error("udp2raw server 对外地址必须填写 IP，不能填写域名");
+  }
+  if (serverSide === "local" && !localListenPort) {
+    throw new Error("udp2raw server 在本端时，本端 WireGuard 监听端口必须填写");
+  }
+  if (serverSide === "peer" && !peerListenPort) {
+    throw new Error("udp2raw server 在对端时，对端 WireGuard 监听端口必须填写");
+  }
 }
 
 function App() {
@@ -1229,18 +1270,7 @@ function App() {
     if (!localEndpointHost || !peerEndpointHost) {
       throw new Error("请填写双方用于互联的入口地址");
     }
-    if (udp2raw) {
-      const serverSide = String(udp2raw.server_side);
-      if (!isValidPort(Number(udp2raw.server_listen_port) || null) || !isValidPort(Number(udp2raw.client_listen_port) || null)) {
-        throw new Error("udp2raw 服务端和客户端监听端口必须填写 1-65535 之间的整数");
-      }
-      if (serverSide === "local" && !localListenPort) {
-        throw new Error("udp2raw 服务端在本端时，本端 WireGuard 监听端口必须填写");
-      }
-      if (serverSide === "peer" && !peerListenPort) {
-        throw new Error("udp2raw 服务端在对端时，对端 WireGuard 监听端口必须填写");
-      }
-    }
+    validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
     if (replaceLocalConfigId && !replacePeerConfigId) {
       throw new Error("请选择对端的导入配置覆盖项");
     }
@@ -1371,18 +1401,7 @@ function App() {
     if (keepalive !== null && (!Number.isInteger(keepalive) || keepalive < 0 || keepalive > 65535)) {
       throw new Error("PersistentKeepalive 必须是 0-65535 之间的整数");
     }
-    if (udp2raw) {
-      const serverSide = String(udp2raw.server_side);
-      if (!isValidPort(Number(udp2raw.server_listen_port) || null) || !isValidPort(Number(udp2raw.client_listen_port) || null)) {
-        throw new Error("udp2raw 服务端和客户端监听端口必须填写 1-65535 之间的整数");
-      }
-      if (serverSide === "local" && !localListenPort) {
-        throw new Error("udp2raw 服务端在本端时，本端 WireGuard 监听端口必须填写");
-      }
-      if (serverSide === "peer" && !peerListenPort) {
-        throw new Error("udp2raw 服务端在对端时，对端 WireGuard 监听端口必须填写");
-      }
-    }
+    validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
     await api<ManagedLink>(`/api/wireguard/configs/${selectedConfigId}/managed-link`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -1967,6 +1986,7 @@ function App() {
                   placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
                   options={managedLocalEndpointOptions}
                   disabled={!selectedNodeOnline}
+                  locked={udp2rawEnabled}
                 />
               </Field>
               <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址。">
@@ -1977,6 +1997,7 @@ function App() {
                   placeholder={selectedPeerEndpoints[0] || "203.0.113.20"}
                   options={managedPeerEndpointOptions}
                   disabled={!selectedNodeOnline}
+                  locked={udp2rawEnabled}
                 />
               </Field>
               <Field label="本端隧道 IP" hint="CIDR 格式，例如 10.42.0.1/32。">
@@ -2261,6 +2282,7 @@ function App() {
                       placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
                       options={editLocalEndpointOptions}
                       disabled={!selectedNodeOnline}
+                      locked={udp2rawEnabled}
                     />
                   </Field>
                   <Field label="对端入口地址" hint="本端连接对端节点时使用。">
@@ -2271,6 +2293,7 @@ function App() {
                       placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
                       options={editPeerEndpointOptions}
                       disabled={!selectedNodeOnline}
+                      locked={udp2rawEnabled}
                     />
                   </Field>
                   <Field label="本端监听端口" hint="可选；留空表示不写 ListenPort。">

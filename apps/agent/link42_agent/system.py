@@ -17,6 +17,18 @@ from .service_manager import DirectWgQuickManager, OpenWrtUciManager, Unsupporte
 
 # wg-quick 默认配置目录；可通过环境变量覆盖，便于测试和非标准系统布局。
 DEFAULT_WIREGUARD_DIR = "/etc/wireguard"
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+
+
+def command_timeout_seconds() -> float:
+    """读取系统命令超时时间，避免 systemctl 等命令卡死导致任务无限 running。"""
+
+    value = os.getenv("LINK42_COMMAND_TIMEOUT", str(DEFAULT_COMMAND_TIMEOUT_SECONDS))
+    try:
+        timeout = float(value)
+    except ValueError:
+        return DEFAULT_COMMAND_TIMEOUT_SECONDS
+    return timeout if timeout > 0 else DEFAULT_COMMAND_TIMEOUT_SECONDS
 
 
 def get_hostname() -> str:
@@ -262,12 +274,26 @@ def get_wg_quick_service_state(interface_name: str) -> dict[str, Any]:
 def run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
     """执行系统命令，并返回可上报给 API 的结构化结果。"""
 
-    completed = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        capture_output=True,
-    )
+    timeout = command_timeout_seconds()
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result = {
+            "command": command,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": f"command timed out after {timeout:g}s",
+            "timeout": timeout,
+        }
+        if not allow_failure:
+            raise RuntimeError(f"command timed out after {timeout:g}s: {' '.join(command)}") from exc
+        return result
     result = {
         "command": command,
         "returncode": completed.returncode,

@@ -314,8 +314,11 @@ Agent 处理流程：
 - `raw_mode` 默认 `faketcp`。
 - 密码自动生成，允许手动覆盖。
 - 每条受管连接一组双端 udp2raw 配置。
-- WireGuard Endpoint 指向本机 `127.0.0.1:<proxy_port>`。
+- udp2raw 是 client -> server 的单向封装：client 监听本机 UDP，封装为 raw TCP/faketcp/icmp 发往 server IP:port；server 再转回 UDP 发往本机 WireGuard ListenPort。
+- WireGuard Endpoint 指向 client 本机 `127.0.0.1:<client_listen_port>`。
+- 只有 udp2raw server 侧要求 WireGuard ListenPort，client 侧 WireGuard 可以不写 ListenPort。
 - 插件真实连接地址填写在 udp2raw 表单区域。
+- udp2raw 的 IP 参数必须是 IPv4/IPv6 字面量，不能填写域名。
 - 通过 Agent 的 `middleware.install` 安装 udp2raw，不在节点上执行交互式脚本。
 
 udp2raw 至少要求：
@@ -347,13 +350,14 @@ peer_endpoint_port
 真实连接配置：
 
 ```text
-local_real_host
-local_real_port
-peer_real_host
-peer_real_port
-local_wg_proxy_port
-peer_wg_proxy_port
+server_side
+server_listen_host
+server_connect_host
+server_listen_port
+client_listen_host
+client_listen_port
 raw_mode
+cipher_mode
 password
 ```
 

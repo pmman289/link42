@@ -11,6 +11,7 @@ IMAGE_TAG="${1:-${IMAGE_TAG:-latest}}"
 IMAGE_NAME="${IMAGE_REPO}:${IMAGE_TAG}"
 DOCKERFILE="${DOCKERFILE:-Dockerfile.controller}"
 
+scripts/agent/prepare-release-assets.sh >/dev/null
 docker build -f "$DOCKERFILE" -t "$IMAGE_NAME" .
 docker push "$IMAGE_NAME"
 

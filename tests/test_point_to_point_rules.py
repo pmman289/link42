@@ -33,6 +33,7 @@ from link42_api.main import (
     is_api_auth_exempt,
     list_import_candidates,
     login,
+    normalize_udp2raw_config,
     require_node_endpoint,
     require_online_node,
     set_setting,
@@ -297,12 +298,12 @@ def test_controller_settings_can_change_username_and_password() -> None:
     assert not verify_token("old-session", old_session_hash)
 
 
-def test_api_auth_exemptions_only_cover_login_and_agent() -> None:
-    """验证 API 鉴权白名单只覆盖登录和 Agent token 接口。"""
+def test_api_auth_exemptions_keep_health_login_and_agent_public() -> None:
+    """验证健康检查、登录和 Agent token 接口可匿名访问，业务 API 仍需鉴权。"""
 
+    assert is_api_auth_exempt("/api/health")
     assert is_api_auth_exempt("/api/auth/login")
     assert is_api_auth_exempt("/api/agent/heartbeat")
-    assert not is_api_auth_exempt("/api/health")
     assert not is_api_auth_exempt("/api/nodes")
     assert not is_api_auth_exempt("/api/settings")
 
@@ -1120,6 +1121,7 @@ def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> 
                 udp2raw=Udp2RawMiddlewareConfig(
                     enabled=True,
                     server_side="peer",
+                    server_connect_host="198.51.100.20",
                     server_listen_port=23002,
                     client_listen_port=12312,
                 ),
@@ -1152,6 +1154,105 @@ def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> 
     assert tasks[2].payload["remote_port"] == 51821
     assert tasks[3].payload["mode"] == "client"
     assert tasks[3].payload["remote_host"] == "198.51.100.20"
+
+
+def test_udp2raw_rejects_domain_as_server_connect_host(monkeypatch) -> None:
+    """验证 udp2raw 的 server 连接地址必须是 IP，不能使用域名。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: ("private", "public"))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    capabilities = [
+        "wireguard",
+        "wg_quick_import",
+        "service:systemd",
+        "middleware",
+        "middleware.install",
+        "middleware.udp2raw",
+    ]
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            agent_version="0.2.0",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["vpn.example.com"],
+            agent_version="0.2.0",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_managed_link(
+                node_a.id,
+                ManagedLinkCreate(
+                    peer_node_id=node_b.id,
+                    local_interface_name="wg-a",
+                    peer_interface_name="wg-b",
+                    local_tunnel_ips=["10.42.0.1/32"],
+                    peer_tunnel_ips=["10.42.0.2/32"],
+                    local_endpoint_host="198.51.100.10",
+                    peer_endpoint_host="vpn.example.com",
+                    local_listen_port=None,
+                    peer_listen_port=51821,
+                    udp2raw=Udp2RawMiddlewareConfig(
+                        enabled=True,
+                        server_side="peer",
+                        server_listen_port=23002,
+                        client_listen_port=12312,
+                    ),
+                ),
+                session,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert "must be an IP address" in str(exc_info.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("server_listen_host", "example.com"),
+        ("client_listen_host", "client.example.com"),
+    ],
+)
+def test_udp2raw_normalize_rejects_domain_listen_hosts(field_name: str, value: str) -> None:
+    """验证后端清洗 udp2raw 配置时兜底拒绝 listen host 域名。"""
+
+    payload = Udp2RawMiddlewareConfig.model_construct(
+        enabled=True,
+        server_side="peer",
+        server_listen_host="0.0.0.0",
+        server_connect_host="198.51.100.20",
+        server_listen_port=23002,
+        client_listen_host="127.0.0.1",
+        client_listen_port=12312,
+        raw_mode="faketcp",
+        cipher_mode="xor",
+        password=None,
+        auto_rule=True,
+    )
+    setattr(payload, field_name, value)
+
+    with pytest.raises(HTTPException) as exc_info:
+        normalize_udp2raw_config(payload)
+
+    assert exc_info.value.status_code == 400
+    assert "must be an IP address" in str(exc_info.value.detail)
 
 
 def test_stop_managed_link_queues_both_sides(monkeypatch) -> None:

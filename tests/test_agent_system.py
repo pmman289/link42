@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from typing import Any
 
-from link42_agent import main, service_manager, system, upgrade
+from link42_agent import main, middleware, service_manager, system, upgrade
 
 
 def command_result(command: list[str], returncode: int = 0, stdout: str = "") -> dict[str, Any]:
@@ -32,6 +33,96 @@ def use_service_binaries(
         return None
 
     monkeypatch.setattr(service_manager.shutil, "which", fake_which)
+
+
+def test_run_command_passes_timeout_to_subprocess(monkeypatch) -> None:
+    """验证 Agent 执行系统命令时会设置超时。"""
+
+    seen: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any):
+        seen["command"] = command
+        seen["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setenv("LINK42_COMMAND_TIMEOUT", "7")
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    result = system.run_command(["systemctl", "status", "link42-agent"], allow_failure=False)
+
+    assert result["stdout"] == "ok\n"
+    assert seen == {"command": ["systemctl", "status", "link42-agent"], "timeout": 7.0}
+
+
+def test_run_command_timeout_returns_result_or_raises(monkeypatch) -> None:
+    """验证命令超时不会卡死任务，允许失败时返回结果，不允许失败时抛错。"""
+
+    def fake_run(command: list[str], **kwargs: Any):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output="partial")
+
+    monkeypatch.setenv("LINK42_COMMAND_TIMEOUT", "3")
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    result = system.run_command(["systemctl", "restart", "wg-quick@wg0.service"], allow_failure=True)
+
+    assert result["returncode"] == 124
+    assert result["timeout"] == 3.0
+    assert "timed out" in result["stderr"]
+    try:
+        system.run_command(["systemctl", "restart", "wg-quick@wg0.service"], allow_failure=False)
+    except RuntimeError as exc:
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("timeout did not raise for required command")
+
+
+def test_udp2raw_remove_last_instance_deletes_config_file(tmp_path: Path) -> None:
+    """验证删除 udp2raw 最后一个实例时移除配置文件，而不是留下 0 字节文件。"""
+
+    config_file = tmp_path / "client"
+    config_file.write_text("link42-1 -c -l127.0.0.1:12312\n", encoding="utf-8")
+
+    middleware.remove_instance(config_file, "link42-1")
+
+    assert not config_file.exists()
+
+
+def test_udp2raw_delete_uses_payload_mode_only(tmp_path: Path, monkeypatch) -> None:
+    """验证 udp2raw delete 只操作本节点实际角色对应的 unit。"""
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", tmp_path)
+    (tmp_path / "client").write_text("link42-1 -c -l127.0.0.1:12312\n", encoding="utf-8")
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    result = middleware.delete_udp2raw({"instance": "link42-1", "mode": "client"})
+
+    assert result["modes"] == ["client"]
+    assert ["systemctl", "disable", "--now", "link42-udp2raw-client@link42-1.service"] in commands
+    assert not any("link42-udp2raw-server@link42-1.service" in command for command in commands)
+    assert not (tmp_path / "client").exists()
+
+
+def test_udp2raw_stop_uses_payload_mode_only(monkeypatch) -> None:
+    """验证 udp2raw stop 不再同时尝试 server/client 两种 unit。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    result = middleware.stop_udp2raw({"instance": "link42-1", "mode": "server"})
+
+    assert result["modes"] == ["server"]
+    assert commands == [["systemctl", "stop", "link42-udp2raw-server@link42-1.service"]]
 
 
 def test_apply_config_restarts_existing_systemd_service(tmp_path: Path, monkeypatch) -> None:

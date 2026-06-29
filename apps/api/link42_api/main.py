@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+import ipaddress
 import logging
 from pathlib import Path
 import secrets
@@ -151,9 +152,9 @@ def bearer_token_from_request(request: Request) -> str | None:
 
 
 def is_api_auth_exempt(path: str) -> bool:
-    """API 鉴权白名单：登录和 Agent 自身 token 接口。"""
+    """API 鉴权白名单：健康检查、登录和 Agent 自身 token 接口。"""
 
-    return path == "/api/auth/login" or path.startswith("/api/agent/")
+    return path in {"/api/health", "/api/auth/login"} or path.startswith("/api/agent/")
 
 
 def require_web_session(request: Request, db: Session) -> None:
@@ -460,19 +461,43 @@ def normalize_udp2raw_config(payload: schemas.Udp2RawMiddlewareConfig | None) ->
         raise HTTPException(status_code=400, detail="udp2raw server listen port is required")
     if payload.client_listen_port is None:
         raise HTTPException(status_code=400, detail="udp2raw client listen port is required")
+    server_listen_host = require_udp2raw_ip(
+        payload.server_listen_host.strip() or "0.0.0.0",
+        "udp2raw server listen host",
+    )
+    server_connect_host = (
+        require_udp2raw_ip(payload.server_connect_host.strip(), "udp2raw server connect host")
+        if payload.server_connect_host
+        else None
+    )
+    client_listen_host = require_udp2raw_ip(
+        payload.client_listen_host.strip() or "127.0.0.1",
+        "udp2raw client listen host",
+    )
     return {
         "type": "udp2raw",
         "enabled": True,
         "server_side": payload.server_side,
-        "server_listen_host": payload.server_listen_host.strip() or "0.0.0.0",
+        "server_listen_host": server_listen_host,
+        "server_connect_host": server_connect_host,
         "server_listen_port": payload.server_listen_port,
-        "client_listen_host": payload.client_listen_host.strip() or "127.0.0.1",
+        "client_listen_host": client_listen_host,
         "client_listen_port": payload.client_listen_port,
         "raw_mode": payload.raw_mode,
         "cipher_mode": payload.cipher_mode,
         "password": payload.password or generate_token("u2r"),
         "auto_rule": payload.auto_rule,
     }
+
+
+def require_udp2raw_ip(value: str, field_name: str) -> str:
+    """udp2raw 的 -r 目标必须是 IP 字面量，不能是域名。"""
+
+    try:
+        ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an IP address for udp2raw") from exc
+    return value
 
 
 def managed_link_middleware(interface: models.WireGuardInterface) -> dict | None:
@@ -553,6 +578,10 @@ def udp2raw_endpoint_payloads(
         server_public_host = local_endpoint
     if server_interface.listen_port is None:
         raise HTTPException(status_code=400, detail="udp2raw server side requires WireGuard listen port")
+    server_connect_host = require_udp2raw_ip(
+        middleware.get("server_connect_host") or server_public_host,
+        "udp2raw server connect host",
+    )
 
     common = {
         "plugin": "udp2raw",
@@ -575,7 +604,7 @@ def udp2raw_endpoint_payloads(
         "mode": "client",
         "listen_host": middleware["client_listen_host"],
         "listen_port": middleware["client_listen_port"],
-        "remote_host": server_public_host,
+        "remote_host": server_connect_host,
         "remote_port": middleware["server_listen_port"],
     }
     return [
