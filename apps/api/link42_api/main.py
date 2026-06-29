@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import logging
 from pathlib import Path
 import secrets
 import subprocess
@@ -25,6 +26,9 @@ from .wireguard_service import (
     render_interface_config,
     split_endpoint,
 )
+
+
+logging.getLogger("uvicorn.access").disabled = True
 
 
 # FastAPI 应用实例，所有 API 路由都挂载在这里。
