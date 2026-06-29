@@ -16,6 +16,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/link42
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wireguard-tools \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml README.md ./
 COPY apps/api ./apps/api
 COPY apps/agent ./apps/agent
