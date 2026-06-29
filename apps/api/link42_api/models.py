@@ -109,6 +109,15 @@ class WireGuardInterface(TimestampMixin, Base):
                 return peer.endpoint_port
         return None
 
+    @property
+    def primary_peer_allowed_ips(self) -> list[str]:
+        """返回第一个 Peer 的原始 AllowedIPs，供导入受管连接时预填。"""
+
+        for peer in self.peers or []:
+            if peer.allowed_ips:
+                return peer.allowed_ips
+        return []
+
 
 class WireGuardPeer(TimestampMixin, Base):
     """节点本地 WireGuard 链路配置下的唯一对端配置。"""

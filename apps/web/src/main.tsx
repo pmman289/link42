@@ -34,6 +34,7 @@ type ConfigItem = {
   runtime_status: string;
   primary_peer_endpoint_host: string | null;
   primary_peer_endpoint_port: number | null;
+  primary_peer_allowed_ips: string[];
   warnings: string[];
 };
 
@@ -127,6 +128,7 @@ const API_BASE =
 const DEFAULT_CONTROLLER_URL =
   import.meta.env.VITE_LINK42_CONTROLLER_URL || API_BASE;
 const AUTH_TOKEN_KEY = "link42.authToken";
+const AUTH_EXPIRED_EVENT = "link42:auth-expired";
 
 function splitList(value: string): string[] {
   // 将输入框中的逗号分隔内容转换成 API 需要的数组。
@@ -155,6 +157,10 @@ async function api<T>(path: string, options?: RequestInit & { skipAuth?: boolean
   });
   if (!response.ok) {
     const text = await response.text();
+    if (response.status === 401 && path !== "/api/auth/login") {
+      window.localStorage.removeItem(AUTH_TOKEN_KEY);
+      window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
+    }
     throw new Error(formatApiError(response.status, text, response.statusText));
   }
   return response.json() as Promise<T>;
@@ -415,7 +421,7 @@ function EndpointSelect({
 }
 
 function RouteModeSelect({
-  defaultValue,
+  defaultValue = "off",
   disabled,
 }: {
   defaultValue?: string | null;
@@ -504,6 +510,12 @@ function App() {
   );
   const managedLocalEndpointDefault = managedLocalEndpointOptions[0]?.value || "";
   const managedPeerEndpointDefault = managedPeerEndpointOptions[0]?.value || "";
+  const managedLocalAllowedIpsDefault = (replaceLocalConfig?.primary_peer_allowed_ips?.length
+    ? replaceLocalConfig.primary_peer_allowed_ips
+    : replacePeerConfig?.tunnel_ips || []).join(", ");
+  const managedPeerAllowedIpsDefault = (replacePeerConfig?.primary_peer_allowed_ips?.length
+    ? replacePeerConfig.primary_peer_allowed_ips
+    : replaceLocalConfig?.tunnel_ips || []).join(", ");
   const editLocalEndpointOptions = endpointOptionsFrom(
     null,
     selectedLocalEndpoints,
@@ -524,15 +536,37 @@ function App() {
     }, type === "error" ? 6000 : 3800);
   }
 
+  function clearAuthenticatedState() {
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    setAuthToken("");
+    setCurrentUser(null);
+    setNodes([]);
+    setSelectedNodeId(null);
+    setConfigs([]);
+    setSelectedConfigId(null);
+    setPeer(null);
+    setManagedLink(null);
+    setImportCandidates([]);
+    setPlan(null);
+    setCreateDialog(null);
+    setNodeCreateOpen(false);
+    setEditingNodeId(null);
+    setManagedPeerNodeId(null);
+    setReplaceLocalConfigId(null);
+    setReplacePeerConfigId(null);
+    setForceEndpointMismatch(false);
+    setPeerNodeConfigs([]);
+    setSettingsOpen(false);
+  }
+
   async function runAction(action: () => Promise<void>) {
     // 所有用户操作都通过这里展示 API 错误，避免点击后页面无反馈。
     try {
       await action();
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("401:")) {
-        window.localStorage.removeItem(AUTH_TOKEN_KEY);
-        setAuthToken("");
-        setCurrentUser(null);
+        clearAuthenticatedState();
+        return;
       }
       notify("error", error instanceof Error ? error.message : String(error));
     }
@@ -558,13 +592,7 @@ function App() {
 
   async function logout() {
     await api<{ status: string }>("/api/auth/logout", { method: "POST" });
-    window.localStorage.removeItem(AUTH_TOKEN_KEY);
-    setAuthToken("");
-    setCurrentUser(null);
-    setNodes([]);
-    setSelectedNodeId(null);
-    setConfigs([]);
-    setSelectedConfigId(null);
+    clearAuthenticatedState();
   }
 
   async function refreshSettings() {
@@ -589,9 +617,7 @@ function App() {
     setSettingsUsername(data.username || "pmman");
     setSettingsOpen(false);
     if (newPassword) {
-      window.localStorage.removeItem(AUTH_TOKEN_KEY);
-      setAuthToken("");
-      setCurrentUser(null);
+      clearAuthenticatedState();
       notify("success", "账号已更新，请使用新凭据重新登录。");
       return;
     }
@@ -640,6 +666,15 @@ function App() {
   }
 
   useEffect(() => {
+    function handleAuthExpired() {
+      clearAuthenticatedState();
+    }
+
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+  }, []);
+
+  useEffect(() => {
     async function bootstrap() {
       if (!authToken) {
         setAuthChecked(true);
@@ -651,9 +686,7 @@ function App() {
         await refreshSettings();
         await refreshNodes();
       } catch {
-        window.localStorage.removeItem(AUTH_TOKEN_KEY);
-        setAuthToken("");
-        setCurrentUser(null);
+        clearAuthenticatedState();
       } finally {
         setAuthChecked(true);
       }
@@ -664,7 +697,11 @@ function App() {
   useEffect(() => {
     if (!authToken) return;
     const timer = window.setInterval(() => {
-      refreshNodes().catch((error) => notify("error", error.message));
+      refreshNodes().catch((error) => {
+        if (!(error instanceof Error && error.message.startsWith("401:"))) {
+          notify("error", error instanceof Error ? error.message : String(error));
+        }
+      });
     }, 5000);
     return () => window.clearInterval(timer);
   }, [selectedNodeId, authToken]);
@@ -873,6 +910,39 @@ function App() {
     if (!isProbablyWireGuardKey(form.get("public_key")) || !isProbablyWireGuardKey(form.get("private_key"))) {
       throw new Error("WireGuard 密钥格式应为 44 位 base64 字符串");
     }
+    const createPeerPublicKey = String(form.get("peer_public_key") || "").trim();
+    const createPeerAllowedIps = splitList(String(form.get("peer_allowed_ips") || ""));
+    const createPeerEndpointPort = optionalInt(form.get("peer_endpoint_port"));
+    const createPeerKeepalive = optionalInt(form.get("peer_persistent_keepalive"));
+    if (mode === "create") {
+      const hasCreatePeerData = Boolean(
+        createPeerAllowedIps.length ||
+        createPeerEndpointPort ||
+        createPeerKeepalive !== null ||
+        String(form.get("peer_name") || "").trim() ||
+        String(form.get("peer_preshared_key") || "").trim() ||
+        String(form.get("peer_endpoint_host") || "").trim() ||
+        String(form.get("peer_custom_config") || "").trim(),
+      );
+      if (hasCreatePeerData && !createPeerPublicKey) {
+        throw new Error("填写 Peer 信息时必须填写对端公钥");
+      }
+      if (!isProbablyWireGuardKey(createPeerPublicKey)) {
+        throw new Error("对端公钥格式应为 44 位 base64 字符串");
+      }
+      if (!isProbablyWireGuardKey(form.get("peer_preshared_key"))) {
+        throw new Error("预共享密钥格式应为 44 位 base64 字符串");
+      }
+      if (!isValidCidrs(createPeerAllowedIps)) {
+        throw new Error("AllowedIPs 必须使用 CIDR 格式，例如 172.20.0.0/14 或 fd00::/8");
+      }
+      if (!isValidPort(createPeerEndpointPort)) {
+        throw new Error("Endpoint Port 必须留空，或填写 1-65535 之间的整数");
+      }
+      if (createPeerKeepalive !== null && (!Number.isInteger(createPeerKeepalive) || createPeerKeepalive < 0 || createPeerKeepalive > 65535)) {
+        throw new Error("PersistentKeepalive 必须是 0-65535 之间的整数");
+      }
+    }
     const payload = {
       name: form.get("name"),
       tunnel_ips: tunnelIps,
@@ -892,6 +962,21 @@ function App() {
           method: "POST",
           body: JSON.stringify(payload),
         });
+    if (mode === "create" && createPeerPublicKey) {
+      await api<PeerItem>(`/api/wireguard/configs/${item.id}/peer`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: form.get("peer_name") || null,
+          public_key: createPeerPublicKey,
+          preshared_key: form.get("peer_preshared_key") || null,
+          endpoint_host: form.get("peer_endpoint_host") || null,
+          endpoint_port: createPeerEndpointPort,
+          allowed_ips: createPeerAllowedIps,
+          persistent_keepalive: createPeerKeepalive,
+          peer_custom_config: form.get("peer_custom_config") || null,
+        }),
+      });
+    }
     formElement.reset();
     await refreshConfigs(selectedNodeId, item.id);
     setPlan(null);
@@ -913,6 +998,8 @@ function App() {
     const peerNodeId = Number(form.get("peer_node_id"));
     const localTunnelIps = splitList(String(form.get("local_tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
+    const localAllowedIps = splitList(String(form.get("local_allowed_ips") || ""));
+    const peerAllowedIps = splitList(String(form.get("peer_allowed_ips") || ""));
     const localEndpointHost = String(form.get("local_endpoint_host") || "").trim();
     const peerEndpointHost = String(form.get("peer_endpoint_host") || "").trim();
     const localListenPort = optionalInt(form.get("local_listen_port"));
@@ -923,6 +1010,9 @@ function App() {
     }
     if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
       throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32");
+    }
+    if (!isValidCidrs(localAllowedIps) || !isValidCidrs(peerAllowedIps)) {
+      throw new Error("AllowedIPs 必须使用 CIDR 格式，例如 10.42.0.2/32 或 192.168.10.0/24");
     }
     if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
       throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
@@ -946,6 +1036,8 @@ function App() {
           peer_interface_name: form.get("peer_interface_name") || form.get("local_interface_name"),
           local_tunnel_ips: localTunnelIps,
           peer_tunnel_ips: peerTunnelIps,
+          local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
+          peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
           local_endpoint_host: localEndpointHost,
           peer_endpoint_host: peerEndpointHost,
           local_listen_port: localListenPort,
@@ -1036,12 +1128,17 @@ function App() {
     const form = new FormData(event.currentTarget);
     const localTunnelIps = splitList(String(form.get("local_tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
+    const localAllowedIps = splitList(String(form.get("local_allowed_ips") || ""));
+    const peerAllowedIps = splitList(String(form.get("peer_allowed_ips") || ""));
     const localListenPort = optionalInt(form.get("local_listen_port"));
     const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const keepalive = Number(form.get("persistent_keepalive")) || null;
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
     if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
       throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32, fd42::1/64");
+    }
+    if (!isValidCidrs(localAllowedIps) || !isValidCidrs(peerAllowedIps)) {
+      throw new Error("AllowedIPs 必须使用 CIDR 格式，例如 10.42.0.2/32 或 192.168.10.0/24");
     }
     if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
       throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
@@ -1059,6 +1156,8 @@ function App() {
         peer_interface_name: form.get("peer_interface_name"),
         local_tunnel_ips: localTunnelIps,
         peer_tunnel_ips: peerTunnelIps,
+        local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
+        peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
         local_endpoint_host: String(form.get("local_endpoint_host") || "").trim(),
         peer_endpoint_host: String(form.get("peer_endpoint_host") || "").trim(),
         local_listen_port: localListenPort,
@@ -1430,7 +1529,7 @@ function App() {
             <header className="modalHeader">
               <div>
                 <h2 id="manual-link-title"><Plus size={18} /> 手动创建连接</h2>
-                <p className="muted">{selectedNode.name} 连接到非受管节点。创建后还需要配置 Peer 并生成部署计划。</p>
+                <p className="muted">{selectedNode.name} 连接到非受管节点。可在创建时直接填写 Peer，随后生成部署计划。</p>
               </div>
               <button className="iconButton" onClick={() => setCreateDialog(null)}>
                 <X size={18} />
@@ -1465,7 +1564,31 @@ function App() {
               <Field label="Interface 高级配置" hint="逐行写入 [Interface] 后，例如 PostUp/PostDown。不会做语义校验。" wide>
                 <textarea name="interface_custom_config" placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
               </Field>
-              <button type="submit" disabled={!selectedNodeOnline}><Plus size={16} /> 添加配置</button>
+              <Field label="对端名称" hint="可选，仅用于界面识别。">
+                <input name="peer_name" placeholder="remote-site" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="对端公钥" hint="可选；填写后会同时创建唯一 Peer。">
+                <input name="peer_public_key" placeholder="base64 public key" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="AllowedIPs" hint="写入 [Peer]，dn42 常见为 172.20.0.0/14, fd00::/8。">
+                <input name="peer_allowed_ips" placeholder="172.20.0.0/14, fd00::/8" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="Endpoint Host" hint="对端公网 IP、内网 IP 或域名；可留空。">
+                <input name="peer_endpoint_host" placeholder="203.0.113.20" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="Endpoint Port" hint="对端 UDP 端口；Host 留空时通常也留空。">
+                <input name="peer_endpoint_port" placeholder="51820" inputMode="numeric" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="PersistentKeepalive" hint="NAT 后常用 25；留空表示不写。">
+                <input name="peer_persistent_keepalive" placeholder="25" inputMode="numeric" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="预共享密钥" hint="可选，填写后会渲染 PresharedKey。">
+                <input name="peer_preshared_key" placeholder="base64 preshared key" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="Peer 高级配置" hint="逐行写入 [Peer] 后，例如自定义标记行。不会做语义校验。" wide>
+                <textarea name="peer_custom_config" placeholder="自定义 Peer 行" disabled={!selectedNodeOnline} />
+              </Field>
+	              <button type="submit" disabled={!selectedNodeOnline}><Plus size={16} /> 添加配置</button>
             </form>
           </section>
         </div>
@@ -1572,6 +1695,24 @@ function App() {
               </Field>
               <Field label="对端隧道 IP" hint="CIDR 格式，例如 10.42.0.2/32。">
                 <input name="peer_tunnel_ips" placeholder="10.42.0.2/32, fd42::2/64" defaultValue={replacePeerConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="本端 Peer AllowedIPs" hint="写入当前节点 [Peer]；留空则使用对端隧道 IP。">
+                <input
+                  key={`managed-local-allowed-${replaceLocalConfigId || "none"}-${replacePeerConfigId || "none"}-${managedLocalAllowedIpsDefault}`}
+                  name="local_allowed_ips"
+                  placeholder="10.42.0.2/32, 192.168.20.0/24"
+                  defaultValue={managedLocalAllowedIpsDefault}
+                  disabled={!selectedNodeOnline}
+                />
+              </Field>
+              <Field label="对端 Peer AllowedIPs" hint="写入对端节点 [Peer]；留空则使用本端隧道 IP。">
+                <input
+                  key={`managed-peer-allowed-${replaceLocalConfigId || "none"}-${replacePeerConfigId || "none"}-${managedPeerAllowedIpsDefault}`}
+                  name="peer_allowed_ips"
+                  placeholder="10.42.0.1/32, 192.168.10.0/24"
+                  defaultValue={managedPeerAllowedIpsDefault}
+                  disabled={!selectedNodeOnline}
+                />
               </Field>
               <Field label="本端监听端口" hint="可选；留空表示不写 ListenPort。">
                 <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
@@ -1809,6 +1950,12 @@ function App() {
                   </Field>
                   <Field label="对端隧道地址" hint="支持多个地址，例如 IPv4 + IPv6，用逗号分隔。">
                     <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
+                  </Field>
+                  <Field label="本端 Peer AllowedIPs" hint="写入当前节点 [Peer]，用于声明可经对端到达的地址段。">
+                    <input name="local_allowed_ips" defaultValue={managedLink.local_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
+                  </Field>
+                  <Field label="对端 Peer AllowedIPs" hint="写入对端节点 [Peer]，用于声明可经本端到达的地址段。">
+                    <input name="peer_allowed_ips" defaultValue={managedLink.peer_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
                   </Field>
                   <Field label="本端入口地址" hint="对端连接本节点时使用。">
                     <EndpointSelect

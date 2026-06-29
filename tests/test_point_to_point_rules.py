@@ -168,6 +168,7 @@ def test_interface_read_exposes_primary_peer_endpoint() -> None:
             public_key="peer-public",
             endpoint_host="127.0.0.1",
             endpoint_port=40000,
+            allowed_ips=["10.99.0.0/24"],
         )
     ]
 
@@ -175,6 +176,7 @@ def test_interface_read_exposes_primary_peer_endpoint() -> None:
 
     assert data.primary_peer_endpoint_host == "127.0.0.1"
     assert data.primary_peer_endpoint_port == 40000
+    assert data.primary_peer_allowed_ips == ["10.99.0.0/24"]
 
 
 def test_require_node_endpoint_allows_original_or_manual_host() -> None:
@@ -850,6 +852,8 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
                 peer_interface_name="wg-b",
                 local_tunnel_ips=["10.42.0.1/32"],
                 peer_tunnel_ips=["10.42.0.2/32"],
+                local_allowed_ips=["10.88.0.0/24"],
+                peer_allowed_ips=["10.99.0.0/24"],
                 local_endpoint_host="10.0.0.10",
                 peer_endpoint_host="10.0.0.20",
                 local_listen_port=51820,
@@ -882,12 +886,12 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
     assert local_peer.preshared_key_value == "shared-key"
     assert local_peer.endpoint_host == "10.0.0.20"
     assert local_peer.endpoint_port == 51821
-    assert local_peer.allowed_ips == ["10.42.0.2/32"]
+    assert local_peer.allowed_ips == ["10.88.0.0/24"]
     assert remote_peer is not None
     assert remote_peer.public_key == "local-public"
     assert remote_peer.endpoint_host == "10.0.0.10"
     assert remote_peer.endpoint_port == 51820
-    assert remote_peer.allowed_ips == ["10.42.0.1/32"]
+    assert remote_peer.allowed_ips == ["10.99.0.0/24"]
     assert len(tasks) == 2
     assert {task.node_id for task in tasks} == {result.local_interface.node_id, result.peer_interface.node_id}
     assert {task.payload["interface_id"] for task in tasks} == {result.local_interface.id, result.peer_interface.id}
@@ -897,6 +901,8 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
     assert all("[Peer]" in task.payload["config"] for task in tasks)
     assert all("MTU = 1420" in task.payload["config"] for task in tasks)
     assert all("Table = off" in task.payload["config"] for task in tasks)
+    assert any("AllowedIPs = 10.88.0.0/24" in task.payload["config"] for task in tasks)
+    assert any("AllowedIPs = 10.99.0.0/24" in task.payload["config"] for task in tasks)
     assert any("PublicKey = peer-public" in task.payload["config"] for task in tasks)
     assert any("PublicKey = local-public" in task.payload["config"] for task in tasks)
     assert any("PostUp = ip route add 10.1.0.0/16 dev wg-a" in task.payload["config"] for task in tasks)

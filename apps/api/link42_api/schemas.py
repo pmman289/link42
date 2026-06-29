@@ -91,7 +91,7 @@ class InterfaceCreate(BaseModel):
     private_key: str | None = None
     public_key: str | None = None
     mtu: int | None = 1420
-    table_name: str | None = None
+    table_name: str | None = "off"
     dns: list[str] = Field(default_factory=list)
     interface_custom_config: str | None = None
 
@@ -116,12 +116,14 @@ class ManagedLinkCreate(BaseModel):
     peer_interface_name: str | None = Field(default=None, min_length=1, max_length=32)
     local_tunnel_ips: list[str] = Field(min_length=1)
     peer_tunnel_ips: list[str] = Field(min_length=1)
+    local_allowed_ips: list[str] | None = None
+    peer_allowed_ips: list[str] | None = None
     local_endpoint_host: str = Field(min_length=1, max_length=255)
     peer_endpoint_host: str = Field(min_length=1, max_length=255)
     local_listen_port: int | None = None
     peer_listen_port: int | None = None
     mtu: int | None = 1420
-    table_name: str | None = None
+    table_name: str | None = "off"
     persistent_keepalive: int | None = 25
     local_interface_custom_config: str | None = None
     local_peer_custom_config: str | None = None
@@ -153,6 +155,13 @@ class ManagedLinkCreate(BaseModel):
         """校验双方接口地址应包含 CIDR 前缀。"""
 
         return _validate_cidrs(values)
+
+    @field_validator("local_allowed_ips", "peer_allowed_ips")
+    @classmethod
+    def validate_allowed_ips(cls, values: list[str] | None) -> list[str] | None:
+        """校验双方 Peer AllowedIPs 应包含 CIDR 前缀。"""
+
+        return _validate_cidrs(values or []) if values is not None else None
 
 
 class InterfaceUpdate(BaseModel):
@@ -200,6 +209,7 @@ class InterfaceRead(BaseModel):
     import_path: str | None
     primary_peer_endpoint_host: str | None = None
     primary_peer_endpoint_port: int | None = None
+    primary_peer_allowed_ips: list[str] = Field(default_factory=list)
     warnings: list[str]
 
     model_config = {"from_attributes": True}
@@ -280,6 +290,8 @@ class ManagedLinkUpdate(BaseModel):
     peer_interface_name: str = Field(min_length=1, max_length=32)
     local_tunnel_ips: list[str] = Field(min_length=1)
     peer_tunnel_ips: list[str] = Field(min_length=1)
+    local_allowed_ips: list[str] | None = None
+    peer_allowed_ips: list[str] | None = None
     local_endpoint_host: str = Field(min_length=1, max_length=255)
     peer_endpoint_host: str = Field(min_length=1, max_length=255)
     local_listen_port: int | None = None
@@ -308,6 +320,11 @@ class ManagedLinkUpdate(BaseModel):
     @classmethod
     def validate_tunnel_ips(cls, values: list[str]) -> list[str]:
         return _validate_cidrs(values)
+
+    @field_validator("local_allowed_ips", "peer_allowed_ips")
+    @classmethod
+    def validate_allowed_ips(cls, values: list[str] | None) -> list[str] | None:
+        return _validate_cidrs(values or []) if values is not None else None
 
 
 class ImportCandidateRead(BaseModel):

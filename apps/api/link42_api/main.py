@@ -879,7 +879,7 @@ def create_managed_link(
         preshared_key_value=preshared_key,
         endpoint_host=peer_endpoint,
         endpoint_port=payload.peer_listen_port,
-        allowed_ips=payload.peer_tunnel_ips,
+        allowed_ips=payload.local_allowed_ips or payload.peer_tunnel_ips,
         persistent_keepalive=payload.persistent_keepalive,
         source="managed-node",
     )
@@ -893,7 +893,7 @@ def create_managed_link(
         preshared_key_value=preshared_key,
         endpoint_host=local_endpoint,
         endpoint_port=payload.local_listen_port,
-        allowed_ips=payload.local_tunnel_ips,
+        allowed_ips=payload.peer_allowed_ips or payload.local_tunnel_ips,
         persistent_keepalive=payload.persistent_keepalive,
         source="managed-node",
     )
@@ -997,12 +997,12 @@ def update_managed_link(
 
     local_peer.endpoint_host = peer_endpoint
     local_peer.endpoint_port = payload.peer_listen_port
-    local_peer.allowed_ips = payload.peer_tunnel_ips
+    local_peer.allowed_ips = payload.local_allowed_ips or payload.peer_tunnel_ips
     local_peer.persistent_keepalive = payload.persistent_keepalive
     local_peer.source = "managed-node"
     peer_peer.endpoint_host = local_endpoint
     peer_peer.endpoint_port = payload.local_listen_port
-    peer_peer.allowed_ips = payload.local_tunnel_ips
+    peer_peer.allowed_ips = payload.peer_allowed_ips or payload.local_tunnel_ips
     peer_peer.persistent_keepalive = payload.persistent_keepalive
     peer_peer.source = "managed-node"
     set_extra_value(local_interface, "custom_config", payload.local_interface_custom_config)
