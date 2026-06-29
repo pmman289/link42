@@ -584,7 +584,8 @@ Request:
 {
   "node_id": "node_123",
   "agent_version": "0.1.0",
-  "capabilities": ["wireguard", "wg_quick_import"]
+  "protocol_version": 1,
+  "capabilities": ["wireguard", "wg_quick_import", "service:systemd"]
 }
 ```
 
@@ -623,6 +624,12 @@ Result:
 
 Failed tasks should include enough information for the UI to show a useful
 message, but secrets must be redacted.
+
+Agent versioning is part of this protocol. New task types, such as connection
+middleware and udp2raw installation, must declare their minimum Agent version
+and required capabilities before the API creates tasks for a node. See
+`docs/agent-versioning-and-upgrade.md` for the version, capability, and upgrade
+design.
 
 ## 10. Security Rules
 

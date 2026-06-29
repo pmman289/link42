@@ -37,6 +37,12 @@ class Node(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     agent_token_hash: Mapped[str] = mapped_column(String(128))
     agent_token_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_protocol_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    agent_capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
+    agent_platform: Mapped[dict] = mapped_column(JSON, default=dict)
+    agent_update_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     interfaces: Mapped[list[WireGuardInterface]] = relationship(

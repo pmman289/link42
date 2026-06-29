@@ -145,6 +145,18 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 connection.execute(text("ALTER TABLE nodes ADD COLUMN endpoint_ips JSON DEFAULT '[]'"))
             if "agent_token_value" not in node_columns:
                 connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_token_value TEXT"))
+            if "agent_version" not in node_columns:
+                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_version VARCHAR(32)"))
+            if "agent_protocol_version" not in node_columns:
+                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_protocol_version INTEGER"))
+            if "agent_capabilities" not in node_columns:
+                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_capabilities JSON DEFAULT '[]'"))
+            if "agent_platform" not in node_columns:
+                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_platform JSON DEFAULT '{}'"))
+            if "agent_update_status" not in node_columns:
+                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_update_status VARCHAR(32)"))
+            if "agent_last_error" not in node_columns:
+                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_last_error TEXT"))
             fallback_columns = [name for name in ["public_ip", "management_ip", "hostname"] if name in node_columns]
             if fallback_columns:
                 fallback_expr = f"COALESCE({', '.join(fallback_columns)})"

@@ -13,6 +13,12 @@ type NodeItem = {
   public_ip: string | null;
   endpoint_ips: string[];
   agent_token_value: string | null;
+  agent_version: string | null;
+  agent_protocol_version: number | null;
+  agent_capabilities: string[];
+  agent_platform: Record<string, unknown>;
+  agent_update_status: string | null;
+  agent_last_error: string | null;
   status: string;
   last_seen_at: string | null;
 };
@@ -58,6 +64,21 @@ type ManagedLink = {
   peer_interface: ConfigItem;
   local_peer: PeerItem;
   peer_peer: PeerItem;
+  middleware: Udp2RawMiddleware | null;
+};
+
+type Udp2RawMiddleware = {
+  type: "udp2raw";
+  enabled: boolean;
+  server_side: "local" | "peer";
+  server_listen_host: string;
+  server_listen_port: number;
+  client_listen_host: string;
+  client_listen_port: number;
+  raw_mode: string;
+  cipher_mode: string;
+  password: string;
+  auto_rule: boolean;
 };
 
 type ChangePlan = {
@@ -435,6 +456,105 @@ function RouteModeSelect({
   );
 }
 
+function Udp2RawFields({
+  enabled,
+  serverSide,
+  defaults,
+  disabled,
+  onEnabledChange,
+  onServerSideChange,
+}: {
+  enabled: boolean;
+  serverSide: "local" | "peer";
+  defaults?: Partial<Udp2RawMiddleware> | null;
+  disabled?: boolean;
+  onEnabledChange: (value: boolean) => void;
+  onServerSideChange: (value: "local" | "peer") => void;
+}) {
+  return (
+    <>
+      <label className="checkField wideField">
+        <input
+          name="udp2raw_enabled"
+          type="checkbox"
+          checked={enabled}
+          disabled={disabled}
+          onChange={(event) => onEnabledChange(event.currentTarget.checked)}
+        />
+        <span>启用 udp2raw 连接中间层</span>
+      </label>
+      {enabled && (
+        <>
+          <Field label="udp2raw 服务端" hint="只有服务端侧要求 WireGuard ListenPort；另一端可被动运行 WireGuard。">
+            <select
+              name="udp2raw_server_side"
+              value={serverSide}
+              disabled={disabled}
+              onChange={(event) => onServerSideChange(event.currentTarget.value as "local" | "peer")}
+            >
+              <option value="peer">对端作为 udp2raw server</option>
+              <option value="local">本端作为 udp2raw server</option>
+            </select>
+          </Field>
+          <Field label="server 监听地址">
+            <input name="udp2raw_server_listen_host" defaultValue={defaults?.server_listen_host || "0.0.0.0"} disabled={disabled} />
+          </Field>
+          <Field label="server 监听端口" hint="对外暴露的 udp2raw faketcp/udp/icmp 端口。">
+            <input name="udp2raw_server_listen_port" defaultValue={defaults?.server_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
+          </Field>
+          <Field label="client 本地监听地址">
+            <input name="udp2raw_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} />
+          </Field>
+          <Field label="client 本地监听端口" hint="WireGuard Peer Endpoint 会指向这里。">
+            <input name="udp2raw_client_listen_port" defaultValue={defaults?.client_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
+          </Field>
+          <Field label="raw mode">
+            <select name="udp2raw_raw_mode" defaultValue={defaults?.raw_mode || "faketcp"} disabled={disabled}>
+              <option value="faketcp">faketcp</option>
+              <option value="udp">udp</option>
+              <option value="icmp">icmp</option>
+            </select>
+          </Field>
+          <Field label="cipher mode">
+            <select name="udp2raw_cipher_mode" defaultValue={defaults?.cipher_mode || "xor"} disabled={disabled}>
+              <option value="xor">xor</option>
+              <option value="aes128cbc">aes128cbc</option>
+              <option value="none">none</option>
+            </select>
+          </Field>
+          <Field label="密码" hint="留空由主控自动生成；保存后会复用当前值。">
+            <input name="udp2raw_password" defaultValue={defaults?.password || ""} disabled={disabled} />
+          </Field>
+          <label className="checkField wideField">
+            <input name="udp2raw_auto_rule" type="checkbox" defaultChecked={defaults?.auto_rule ?? true} disabled={disabled} />
+            <span>允许 udp2raw 自动添加 iptables 规则（-a）</span>
+          </label>
+          <div className="empty wideField">
+            {serverSide === "peer" ? "本端 WireGuard Endpoint 将由 udp2raw client 接管；对端作为服务端被动接收。" : "对端 WireGuard Endpoint 将由 udp2raw client 接管；本端作为服务端被动接收。"}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+function readUdp2RawForm(form: FormData): Record<string, unknown> | null {
+  const enabled = form.get("udp2raw_enabled") === "on";
+  if (!enabled) return null;
+  return {
+    enabled: true,
+    server_side: String(form.get("udp2raw_server_side") || "peer"),
+    server_listen_host: String(form.get("udp2raw_server_listen_host") || "0.0.0.0").trim(),
+    server_listen_port: optionalInt(form.get("udp2raw_server_listen_port")),
+    client_listen_host: String(form.get("udp2raw_client_listen_host") || "127.0.0.1").trim(),
+    client_listen_port: optionalInt(form.get("udp2raw_client_listen_port")),
+    raw_mode: String(form.get("udp2raw_raw_mode") || "faketcp"),
+    cipher_mode: String(form.get("udp2raw_cipher_mode") || "xor"),
+    password: String(form.get("udp2raw_password") || "").trim() || null,
+    auto_rule: form.get("udp2raw_auto_rule") === "on",
+  };
+}
+
 function App() {
   // Link42 第一版的主界面组件，集中承载节点和 WireGuard 管理流程。
   // 页面状态保持在顶层，第一版避免引入复杂状态管理。
@@ -460,6 +580,8 @@ function App() {
   const [replaceLocalConfigId, setReplaceLocalConfigId] = useState<number | null>(null);
   const [replacePeerConfigId, setReplacePeerConfigId] = useState<number | null>(null);
   const [forceEndpointMismatch, setForceEndpointMismatch] = useState(false);
+  const [udp2rawEnabled, setUdp2rawEnabled] = useState(false);
+  const [udp2rawServerSide, setUdp2rawServerSide] = useState<"local" | "peer">("peer");
   const [peerNodeConfigs, setPeerNodeConfigs] = useState<ConfigItem[]>([]);
   const [importCandidatesExpanded, setImportCandidatesExpanded] = useState(false);
   const selectedNode = useMemo(
@@ -555,6 +677,8 @@ function App() {
     setReplaceLocalConfigId(null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
+    setUdp2rawEnabled(false);
+    setUdp2rawServerSide("peer");
     setPeerNodeConfigs([]);
     setSettingsOpen(false);
   }
@@ -745,6 +869,12 @@ function App() {
       setManagedLink(null);
     }
   }, [selectedConfigId, selectedConfigIsManagedLink]);
+
+  useEffect(() => {
+    if (!managedLink?.middleware) return;
+    setUdp2rawEnabled(Boolean(managedLink.middleware.enabled));
+    setUdp2rawServerSide(managedLink.middleware.server_side || "peer");
+  }, [managedLink?.middleware]);
 
   useEffect(() => {
     if (!selectedNodeId || !selectedConfigId || !selectedNodeOnline) return;
@@ -1005,6 +1135,7 @@ function App() {
     const localListenPort = optionalInt(form.get("local_listen_port"));
     const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
+    const udp2raw = readUdp2RawForm(form);
     if (!peerNodeId || peerNodeId === selectedNodeId) {
       throw new Error("请选择另一个在线受管节点");
     }
@@ -1022,6 +1153,18 @@ function App() {
     }
     if (!localEndpointHost || !peerEndpointHost) {
       throw new Error("请填写双方用于互联的入口地址");
+    }
+    if (udp2raw) {
+      const serverSide = String(udp2raw.server_side);
+      if (!isValidPort(Number(udp2raw.server_listen_port) || null) || !isValidPort(Number(udp2raw.client_listen_port) || null)) {
+        throw new Error("udp2raw 服务端和客户端监听端口必须填写 1-65535 之间的整数");
+      }
+      if (serverSide === "local" && !localListenPort) {
+        throw new Error("udp2raw 服务端在本端时，本端 WireGuard 监听端口必须填写");
+      }
+      if (serverSide === "peer" && !peerListenPort) {
+        throw new Error("udp2raw 服务端在对端时，对端 WireGuard 监听端口必须填写");
+      }
     }
     if (replaceLocalConfigId && !replacePeerConfigId) {
       throw new Error("请选择对端的导入配置覆盖项");
@@ -1051,6 +1194,7 @@ function App() {
           replace_local_interface_id: replaceLocalConfigId,
           replace_peer_interface_id: replacePeerConfigId,
           force_endpoint_mismatch: forceEndpointMismatch,
+          udp2raw,
         }),
       },
     );
@@ -1061,6 +1205,8 @@ function App() {
     setReplaceLocalConfigId(null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
+    setUdp2rawEnabled(false);
+    setUdp2rawServerSide("peer");
     setCreateDialog(null);
     [1000, 2500, 4500].forEach((delay) => {
       window.setTimeout(() => {
@@ -1134,6 +1280,7 @@ function App() {
     const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const keepalive = Number(form.get("persistent_keepalive")) || null;
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
+    const udp2raw = readUdp2RawForm(form);
     if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
       throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32, fd42::1/64");
     }
@@ -1148,6 +1295,18 @@ function App() {
     }
     if (keepalive !== null && (!Number.isInteger(keepalive) || keepalive < 0 || keepalive > 65535)) {
       throw new Error("PersistentKeepalive 必须是 0-65535 之间的整数");
+    }
+    if (udp2raw) {
+      const serverSide = String(udp2raw.server_side);
+      if (!isValidPort(Number(udp2raw.server_listen_port) || null) || !isValidPort(Number(udp2raw.client_listen_port) || null)) {
+        throw new Error("udp2raw 服务端和客户端监听端口必须填写 1-65535 之间的整数");
+      }
+      if (serverSide === "local" && !localListenPort) {
+        throw new Error("udp2raw 服务端在本端时，本端 WireGuard 监听端口必须填写");
+      }
+      if (serverSide === "peer" && !peerListenPort) {
+        throw new Error("udp2raw 服务端在对端时，对端 WireGuard 监听端口必须填写");
+      }
     }
     await api<ManagedLink>(`/api/wireguard/configs/${selectedConfigId}/managed-link`, {
       method: "PATCH",
@@ -1169,6 +1328,7 @@ function App() {
         local_peer_custom_config: form.get("local_peer_custom_config") || null,
         peer_interface_custom_config: form.get("peer_interface_custom_config") || null,
         peer_peer_custom_config: form.get("peer_peer_custom_config") || null,
+        udp2raw,
       }),
     });
     await refreshConfigs(selectedNodeId, selectedConfigId);
@@ -1506,6 +1666,11 @@ function App() {
               ) : (
                 <div className="empty">该节点创建时未保存明文 token，请轮换后查看。</div>
               )}
+              <div className="empty">
+                Agent {editingNode.agent_version || "未知版本"} / {String(editingNode.agent_platform?.service_manager || "未知服务管理器")}
+                <br />
+                {(editingNode.agent_capabilities || []).join(", ") || "尚未上报能力"}
+              </div>
               <pre className="tokenBox">{buildAgentCommand(editingNode) || "轮换 token 后显示 Agent 启动命令。"}</pre>
               <div className="actionRow">
                 <button className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
@@ -1720,6 +1885,13 @@ function App() {
               <Field label="对端监听端口" hint="可选；留空表示不写 ListenPort。">
                 <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
+              <Udp2RawFields
+                enabled={udp2rawEnabled}
+                serverSide={udp2rawServerSide}
+                disabled={!selectedNodeOnline}
+                onEnabledChange={setUdp2rawEnabled}
+                onServerSideChange={setUdp2rawServerSide}
+              />
               <Field label="MTU" hint="双方链路 MTU，默认 1420。">
                 <input name="mtu" placeholder="1420" defaultValue={replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
@@ -1983,6 +2155,14 @@ function App() {
                   <Field label="对端监听端口" hint="可选；留空表示不写 ListenPort。">
                     <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} disabled={!selectedNodeOnline} />
                   </Field>
+                  <Udp2RawFields
+                    enabled={udp2rawEnabled}
+                    serverSide={udp2rawServerSide}
+                    defaults={managedLink.middleware}
+                    disabled={!selectedNodeOnline}
+                    onEnabledChange={setUdp2rawEnabled}
+                    onServerSideChange={setUdp2rawServerSide}
+                  />
                   <Field label="MTU" hint="双方链路 MTU，默认 1420。">
                     <input name="mtu" defaultValue={managedLink.local_interface.mtu || managedLink.peer_interface.mtu || 1420} disabled={!selectedNodeOnline} />
                   </Field>

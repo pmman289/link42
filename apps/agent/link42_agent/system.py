@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,18 @@ def get_service_manager_name() -> str:
     """返回当前主机使用的 wg-quick 服务管理后端名称。"""
 
     return detect_service_manager(run_command).name
+
+
+def get_agent_platform() -> dict[str, Any]:
+    """返回 Agent 当前运行平台信息，用于主控判断插件和升级资产。"""
+
+    glibc_name, glibc_version = platform.libc_ver()
+    return {
+        "os": platform.system().lower(),
+        "arch": platform.machine(),
+        "service_manager": get_service_manager_name(),
+        "glibc": glibc_version if glibc_name == "glibc" else None,
+    }
 
 
 def scan_wg_quick_configs(wireguard_dir: str = DEFAULT_WIREGUARD_DIR) -> list[dict[str, Any]]:

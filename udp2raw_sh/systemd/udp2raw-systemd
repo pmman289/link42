@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "usage: $0 server|client instance-name" >&2
+    exit 2
+}
+
+[ "$#" -eq 2 ] || usage
+
+mode="$1"
+instance="$2"
+
+case "$mode" in
+    server|client) ;;
+    *) usage ;;
+esac
+
+config="/etc/udp2raw/$mode"
+
+if [ ! -r "$config" ]; then
+    echo "udp2raw: config file not found or not readable: $config" >&2
+    exit 1
+fi
+
+line=$(
+    awk -v name="$instance" '
+        /^[[:space:]]*($|#)/ { next }
+        {
+            key = $1
+            sub(/=$/, "", key)
+            if (key == name) {
+                sub(/^[[:space:]]*[^[:space:]=]+[[:space:]]*=?[[:space:]]*/, "")
+                print
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) exit 1
+        }
+    ' "$config"
+) || {
+    echo "udp2raw: instance '$instance' not found in $config" >&2
+    exit 1
+}
+
+if [ -z "$line" ]; then
+    echo "udp2raw: instance '$instance' has empty arguments in $config" >&2
+    exit 1
+fi
+
+# The mapping files are root-owned service configuration. Parse the selected
+# argument line as shell syntax so quoted keys and options work as expected.
+eval "set -- $line"
+exec /usr/local/bin/udp2raw "$@"

@@ -24,6 +24,7 @@ COPY pyproject.toml README.md ./
 COPY apps/api ./apps/api
 COPY apps/agent ./apps/agent
 COPY packages ./packages
+COPY udp2raw_sh/udp2raw_bin ./plugins/udp2raw/assets
 RUN pip install --no-cache-dir .
 
 COPY --from=web-build /src/apps/web/dist ./web

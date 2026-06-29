@@ -20,6 +20,8 @@ from link42_api.main import (
     confirm_change_plan,
     delete_interface,
     delete_node,
+    agent_poll,
+    agent_register,
     agent_task_result,
     enqueue_interface_task_once,
     ensure_unique_interface_name,
@@ -47,6 +49,9 @@ from link42_api.schemas import (
     ManagedLinkCreate,
     NodeCreate,
     PeerCreate,
+    AgentPollRequest,
+    AgentRegisterRequest,
+    Udp2RawMiddlewareConfig,
 )
 from link42_common.security import hash_token, verify_token
 from link42_api.wireguard_service import build_diff, count_enabled_peers, render_interface_config
@@ -907,6 +912,151 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
     assert any("PublicKey = local-public" in task.payload["config"] for task in tasks)
     assert any("PostUp = ip route add 10.1.0.0/16 dev wg-a" in task.payload["config"] for task in tasks)
     assert any("PostUp = ip route add 10.2.0.0/16 dev wg-b" in task.payload["config"] for task in tasks)
+
+
+def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeypatch) -> None:
+    """验证主控保存 Agent 版本能力，并不会把不支持的任务交给旧 Agent。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="offline")
+        session.add(node)
+        session.commit()
+        node_id = node.id
+        session.add_all(
+            [
+                models.AgentTask(node_id=node_id, type="middleware.udp2raw.apply", payload={"node_id": node_id}),
+                models.AgentTask(node_id=node_id, type="wireguard.import_scan", payload={"node_id": node_id}),
+            ]
+        )
+        session.commit()
+
+        agent_register(
+            AgentRegisterRequest(
+                node_id=node_id,
+                token="token",
+                hostname="host-a",
+                agent_version="0.1.0",
+                protocol_version=1,
+                capabilities=["wireguard", "wg_quick_import", "service:systemd"],
+                platform={"service_manager": "systemd"},
+            ),
+            session,
+        )
+        response = agent_poll(
+            AgentPollRequest(
+                node_id=node_id,
+                token="token",
+                agent_version="0.1.0",
+                protocol_version=1,
+                capabilities=["wireguard", "wg_quick_import", "service:systemd"],
+            ),
+            session,
+        )
+        node = session.get(models.Node, node_id)
+
+    assert node is not None
+    assert node.agent_version == "0.1.0"
+    assert node.agent_capabilities == ["service:systemd", "wg_quick_import", "wireguard"]
+    assert [task.type for task in response.tasks] == ["wireguard.import_scan"]
+
+
+def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> None:
+    """验证 udp2raw 中间层只要求服务端 WireGuard ListenPort，并接管客户端 Endpoint。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+    monkeypatch.setattr(api_main, "generate_token", lambda prefix: f"{prefix}_secret")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    capabilities = [
+        "wireguard",
+        "wg_quick_import",
+        "service:systemd",
+        "middleware",
+        "middleware.install",
+        "middleware.udp2raw",
+    ]
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            agent_version="0.2.0",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            agent_version="0.2.0",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        result = create_managed_link(
+            node_a.id,
+            ManagedLinkCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=None,
+                peer_listen_port=51821,
+                udp2raw=Udp2RawMiddlewareConfig(
+                    enabled=True,
+                    server_side="peer",
+                    server_listen_port=23002,
+                    client_listen_port=12312,
+                ),
+            ),
+            session,
+        )
+        local_peer = session.scalar(
+            select(models.WireGuardPeer).where(models.WireGuardPeer.interface_id == result.local_interface.id)
+        )
+        remote_peer = session.scalar(
+            select(models.WireGuardPeer).where(models.WireGuardPeer.interface_id == result.peer_interface.id)
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+
+    assert local_peer is not None
+    assert local_peer.endpoint_host == "127.0.0.1"
+    assert local_peer.endpoint_port == 12312
+    assert remote_peer is not None
+    assert remote_peer.endpoint_host is None
+    assert remote_peer.endpoint_port is None
+    assert [task.type for task in tasks] == [
+        "middleware.install",
+        "middleware.install",
+        "middleware.udp2raw.apply",
+        "middleware.udp2raw.apply",
+        "wireguard.apply_config",
+        "wireguard.apply_config",
+    ]
+    assert tasks[2].payload["mode"] == "server"
+    assert tasks[2].payload["remote_port"] == 51821
+    assert tasks[3].payload["mode"] == "client"
+    assert tasks[3].payload["remote_host"] == "198.51.100.20"
 
 
 def test_stop_managed_link_queues_both_sides(monkeypatch) -> None:

@@ -1,0 +1,16 @@
+[Unit]
+Description=udp2raw server instance %i
+Documentation=https://github.com/wangyu-/udp2raw
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/udp2raw-systemd server %i
+User=root
+Group=root
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

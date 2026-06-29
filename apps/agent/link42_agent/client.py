@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from link42_common.version import AGENT_PROTOCOL_VERSION, AGENT_VERSION
 
 from .config import AgentConfig
 
@@ -21,24 +22,36 @@ class AgentClient:
 
         return {"node_id": self.config.node_id, "token": self.config.token}
 
-    def register(self, hostname: str) -> None:
+    def agent_payload(self, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> dict[str, Any]:
+        """生成 Agent 版本、协议和能力描述。"""
+
+        return {
+            "agent_version": AGENT_VERSION,
+            "protocol_version": AGENT_PROTOCOL_VERSION,
+            "capabilities": capabilities or ["wireguard", "wg_quick_import"],
+            "platform": platform or {},
+        }
+
+    def register(self, hostname: str, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> None:
         """向中心 API 注册当前节点。"""
 
-        payload = {**self.auth_payload(), "hostname": hostname}
+        payload = {**self.auth_payload(), **self.agent_payload(capabilities, platform), "hostname": hostname}
         self.client.post("/api/agent/register", json=payload).raise_for_status()
 
-    def heartbeat(self) -> None:
+    def heartbeat(self, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> None:
         """发送心跳，维持节点在线状态。"""
 
-        self.client.post("/api/agent/heartbeat", json=self.auth_payload()).raise_for_status()
+        self.client.post(
+            "/api/agent/heartbeat",
+            json={**self.auth_payload(), **self.agent_payload(capabilities, platform)},
+        ).raise_for_status()
 
-    def poll_tasks(self, capabilities: list[str] | None = None) -> list[dict[str, Any]]:
+    def poll_tasks(self, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """拉取待执行任务。"""
 
         payload = {
             **self.auth_payload(),
-            "agent_version": "0.1.0",
-            "capabilities": capabilities or ["wireguard", "wg_quick_import"],
+            **self.agent_payload(capabilities, platform),
         }
         response = self.client.post("/api/agent/tasks/poll", json=payload)
         response.raise_for_status()

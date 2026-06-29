@@ -239,9 +239,13 @@ const connectionMiddlewarePlugins = {
 
 连接中间层任务不要混入 WireGuard 任务，应使用独立任务类型。
 
+插件任务必须经过 Agent 版本和能力门禁。详细规则见
+`docs/agent-versioning-and-upgrade.md`。
+
 建议任务类型：
 
 ```text
+middleware.install
 middleware.apply
 middleware.start
 middleware.stop
@@ -270,6 +274,7 @@ middleware.delete
 
 Agent 处理流程：
 
+- `middleware.install`：安装插件二进制、服务模板和运行目录。
 - `middleware.apply`：写入插件配置和服务文件。
 - `middleware.start`：启动插件服务。
 - `middleware.stop`：停止插件服务。
@@ -311,7 +316,24 @@ Agent 处理流程：
 - 每条受管连接一组双端 udp2raw 配置。
 - WireGuard Endpoint 指向本机 `127.0.0.1:<proxy_port>`。
 - 插件真实连接地址填写在 udp2raw 表单区域。
-- 不自动安装 udp2raw，先做检测和缺失提示；后续再加入安装脚本。
+- 通过 Agent 的 `middleware.install` 安装 udp2raw，不在节点上执行交互式脚本。
+
+udp2raw 至少要求：
+
+```text
+min_agent_version = 0.2.0
+capabilities = middleware, middleware.install, middleware.udp2raw, service:systemd
+```
+
+插件资产由主控提供，Agent 下载并校验后安装：
+
+```text
+/usr/local/bin/udp2raw
+/usr/local/libexec/link42-udp2raw-systemd
+/etc/systemd/system/link42-udp2raw-server@.service
+/etc/systemd/system/link42-udp2raw-client@.service
+/etc/link42/middleware/udp2raw/
+```
 
 字段接管：
 

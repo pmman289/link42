@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from link42_common.security import generate_token, hash_token, verify_token
+from link42_common.version import CONTROLLER_VERSION
 
 from . import models, schemas
 from .config import settings
@@ -32,7 +33,7 @@ logging.getLogger("uvicorn.access").disabled = True
 
 
 # FastAPI 应用实例，所有 API 路由都挂载在这里。
-app = FastAPI(title="Link42 API", version="0.1.0")
+app = FastAPI(title="Link42 API", version=CONTROLLER_VERSION)
 app.add_middleware(
     CORSMiddleware,
     # 第一版定位小型内网系统，允许前端预览服务跨端口访问 API。
@@ -48,6 +49,22 @@ SETTING_ADMIN_USERNAME = "admin_username"
 SETTING_ADMIN_PASSWORD_HASH = "admin_password_hash"
 SETTING_ADMIN_SESSION_HASH = "admin_session_hash"
 SETTING_CONTROLLER_URL = "controller_url"
+
+TASK_REQUIREMENTS = {
+    "wireguard.import_scan": {"min_agent_version": "0.1.0", "capabilities": ["wg_quick_import"]},
+    "wireguard.apply_config": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
+    "wireguard.read_config": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
+    "wireguard.status": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
+    "wireguard.start_interface": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
+    "wireguard.stop_interface": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
+    "wireguard.delete_config": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
+    "middleware.install": {"min_agent_version": "0.2.0", "capabilities": ["middleware.install"]},
+    "middleware.udp2raw.apply": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
+    "middleware.udp2raw.start": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
+    "middleware.udp2raw.stop": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
+    "middleware.udp2raw.delete": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
+    "middleware.udp2raw.status": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
+}
 
 
 def mount_web_panel() -> None:
@@ -193,6 +210,223 @@ def refresh_node_runtime_status(node: models.Node, now: datetime | None = None) 
     return node
 
 
+def parse_version(value: str | None) -> tuple[int, int, int]:
+    """把 SemVer 前三段解析成可比较元组。"""
+
+    if not value:
+        return (0, 1, 0)
+    parts = value.split("-", 1)[0].split(".")
+    parsed: list[int] = []
+    for part in parts[:3]:
+        try:
+            parsed.append(int(part))
+        except ValueError:
+            parsed.append(0)
+    while len(parsed) < 3:
+        parsed.append(0)
+    return tuple(parsed)  # type: ignore[return-value]
+
+
+def update_agent_metadata(
+    node: models.Node,
+    agent_version: str | None,
+    protocol_version: int | None,
+    capabilities: list[str] | None,
+    platform: dict | None,
+) -> None:
+    """保存 Agent 上报的版本、能力和平台信息。"""
+
+    if agent_version:
+        node.agent_version = agent_version
+    if protocol_version is not None:
+        node.agent_protocol_version = protocol_version
+    if capabilities:
+        node.agent_capabilities = sorted(set(capabilities))
+    if platform:
+        node.agent_platform = platform
+    node.agent_update_status = "ok"
+    node.agent_last_error = None
+
+
+def agent_satisfies_task(node: models.Node, task_type: str) -> bool:
+    """判断节点当前 Agent 是否满足任务要求。"""
+
+    requirement = TASK_REQUIREMENTS.get(task_type)
+    if not requirement:
+        return True
+    if parse_version(node.agent_version) < parse_version(requirement.get("min_agent_version")):
+        return False
+    capabilities = set(node.agent_capabilities or ["wireguard", "wg_quick_import"])
+    return all(capability in capabilities for capability in requirement.get("capabilities", []))
+
+
+def require_task_supported(node: models.Node, task_type: str) -> None:
+    """创建任务前校验 Agent 版本和能力。"""
+
+    if not agent_satisfies_task(node, task_type):
+        raise HTTPException(status_code=409, detail=f"agent does not support task: {task_type}")
+
+
+def normalize_udp2raw_config(payload: schemas.Udp2RawMiddlewareConfig | None) -> dict | None:
+    """清洗 udp2raw 插件配置，未启用时返回 None。"""
+
+    if payload is None or not payload.enabled:
+        return None
+    if payload.server_listen_port is None:
+        raise HTTPException(status_code=400, detail="udp2raw server listen port is required")
+    if payload.client_listen_port is None:
+        raise HTTPException(status_code=400, detail="udp2raw client listen port is required")
+    return {
+        "type": "udp2raw",
+        "enabled": True,
+        "server_side": payload.server_side,
+        "server_listen_host": payload.server_listen_host.strip() or "0.0.0.0",
+        "server_listen_port": payload.server_listen_port,
+        "client_listen_host": payload.client_listen_host.strip() or "127.0.0.1",
+        "client_listen_port": payload.client_listen_port,
+        "raw_mode": payload.raw_mode,
+        "cipher_mode": payload.cipher_mode,
+        "password": payload.password or generate_token("u2r"),
+        "auto_rule": payload.auto_rule,
+    }
+
+
+def managed_link_middleware(interface: models.WireGuardInterface) -> dict | None:
+    """读取受管连接绑定的中间层配置。"""
+
+    middleware = (interface.extras or {}).get("middleware")
+    return middleware if isinstance(middleware, dict) and middleware.get("enabled") else None
+
+
+def require_udp2raw_supported(node: models.Node) -> None:
+    """要求节点 Agent 支持 systemd udp2raw 中间层。"""
+
+    for task_type in ["middleware.install", "middleware.udp2raw.apply"]:
+        require_task_supported(node, task_type)
+    if "service:systemd" not in set(node.agent_capabilities or []):
+        raise HTTPException(status_code=409, detail="udp2raw middleware currently requires systemd agent")
+
+
+def apply_udp2raw_to_peers(
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_peer: models.WireGuardPeer,
+    peer_peer: models.WireGuardPeer,
+    local_endpoint: str,
+    peer_endpoint: str,
+) -> None:
+    """根据单向 udp2raw 配置覆盖 WireGuard Peer Endpoint。"""
+
+    if not middleware:
+        local_peer.endpoint_host = peer_endpoint
+        local_peer.endpoint_port = peer_interface.listen_port
+        peer_peer.endpoint_host = local_endpoint
+        peer_peer.endpoint_port = local_interface.listen_port
+        return
+
+    server_side = middleware["server_side"]
+    if server_side == "peer":
+        if peer_interface.listen_port is None:
+            raise HTTPException(status_code=400, detail="udp2raw server side requires WireGuard listen port")
+        local_peer.endpoint_host = middleware["client_listen_host"]
+        local_peer.endpoint_port = middleware["client_listen_port"]
+        peer_peer.endpoint_host = None
+        peer_peer.endpoint_port = None
+    else:
+        if local_interface.listen_port is None:
+            raise HTTPException(status_code=400, detail="udp2raw server side requires WireGuard listen port")
+        local_peer.endpoint_host = None
+        local_peer.endpoint_port = None
+        peer_peer.endpoint_host = middleware["client_listen_host"]
+        peer_peer.endpoint_port = middleware["client_listen_port"]
+
+
+def udp2raw_instance_name(local_interface: models.WireGuardInterface, peer_interface: models.WireGuardInterface) -> str:
+    return f"link42-{min(local_interface.id, peer_interface.id)}-{max(local_interface.id, peer_interface.id)}"
+
+
+def udp2raw_endpoint_payloads(
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_endpoint: str,
+    peer_endpoint: str,
+) -> list[tuple[models.WireGuardInterface, str, dict]]:
+    """生成双方 udp2raw Agent payload；返回 interface、task_type、payload。"""
+
+    if not middleware:
+        return []
+    instance = udp2raw_instance_name(local_interface, peer_interface)
+    server_side = middleware["server_side"]
+    if server_side == "peer":
+        server_interface = peer_interface
+        client_interface = local_interface
+        server_public_host = peer_endpoint
+    else:
+        server_interface = local_interface
+        client_interface = peer_interface
+        server_public_host = local_endpoint
+    if server_interface.listen_port is None:
+        raise HTTPException(status_code=400, detail="udp2raw server side requires WireGuard listen port")
+
+    common = {
+        "plugin": "udp2raw",
+        "instance": instance,
+        "raw_mode": middleware["raw_mode"],
+        "cipher_mode": middleware["cipher_mode"],
+        "password": middleware["password"],
+        "auto_rule": middleware["auto_rule"],
+    }
+    server_payload = {
+        **common,
+        "mode": "server",
+        "listen_host": middleware["server_listen_host"],
+        "listen_port": middleware["server_listen_port"],
+        "remote_host": "127.0.0.1",
+        "remote_port": server_interface.listen_port,
+    }
+    client_payload = {
+        **common,
+        "mode": "client",
+        "listen_host": middleware["client_listen_host"],
+        "listen_port": middleware["client_listen_port"],
+        "remote_host": server_public_host,
+        "remote_port": middleware["server_listen_port"],
+    }
+    return [
+        (server_interface, "middleware.udp2raw.apply", server_payload),
+        (client_interface, "middleware.udp2raw.apply", client_payload),
+    ]
+
+
+def enqueue_udp2raw_tasks(
+    db: Session,
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_endpoint: str,
+    peer_endpoint: str,
+) -> None:
+    """为启用 udp2raw 的受管连接下发安装和配置任务。"""
+
+    if not middleware:
+        return
+    for interface in [local_interface, peer_interface]:
+        node = db.get(models.Node, interface.node_id)
+        if node is not None:
+            require_udp2raw_supported(node)
+        enqueue_interface_task_once(db, interface, "middleware.install", {"plugin": "udp2raw"})
+    for interface, task_type, payload in udp2raw_endpoint_payloads(
+        middleware,
+        local_interface,
+        peer_interface,
+        local_endpoint,
+        peer_endpoint,
+    ):
+        enqueue_interface_task_once(db, interface, task_type, payload)
+
+
 def require_online_node(db: Session, node_id: int) -> models.Node:
     """读取节点并要求 Agent 当前在线，否则返回可展示的业务错误。"""
 
@@ -221,6 +455,17 @@ def set_extra_value(model: models.WireGuardInterface | models.WireGuardPeer, key
     cleaned = value.strip() if value else None
     if cleaned:
         extras[key] = cleaned
+    else:
+        extras.pop(key, None)
+    model.extras = extras
+
+
+def set_extra_object(model: models.WireGuardInterface | models.WireGuardPeer, key: str, value: dict | None) -> None:
+    """在 JSON extras 中保存对象扩展字段。"""
+
+    extras = dict(model.extras or {})
+    if value:
+        extras[key] = value
     else:
         extras.pop(key, None)
     model.extras = extras
@@ -374,6 +619,9 @@ def enqueue_interface_task_once(
 
     if has_active_interface_task(db, interface.id, task_type):
         return False
+    node = db.get(models.Node, interface.node_id)
+    if node is not None:
+        require_task_supported(node, task_type)
     db.add(create_interface_task(interface, task_type, payload_extra=payload_extra))
     return True
 
@@ -820,6 +1068,7 @@ def create_managed_link(
         payload.peer_endpoint_host,
         "peer endpoint address is not registered on node",
     )
+    udp2raw = normalize_udp2raw_config(payload.udp2raw)
 
     peer_interface_name = payload.peer_interface_name or payload.local_interface_name
     ensure_unique_interface_name(
@@ -877,8 +1126,6 @@ def create_managed_link(
         public_key=peer_public_key,
         preshared_key_ref="local-db",
         preshared_key_value=preshared_key,
-        endpoint_host=peer_endpoint,
-        endpoint_port=payload.peer_listen_port,
         allowed_ips=payload.local_allowed_ips or payload.peer_tunnel_ips,
         persistent_keepalive=payload.persistent_keepalive,
         source="managed-node",
@@ -891,8 +1138,6 @@ def create_managed_link(
         public_key=local_public_key,
         preshared_key_ref="local-db",
         preshared_key_value=preshared_key,
-        endpoint_host=local_endpoint,
-        endpoint_port=payload.local_listen_port,
         allowed_ips=payload.peer_allowed_ips or payload.local_tunnel_ips,
         persistent_keepalive=payload.persistent_keepalive,
         source="managed-node",
@@ -901,12 +1146,16 @@ def create_managed_link(
     set_extra_value(peer_interface, "custom_config", payload.peer_interface_custom_config)
     set_extra_value(local_peer, "custom_config", payload.local_peer_custom_config)
     set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
+    set_extra_object(local_interface, "middleware", udp2raw)
+    set_extra_object(peer_interface, "middleware", udp2raw)
+    apply_udp2raw_to_peers(udp2raw, local_interface, peer_interface, local_peer, peer_peer, local_endpoint, peer_endpoint)
     db.add_all([local_peer, peer_peer])
     db.flush()
     if replace_local:
         queue_replace_interface(db, replace_local)
     if replace_peer:
         queue_replace_interface(db, replace_peer)
+    enqueue_udp2raw_tasks(db, udp2raw, local_interface, peer_interface, local_endpoint, peer_endpoint)
     enqueue_apply_config(db, local_interface)
     enqueue_apply_config(db, peer_interface)
     db.commit()
@@ -953,6 +1202,7 @@ def get_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[s
         "peer_interface": peer_interface,
         "local_peer": local_peer,
         "peer_peer": peer_peer,
+        "middleware": managed_link_middleware(local_interface),
     }
 
 
@@ -977,6 +1227,7 @@ def update_managed_link(
         payload.peer_endpoint_host,
         "peer endpoint address is not registered on node",
     )
+    udp2raw = normalize_udp2raw_config(payload.udp2raw)
     ensure_unique_interface_name(db, local_interface.node_id, payload.local_interface_name, local_interface.id)
     ensure_unique_interface_name(db, peer_interface.node_id, payload.peer_interface_name, peer_interface.id)
 
@@ -995,13 +1246,9 @@ def update_managed_link(
     peer_interface.managed = True
     peer_interface.source = "managed-node"
 
-    local_peer.endpoint_host = peer_endpoint
-    local_peer.endpoint_port = payload.peer_listen_port
     local_peer.allowed_ips = payload.local_allowed_ips or payload.peer_tunnel_ips
     local_peer.persistent_keepalive = payload.persistent_keepalive
     local_peer.source = "managed-node"
-    peer_peer.endpoint_host = local_endpoint
-    peer_peer.endpoint_port = payload.local_listen_port
     peer_peer.allowed_ips = payload.peer_allowed_ips or payload.local_tunnel_ips
     peer_peer.persistent_keepalive = payload.persistent_keepalive
     peer_peer.source = "managed-node"
@@ -1009,7 +1256,11 @@ def update_managed_link(
     set_extra_value(peer_interface, "custom_config", payload.peer_interface_custom_config)
     set_extra_value(local_peer, "custom_config", payload.local_peer_custom_config)
     set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
+    set_extra_object(local_interface, "middleware", udp2raw)
+    set_extra_object(peer_interface, "middleware", udp2raw)
+    apply_udp2raw_to_peers(udp2raw, local_interface, peer_interface, local_peer, peer_peer, local_endpoint, peer_endpoint)
 
+    enqueue_udp2raw_tasks(db, udp2raw, local_interface, peer_interface, local_endpoint, peer_endpoint)
     if enqueue_apply_config(db, local_interface):
         local_interface.runtime_status = "starting"
     if enqueue_apply_config(db, peer_interface):
@@ -1024,6 +1275,7 @@ def update_managed_link(
         "peer_interface": peer_interface,
         "local_peer": local_peer,
         "peer_peer": peer_peer,
+        "middleware": managed_link_middleware(local_interface),
     }
 
 
@@ -1034,6 +1286,13 @@ def start_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict
     local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
     require_online_node(db, local_interface.node_id)
     require_online_node(db, peer_interface.node_id)
+    middleware = managed_link_middleware(local_interface)
+    if middleware:
+        for interface in [local_interface, peer_interface]:
+            enqueue_interface_task_once(db, interface, "middleware.udp2raw.start", {
+                "plugin": "udp2raw",
+                "instance": udp2raw_instance_name(local_interface, peer_interface),
+            })
     for interface in [local_interface, peer_interface]:
         if interface.runtime_status not in ["running", "starting"]:
             if enqueue_interface_task_once(db, interface, "wireguard.start_interface"):
@@ -1044,6 +1303,7 @@ def start_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict
         "peer_interface": peer_interface,
         "local_peer": local_peer,
         "peer_peer": peer_peer,
+        "middleware": middleware,
     }
 
 
@@ -1054,16 +1314,24 @@ def stop_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[
     local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
     require_online_node(db, local_interface.node_id)
     require_online_node(db, peer_interface.node_id)
+    middleware = managed_link_middleware(local_interface)
     for interface in [local_interface, peer_interface]:
         if interface.runtime_status not in ["stopped", "stopping"]:
             if enqueue_interface_task_once(db, interface, "wireguard.stop_interface"):
                 interface.runtime_status = "stopping"
+    if middleware:
+        for interface in [local_interface, peer_interface]:
+            enqueue_interface_task_once(db, interface, "middleware.udp2raw.stop", {
+                "plugin": "udp2raw",
+                "instance": udp2raw_instance_name(local_interface, peer_interface),
+            })
     db.commit()
     return {
         "local_interface": local_interface,
         "peer_interface": peer_interface,
         "local_peer": local_peer,
         "peer_peer": peer_peer,
+        "middleware": middleware,
     }
 
 
@@ -1076,7 +1344,13 @@ def delete_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dic
     require_online_node(db, peer_interface.node_id)
     if any(interface.runtime_status in ["running", "starting", "stopping"] for interface in [local_interface, peer_interface]):
         raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
+    middleware = managed_link_middleware(local_interface)
     for interface in [local_interface, peer_interface]:
+        if middleware:
+            enqueue_interface_task_once(db, interface, "middleware.udp2raw.delete", {
+                "plugin": "udp2raw",
+                "instance": udp2raw_instance_name(local_interface, peer_interface),
+            })
         mark_import_candidate_available_for_interface(db, interface)
         if should_delete_node_config_file(interface):
             enqueue_interface_task_once(db, interface, "wireguard.delete_config")
@@ -1301,7 +1575,8 @@ def confirm_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.C
     task_type = plan.payload.get("task_type")
     if not task_payload or not task_type:
         raise HTTPException(status_code=400, detail="change plan has no task payload")
-    require_online_node(db, task_payload["node_id"])
+    node = require_online_node(db, task_payload["node_id"])
+    require_task_supported(node, task_type)
 
     plan.status = "confirmed"
     plan.confirmed_at = datetime.utcnow()
@@ -1377,6 +1652,35 @@ def get_agent_task(task_id: int, db: Session = Depends(get_db)) -> models.AgentT
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+@app.get("/api/agent/plugins/udp2raw/assets/{asset_name}")
+def get_udp2raw_asset(asset_name: str) -> FileResponse:
+    """为 Agent 提供主控内置的 udp2raw 二进制资产。"""
+
+    allowed = {
+        "udp2raw_amd64",
+        "udp2raw_amd64_hw_aes",
+        "udp2raw_x86",
+        "udp2raw_x86_asm_aes",
+        "udp2raw_arm",
+        "udp2raw_arm_asm_aes",
+        "udp2raw_mips24kc_le",
+        "udp2raw_mips24kc_le_asm_aes",
+        "udp2raw_mips24kc_be",
+        "udp2raw_mips24kc_be_asm_aes",
+    }
+    if asset_name not in allowed:
+        raise HTTPException(status_code=404, detail="udp2raw asset not found")
+    candidates = [
+        Path("/opt/link42/plugins/udp2raw/assets") / asset_name,
+        Path(__file__).resolve().parents[3] / "plugins" / "udp2raw" / "assets" / asset_name,
+        Path(__file__).resolve().parents[3] / "udp2raw_sh" / "udp2raw_bin" / asset_name,
+    ]
+    for path in candidates:
+        if path.exists():
+            return FileResponse(path)
+    raise HTTPException(status_code=404, detail="udp2raw asset not found")
 
 
 @app.get("/api/nodes/{node_id}/wireguard/import-candidates", response_model=list[schemas.ImportCandidateRead])
@@ -1534,6 +1838,7 @@ def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(
     node.hostname = payload.hostname or node.hostname
     node.management_ip = payload.management_ip or node.management_ip
     node.public_ip = payload.public_ip or node.public_ip
+    update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     node.status = "online"
     node.last_seen_at = datetime.utcnow()
     db.commit()
@@ -1544,6 +1849,7 @@ def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(
 def agent_heartbeat(payload: schemas.AgentHeartbeatRequest, db: Session = Depends(get_db)) -> dict[str, str]:
     """Agent 心跳，用于更新节点在线状态。"""
     node = require_agent(db, payload.node_id, payload.token)
+    update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     node.status = "online"
     node.last_seen_at = datetime.utcnow()
     db.commit()
@@ -1553,7 +1859,8 @@ def agent_heartbeat(payload: schemas.AgentHeartbeatRequest, db: Session = Depend
 @app.post("/api/agent/tasks/poll", response_model=schemas.AgentPollResponse)
 def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db)) -> schemas.AgentPollResponse:
     """Agent 轮询待执行任务，并把任务标记为 running。"""
-    require_agent(db, payload.node_id, payload.token)
+    node = require_agent(db, payload.node_id, payload.token)
+    update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     tasks = list(
         db.scalars(
             select(models.AgentTask)
@@ -1562,6 +1869,7 @@ def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db))
             .limit(5)
         )
     )
+    tasks = [task for task in tasks if agent_satisfies_task(node, task.type)]
     for task in tasks:
         task.status = "running"
         task.started_at = datetime.utcnow()

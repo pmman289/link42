@@ -47,6 +47,12 @@ class NodeRead(BaseModel):
     public_ip: str | None
     endpoint_ips: list[str]
     agent_token_value: str | None
+    agent_version: str | None = None
+    agent_protocol_version: int | None = None
+    agent_capabilities: list[str] = Field(default_factory=list)
+    agent_platform: dict[str, Any] = Field(default_factory=dict)
+    agent_update_status: str | None = None
+    agent_last_error: str | None = None
     status: str
     last_seen_at: datetime | None
 
@@ -132,6 +138,7 @@ class ManagedLinkCreate(BaseModel):
     replace_local_interface_id: int | None = None
     replace_peer_interface_id: int | None = None
     force_endpoint_mismatch: bool = False
+    udp2raw: Udp2RawMiddlewareConfig | None = None
 
     @field_validator("local_listen_port", "peer_listen_port")
     @classmethod
@@ -269,6 +276,45 @@ class PeerRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class Udp2RawMiddlewareConfig(BaseModel):
+    enabled: bool = False
+    server_side: str = "peer"
+    server_listen_host: str = "0.0.0.0"
+    server_listen_port: int | None = None
+    client_listen_host: str = "127.0.0.1"
+    client_listen_port: int | None = None
+    raw_mode: str = "faketcp"
+    cipher_mode: str = "xor"
+    password: str | None = None
+    auto_rule: bool = True
+
+    @field_validator("server_side")
+    @classmethod
+    def validate_server_side(cls, value: str) -> str:
+        if value not in ["local", "peer"]:
+            raise ValueError("server_side must be local or peer")
+        return value
+
+    @field_validator("server_listen_port", "client_listen_port")
+    @classmethod
+    def validate_udp2raw_ports(cls, value: int | None) -> int | None:
+        return _validate_port(value)
+
+    @field_validator("raw_mode")
+    @classmethod
+    def validate_raw_mode(cls, value: str) -> str:
+        if value not in ["faketcp", "udp", "icmp"]:
+            raise ValueError("raw_mode must be faketcp, udp, or icmp")
+        return value
+
+    @field_validator("cipher_mode")
+    @classmethod
+    def validate_cipher_mode(cls, value: str) -> str:
+        if value not in ["xor", "aes128cbc", "none"]:
+            raise ValueError("cipher_mode must be xor, aes128cbc, or none")
+        return value
+
+
 class ManagedLinkCreateResult(BaseModel):
     local_interface: InterfaceRead
     peer_interface: InterfaceRead
@@ -281,6 +327,7 @@ class ManagedLinkRead(BaseModel):
     peer_interface: InterfaceRead
     local_peer: PeerRead
     peer_peer: PeerRead
+    middleware: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -303,6 +350,7 @@ class ManagedLinkUpdate(BaseModel):
     local_peer_custom_config: str | None = None
     peer_interface_custom_config: str | None = None
     peer_peer_custom_config: str | None = None
+    udp2raw: Udp2RawMiddlewareConfig | None = None
 
     @field_validator("local_listen_port", "peer_listen_port")
     @classmethod
@@ -380,19 +428,28 @@ class AgentRegisterRequest(BaseModel):
     hostname: str | None = None
     management_ip: str | None = None
     public_ip: str | None = None
+    agent_version: str | None = None
+    protocol_version: int | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    platform: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentHeartbeatRequest(BaseModel):
     node_id: int
     token: str
     agent_version: str | None = None
+    protocol_version: int | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    platform: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentPollRequest(BaseModel):
     node_id: int
     token: str
     agent_version: str | None = None
+    protocol_version: int | None = None
     capabilities: list[str] = Field(default_factory=list)
+    platform: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentTaskRead(BaseModel):
