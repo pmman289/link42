@@ -1,45 +1,44 @@
 # 项目结构
 
-本文记录 Link42 仓库的目录约定，避免脚本和部署文件后续散落。
+Link42 以“应用代码 / 部署脚本 / 文档 / 构建产物”四层来组织。
 
-## 应用代码
+## 源码
 
-- `apps/api/`：中心 FastAPI 主控后端。
-- `apps/web/`：React/Vite Web 面板。
-- `apps/agent/`：节点 Agent 入口和轮询执行逻辑。
-- `packages/link42_common/`：API 与 Agent 共享的通用工具。
+- `apps/api/`：主控 FastAPI 后端。
+- `apps/web/`：React + Vite 前端。
+- `apps/agent/`：节点 Agent 入口和任务执行逻辑。
+- `packages/link42_common/`：后端和 Agent 共享工具。
 - `packages/link42_wireguard/`：WireGuard 配置解析和渲染。
-- `tests/`：后端、Agent 和 WireGuard 规则测试。
+- `tests/`：单元测试和规则测试。
 
-## 脚本
+## 部署与脚本
 
+- `Dockerfile.controller`：主控镜像 Dockerfile。
+- `scripts/controller/`：主控镜像构建、导出、推送脚本。
 - `scripts/agent/`：Agent 构建脚本。
-  - `build-x64.sh`：构建 Linux x64 单文件 Agent 二进制。
-- `scripts/controller/`：主控镜像脚本。
-  - `build-image.sh`：构建 `pmman/link42:<tag>` 主控镜像。
-  - `push-image.sh`：构建并推送主控镜像到 DockerHub。
-  - `export-image.sh`：将主控镜像导出为 tar，供离线机器 `docker load`。
-
-## 部署文件
-
-- `Dockerfile.controller`：主控镜像 Dockerfile，包含 API 和已构建 Web 面板。
 - `deploy/docker-compose.yml`：主控容器运行示例。
-- `deploy/sh/`：一键安装脚本，目前包含 Agent 安装/卸载脚本。
+- `deploy/sh/`：Agent 安装和卸载脚本。
 - `deploy/systemd/`：systemd service 示例。
 
-## 文档和示例
+## 文档
 
-- `docs/`：架构、运维、构建和决策记录。
+- `docs/architecture.md`：设计和架构说明。
+- `docs/project-decisions.md`：产品和技术决策。
+- `docs/operations-notes.md`：运维、部署和踩坑记录。
+- `docs/agent-binary-build.md`：Agent 二进制构建说明。
+- `docs/handoff-memory.md`：上下文恢复说明。
+
+## 示例与产物
+
 - `local-demo/`：本地演示配置样例。
+- `build/`：PyInstaller 中间产物。
+- `dist/`：Agent 二进制和导出镜像等发布物。
+- `apps/web/dist/`：前端构建产物。
+- `.venv/`：本地 Python 虚拟环境。
 
-## 构建产物
+## 运行目录
 
-以下目录只作为本机构建输出，不应提交：
+容器内部统一挂载到 `/link42`：
 
-- `build/`
-- `dist/`
-- `.venv/`
-- `apps/web/dist/`
-- `apps/web/node_modules/`
-- `*.db`
-- `*.egg-info/`
+- `/link42/data`：数据库和运行数据。
+- `/link42/config`：预留配置目录。
