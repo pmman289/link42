@@ -108,6 +108,13 @@ case "$ACTION" in
     ;;
 esac
 
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
 need_env LINK42_SERVER_URL
 need_env LINK42_NODE_ID
 need_env LINK42_AGENT_TOKEN
@@ -149,7 +156,8 @@ install_packages() {
 download_agent() {
   mkdir -p "$INSTALL_DIR"
   tmp_file="$(mktemp "${TMPDIR:-/tmp}/link42-agent.XXXXXX")"
-  trap 'rm -f "$tmp_file"' EXIT HUP INT TERM
+  tmp_sha="$(mktemp "${TMPDIR:-/tmp}/link42-agent.sha256.XXXXXX")"
+  trap 'rm -f "$tmp_file" "$tmp_sha"' EXIT HUP INT TERM
 
   if [ "$AGENT_VERSION" = "latest" ]; then
     url="$RES_BASE_URL/$AGENT_FILE"
@@ -166,8 +174,24 @@ download_agent() {
     fail "curl or wget is required to download the agent"
   fi
 
+  sha_url="$url.sha256"
+  if command -v sha256sum >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsL "$sha_url" -o "$tmp_sha" || true
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q -O "$tmp_sha" "$sha_url" || true
+    fi
+    if [ -s "$tmp_sha" ]; then
+      expected="$(awk '{print $1}' "$tmp_sha")"
+      actual="$(sha256sum "$tmp_file" | awk '{print $1}')"
+      [ "$expected" = "$actual" ] || fail "sha256 mismatch for downloaded agent"
+    else
+      log "sha256 file not found; skipping checksum verification"
+    fi
+  fi
+
   install -m 0755 "$tmp_file" "$BIN_PATH"
-  rm -f "$tmp_file"
+  rm -f "$tmp_file" "$tmp_sha"
   trap - EXIT HUP INT TERM
 }
 
@@ -183,6 +207,14 @@ write_env_file() {
     printf 'LINK42_POLL_INTERVAL=%s\n' "$(shell_quote "$POLL_INTERVAL")"
   } > "$ENV_FILE"
   chmod 0600 "$ENV_FILE"
+}
+
+stop_existing_service() {
+  if [ "$SERVICE_BACKEND" = "systemd" ]; then
+    systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+  elif [ "$SERVICE_BACKEND" = "openrc" ]; then
+    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+  fi
 }
 
 install_systemd_service() {
@@ -249,6 +281,7 @@ if ! command -v wg-quick >/dev/null 2>&1; then
   fi
 fi
 
+stop_existing_service
 download_agent
 write_env_file
 

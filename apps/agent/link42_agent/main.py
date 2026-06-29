@@ -30,6 +30,7 @@ from .system import (
     start_wireguard_interface,
     stop_wireguard_interface,
 )
+from .upgrade import self_upgrade
 
 
 def build_capabilities() -> list[str]:
@@ -42,6 +43,7 @@ def build_capabilities() -> list[str]:
         "middleware",
         "middleware.install",
         "middleware.udp2raw",
+        "agent.self_upgrade",
         f"service:{service_manager}",
     ]
     if service_manager == "systemd":
@@ -82,6 +84,8 @@ def execute_task(task: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
         return delete_udp2raw(payload, dry_run=dry_run)
     if task_type == "middleware.udp2raw.status":
         return status_udp2raw(payload)
+    if task_type == "agent.self_upgrade":
+        return self_upgrade(payload, config, dry_run=dry_run)
 
     raise ValueError(f"unsupported task type: {task_type}")
 

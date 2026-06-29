@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     web_dist_dir: str | None = None
     # 预留给容器和后续部署读取配置文件的目录。
     config_dir: str = "/link42/config"
+    # 主控内置或挂载的 Agent 发布资产目录。
+    agent_release_dir: str = "/opt/link42/releases/agent"
+    # 外部一键安装脚本地址；节点不支持自升级时由前端展示。
+    agent_install_script_url: str = "https://get.pmman.tech/sh/link42-agent.sh"
+    # 外部 Agent 资源地址；安装脚本会使用该地址下载版本化二进制。
+    agent_res_base_url: str = "https://get.pmman.tech/res/link42"
     # Agent 心跳超过该秒数后视为离线，前端和部署确认都会据此拦截。
     agent_offline_after_seconds: int = 15
 

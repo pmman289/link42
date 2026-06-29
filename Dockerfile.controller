@@ -25,6 +25,7 @@ COPY apps/api ./apps/api
 COPY apps/agent ./apps/agent
 COPY packages ./packages
 COPY udp2raw_sh/udp2raw_bin ./plugins/udp2raw/assets
+COPY dist/controller-agent-releases ./releases/agent
 RUN pip install --no-cache-dir .
 
 COPY --from=web-build /src/apps/web/dist ./web

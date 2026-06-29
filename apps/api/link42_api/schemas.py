@@ -412,6 +412,42 @@ class TaskRequestResult(BaseModel):
     message: str
 
 
+class AgentReleaseAsset(BaseModel):
+    path: str
+    sha256: str
+    size: int | None = None
+
+
+class AgentReleaseInfo(BaseModel):
+    released_at: str | None = None
+    protocol_version: int | None = None
+    notes: str | None = None
+    assets: dict[str, AgentReleaseAsset] = Field(default_factory=dict)
+
+
+class AgentReleaseManifest(BaseModel):
+    latest: str | None = None
+    minimum_supported: str | None = None
+    releases: dict[str, AgentReleaseInfo] = Field(default_factory=dict)
+
+
+class AgentUpgradePlan(BaseModel):
+    node_id: int
+    current_version: str | None
+    target_version: str | None
+    upgrade_mode: str
+    reason: str | None = None
+    matched_platform: str | None = None
+    matched_asset: AgentReleaseAsset | None = None
+    manual_command: str | None = None
+    status: str | None = None
+
+
+class AgentUpgradeRequest(BaseModel):
+    target_version: str | None = None
+    force: bool = False
+
+
 class AgentTaskStatusRead(BaseModel):
     id: int
     node_id: int

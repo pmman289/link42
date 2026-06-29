@@ -23,6 +23,7 @@ from link42_api.main import (
     agent_poll,
     agent_register,
     agent_task_result,
+    build_agent_upgrade_plan,
     enqueue_interface_task_once,
     ensure_unique_interface_name,
     get_controller_settings,
@@ -39,6 +40,7 @@ from link42_api.main import (
     should_delete_node_config_file,
     stop_managed_link,
     update_controller_settings,
+    request_agent_upgrade,
 )
 from link42_api.schemas import (
     AgentTaskResultRequest,
@@ -51,6 +53,7 @@ from link42_api.schemas import (
     PeerCreate,
     AgentPollRequest,
     AgentRegisterRequest,
+    AgentUpgradeRequest,
     Udp2RawMiddlewareConfig,
 )
 from link42_common.security import hash_token, verify_token
@@ -964,6 +967,98 @@ def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeyp
     assert node.agent_version == "0.1.0"
     assert node.agent_capabilities == ["service:systemd", "wg_quick_import", "wireguard"]
     assert [task.type for task in response.tasks] == ["wireguard.import_scan"]
+
+
+def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_path) -> None:
+    """验证旧 Agent 不支持自升级时，主控生成手动覆盖安装命令。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main.settings, "agent_release_dir", str(tmp_path))
+    monkeypatch.setattr(api_main.settings, "agent_install_script_url", "https://example.com/link42-agent.sh")
+    monkeypatch.setattr(api_main.settings, "agent_res_base_url", "https://example.com/res")
+    (tmp_path / "manifest.json").write_text('{"latest":"0.2.0","releases":{}}', encoding="utf-8")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            agent_token_value="token",
+            status="online",
+            agent_version="0.1.0",
+            agent_capabilities=["wireguard", "wg_quick_import", "service:systemd"],
+            agent_platform={"os": "linux", "arch": "x86_64", "service_manager": "systemd", "glibc": "2.31"},
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        set_setting(session, SETTING_CONTROLLER_URL, "http://controller:8000")
+        session.commit()
+
+        plan = build_agent_upgrade_plan(node, session)
+
+    assert plan.upgrade_mode == "manual"
+    assert plan.reason == "当前 Agent 不支持自升级"
+    assert plan.manual_command is not None
+    assert "LINK42_AGENT_VERSION=0.2.0" in plan.manual_command
+    assert "LINK42_NODE_ID=" in plan.manual_command
+    assert "LINK42_AGENT_TOKEN=token" in plan.manual_command
+
+
+def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) -> None:
+    """验证支持自升级的 Agent 会收到 agent.self_upgrade 任务。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main.settings, "agent_release_dir", str(tmp_path))
+    (tmp_path / "agent.bin").write_text("binary", encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(
+        """
+        {
+          "latest": "0.2.1",
+          "releases": {
+            "0.2.1": {
+              "assets": {
+                "linux-x64-glibc2.31": {
+                  "path": "agent.bin",
+                  "sha256": "abc123",
+                  "size": 6
+                }
+              }
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            agent_token_value="token",
+            status="online",
+            agent_version="0.2.0",
+            agent_capabilities=["wireguard", "agent.self_upgrade", "service:systemd"],
+            agent_platform={"os": "linux", "arch": "x86_64", "service_manager": "systemd", "glibc": "2.31"},
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        set_setting(session, SETTING_CONTROLLER_URL, "http://controller:8000")
+        session.commit()
+
+        result = request_agent_upgrade(node.id, AgentUpgradeRequest(), session)
+        task = session.scalar(select(models.AgentTask).where(models.AgentTask.node_id == node.id))
+
+    assert result.task_id is not None
+    assert task is not None
+    assert task.type == "agent.self_upgrade"
+    assert task.payload["target_version"] == "0.2.1"
+    assert task.payload["download_url"] == "http://controller:8000/api/agent/releases/0.2.1/download?platform=linux-x64-glibc2.31"
+    assert task.payload["sha256"] == "abc123"
 
 
 def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> None:

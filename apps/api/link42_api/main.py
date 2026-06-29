@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
@@ -14,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from link42_common.security import generate_token, hash_token, verify_token
-from link42_common.version import CONTROLLER_VERSION
+from link42_common.version import AGENT_VERSION, CONTROLLER_VERSION
 
 from . import models, schemas
 from .config import settings
@@ -64,6 +65,7 @@ TASK_REQUIREMENTS = {
     "middleware.udp2raw.stop": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
     "middleware.udp2raw.delete": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
     "middleware.udp2raw.status": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
+    "agent.self_upgrade": {"min_agent_version": "0.2.0", "capabilities": ["agent.self_upgrade"]},
 }
 
 
@@ -236,6 +238,7 @@ def update_agent_metadata(
 ) -> None:
     """保存 Agent 上报的版本、能力和平台信息。"""
 
+    previous_version = node.agent_version
     if agent_version:
         node.agent_version = agent_version
     if protocol_version is not None:
@@ -244,8 +247,10 @@ def update_agent_metadata(
         node.agent_capabilities = sorted(set(capabilities))
     if platform:
         node.agent_platform = platform
-    node.agent_update_status = "ok"
-    node.agent_last_error = None
+    if node.agent_update_status in {None, "queued", "staged", "restarting", "healthy", "failed", "rolled_back"}:
+        if not previous_version or previous_version != agent_version or node.agent_update_status in {None, "healthy"}:
+            node.agent_update_status = "ok"
+            node.agent_last_error = None
 
 
 def agent_satisfies_task(node: models.Node, task_type: str) -> bool:
@@ -265,6 +270,185 @@ def require_task_supported(node: models.Node, task_type: str) -> None:
 
     if not agent_satisfies_task(node, task_type):
         raise HTTPException(status_code=409, detail=f"agent does not support task: {task_type}")
+
+
+def agent_release_dir() -> Path:
+    """返回 Agent 发布资产目录。"""
+
+    return Path(settings.agent_release_dir)
+
+
+def load_agent_release_manifest() -> dict:
+    """读取 Agent release manifest；缺失时返回空 manifest。"""
+
+    manifest_path = agent_release_dir() / "manifest.json"
+    if not manifest_path.exists():
+        return {"latest": None, "minimum_supported": None, "releases": {}}
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="invalid agent release manifest") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="invalid agent release manifest")
+    data.setdefault("releases", {})
+    return data
+
+
+def normalize_agent_arch(value: str | None) -> str | None:
+    """把平台架构规整为 release manifest 使用的短名。"""
+
+    if not value:
+        return None
+    arch = value.lower()
+    if arch in {"x86_64", "amd64"}:
+        return "x64"
+    if arch in {"aarch64", "arm64"}:
+        return "arm64"
+    return arch
+
+
+def agent_platform_candidates(node: models.Node) -> list[str]:
+    """根据节点上报平台生成可接受的 release asset key。"""
+
+    platform = node.agent_platform or {}
+    os_name = str(platform.get("os") or "linux").lower()
+    arch = normalize_agent_arch(str(platform.get("arch") or "")) or "x64"
+    glibc = platform.get("glibc")
+    service_manager = str(platform.get("service_manager") or "").lower()
+    candidates: list[str] = []
+    if service_manager == "openwrt-uci":
+        candidates.append(f"openwrt-{arch}-musl")
+    if glibc:
+        candidates.append(f"{os_name}-{arch}-glibc{glibc}")
+        candidates.append(f"{os_name}-{arch}-glibc")
+    candidates.append(f"{os_name}-{arch}")
+    return candidates
+
+
+def select_agent_release_asset(node: models.Node, release: dict) -> tuple[str, dict] | tuple[None, None]:
+    """为节点选择匹配的 Agent release asset。"""
+
+    assets = release.get("assets") or {}
+    if not isinstance(assets, dict):
+        return (None, None)
+    candidates = agent_platform_candidates(node)
+    for candidate in candidates:
+        if candidate in assets:
+            asset = assets[candidate]
+            return (candidate, asset) if isinstance(asset, dict) else (None, None)
+    for candidate in candidates:
+        for key, asset in assets.items():
+            if key.startswith(candidate) and isinstance(asset, dict):
+                return key, asset
+    return (None, None)
+
+
+def controller_url_for_agent(db: Session) -> str:
+    """返回 Agent 访问主控时应使用的 URL。"""
+
+    return (get_setting(db, SETTING_CONTROLLER_URL) or "").rstrip("/")
+
+
+def build_agent_manual_upgrade_command(node: models.Node, target_version: str | None, db: Session) -> str:
+    """生成旧 Agent 可执行的覆盖安装命令。"""
+
+    env_parts = [
+        f"LINK42_AGENT_VERSION={target_version or 'latest'}",
+        f"LINK42_RES_BASE_URL={settings.agent_res_base_url}",
+    ]
+    controller_url = controller_url_for_agent(db)
+    if controller_url:
+        env_parts.append(f"LINK42_SERVER_URL={controller_url}")
+    env_parts.append(f"LINK42_NODE_ID={node.id}")
+    if node.agent_token_value:
+        env_parts.append(f"LINK42_AGENT_TOKEN={node.agent_token_value}")
+    return f"curl -fsSL {settings.agent_install_script_url} | sudo env {' '.join(env_parts)} sh"
+
+
+def build_agent_upgrade_plan(
+    node: models.Node,
+    db: Session,
+    target_version: str | None = None,
+    force: bool = False,
+) -> schemas.AgentUpgradePlan:
+    """生成单节点 Agent 升级计划。"""
+
+    manifest = load_agent_release_manifest()
+    releases = manifest.get("releases") or {}
+    selected_version = target_version or manifest.get("latest") or AGENT_VERSION
+    release = releases.get(selected_version)
+    manual_command = build_agent_manual_upgrade_command(node, selected_version, db)
+    if not selected_version:
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=None,
+            upgrade_mode="unavailable",
+            reason="没有可用的 Agent 发布版本",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    if not is_node_online(node):
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="manual",
+            reason="节点离线，只能手动覆盖安装",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    if not force and node.agent_version and parse_version(node.agent_version) >= parse_version(selected_version):
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="none",
+            reason="当前 Agent 已是目标版本或更高版本",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    if "agent.self_upgrade" not in set(node.agent_capabilities or []):
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="manual",
+            reason="当前 Agent 不支持自升级",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    if not isinstance(release, dict):
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="manual",
+            reason="主控缺少目标版本 Agent 资产",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    platform_key, asset = select_agent_release_asset(node, release)
+    if not platform_key or not asset:
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="manual",
+            reason="主控没有匹配该节点平台的 Agent 资产",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    return schemas.AgentUpgradePlan(
+        node_id=node.id,
+        current_version=node.agent_version,
+        target_version=selected_version,
+        upgrade_mode="self_upgrade",
+        matched_platform=platform_key,
+        matched_asset=schemas.AgentReleaseAsset.model_validate(asset),
+        manual_command=manual_command,
+        status=node.agent_update_status,
+    )
 
 
 def normalize_udp2raw_config(payload: schemas.Udp2RawMiddlewareConfig | None) -> dict | None:
@@ -888,6 +1072,118 @@ def update_controller_settings(
         set_setting(db, SETTING_ADMIN_SESSION_HASH, "")
     db.commit()
     return schemas.ControllerSettingsRead(controller_url=controller_url, username=username)
+
+
+@app.get("/api/agent/releases", response_model=schemas.AgentReleaseManifest)
+def list_agent_releases() -> schemas.AgentReleaseManifest:
+    """返回主控内置的 Agent release manifest。"""
+
+    return schemas.AgentReleaseManifest.model_validate(load_agent_release_manifest())
+
+
+@app.get("/api/agent/releases/{version}/download")
+def download_agent_release(version: str, platform: str) -> FileResponse:
+    """Agent 下载匹配平台的版本化二进制。"""
+
+    manifest = load_agent_release_manifest()
+    release = (manifest.get("releases") or {}).get(version)
+    if not isinstance(release, dict):
+        raise HTTPException(status_code=404, detail="agent release not found")
+    asset = (release.get("assets") or {}).get(platform)
+    if not isinstance(asset, dict):
+        raise HTTPException(status_code=404, detail="agent release asset not found")
+    path = agent_release_dir() / str(asset.get("path") or "")
+    try:
+        path.resolve().relative_to(agent_release_dir().resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid agent release asset path") from exc
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="agent release asset file not found")
+    return FileResponse(path, filename=path.name)
+
+
+@app.get("/api/agent/releases/{version}/sha256")
+def agent_release_sha256(version: str, platform: str) -> dict[str, str]:
+    """返回 Agent release asset 的 SHA256。"""
+
+    manifest = load_agent_release_manifest()
+    release = (manifest.get("releases") or {}).get(version)
+    if not isinstance(release, dict):
+        raise HTTPException(status_code=404, detail="agent release not found")
+    asset = (release.get("assets") or {}).get(platform)
+    if not isinstance(asset, dict) or not asset.get("sha256"):
+        raise HTTPException(status_code=404, detail="agent release asset not found")
+    return {"sha256": str(asset["sha256"])}
+
+
+@app.get("/api/nodes/{node_id}/agent/upgrade-plan", response_model=schemas.AgentUpgradePlan)
+def get_agent_upgrade_plan(
+    node_id: int,
+    target_version: str | None = None,
+    force: bool = False,
+    db: Session = Depends(get_db),
+) -> schemas.AgentUpgradePlan:
+    """为节点生成 Agent 升级计划。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    refresh_node_runtime_status(node)
+    return build_agent_upgrade_plan(node, db, target_version=target_version, force=force)
+
+
+@app.post("/api/nodes/{node_id}/agent/upgrade", response_model=schemas.TaskRequestResult)
+def request_agent_upgrade(
+    node_id: int,
+    payload: schemas.AgentUpgradeRequest,
+    db: Session = Depends(get_db),
+) -> schemas.TaskRequestResult:
+    """创建 Agent 自升级任务。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    refresh_node_runtime_status(node)
+    plan = build_agent_upgrade_plan(node, db, target_version=payload.target_version, force=payload.force)
+    if plan.upgrade_mode != "self_upgrade" or not plan.target_version or not plan.matched_platform or not plan.matched_asset:
+        raise HTTPException(status_code=409, detail=plan.reason or "agent self upgrade is not available")
+    active = db.scalar(
+        select(models.AgentTask).where(
+            models.AgentTask.node_id == node_id,
+            models.AgentTask.type == "agent.self_upgrade",
+            models.AgentTask.status.in_(["pending", "running"]),
+        )
+    )
+    if active:
+        return schemas.TaskRequestResult(task_id=active.id, status=active.status, message="升级任务已存在")
+    require_task_supported(node, "agent.self_upgrade")
+    controller_url = controller_url_for_agent(db)
+    if not controller_url:
+        raise HTTPException(status_code=400, detail="controller url is required before agent upgrade")
+    asset = plan.matched_asset
+    task = models.AgentTask(
+        node_id=node_id,
+        type="agent.self_upgrade",
+        payload={
+            "target_version": plan.target_version,
+            "download_url": (
+                f"{controller_url}/api/agent/releases/{plan.target_version}/download"
+                f"?platform={plan.matched_platform}"
+            ),
+            "sha256": asset.sha256,
+            "size": asset.size,
+            "binary_args": ["--version"],
+            "service_name": "link42-agent",
+            "install_path": "/usr/local/bin/link42-agent",
+            "rollback": True,
+        },
+    )
+    db.add(task)
+    node.agent_update_status = "queued"
+    node.agent_last_error = None
+    db.commit()
+    db.refresh(task)
+    return schemas.TaskRequestResult(task_id=task.id, status=task.status, message="升级任务已创建")
 
 
 @app.post("/api/nodes", response_model=schemas.NodeCreateResult)
@@ -1892,6 +2188,15 @@ def agent_task_result(
     task.status = payload.status
     task.result = payload.result
     task.finished_at = datetime.utcnow()
+    node = db.get(models.Node, payload.node_id)
+
+    if task.type == "agent.self_upgrade" and node is not None:
+        reported_status = str(payload.result.get("status") or payload.status)
+        node.agent_update_status = reported_status
+        if payload.status == "failed" or reported_status in {"failed", "rolled_back"}:
+            node.agent_last_error = str(payload.result.get("error") or payload.result)
+        else:
+            node.agent_last_error = None
 
     if task.change_plan_id:
         plan = db.get(models.ChangePlan, task.change_plan_id)

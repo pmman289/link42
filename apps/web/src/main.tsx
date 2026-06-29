@@ -106,6 +106,18 @@ type AgentTaskStatus = {
   result: Record<string, unknown> | null;
 };
 
+type AgentUpgradePlan = {
+  node_id: number;
+  current_version: string | null;
+  target_version: string | null;
+  upgrade_mode: "self_upgrade" | "manual" | "none" | "unavailable";
+  reason: string | null;
+  matched_platform: string | null;
+  matched_asset: { path: string; sha256: string; size: number | null } | null;
+  manual_command: string | null;
+  status: string | null;
+};
+
 type ImportCandidate = {
   id: number;
   node_id: number;
@@ -576,6 +588,7 @@ function App() {
   const [createDialog, setCreateDialog] = useState<"external" | "managed" | null>(null);
   const [nodeCreateOpen, setNodeCreateOpen] = useState(false);
   const [editingNodeId, setEditingNodeId] = useState<number | null>(null);
+  const [agentUpgradePlan, setAgentUpgradePlan] = useState<AgentUpgradePlan | null>(null);
   const [managedPeerNodeId, setManagedPeerNodeId] = useState<number | null>(null);
   const [replaceLocalConfigId, setReplaceLocalConfigId] = useState<number | null>(null);
   const [replacePeerConfigId, setReplacePeerConfigId] = useState<number | null>(null);
@@ -673,6 +686,7 @@ function App() {
     setCreateDialog(null);
     setNodeCreateOpen(false);
     setEditingNodeId(null);
+    setAgentUpgradePlan(null);
     setManagedPeerNodeId(null);
     setReplaceLocalConfigId(null);
     setReplacePeerConfigId(null);
@@ -856,6 +870,14 @@ function App() {
   }, [selectedNodeId]);
 
   useEffect(() => {
+    if (!editingNodeId || !authToken) {
+      setAgentUpgradePlan(null);
+      return;
+    }
+    refreshAgentUpgradePlan(editingNodeId).catch((error) => notify("error", error.message));
+  }, [editingNodeId, authToken]);
+
+  useEffect(() => {
     if (selectedConfigId) {
       if (selectedConfigIsManagedLink) {
         setPeer(null);
@@ -1014,6 +1036,59 @@ function App() {
     }
     await navigator.clipboard.writeText(command);
     notify("success", "Agent 启动命令已复制。");
+  }
+
+  async function refreshAgentUpgradePlan(nodeId: number = editingNodeId || 0) {
+    if (!nodeId) return;
+    const data = await api<AgentUpgradePlan>(`/api/nodes/${nodeId}/agent/upgrade-plan`);
+    setAgentUpgradePlan(data);
+  }
+
+  async function copyAgentUpgradeCommand() {
+    if (!agentUpgradePlan?.manual_command) {
+      throw new Error("当前没有可用的手动升级命令");
+    }
+    await navigator.clipboard.writeText(agentUpgradePlan.manual_command);
+    notify("success", "Agent 升级命令已复制。");
+  }
+
+  async function requestAgentUpgrade() {
+    if (!editingNode || !agentUpgradePlan) return;
+    if (agentUpgradePlan.upgrade_mode !== "self_upgrade") {
+      throw new Error(agentUpgradePlan.reason || "当前节点不能一键升级");
+    }
+    const result = await api<TaskRequestResult>(`/api/nodes/${editingNode.id}/agent/upgrade`, {
+      method: "POST",
+      body: JSON.stringify({ target_version: agentUpgradePlan.target_version, force: false }),
+    });
+    notify("success", result.message);
+    await refreshNodes();
+    await refreshAgentUpgradePlan(editingNode.id);
+    if (result.task_id) {
+      void pollAgentUpgradeTask(result.task_id, editingNode.id);
+    }
+  }
+
+  async function pollAgentUpgradeTask(taskId: number, nodeId: number) {
+    try {
+      for (let attempt = 0; attempt < 45; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
+        await refreshNodes();
+        await refreshAgentUpgradePlan(nodeId);
+        if (task.status === "succeeded") {
+          notify("success", "Agent 升级已暂存，等待服务重启后上报新版本。");
+          return;
+        }
+        if (task.status === "failed") {
+          notify("error", `Agent 升级失败：${JSON.stringify(task.result || {})}`);
+          return;
+        }
+      }
+      notify("info", "Agent 升级任务仍在进行，请稍后刷新节点状态。");
+    } catch (error) {
+      notify("error", error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function saveConfig(event: React.FormEvent<HTMLFormElement>, mode: "create" | "update") {
@@ -1676,6 +1751,55 @@ function App() {
                 <button className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
                 <button className="danger" onClick={() => void runAction(rotateNodeToken)}>轮换 token</button>
               </div>
+            </section>
+            <section className="modalSection">
+              <h3>Agent 升级</h3>
+              {agentUpgradePlan ? (
+                <>
+                  <div className="empty">
+                    当前版本：{agentUpgradePlan.current_version || editingNode.agent_version || "未知"}
+                    <br />
+                    目标版本：{agentUpgradePlan.target_version || "无可用版本"}
+                    <br />
+                    升级状态：{agentUpgradePlan.status || editingNode.agent_update_status || "未开始"}
+                    {agentUpgradePlan.matched_platform && (
+                      <>
+                        <br />
+                        匹配资产：{agentUpgradePlan.matched_platform}
+                      </>
+                    )}
+                    {agentUpgradePlan.reason && (
+                      <>
+                        <br />
+                        {agentUpgradePlan.reason}
+                      </>
+                    )}
+                  </div>
+                  <div className="actionRow">
+                    <button
+                      className="secondary"
+                      onClick={() => void runAction(() => refreshAgentUpgradePlan(editingNode.id))}
+                    >
+                      <RefreshCw size={16} /> 刷新升级计划
+                    </button>
+                    {agentUpgradePlan.upgrade_mode === "self_upgrade" ? (
+                      <button onClick={() => void runAction(requestAgentUpgrade)}>
+                        <Upload size={16} /> 一键升级
+                      </button>
+                    ) : (
+                      <button className="secondary" disabled={!agentUpgradePlan.manual_command} onClick={() => void runAction(copyAgentUpgradeCommand)}>
+                        复制升级命令
+                      </button>
+                    )}
+                  </div>
+                  {agentUpgradePlan.manual_command && (
+                    <pre className="tokenBox">{agentUpgradePlan.manual_command}</pre>
+                  )}
+                  {editingNode.agent_last_error && <div className="empty">上次错误：{editingNode.agent_last_error}</div>}
+                </>
+              ) : (
+                <div className="empty">正在读取 Agent 升级计划。</div>
+              )}
             </section>
             <section className="modalSection dangerZone">
               <h3>删除节点</h3>

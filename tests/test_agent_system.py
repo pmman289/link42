@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from link42_agent import main, service_manager, system
+from link42_agent import main, service_manager, system, upgrade
 
 
 def command_result(command: list[str], returncode: int = 0, stdout: str = "") -> dict[str, Any]:
@@ -400,3 +400,44 @@ def test_run_once_reports_service_manager_capability(monkeypatch, tmp_path: Path
     assert "wireguard" in seen_capabilities
     assert "wg_quick_import" in seen_capabilities
     assert "service:openrc" in seen_capabilities
+    assert "agent.self_upgrade" in seen_capabilities
+
+
+def test_self_upgrade_rejects_foreign_download_url() -> None:
+    """验证 Agent 自升级只能从当前主控下载资产。"""
+
+    config = type("Config", (), {"server_url": "http://controller:8000", "token": "token"})()
+
+    try:
+        upgrade.self_upgrade(
+            {
+                "download_url": "https://evil.example/agent",
+                "target_version": "0.2.1",
+                "sha256": "abc123",
+            },
+            config,
+            dry_run=True,
+        )
+    except ValueError as exc:
+        assert "configured controller" in str(exc)
+    else:
+        raise AssertionError("foreign download url was accepted")
+
+
+def test_self_upgrade_dry_run_stages_when_systemd(monkeypatch) -> None:
+    """验证 dry-run 下自升级任务会走到 staged，不写真实二进制。"""
+
+    config = type("Config", (), {"server_url": "http://controller:8000", "token": "token"})()
+    monkeypatch.setattr(upgrade, "get_service_manager_name", lambda: "systemd")
+
+    result = upgrade.self_upgrade(
+        {
+            "download_url": "http://controller:8000/api/agent/releases/0.2.1/download?platform=linux-x64",
+            "target_version": "0.2.1",
+            "sha256": "abc123",
+        },
+        config,
+        dry_run=True,
+    )
+
+    assert result == {"status": "staged", "dry_run": True, "target_version": "0.2.1"}

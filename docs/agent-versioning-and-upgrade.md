@@ -165,7 +165,29 @@ TASK_REQUIREMENTS = {
 节点 Agent 版本过旧，需要升级到 0.2.0 才能使用 udp2raw 中间层。
 ```
 
-## Agent 升级模型
+## Agent 升级方案
+
+Agent 升级分两层：
+
+- **手动安装脚本升级**：兼容所有历史 Agent，适合首次把旧节点升到支持自升级的版本。
+- **主控下发自升级任务**：要求当前 Agent 已支持 `agent.self_upgrade` 能力，适合后续常规升级。
+
+第一版必须同时保留这两条路径。旧 Agent 不认识 `agent.self_upgrade`，主控不能指望它们自动升级，只能在 UI 给出重新执行安装脚本的命令。
+
+### 升级兼容矩阵
+
+| 当前 Agent | 上报能力 | 推荐升级方式 | 说明 |
+| --- | --- | --- | --- |
+| 无版本 / 0.1.x | 无 `agent.self_upgrade` | 安装脚本覆盖安装 | 主控展示升级命令，用户在节点执行。 |
+| 0.2.x | 有 `agent.self_upgrade` | 主控一键升级 | 主控下发 `agent.self_upgrade` 任务。 |
+| 协议版本不兼容 | 可能无法可靠轮询 | 安装脚本覆盖安装 | UI 标记为需要手动升级。 |
+
+主控判断顺序：
+
+1. 节点离线：不能升级，只能展示安装命令。
+2. 节点在线但无 `agent.self_upgrade`：展示手动升级命令。
+3. 节点在线且有 `agent.self_upgrade`：允许点击“一键升级”。
+4. 目标版本低于或等于当前版本：默认不升级，除非用户选择“强制重装”。
 
 ### 升级来源
 
@@ -202,6 +224,40 @@ GET /api/agent/releases/{version}/sha256?platform=linux-x64
 }
 ```
 
+Manifest 需要包含更多元信息，方便主控选择资产：
+
+```json
+{
+  "latest": "0.2.0",
+  "minimum_supported": "0.1.0",
+  "releases": {
+    "0.2.0": {
+      "released_at": "2026-06-30T00:00:00Z",
+      "protocol_version": 1,
+      "notes": "新增 udp2raw 中间层和 Agent 自升级能力",
+      "assets": {
+        "linux-x64-glibc2.31": {
+          "path": "link42-agent-linux-x64-glibc2.31-0.2.0",
+          "sha256": "...",
+          "size": 29500000
+        }
+      }
+    }
+  }
+}
+```
+
+平台命名建议：
+
+```text
+linux-x64-glibc2.31
+linux-arm64-glibc2.31
+linux-mips24kc-musl
+openwrt-mips24kc-musl
+```
+
+主控根据 `agent_platform.os`、`agent_platform.arch`、`agent_platform.glibc`、`agent_platform.service_manager` 选择最匹配资产。没有精确匹配时不要猜测升级，UI 显示“无匹配 Agent 资产”。
+
 ### 升级任务
 
 任务类型：
@@ -217,10 +273,29 @@ payload：
   "target_version": "0.2.0",
   "download_url": "https://controller/api/agent/releases/0.2.0/download?platform=linux-x64",
   "sha256": "...",
+  "size": 29500000,
+  "binary_args": ["--version"],
   "service_name": "link42-agent",
+  "install_path": "/usr/local/bin/link42-agent",
   "rollback": true
 }
 ```
+
+任务门禁：
+
+```python
+"agent.self_upgrade": {
+    "min_agent_version": "0.2.0",
+    "capabilities": ["agent.self_upgrade"],
+}
+```
+
+主控创建任务前还要检查：
+
+- 目标版本存在。
+- 当前平台有匹配资产。
+- 该节点没有未完成的 `agent.self_upgrade` 任务。
+- 节点没有正在运行的高风险任务，例如 `wireguard.apply_config`、`middleware.udp2raw.apply`。
 
 执行流程：
 
@@ -235,23 +310,237 @@ payload：
 
 如果新 Agent 启动失败，systemd 可以通过 wrapper 或升级脚本回滚 `.bak`。第一版可以先要求用户手动回滚，但任务结果必须保留备份路径。
 
-### systemd 注意事项
+### 自升级状态机
+
+节点侧状态写入 `/var/lib/link42/agent/upgrade-state.json`，主控侧同步到 `nodes.agent_update_status` 和 `nodes.agent_last_error`。
+
+状态建议：
+
+```text
+idle
+queued
+downloading
+verified
+staged
+restarting
+healthy
+failed
+rolled_back
+```
+
+Agent 任务结果分两次上报：
+
+1. 旧 Agent 在替换前上报 `staged`，表示下载校验完成，升级脚本已安排。
+2. 新 Agent 启动后，在注册或心跳中上报新版本，主控把状态改为 `healthy`。
+
+如果主控在超时时间内没有看到新版本心跳：
+
+- 状态改为 `failed`。
+- 如果节点随后上报旧版本且 `upgrade-state.json` 显示回滚，状态改为 `rolled_back`。
+- UI 显示失败原因和手动修复命令。
+
+### systemd 自升级脚本
 
 Agent 不能在自己的进程里直接阻塞式重启自己。推荐做法：
 
+- Agent 下载新二进制到 `/var/lib/link42/agent/link42-agent.new`。
 - Agent 写入升级脚本到 `/var/lib/link42/agent/upgrade.sh`。
-- Agent 上报任务结果。
-- Agent 使用 `systemd-run --on-active=1 /var/lib/link42/agent/upgrade.sh` 或 `nohup sh upgrade.sh &` 让子进程替换并重启服务。
+- Agent 上报任务结果 `staged`。
+- Agent 使用 `systemd-run --on-active=1 /var/lib/link42/agent/upgrade.sh` 让 systemd 托管替换动作。
 
-升级脚本执行：
+脚本流程：
 
 ```sh
-systemctl stop link42-agent
-install -m 0755 new-binary /usr/local/bin/link42-agent
-systemctl start link42-agent
+#!/bin/sh
+set -eu
+
+SERVICE_NAME="${SERVICE_NAME:-link42-agent}"
+INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/link42-agent}"
+STATE_DIR="${STATE_DIR:-/var/lib/link42/agent}"
+NEW_BIN="$STATE_DIR/link42-agent.new"
+BACKUP_BIN="$STATE_DIR/link42-agent.bak"
+STATE_FILE="$STATE_DIR/upgrade-state.json"
+
+write_state() {
+  printf '%s\n' "$1" > "$STATE_FILE"
+}
+
+write_state '{"status":"restarting"}'
+systemctl stop "$SERVICE_NAME"
+
+cp "$INSTALL_PATH" "$BACKUP_BIN"
+install -m 0755 "$NEW_BIN" "$INSTALL_PATH"
+
+if systemctl start "$SERVICE_NAME"; then
+  sleep 5
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    write_state '{"status":"healthy"}'
+    exit 0
+  fi
+fi
+
+install -m 0755 "$BACKUP_BIN" "$INSTALL_PATH"
+systemctl start "$SERVICE_NAME" || true
+write_state '{"status":"rolled_back"}'
+exit 1
 ```
 
-OpenWrt/OpenRC 后续单独实现。
+第一版只实现 systemd。OpenRC/OpenWrt 后续按同一状态机补 backend：
+
+```text
+service:openrc      -> rc-service link42-agent stop/start
+service:openwrt-uci -> /etc/init.d/link42-agent stop/start
+```
+
+### 安装脚本覆盖升级
+
+旧 Agent 或不支持自升级的节点，使用安装脚本完成覆盖安装。安装脚本必须做到幂等：
+
+1. 停止已有服务。
+2. 下载指定版本 Agent。
+3. 校验 SHA256。
+4. 写入 `/etc/link42/agent.env`，保留已有 `LINK42_SERVER_URL`、`LINK42_NODE_ID`、`LINK42_AGENT_TOKEN`，除非命令显式覆盖。
+5. 安装/更新 service unit。
+6. 启动服务。
+7. 输出当前安装版本。
+
+命令示例：
+
+```sh
+curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
+sudo env LINK42_AGENT_VERSION=0.2.0 sh
+```
+
+如果是新节点或需要重写配置，则带完整环境变量：
+
+```sh
+curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
+sudo env \
+  LINK42_AGENT_VERSION=0.2.0 \
+  LINK42_SERVER_URL=http://controller:8000 \
+  LINK42_NODE_ID=1 \
+  LINK42_AGENT_TOKEN=l42agent_xxx \
+  sh
+```
+
+### 主控 API 设计
+
+Web 用户侧 API：
+
+```text
+GET  /api/agent/releases
+GET  /api/nodes/{node_id}/agent/upgrade-plan
+POST /api/nodes/{node_id}/agent/upgrade
+POST /api/nodes/{node_id}/agent/upgrade/manual-command
+```
+
+`upgrade-plan` 返回：
+
+```json
+{
+  "current_version": "0.1.0",
+  "target_version": "0.2.0",
+  "upgrade_mode": "manual",
+  "reason": "当前 Agent 不支持自升级",
+  "matched_asset": null,
+  "manual_command": "curl -fsSL ... | sudo env LINK42_AGENT_VERSION=0.2.0 sh"
+}
+```
+
+支持自升级时：
+
+```json
+{
+  "current_version": "0.2.0",
+  "target_version": "0.2.1",
+  "upgrade_mode": "self_upgrade",
+  "reason": null,
+  "matched_asset": {
+    "platform": "linux-x64-glibc2.31",
+    "sha256": "...",
+    "size": 29500000
+  }
+}
+```
+
+Agent 侧资产 API：
+
+```text
+GET /api/agent/releases
+GET /api/agent/releases/{version}/download?platform=linux-x64-glibc2.31
+GET /api/agent/releases/{version}/sha256?platform=linux-x64-glibc2.31
+```
+
+这些接口走 Agent token 白名单，不走 Web session token。
+
+### 前端交互
+
+节点详情展示：
+
+- 当前 Agent 版本。
+- 最新可用版本。
+- 协议版本。
+- 平台和服务管理器。
+- 能力列表。
+- 升级状态。
+
+按钮规则：
+
+- `Agent 离线`：按钮禁用，显示手动命令。
+- `无匹配资产`：按钮禁用，提示需要构建该平台 Agent。
+- `不支持自升级`：显示“复制手动升级命令”。
+- `支持自升级`：显示“一键升级到 x.y.z”。
+- `升级中`：禁用重复点击，显示任务状态。
+
+升级失败时显示：
+
+```text
+升级失败：SHA256 校验失败 / 新 Agent 未在 60 秒内恢复心跳 / systemd 启动失败
+```
+
+并提供手动命令。
+
+### 发布流程
+
+每次发布 Agent：
+
+1. 更新 `packages/link42_common/version.py` 的 `AGENT_VERSION`。
+2. 构建各平台 Agent 二进制。
+3. 生成 SHA256。
+4. 生成 `manifest.json`。
+5. 将资产复制进主控镜像：
+
+```text
+/opt/link42/releases/agent/manifest.json
+/opt/link42/releases/agent/link42-agent-linux-x64-glibc2.31-0.2.0
+/opt/link42/releases/agent/link42-agent-linux-x64-glibc2.31-0.2.0.sha256
+```
+
+6. Docker 镜像构建并推送。
+7. 主控启动后读取 manifest，前端即可看到可升级版本。
+
+### 安全约束
+
+- 只允许从主控下载 Agent 资产，不允许任务传入任意外部 URL。
+- download URL 可以由主控生成，但 Agent 端仍应校验它属于当前 `LINK42_SERVER_URL`。
+- 必须校验 SHA256。
+- 新二进制必须能执行 `--version`，输出版本必须等于目标版本。
+- 替换路径必须限制在安装路径，禁止 payload 任意写文件。
+- 升级任务 payload 不允许携带任意 shell 命令。
+- 升级时不修改 `/etc/wireguard`。
+
+### 第一版开发拆分
+
+后续开发可以按这个顺序落地：
+
+1. 构建脚本输出版本化 Agent 二进制和 `manifest.json`。
+2. 主控读取 manifest，提供 releases API。
+3. 主控提供 `upgrade-plan`，前端展示升级入口和手动命令。
+4. 安装脚本支持 `LINK42_AGENT_VERSION` 并保留已有 env。
+5. Agent 增加 `agent.self_upgrade` 能力和任务处理器。
+6. systemd 自升级脚本、SHA256 校验、回滚状态文件。
+7. 主控创建 `agent.self_upgrade` 任务并跟踪状态。
+8. 测试覆盖：旧 Agent 手动升级提示、新 Agent 一键升级任务、无匹配资产、校验失败、回滚状态。
 
 ## 一键安装脚本与版本
 
@@ -329,7 +618,16 @@ Agent 版本：0.2.0
 7. 构建脚本产出带版本号的二进制副本：
    - `link42-agent-linux-x64`
    - `link42-agent-linux-x64-0.2.0`
-8. 后续再实现 `agent.self_upgrade`。
+8. 主控提供升级计划和手动升级命令。
+
+## 第二阶段实现清单
+
+1. 主控镜像内置 Agent release manifest 和二进制资产。
+2. 主控提供 Agent release 下载 API。
+3. 安装脚本支持版本化覆盖升级。
+4. Agent 实现 `agent.self_upgrade` 任务。
+5. systemd 节点支持自动替换、重启、失败回滚。
+6. 前端节点详情提供一键升级入口。
 
 ## 非目标
 
