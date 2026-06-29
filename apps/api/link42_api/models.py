@@ -220,3 +220,12 @@ class AgentTask(TimestampMixin, Base):
 
     node: Mapped[Node] = relationship(back_populates="tasks")
     change_plan: Mapped[ChangePlan | None] = relationship(back_populates="tasks")
+
+
+class SystemSetting(TimestampMixin, Base):
+    """主控级系统设置和单用户认证状态。"""
+
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)

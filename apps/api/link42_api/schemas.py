@@ -58,6 +58,29 @@ class NodeCreateResult(BaseModel):
     agent_token: str
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=255)
+
+
+class LoginResult(BaseModel):
+    token: str
+    username: str
+
+
+class AuthStatus(BaseModel):
+    authenticated: bool
+    username: str | None = None
+
+
+class ControllerSettingsRead(BaseModel):
+    controller_url: str
+
+
+class ControllerSettingsUpdate(BaseModel):
+    controller_url: str = Field(min_length=1, max_length=255)
+
+
 class InterfaceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=32)
     tunnel_ips: list[str] = Field(default_factory=list)

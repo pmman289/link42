@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+import secrets
 import subprocess
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
@@ -36,6 +38,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+ADMIN_USERNAME = "pmman"
+SETTING_ADMIN_PASSWORD_HASH = "admin_password_hash"
+SETTING_ADMIN_SESSION_HASH = "admin_session_hash"
+SETTING_CONTROLLER_URL = "controller_url"
+
 
 def mount_web_panel() -> None:
     """按配置挂载前端静态文件，让主控镜像可以单端口运行。"""
@@ -65,11 +72,84 @@ def mount_web_panel() -> None:
         return FileResponse(index_file)
 
 
+def get_setting(db: Session, key: str) -> str | None:
+    """读取系统设置值。"""
+
+    setting = db.get(models.SystemSetting, key)
+    return setting.value if setting else None
+
+
+def set_setting(db: Session, key: str, value: str) -> None:
+    """写入系统设置值。"""
+
+    setting = db.get(models.SystemSetting, key)
+    if setting:
+        setting.value = value
+    else:
+        db.add(models.SystemSetting(key=key, value=value))
+
+
+def ensure_admin_credentials() -> None:
+    """首次启动时生成单用户管理员密码，并输出到容器日志。"""
+
+    db = next(get_db())
+    try:
+        if get_setting(db, SETTING_ADMIN_PASSWORD_HASH):
+            return
+        password = secrets.token_urlsafe(18)
+        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_token(password))
+        set_setting(db, SETTING_CONTROLLER_URL, get_setting(db, SETTING_CONTROLLER_URL) or "")
+        db.commit()
+    finally:
+        db.close()
+    print(f"Link42 initial login: username={ADMIN_USERNAME} password={password}", flush=True)
+
+
+def bearer_token_from_request(request: Request) -> str | None:
+    """从 Authorization header 中提取 Bearer token。"""
+
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def is_api_auth_exempt(path: str) -> bool:
+    """API 鉴权白名单：登录和 Agent 自身 token 接口。"""
+
+    return path == "/api/auth/login" or path.startswith("/api/agent/")
+
+
+def require_web_session(request: Request, db: Session) -> None:
+    """校验 Web 管理端会话 token。"""
+
+    token = bearer_token_from_request(request)
+    session_hash = get_setting(db, SETTING_ADMIN_SESSION_HASH)
+    if not token or not session_hash or not verify_token(token, session_hash):
+        raise HTTPException(status_code=401, detail="not authenticated")
+
+
+@app.middleware("http")
+async def require_api_authentication(request: Request, call_next):
+    """为所有非白名单 API 统一加 Web 鉴权，避免遗漏单个路由。"""
+
+    if request.url.path.startswith("/api/") and not is_api_auth_exempt(request.url.path):
+        db = next(get_db())
+        try:
+            require_web_session(request, db)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        finally:
+            db.close()
+    return await call_next(request)
+
 
 @app.on_event("startup")
 def on_startup() -> None:
     """应用启动时初始化数据库。"""
     init_db()
+    ensure_admin_credentials()
 
 
 def require_agent(db: Session, node_id: int, token: str) -> models.Node:
@@ -463,6 +543,57 @@ def generate_preshared_key() -> str:
 def health() -> dict[str, str]:
     """健康检查接口，用于确认 API 进程可响应。"""
     return {"status": "ok"}
+
+
+@app.post("/api/auth/login", response_model=schemas.LoginResult)
+def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)) -> schemas.LoginResult:
+    """单用户登录，成功后返回 Web 管理端 Bearer token。"""
+
+    password_hash = get_setting(db, SETTING_ADMIN_PASSWORD_HASH)
+    if payload.username != ADMIN_USERNAME or not password_hash or not verify_token(payload.password, password_hash):
+        raise HTTPException(status_code=401, detail="invalid username or password")
+    token = generate_token("l42web")
+    set_setting(db, SETTING_ADMIN_SESSION_HASH, hash_token(token))
+    db.commit()
+    return schemas.LoginResult(token=token, username=ADMIN_USERNAME)
+
+
+@app.post("/api/auth/logout")
+def logout(db: Session = Depends(get_db)) -> dict[str, str]:
+    """退出当前 Web 管理端会话。"""
+
+    set_setting(db, SETTING_ADMIN_SESSION_HASH, "")
+    db.commit()
+    return {"status": "logged out"}
+
+
+@app.get("/api/auth/me", response_model=schemas.AuthStatus)
+def auth_me() -> schemas.AuthStatus:
+    """返回当前登录用户。"""
+
+    return schemas.AuthStatus(authenticated=True, username=ADMIN_USERNAME)
+
+
+@app.get("/api/settings", response_model=schemas.ControllerSettingsRead)
+def get_controller_settings(db: Session = Depends(get_db)) -> schemas.ControllerSettingsRead:
+    """读取主控 Web 设置。"""
+
+    return schemas.ControllerSettingsRead(controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "")
+
+
+@app.patch("/api/settings", response_model=schemas.ControllerSettingsRead)
+def update_controller_settings(
+    payload: schemas.ControllerSettingsUpdate,
+    db: Session = Depends(get_db),
+) -> schemas.ControllerSettingsRead:
+    """保存主控访问地址，用于生成 Agent 安装命令。"""
+
+    controller_url = payload.controller_url.strip()
+    if not controller_url:
+        raise HTTPException(status_code=400, detail="controller url is required")
+    set_setting(db, SETTING_CONTROLLER_URL, controller_url)
+    db.commit()
+    return schemas.ControllerSettingsRead(controller_url=controller_url)
 
 
 @app.post("/api/nodes", response_model=schemas.NodeCreateResult)
@@ -1208,7 +1339,10 @@ def list_import_candidates(node_id: int, db: Session = Depends(get_db)) -> list[
     return list(
         db.scalars(
             select(models.ImportCandidate)
-            .where(models.ImportCandidate.node_id == node_id)
+            .where(
+                models.ImportCandidate.node_id == node_id,
+                models.ImportCandidate.imported.is_(False),
+            )
             .order_by(models.ImportCandidate.id.desc())
         )
     )
@@ -1430,10 +1564,11 @@ def agent_task_result(
                 select(models.ImportCandidate).where(
                     models.ImportCandidate.node_id == payload.node_id,
                     models.ImportCandidate.path == candidate["path"],
-                    models.ImportCandidate.imported.is_(False),
                 )
             )
             if existing_candidate:
+                if existing_candidate.imported:
+                    continue
                 # 重复扫描同一路径时更新候选，避免前端出现多条相同导入项。
                 existing_candidate.interface_name = parsed["name"]
                 existing_candidate.parsed = parsed

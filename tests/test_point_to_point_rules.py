@@ -10,6 +10,10 @@ from sqlalchemy.orm import Session
 from link42_api.database import Base
 from link42_api import models
 from link42_api.main import (
+    ADMIN_USERNAME,
+    SETTING_ADMIN_PASSWORD_HASH,
+    SETTING_ADMIN_SESSION_HASH,
+    SETTING_CONTROLLER_URL,
     create_managed_link,
     create_node,
     confirm_change_plan,
@@ -18,15 +22,32 @@ from link42_api.main import (
     agent_task_result,
     enqueue_interface_task_once,
     ensure_unique_interface_name,
+    get_controller_settings,
+    get_setting,
     mark_import_candidate_available_for_interface,
     is_node_online,
+    is_api_auth_exempt,
+    list_import_candidates,
+    login,
     require_node_endpoint,
     require_online_node,
+    set_setting,
     set_unique_peer,
     should_delete_node_config_file,
     stop_managed_link,
+    update_controller_settings,
 )
-from link42_api.schemas import AgentTaskResultRequest, InterfaceCreate, InterfaceRead, ManagedLinkCreate, NodeCreate, PeerCreate
+from link42_api.schemas import (
+    AgentTaskResultRequest,
+    ControllerSettingsUpdate,
+    InterfaceCreate,
+    InterfaceRead,
+    LoginRequest,
+    ManagedLinkCreate,
+    NodeCreate,
+    PeerCreate,
+)
+from link42_common.security import hash_token, verify_token
 from link42_api.wireguard_service import build_diff, count_enabled_peers, render_interface_config
 from link42_api.database import ensure_sqlite_point_to_point_constraints
 
@@ -181,6 +202,67 @@ def test_managed_link_schema_allows_passive_listen_ports() -> None:
 
     assert payload.local_listen_port is None
     assert payload.peer_listen_port is None
+
+
+def test_web_login_rotates_session_token() -> None:
+    """验证 Web 单用户登录成功后会写入新的会话 token hash。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        set_setting(session, SETTING_ADMIN_PASSWORD_HASH, hash_token("secret-pass"))
+        session.commit()
+
+        result = login(LoginRequest(username=ADMIN_USERNAME, password="secret-pass"), session)
+        session_hash = get_setting(session, SETTING_ADMIN_SESSION_HASH)
+
+    assert result.username == ADMIN_USERNAME
+    assert result.token.startswith("l42web_")
+    assert session_hash is not None
+    assert verify_token(result.token, session_hash)
+
+
+def test_web_login_rejects_wrong_password() -> None:
+    """验证错误密码不会通过 Web 登录。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        set_setting(session, SETTING_ADMIN_PASSWORD_HASH, hash_token("secret-pass"))
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            login(LoginRequest(username=ADMIN_USERNAME, password="bad-pass"), session)
+
+    assert exc_info.value.status_code == 401
+
+
+def test_controller_settings_round_trip() -> None:
+    """验证设置页保存的主控访问地址会进入系统设置。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        updated = update_controller_settings(
+            ControllerSettingsUpdate(controller_url=" http://10.0.0.1:8000 "),
+            session,
+        )
+        loaded = get_controller_settings(session)
+        stored = get_setting(session, SETTING_CONTROLLER_URL)
+
+    assert updated.controller_url == "http://10.0.0.1:8000"
+    assert loaded.controller_url == "http://10.0.0.1:8000"
+    assert stored == "http://10.0.0.1:8000"
+
+
+def test_api_auth_exemptions_only_cover_login_and_agent() -> None:
+    """验证 API 鉴权白名单只覆盖登录和 Agent token 接口。"""
+
+    assert is_api_auth_exempt("/api/auth/login")
+    assert is_api_auth_exempt("/api/agent/heartbeat")
+    assert not is_api_auth_exempt("/api/health")
+    assert not is_api_auth_exempt("/api/nodes")
+    assert not is_api_auth_exempt("/api/settings")
 
 
 def test_set_unique_peer_replaces_existing_duplicates() -> None:
@@ -476,6 +558,58 @@ def test_import_scan_result_removes_stale_unimported_candidates(monkeypatch) -> 
     assert candidates[0].interface_name == "current-new"
     assert candidates[0].parsed["raw_config"] == "[Interface]\nPrivateKey = private\n"
     assert candidates[1].imported is True
+
+
+def test_import_scan_does_not_reoffer_already_imported_path(monkeypatch) -> None:
+    """验证已导入的 wg-quick 路径重新扫描后不会再次出现在可导入候选中。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", endpoint_ips=["10.0.0.1"])
+        session.add(node)
+        session.commit()
+        imported = models.ImportCandidate(
+            node_id=node.id,
+            path="/etc/wireguard/imported.conf",
+            interface_name="imported",
+            parsed={"name": "imported"},
+            imported=True,
+        )
+        task = models.AgentTask(node_id=node.id, type="wireguard.import_scan", status="running", payload={})
+        session.add_all([imported, task])
+        session.commit()
+
+        agent_task_result(
+            task.id,
+            AgentTaskResultRequest(
+                node_id=node.id,
+                token="token",
+                status="succeeded",
+                result={
+                    "candidates": [
+                        {
+                            "path": "/etc/wireguard/imported.conf",
+                            "content": "[Interface]\nPrivateKey = new\n",
+                            "parsed": {"name": "imported-new", "warnings": []},
+                            "warnings": [],
+                        }
+                    ]
+                },
+            ),
+            session,
+        )
+        all_candidates = list(session.scalars(select(models.ImportCandidate)))
+        visible_candidates = list_import_candidates(node.id, session)
+
+    assert len(all_candidates) == 1
+    assert all_candidates[0].imported is True
+    assert all_candidates[0].interface_name == "imported"
+    assert visible_candidates == []
 
 
 def test_unmanaged_imported_config_delete_keeps_node_file() -> None:

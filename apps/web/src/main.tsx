@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Check, ChevronDown, ChevronRight, GitBranch, Pencil, Plus, RefreshCw, Server, Upload, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, GitBranch, LogOut, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
 import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
 import "./styles.css";
@@ -98,6 +98,15 @@ type NodeCreateResult = {
   agent_token: string;
 };
 
+type LoginResult = {
+  token: string;
+  username: string;
+};
+
+type ControllerSettings = {
+  controller_url: string;
+};
+
 type Toast = {
   id: number;
   type: "success" | "error" | "info";
@@ -116,6 +125,7 @@ const API_BASE =
 // 默认主控地址；节点 Agent 从本机访问时通常使用 127.0.0.1。
 const DEFAULT_CONTROLLER_URL =
   import.meta.env.VITE_LINK42_CONTROLLER_URL || API_BASE;
+const AUTH_TOKEN_KEY = "link42.authToken";
 
 function splitList(value: string): string[] {
   // 将输入框中的逗号分隔内容转换成 API 需要的数组。
@@ -130,11 +140,17 @@ function optionalInt(value: FormDataEntryValue | null): number | null {
   return text ? Number(text) : null;
 }
 
-async function api<T>(path: string, options?: RequestInit): Promise<T> {
+async function api<T>(path: string, options?: RequestInit & { skipAuth?: boolean }): Promise<T> {
   // 统一封装 fetch，集中处理 JSON 和错误信息。
+  const token = options?.skipAuth ? "" : window.localStorage.getItem(AUTH_TOKEN_KEY);
+  const { skipAuth: _skipAuth, ...fetchOptions } = options || {};
   const response = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...(options?.headers || {}) },
-    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(fetchOptions.headers || {}),
+    },
+    ...fetchOptions,
   });
   if (!response.ok) {
     const text = await response.text();
@@ -187,6 +203,9 @@ function translateApiDetail(detail: string): string {
     "local imported endpoint does not point to peer node": "本端导入配置的 Endpoint 不指向所选对端节点",
     "peer imported endpoint does not point to local node": "对端导入配置的 Endpoint 不指向当前节点",
     "node has wireguard configs": "节点下仍有 WireGuard 配置，请先删除所有配置",
+    "not authenticated": "请先登录",
+    "invalid username or password": "用户名或密码错误",
+    "controller url is required": "请填写主控访问地址",
   };
   return messages[detail] || detail;
 }
@@ -412,6 +431,11 @@ function RouteModeSelect({
 function App() {
   // Link42 第一版的主界面组件，集中承载节点和 WireGuard 管理流程。
   // 页面状态保持在顶层，第一版避免引入复杂状态管理。
+  const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_KEY) || "");
+  const [authChecked, setAuthChecked] = useState(false);
+  const [currentUser, setCurrentUser] = useState<string | null>(null);
+  const [controllerUrl, setControllerUrl] = useState(DEFAULT_CONTROLLER_URL);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
   const [configs, setConfigs] = useState<ConfigItem[]>([]);
@@ -503,8 +527,59 @@ function App() {
     try {
       await action();
     } catch (error) {
+      if (error instanceof Error && error.message.startsWith("401:")) {
+        window.localStorage.removeItem(AUTH_TOKEN_KEY);
+        setAuthToken("");
+        setCurrentUser(null);
+      }
       notify("error", error instanceof Error ? error.message : String(error));
     }
+  }
+
+  async function login(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const result = await api<LoginResult>("/api/auth/login", {
+      method: "POST",
+      skipAuth: true,
+      body: JSON.stringify({
+        username: form.get("username"),
+        password: form.get("password"),
+      }),
+    });
+    window.localStorage.setItem(AUTH_TOKEN_KEY, result.token);
+    setAuthToken(result.token);
+    setCurrentUser(result.username);
+    await refreshSettings();
+    await refreshNodes();
+  }
+
+  async function logout() {
+    await api<{ status: string }>("/api/auth/logout", { method: "POST" });
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    setAuthToken("");
+    setCurrentUser(null);
+    setNodes([]);
+    setSelectedNodeId(null);
+    setConfigs([]);
+    setSelectedConfigId(null);
+  }
+
+  async function refreshSettings() {
+    const data = await api<ControllerSettings>("/api/settings");
+    setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
+  }
+
+  async function saveSettings(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const data = await api<ControllerSettings>("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify({ controller_url: String(form.get("controller_url") || "").trim() }),
+    });
+    setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
+    setSettingsOpen(false);
+    notify("success", "设置已保存。");
   }
 
   async function refreshNodes() {
@@ -548,15 +623,34 @@ function App() {
   }
 
   useEffect(() => {
-    refreshNodes().catch((error) => notify("error", error.message));
-  }, []);
+    async function bootstrap() {
+      if (!authToken) {
+        setAuthChecked(true);
+        return;
+      }
+      try {
+        const me = await api<{ authenticated: boolean; username: string | null }>("/api/auth/me");
+        setCurrentUser(me.username);
+        await refreshSettings();
+        await refreshNodes();
+      } catch {
+        window.localStorage.removeItem(AUTH_TOKEN_KEY);
+        setAuthToken("");
+        setCurrentUser(null);
+      } finally {
+        setAuthChecked(true);
+      }
+    }
+    void bootstrap();
+  }, [authToken]);
 
   useEffect(() => {
+    if (!authToken) return;
     const timer = window.setInterval(() => {
       refreshNodes().catch((error) => notify("error", error.message));
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [selectedNodeId]);
+  }, [selectedNodeId, authToken]);
 
   useEffect(() => {
     if (managedPeerNodeId) {
@@ -1153,16 +1247,55 @@ function App() {
     }
   }
 
+  if (!authChecked) {
+    return <main className="app loginPage" />;
+  }
+
+  if (!authToken) {
+    return (
+      <main className="app loginPage">
+        <section className="loginPanel">
+          <h1>Link42</h1>
+          <p className="muted">主控访问登录</p>
+          <form className="stack" onSubmit={(event) => void runAction(() => login(event))}>
+            <Field label="用户名">
+              <input name="username" defaultValue="pmman" autoComplete="username" required />
+            </Field>
+            <Field label="密码">
+              <input name="password" type="password" autoComplete="current-password" required />
+            </Field>
+            <button type="submit"><Check size={16} /> 登录</button>
+          </form>
+        </section>
+        <div className="toastStack" aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} className={`toast ${toast.type}`}>
+              {toast.text}
+            </div>
+          ))}
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="app">
       <header className="topbar">
         <div>
           <h1>Link42</h1>
-          <p>轻量 WireGuard 点对点链路管理</p>
+          <p>轻量 WireGuard 点对点链路管理 / {currentUser || "pmman"}</p>
         </div>
-        <button className="iconButton" onClick={() => void runAction(refreshNodes)}>
-          <RefreshCw size={18} />
-        </button>
+        <div className="topbarActions">
+          <button className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
+            <Settings size={18} />
+          </button>
+          <button className="iconButton" onClick={() => void runAction(refreshNodes)} title="刷新">
+            <RefreshCw size={18} />
+          </button>
+          <button className="iconButton" onClick={() => void runAction(logout)} title="退出">
+            <LogOut size={18} />
+          </button>
+        </div>
       </header>
 
       <div className="toastStack" aria-live="polite">
@@ -1172,6 +1305,28 @@ function App() {
           </div>
         ))}
       </div>
+
+      {settingsOpen && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel compactModal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="settings-title"><Settings size={18} /> 系统设置</h2>
+                <p className="muted">主控访问地址用于生成 Agent 安装命令。</p>
+              </div>
+              <button className="iconButton" onClick={() => setSettingsOpen(false)}>
+                <X size={18} />
+              </button>
+            </header>
+            <form className="stack" onSubmit={(event) => void runAction(() => saveSettings(event))}>
+              <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.168.123.20:8000。">
+                <input name="controller_url" defaultValue={controllerUrl} placeholder={DEFAULT_CONTROLLER_URL} required />
+              </Field>
+              <button type="submit"><Check size={16} /> 保存设置</button>
+            </form>
+          </section>
+        </div>
+      )}
 
       {nodeCreateOpen && (
         <div className="modalBackdrop" role="presentation">
@@ -1190,7 +1345,7 @@ function App() {
                 <input name="name" placeholder="node-a" required />
               </Field>
               <Field label="主控地址" hint="Agent 安装时连接的 Link42 API 地址。">
-                <input name="controller_url" placeholder="http://192.168.123.20:8000" defaultValue={DEFAULT_CONTROLLER_URL} required />
+                <input name="controller_url" placeholder="http://192.168.123.20:8000" defaultValue={controllerUrl} required />
               </Field>
               <Field label="入口地址" hint="多个地址用逗号分隔，后续受管连接会从这里选择 Endpoint。" wide>
                 <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" required />

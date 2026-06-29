@@ -88,6 +88,37 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             connection.execute(
                 text("ALTER TABLE wg_interfaces ADD COLUMN runtime_status VARCHAR(32) DEFAULT 'stopped'")
             )
+        has_import_candidates_table = connection.scalar(
+            text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'import_candidates'")
+        )
+        if has_import_candidates_table:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM import_candidates
+                    WHERE imported = 0
+                      AND EXISTS (
+                          SELECT 1
+                          FROM import_candidates AS already_imported
+                          WHERE already_imported.node_id = import_candidates.node_id
+                            AND already_imported.path = import_candidates.path
+                            AND already_imported.imported = 1
+                      )
+                    """
+                )
+            )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    "key" VARCHAR(80) NOT NULL PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
         has_nodes_table = connection.scalar(
             text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'")
         )

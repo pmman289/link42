@@ -115,6 +115,33 @@ textarea {
   color: #60717b;
 }
 
+.topbarActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.loginPage {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.loginPanel {
+  width: min(420px, 100%);
+  border: 1px solid rgba(207, 220, 226, 0.88);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 18px 44px rgba(27, 54, 68, 0.14);
+  padding: 22px;
+}
+
+.loginPanel h1 {
+  margin: 0;
+  font-size: 26px;
+}
+
 .toastStack {
   position: fixed;
   top: 82px;
