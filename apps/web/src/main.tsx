@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Check, ChevronDown, ChevronRight, GitBranch, Pencil, Plus, RefreshCw, Server, Upload, X } from "lucide-react";
+import CreatableSelect from "react-select/creatable";
+import type { SingleValue, StylesConfig } from "react-select";
 import "./styles.css";
 
 type NodeItem = {
@@ -242,6 +244,10 @@ type EndpointOption = {
   source: "imported" | "node" | "current";
 };
 
+const endpointSelectStyles: StylesConfig<EndpointOption, false> = {
+  menuPortal: (base) => ({ ...base, zIndex: 80 }),
+};
+
 function uniqueEndpointOptions(options: EndpointOption[]): EndpointOption[] {
   // 同一个 host 只保留第一次出现的来源，确保原始导入 Endpoint 优先展示。
   const seen = new Set<string>();
@@ -302,7 +308,7 @@ function Field({
   );
 }
 
-function EndpointPicker({
+function EndpointSelect({
   name,
   defaultValue,
   placeholder,
@@ -316,35 +322,72 @@ function EndpointPicker({
   disabled?: boolean;
 }) {
   const [value, setValue] = useState(defaultValue);
+  const [inputValue, setInputValue] = useState("");
+  const selectedOption = useMemo<EndpointOption | null>(() => {
+    if (!value) return null;
+    return options.find((option) => option.value === value) || {
+      value,
+      label: "手动输入",
+      source: "current",
+    };
+  }, [options, value]);
 
   useEffect(() => {
     setValue(defaultValue);
+    setInputValue("");
   }, [defaultValue]);
 
+  function handleChange(option: SingleValue<EndpointOption>) {
+    setValue(option?.value || "");
+    setInputValue("");
+  }
+
+  function handleCreate(inputValue: string) {
+    setValue(inputValue.trim());
+    setInputValue("");
+  }
+
+  function commitInputValue() {
+    const cleaned = inputValue.trim();
+    if (cleaned) {
+      setValue(cleaned);
+      setInputValue("");
+    }
+  }
+
   return (
-    <div className="endpointPicker">
-      {options.length > 0 && (
-        <div className="endpointChoices">
-          {options.map((option) => (
-            <button
-              key={`${option.source}-${option.value}`}
-              type="button"
-              className={value === option.value ? "endpointChoice active" : "endpointChoice"}
-              disabled={disabled}
-              onClick={() => setValue(option.value)}
-            >
-              <span>{option.value}</span>
-              <small>{option.label}</small>
-            </button>
-          ))}
-        </div>
-      )}
+    <div className="endpointSelect">
+      <CreatableSelect<EndpointOption, false>
+        classNamePrefix="endpointSelect"
+        value={selectedOption}
+        options={options}
+        isDisabled={disabled}
+        isClearable={false}
+        inputValue={inputValue}
+        placeholder={placeholder}
+        noOptionsMessage={() => "没有可选地址，可直接输入"}
+        formatCreateLabel={(inputValue) => `使用 "${inputValue}"`}
+        onChange={handleChange}
+        onCreateOption={handleCreate}
+        onInputChange={(newValue, actionMeta) => {
+          if (actionMeta.action === "input-change") {
+            setInputValue(newValue);
+          }
+        }}
+        onBlur={commitInputValue}
+        menuPortalTarget={document.body}
+        styles={endpointSelectStyles}
+        formatOptionLabel={(option) => (
+          <div className="endpointSelectOption">
+            <span>{option.value}</span>
+            <small>{option.label}</small>
+          </div>
+        )}
+      />
       <input
+        type="hidden"
         name={name}
         value={value}
-        onChange={(event) => setValue(event.currentTarget.value)}
-        placeholder={placeholder}
-        required
         disabled={disabled}
       />
     </div>
@@ -761,8 +804,8 @@ function App() {
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
     const localEndpointHost = String(form.get("local_endpoint_host") || "").trim();
     const peerEndpointHost = String(form.get("peer_endpoint_host") || "").trim();
-    const localListenPort = Number(form.get("local_listen_port"));
-    const peerListenPort = Number(form.get("peer_listen_port"));
+    const localListenPort = optionalInt(form.get("local_listen_port"));
+    const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
     if (!peerNodeId || peerNodeId === selectedNodeId) {
       throw new Error("请选择另一个在线受管节点");
@@ -771,7 +814,7 @@ function App() {
       throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32");
     }
     if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
-      throw new Error("双方端口必须在 1-65535 之间");
+      throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
     }
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
@@ -882,15 +925,15 @@ function App() {
     const form = new FormData(event.currentTarget);
     const localTunnelIps = splitList(String(form.get("local_tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
-    const localListenPort = Number(form.get("local_listen_port"));
-    const peerListenPort = Number(form.get("peer_listen_port"));
+    const localListenPort = optionalInt(form.get("local_listen_port"));
+    const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const keepalive = Number(form.get("persistent_keepalive")) || null;
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
     if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
       throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32, fd42::1/64");
     }
     if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
-      throw new Error("双方端口必须在 1-65535 之间");
+      throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
     }
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
@@ -1327,7 +1370,8 @@ function App() {
                 <input name="peer_interface_name" placeholder="wg-node-b" defaultValue={replacePeerConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
               <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址。">
-                <EndpointPicker
+                <EndpointSelect
+                  key={`managed-local-endpoint-${replacePeerConfigId || "none"}-${managedLocalEndpointDefault}`}
                   name="local_endpoint_host"
                   defaultValue={managedLocalEndpointDefault}
                   placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
@@ -1336,7 +1380,8 @@ function App() {
                 />
               </Field>
               <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址。">
-                <EndpointPicker
+                <EndpointSelect
+                  key={`managed-peer-endpoint-${replaceLocalConfigId || "none"}-${managedPeerEndpointDefault}`}
                   name="peer_endpoint_host"
                   defaultValue={managedPeerEndpointDefault}
                   placeholder={selectedPeerEndpoints[0] || "203.0.113.20"}
@@ -1350,11 +1395,11 @@ function App() {
               <Field label="对端隧道 IP" hint="CIDR 格式，例如 10.42.0.2/32。">
                 <input name="peer_tunnel_ips" placeholder="10.42.0.2/32, fd42::2/64" defaultValue={replacePeerConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="本端监听端口" hint="当前节点 wg-quick ListenPort。">
-                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" required disabled={!selectedNodeOnline} />
+              <Field label="本端监听端口" hint="可选；留空表示不写 ListenPort。">
+                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端监听端口" hint="对端节点 wg-quick ListenPort。">
-                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" required disabled={!selectedNodeOnline} />
+              <Field label="对端监听端口" hint="可选；留空表示不写 ListenPort。">
+                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
               <Field label="MTU" hint="双方链路 MTU，默认 1420。">
                 <input name="mtu" placeholder="1420" defaultValue={replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
@@ -1588,7 +1633,8 @@ function App() {
                     <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
                   </Field>
                   <Field label="本端入口地址" hint="对端连接本节点时使用。">
-                    <EndpointPicker
+                    <EndpointSelect
+                      key={`edit-local-endpoint-${managedLink.peer_peer.endpoint_host || ""}`}
                       name="local_endpoint_host"
                       defaultValue={managedLink.peer_peer.endpoint_host || ""}
                       placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
@@ -1597,7 +1643,8 @@ function App() {
                     />
                   </Field>
                   <Field label="对端入口地址" hint="本端连接对端节点时使用。">
-                    <EndpointPicker
+                    <EndpointSelect
+                      key={`edit-peer-endpoint-${managedLink.local_peer.endpoint_host || ""}`}
                       name="peer_endpoint_host"
                       defaultValue={managedLink.local_peer.endpoint_host || ""}
                       placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
@@ -1605,11 +1652,11 @@ function App() {
                       disabled={!selectedNodeOnline}
                     />
                   </Field>
-                  <Field label="本端监听端口" hint="当前节点 ListenPort。">
-                    <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} required disabled={!selectedNodeOnline} />
+                  <Field label="本端监听端口" hint="可选；留空表示不写 ListenPort。">
+                    <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} disabled={!selectedNodeOnline} />
                   </Field>
-                  <Field label="对端监听端口" hint="对端节点 ListenPort。">
-                    <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} required disabled={!selectedNodeOnline} />
+                  <Field label="对端监听端口" hint="可选；留空表示不写 ListenPort。">
+                    <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} disabled={!selectedNodeOnline} />
                   </Field>
                   <Field label="MTU" hint="双方链路 MTU，默认 1420。">
                     <input name="mtu" defaultValue={managedLink.local_interface.mtu || managedLink.peer_interface.mtu || 1420} disabled={!selectedNodeOnline} />

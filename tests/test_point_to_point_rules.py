@@ -20,6 +20,7 @@ from link42_api.main import (
     ensure_unique_interface_name,
     mark_import_candidate_available_for_interface,
     is_node_online,
+    require_node_endpoint,
     require_online_node,
     set_unique_peer,
     should_delete_node_config_file,
@@ -152,6 +153,34 @@ def test_interface_read_exposes_primary_peer_endpoint() -> None:
 
     assert data.primary_peer_endpoint_host == "127.0.0.1"
     assert data.primary_peer_endpoint_port == 40000
+
+
+def test_require_node_endpoint_allows_original_or_manual_host() -> None:
+    """验证受管连接允许使用原始导入 Endpoint 或手填地址，不要求预先登记到节点。"""
+
+    node = models.Node(name="node-a", endpoint_ips=["198.51.100.10"])
+
+    assert require_node_endpoint(node, "127.0.0.1", "missing") == "127.0.0.1"
+    assert require_node_endpoint(node, " vpn.example.com ", "missing") == "vpn.example.com"
+
+
+def test_managed_link_schema_allows_passive_listen_ports() -> None:
+    """验证受管连接监听端口可留空，以支持 WireGuard 被动模式。"""
+
+    payload = ManagedLinkCreate(
+        peer_node_id=2,
+        local_interface_name="wg-a",
+        peer_interface_name="wg-b",
+        local_tunnel_ips=["10.42.0.1/32"],
+        peer_tunnel_ips=["10.42.0.2/32"],
+        local_endpoint_host="198.51.100.10",
+        peer_endpoint_host="198.51.100.20",
+        local_listen_port=None,
+        peer_listen_port=None,
+    )
+
+    assert payload.local_listen_port is None
+    assert payload.peer_listen_port is None
 
 
 def test_set_unique_peer_replaces_existing_duplicates() -> None:

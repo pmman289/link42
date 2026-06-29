@@ -92,8 +92,8 @@ class ManagedLinkCreate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_endpoint_host: str = Field(min_length=1, max_length=255)
     peer_endpoint_host: str = Field(min_length=1, max_length=255)
-    local_listen_port: int
-    peer_listen_port: int
+    local_listen_port: int | None = None
+    peer_listen_port: int | None = None
     mtu: int | None = 1420
     table_name: str | None = None
     persistent_keepalive: int | None = 25
@@ -107,12 +107,10 @@ class ManagedLinkCreate(BaseModel):
 
     @field_validator("local_listen_port", "peer_listen_port")
     @classmethod
-    def validate_listen_port(cls, value: int) -> int:
+    def validate_listen_port(cls, value: int | None) -> int | None:
         """校验双方监听端口范围。"""
 
-        checked = _validate_port(value)
-        assert checked is not None
-        return checked
+        return _validate_port(value)
 
     @field_validator("persistent_keepalive")
     @classmethod
@@ -258,8 +256,8 @@ class ManagedLinkUpdate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_endpoint_host: str = Field(min_length=1, max_length=255)
     peer_endpoint_host: str = Field(min_length=1, max_length=255)
-    local_listen_port: int
-    peer_listen_port: int
+    local_listen_port: int | None = None
+    peer_listen_port: int | None = None
     mtu: int | None = 1420
     table_name: str | None = None
     persistent_keepalive: int | None = 25
@@ -270,10 +268,8 @@ class ManagedLinkUpdate(BaseModel):
 
     @field_validator("local_listen_port", "peer_listen_port")
     @classmethod
-    def validate_listen_port(cls, value: int) -> int:
-        checked = _validate_port(value)
-        assert checked is not None
-        return checked
+    def validate_listen_port(cls, value: int | None) -> int | None:
+        return _validate_port(value)
 
     @field_validator("persistent_keepalive")
     @classmethod
