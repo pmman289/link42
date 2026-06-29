@@ -745,6 +745,7 @@ def list_interfaces(node_id: int, db: Session = Depends(get_db)) -> list[models.
     return list(
         db.scalars(
             select(models.WireGuardInterface)
+            .options(selectinload(models.WireGuardInterface.peers))
             .where(models.WireGuardInterface.node_id == node_id)
             .order_by(models.WireGuardInterface.name)
         )
@@ -755,7 +756,11 @@ def list_interfaces(node_id: int, db: Session = Depends(get_db)) -> list[models.
 @app.get("/api/wireguard/configs/{interface_id}", response_model=schemas.InterfaceRead)
 def get_interface(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
     """读取单个 WireGuard 点对点配置。"""
-    interface = db.get(models.WireGuardInterface, interface_id)
+    interface = db.scalar(
+        select(models.WireGuardInterface)
+        .options(selectinload(models.WireGuardInterface.peers))
+        .where(models.WireGuardInterface.id == interface_id)
+    )
     if interface is None:
         raise HTTPException(status_code=404, detail="interface not found")
     return interface

@@ -245,6 +245,51 @@ textarea {
   gap: 14px 12px;
 }
 
+.endpointPicker {
+  display: grid;
+  gap: 8px;
+}
+
+.endpointChoices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.endpointChoice {
+  display: inline-grid;
+  justify-items: start;
+  gap: 2px;
+  min-height: 34px;
+  max-width: 100%;
+  border-color: #c8d6dc;
+  background: #f8fbfc;
+  color: #1f4e5f;
+  padding: 6px 9px;
+  box-shadow: none;
+}
+
+.endpointChoice.active {
+  border-color: #24789a;
+  background: #e7f4f8;
+  color: #153946;
+}
+
+.endpointChoice span {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.endpointChoice small {
+  color: #60717b;
+  font-size: 10px;
+  line-height: 1;
+}
+
 .list {
   display: grid;
   gap: 8px;

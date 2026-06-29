@@ -91,6 +91,24 @@ class WireGuardInterface(TimestampMixin, Base):
     def interface_custom_config(self) -> str | None:
         return (self.extras or {}).get("custom_config")
 
+    @property
+    def primary_peer_endpoint_host(self) -> str | None:
+        """返回第一个 Peer 的原始 Endpoint host，供导入受管连接时预填。"""
+
+        for peer in self.peers or []:
+            if peer.endpoint_host:
+                return peer.endpoint_host
+        return None
+
+    @property
+    def primary_peer_endpoint_port(self) -> int | None:
+        """返回第一个 Peer 的原始 Endpoint port，供界面展示和后续扩展。"""
+
+        for peer in self.peers or []:
+            if peer.endpoint_port:
+                return peer.endpoint_port
+        return None
+
 
 class WireGuardPeer(TimestampMixin, Base):
     """节点本地 WireGuard 链路配置下的唯一对端配置。"""

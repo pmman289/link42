@@ -174,6 +174,8 @@ class InterfaceRead(BaseModel):
     enabled: bool
     runtime_status: str
     import_path: str | None
+    primary_peer_endpoint_host: str | None = None
+    primary_peer_endpoint_port: int | None = None
     warnings: list[str]
 
     model_config = {"from_attributes": True}

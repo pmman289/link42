@@ -25,7 +25,7 @@ from link42_api.main import (
     should_delete_node_config_file,
     stop_managed_link,
 )
-from link42_api.schemas import AgentTaskResultRequest, InterfaceCreate, ManagedLinkCreate, NodeCreate, PeerCreate
+from link42_api.schemas import AgentTaskResultRequest, InterfaceCreate, InterfaceRead, ManagedLinkCreate, NodeCreate, PeerCreate
 from link42_api.wireguard_service import build_diff, count_enabled_peers, render_interface_config
 from link42_api.database import ensure_sqlite_point_to_point_constraints
 
@@ -122,6 +122,36 @@ PersistentKeepalive = 30
 
     assert "PrivateKey = local-private" in rendered
     assert "PresharedKey = peer-psk" in rendered
+
+
+def test_interface_read_exposes_primary_peer_endpoint() -> None:
+    """验证配置摘要会带出原始 Peer Endpoint，供受管导入时优先预填。"""
+
+    interface = models.WireGuardInterface(
+        id=1,
+        name="wg0",
+        node_id=1,
+        tunnel_ips=[],
+        dns=[],
+        source="imported",
+        managed=False,
+        enabled=True,
+        runtime_status="unknown",
+        warnings=[],
+    )
+    interface.peers = [
+        models.WireGuardPeer(
+            interface_id=1,
+            public_key="peer-public",
+            endpoint_host="127.0.0.1",
+            endpoint_port=40000,
+        )
+    ]
+
+    data = InterfaceRead.model_validate(interface)
+
+    assert data.primary_peer_endpoint_host == "127.0.0.1"
+    assert data.primary_peer_endpoint_port == 40000
 
 
 def test_set_unique_peer_replaces_existing_duplicates() -> None:

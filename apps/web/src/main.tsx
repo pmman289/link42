@@ -30,6 +30,8 @@ type ConfigItem = {
   table_name: string | null;
   interface_custom_config: string | null;
   runtime_status: string;
+  primary_peer_endpoint_host: string | null;
+  primary_peer_endpoint_port: number | null;
   warnings: string[];
 };
 
@@ -234,6 +236,35 @@ function nodeEndpointOptions(node: NodeItem): string[] {
   ].filter(Boolean) as string[]));
 }
 
+type EndpointOption = {
+  value: string;
+  label: string;
+  source: "imported" | "node" | "current";
+};
+
+function uniqueEndpointOptions(options: EndpointOption[]): EndpointOption[] {
+  // 同一个 host 只保留第一次出现的来源，确保原始导入 Endpoint 优先展示。
+  const seen = new Set<string>();
+  return options.filter((option) => {
+    const value = option.value.trim();
+    if (!value || seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+}
+
+function endpointOptionsFrom(
+  importedHost: string | null | undefined,
+  nodeHosts: string[],
+  currentHost?: string | null,
+): EndpointOption[] {
+  return uniqueEndpointOptions([
+    ...(importedHost ? [{ value: importedHost, label: "原始 Endpoint", source: "imported" as const }] : []),
+    ...(currentHost ? [{ value: currentHost, label: "当前配置", source: "current" as const }] : []),
+    ...nodeHosts.map((host) => ({ value: host, label: "节点地址", source: "node" as const })),
+  ]);
+}
+
 function buildAgentCommand(node: NodeItem, controllerUrl: string = DEFAULT_CONTROLLER_URL): string {
   if (!node.agent_token_value) return "";
   return [
@@ -268,6 +299,55 @@ function Field({
       {children}
       {hint && <small>{hint}</small>}
     </label>
+  );
+}
+
+function EndpointPicker({
+  name,
+  defaultValue,
+  placeholder,
+  options,
+  disabled = false,
+}: {
+  name: string;
+  defaultValue: string;
+  placeholder: string;
+  options: EndpointOption[];
+  disabled?: boolean;
+}) {
+  const [value, setValue] = useState(defaultValue);
+
+  useEffect(() => {
+    setValue(defaultValue);
+  }, [defaultValue]);
+
+  return (
+    <div className="endpointPicker">
+      {options.length > 0 && (
+        <div className="endpointChoices">
+          {options.map((option) => (
+            <button
+              key={`${option.source}-${option.value}`}
+              type="button"
+              className={value === option.value ? "endpointChoice active" : "endpointChoice"}
+              disabled={disabled}
+              onClick={() => setValue(option.value)}
+            >
+              <span>{option.value}</span>
+              <small>{option.label}</small>
+            </button>
+          ))}
+        </div>
+      )}
+      <input
+        name={name}
+        value={value}
+        onChange={(event) => setValue(event.currentTarget.value)}
+        placeholder={placeholder}
+        required
+        disabled={disabled}
+      />
+    </div>
   );
 }
 
@@ -345,6 +425,26 @@ function App() {
   const replacePeerConfig = replacePeerConfigId
     ? replacePeerConfigOptions.find((item) => item.id === replacePeerConfigId) || null
     : null;
+  const managedLocalEndpointOptions = endpointOptionsFrom(
+    replacePeerConfig?.primary_peer_endpoint_host,
+    selectedLocalEndpoints,
+  );
+  const managedPeerEndpointOptions = endpointOptionsFrom(
+    replaceLocalConfig?.primary_peer_endpoint_host,
+    selectedPeerEndpoints,
+  );
+  const managedLocalEndpointDefault = managedLocalEndpointOptions[0]?.value || "";
+  const managedPeerEndpointDefault = managedPeerEndpointOptions[0]?.value || "";
+  const editLocalEndpointOptions = endpointOptionsFrom(
+    null,
+    selectedLocalEndpoints,
+    managedLink?.peer_peer.endpoint_host,
+  );
+  const editPeerEndpointOptions = endpointOptionsFrom(
+    null,
+    selectedManagedLinkPeerEndpoints,
+    managedLink?.local_peer.endpoint_host,
+  );
 
   function notify(type: Toast["type"], text: string) {
     // 右上角 toast 避免把所有消息堆在主页主流程里。
@@ -1227,34 +1327,22 @@ function App() {
                 <input name="peer_interface_name" placeholder="wg-node-b" defaultValue={replacePeerConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
               <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址。">
-                <input
+                <EndpointPicker
                   name="local_endpoint_host"
-                  list={`local-endpoint-options-${selectedNode.id}`}
+                  defaultValue={managedLocalEndpointDefault}
                   placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
-                  defaultValue={selectedLocalEndpoints[0] || ""}
-                  required
+                  options={managedLocalEndpointOptions}
                   disabled={!selectedNodeOnline}
                 />
-                <datalist id={`local-endpoint-options-${selectedNode.id}`}>
-                  {selectedLocalEndpoints.map((endpoint) => (
-                    <option key={endpoint} value={endpoint} />
-                  ))}
-                </datalist>
               </Field>
               <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址。">
-                <input
+                <EndpointPicker
                   name="peer_endpoint_host"
-                  list={`peer-endpoint-options-${selectedManagedPeerNode?.id || "none"}`}
+                  defaultValue={managedPeerEndpointDefault}
                   placeholder={selectedPeerEndpoints[0] || "203.0.113.20"}
-                  defaultValue={selectedPeerEndpoints[0] || ""}
-                  required
+                  options={managedPeerEndpointOptions}
                   disabled={!selectedNodeOnline}
                 />
-                <datalist id={`peer-endpoint-options-${selectedManagedPeerNode?.id || "none"}`}>
-                  {selectedPeerEndpoints.map((endpoint) => (
-                    <option key={endpoint} value={endpoint} />
-                  ))}
-                </datalist>
               </Field>
               <Field label="本端隧道 IP" hint="CIDR 格式，例如 10.42.0.1/32。">
                 <input name="local_tunnel_ips" placeholder="10.42.0.1/32, fd42::1/64" defaultValue={replaceLocalConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
@@ -1500,34 +1588,22 @@ function App() {
                     <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
                   </Field>
                   <Field label="本端入口地址" hint="对端连接本节点时使用。">
-                    <input
+                    <EndpointPicker
                       name="local_endpoint_host"
-                      list={`edit-local-endpoint-options-${selectedNode.id}`}
                       defaultValue={managedLink.peer_peer.endpoint_host || ""}
                       placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
-                      required
+                      options={editLocalEndpointOptions}
                       disabled={!selectedNodeOnline}
                     />
-                    <datalist id={`edit-local-endpoint-options-${selectedNode.id}`}>
-                      {selectedLocalEndpoints.map((endpoint) => (
-                        <option key={endpoint} value={endpoint} />
-                      ))}
-                    </datalist>
                   </Field>
                   <Field label="对端入口地址" hint="本端连接对端节点时使用。">
-                    <input
+                    <EndpointPicker
                       name="peer_endpoint_host"
-                      list={`edit-peer-endpoint-options-${selectedManagedLinkPeerNode?.id || "none"}`}
                       defaultValue={managedLink.local_peer.endpoint_host || ""}
                       placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
-                      required
+                      options={editPeerEndpointOptions}
                       disabled={!selectedNodeOnline}
                     />
-                    <datalist id={`edit-peer-endpoint-options-${selectedManagedLinkPeerNode?.id || "none"}`}>
-                      {selectedManagedLinkPeerEndpoints.map((endpoint) => (
-                        <option key={endpoint} value={endpoint} />
-                      ))}
-                    </datalist>
                   </Field>
                   <Field label="本端监听端口" hint="当前节点 ListenPort。">
                     <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} required disabled={!selectedNodeOnline} />
