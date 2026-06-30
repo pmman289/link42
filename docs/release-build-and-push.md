@@ -220,24 +220,42 @@ docs/agent-public-deployment.md
 deploy/sh/link42-agent.sh
 dist/agent/link42-agent-linux-x64
 dist/agent/link42-agent-linux-x64.sha256
+dist/agent/link42-agent-source.tar.gz
+dist/agent/link42-agent-source.tar.gz.sha256
 dist/agent/<agent_version>/link42-agent-linux-x64
 dist/agent/<agent_version>/link42-agent-linux-x64.sha256
+dist/agent/<agent_version>/link42-agent-source.tar.gz
+dist/agent/<agent_version>/link42-agent-source.tar.gz.sha256
 ```
+
+OpenWrt 安装脚本会固定下载：
+
+```text
+https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
+```
+
+如果该文件缺失，OpenWrt 节点安装会在下载阶段报 404。
 
 当前安装脚本下载规则：
 
 - `LINK42_AGENT_VERSION=latest`：
   - `$LINK42_RES_BASE_URL/link42-agent-linux-x64`
+  - `$LINK42_RES_BASE_URL/link42-agent-source.tar.gz`
 - `LINK42_AGENT_VERSION=0.2.0`：
   - `$LINK42_RES_BASE_URL/0.2.0/link42-agent-linux-x64`
+  - `$LINK42_RES_BASE_URL/0.2.0/link42-agent-source.tar.gz`
 
 发布到对象存储或静态站点时，目录结构应保持一致：
 
 ```text
 res/link42/link42-agent-linux-x64
 res/link42/link42-agent-linux-x64.sha256
+res/link42/link42-agent-source.tar.gz
+res/link42/link42-agent-source.tar.gz.sha256
 res/link42/0.2.0/link42-agent-linux-x64
 res/link42/0.2.0/link42-agent-linux-x64.sha256
+res/link42/0.2.0/link42-agent-source.tar.gz
+res/link42/0.2.0/link42-agent-source.tar.gz.sha256
 sh/link42-agent.sh
 ```
 
@@ -266,6 +284,16 @@ curl -fsS http://127.0.0.1:8000/api/agent/releases
 ```
 
 `/api/auth/me` 未登录时返回 401 属于正常现象。`/api/agent/releases` 应返回 manifest。
+
+检查公网 Agent 资产，尤其是 OpenWrt 源码包：
+
+```bash
+curl -fsSI https://get.pmman.tech/res/link42/link42-agent-linux-x64
+curl -fsSI https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
+curl -fsS https://get.pmman.tech/res/link42/link42-agent-source.tar.gz.sha256
+```
+
+以上任一命令返回 404 都说明静态站点发布不完整。
 
 清理测试容器：
 

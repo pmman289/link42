@@ -137,6 +137,8 @@ ssh aligz "chmod 0755 /opt/1panel/www/sites/get.pmman.tech/index/sh/link42-agent
 ```bash
 scp dist/agent/link42-agent-linux-x64 \
   dist/agent/link42-agent-linux-x64.sha256 \
+  dist/agent/link42-agent-source.tar.gz \
+  dist/agent/link42-agent-source.tar.gz.sha256 \
   dist/agent/manifest.json \
   aligz:/opt/1panel/www/sites/get.pmman.tech/index/res/link42/
 ```
@@ -145,6 +147,8 @@ scp dist/agent/link42-agent-linux-x64 \
 
 ```bash
 scp dist/agent/link42-agent-linux-x64* \
+  dist/agent/link42-agent-source.tar.gz \
+  dist/agent/link42-agent-source.tar.gz.sha256 \
   dist/agent/manifest.json \
   aligz:/opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/
 ```
@@ -152,7 +156,7 @@ scp dist/agent/link42-agent-linux-x64* \
 修正权限：
 
 ```bash
-ssh aligz "chmod 0755 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/link42-agent-linux-x64 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/link42-agent-linux-x64* && chmod 0644 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/*.sha256 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/*.sha256 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/manifest.json /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/manifest.json"
+ssh aligz "chmod 0755 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/link42-agent-linux-x64 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/link42-agent-linux-x64* && chmod 0644 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/link42-agent-source.tar.gz /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/link42-agent-source.tar.gz /opt/1panel/www/sites/get.pmman.tech/index/res/link42/*.sha256 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/*.sha256 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/manifest.json /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/manifest.json"
 ```
 
 ## 发布后验证
@@ -163,16 +167,20 @@ ssh aligz "chmod 0755 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/link
 curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | head
 curl -fsSLO https://get.pmman.tech/res/link42/link42-agent-linux-x64
 curl -fsSLO https://get.pmman.tech/res/link42/link42-agent-linux-x64.sha256
+curl -fsSLO https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
+curl -fsSLO https://get.pmman.tech/res/link42/link42-agent-source.tar.gz.sha256
 sha256sum -c link42-agent-linux-x64.sha256
+sha256sum -c link42-agent-source.tar.gz.sha256
 chmod +x link42-agent-linux-x64
 ./link42-agent-linux-x64 --version
-rm -f link42-agent-linux-x64 link42-agent-linux-x64.sha256
+rm -f link42-agent-linux-x64 link42-agent-linux-x64.sha256 link42-agent-source.tar.gz link42-agent-source.tar.gz.sha256
 ```
 
 检查固定版本：
 
 ```bash
 curl -fsS "https://get.pmman.tech/res/link42/$AGENT_VERSION/link42-agent-linux-x64.sha256"
+curl -fsS "https://get.pmman.tech/res/link42/$AGENT_VERSION/link42-agent-source.tar.gz.sha256"
 curl -fsS "https://get.pmman.tech/res/link42/$AGENT_VERSION/manifest.json"
 ```
 
