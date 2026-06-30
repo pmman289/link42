@@ -165,6 +165,7 @@ ssh aligz "chmod 0755 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/link
 
 ```bash
 curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | head
+curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | grep -E 'stop_service|reload_service|status_service'
 curl -fsSLO https://get.pmman.tech/res/link42/link42-agent-linux-x64
 curl -fsSLO https://get.pmman.tech/res/link42/link42-agent-linux-x64.sha256
 curl -fsSLO https://get.pmman.tech/res/link42/link42-agent-source.tar.gz

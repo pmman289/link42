@@ -93,6 +93,17 @@ def test_agent_task_registry_keeps_wireguard_handlers() -> None:
         assert task_type in TASK_HANDLERS
 
 
+def test_agent_install_script_openwrt_init_defines_rc_common_hooks() -> None:
+    """验证 OpenWrt Agent 安装脚本生成必要 rc.common 钩子，避免成功时输出误导噪音。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+
+    assert "install_openwrt_service()" in script
+    assert "stop_service()" in script
+    assert "reload_service()" in script
+    assert "status_service()" in script
+
+
 def test_udp2raw_remove_last_instance_deletes_config_file(tmp_path: Path) -> None:
     """验证删除 udp2raw 最后一个实例时移除配置文件，而不是留下 0 字节文件。"""
 

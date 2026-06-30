@@ -336,6 +336,24 @@ start_service() {
   procd_set_param stderr 1
   procd_close_instance
 }
+
+stop_service() {
+  return 0
+}
+
+reload_service() {
+  stop
+  start
+}
+
+status_service() {
+  if service_running; then
+    echo "running"
+    return 0
+  fi
+  echo "inactive"
+  return 3
+}
 EOF
   chmod 0755 "/etc/init.d/$SERVICE_NAME"
   "/etc/init.d/$SERVICE_NAME" enable
