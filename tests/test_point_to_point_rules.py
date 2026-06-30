@@ -41,6 +41,7 @@ from link42_api.main import (
     should_delete_node_config_file,
     stop_managed_link,
     update_controller_settings,
+    udp2raw_endpoint_payloads,
     request_agent_upgrade,
 )
 from link42_api.schemas import (
@@ -204,16 +205,25 @@ def test_managed_link_schema_allows_passive_listen_ports() -> None:
         peer_node_id=2,
         local_interface_name="wg-a",
         peer_interface_name="wg-b",
-        local_tunnel_ips=["10.42.0.1/32"],
-        peer_tunnel_ips=["10.42.0.2/32"],
+        local_tunnel_ips=["10.42.0.1/32", "fd42::1/64"],
+        peer_tunnel_ips=["10.42.0.2/32", "fd42::2/64"],
+        local_allowed_ips=["0.0.0.0/0", "::/0"],
+        peer_allowed_ips=["172.20.0.0/14", "fd00::/8"],
         local_endpoint_host="198.51.100.10",
+        local_endpoint_port=11451,
         peer_endpoint_host="198.51.100.20",
+        peer_endpoint_port=11452,
         local_listen_port=None,
         peer_listen_port=None,
     )
 
     assert payload.local_listen_port is None
     assert payload.peer_listen_port is None
+    assert payload.local_tunnel_ips == ["10.42.0.1/32", "fd42::1/64"]
+    assert payload.local_allowed_ips == ["0.0.0.0/0", "::/0"]
+    assert payload.peer_allowed_ips == ["172.20.0.0/14", "fd00::/8"]
+    assert payload.local_endpoint_port == 11451
+    assert payload.peer_endpoint_port == 11452
 
 
 def test_web_login_rotates_session_token() -> None:
@@ -864,7 +874,9 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
                 local_allowed_ips=["10.88.0.0/24"],
                 peer_allowed_ips=["10.99.0.0/24"],
                 local_endpoint_host="10.0.0.10",
+                local_endpoint_port=30020,
                 peer_endpoint_host="10.0.0.20",
+                peer_endpoint_port=30021,
                 local_listen_port=51820,
                 peer_listen_port=51821,
                 mtu=1420,
@@ -894,12 +906,12 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
     assert local_peer.public_key == "peer-public"
     assert local_peer.preshared_key_value == "shared-key"
     assert local_peer.endpoint_host == "10.0.0.20"
-    assert local_peer.endpoint_port == 51821
+    assert local_peer.endpoint_port == 30021
     assert local_peer.allowed_ips == ["10.88.0.0/24"]
     assert remote_peer is not None
     assert remote_peer.public_key == "local-public"
     assert remote_peer.endpoint_host == "10.0.0.10"
-    assert remote_peer.endpoint_port == 51820
+    assert remote_peer.endpoint_port == 30020
     assert remote_peer.allowed_ips == ["10.99.0.0/24"]
     assert len(tasks) == 2
     assert {task.node_id for task in tasks} == {result.local_interface.node_id, result.peer_interface.node_id}
@@ -1123,6 +1135,8 @@ def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> 
                     server_side="peer",
                     server_connect_host="198.51.100.20",
                     server_listen_port=23002,
+                    server_forward_host="127.0.0.1",
+                    server_forward_port=11451,
                     client_listen_port=12312,
                 ),
             ),
@@ -1151,9 +1165,79 @@ def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> 
         "wireguard.apply_config",
     ]
     assert tasks[2].payload["mode"] == "server"
-    assert tasks[2].payload["remote_port"] == 51821
+    assert tasks[2].payload["remote_host"] == "127.0.0.1"
+    assert tasks[2].payload["remote_port"] == 11451
     assert tasks[3].payload["mode"] == "client"
     assert tasks[3].payload["remote_host"] == "198.51.100.20"
+
+
+def test_udp2raw_defaults_server_forward_to_wireguard_listen_port() -> None:
+    """验证旧配置未显式填写 server 转发目的时，仍默认转发到 server 侧 WireGuard ListenPort。"""
+
+    local_interface = models.WireGuardInterface(id=1, node_id=1, name="wg-a", listen_port=None)
+    peer_interface = models.WireGuardInterface(id=2, node_id=2, name="wg-b", listen_port=51821)
+    middleware = {
+        "type": "udp2raw",
+        "enabled": True,
+        "server_side": "peer",
+        "server_listen_host": "0.0.0.0",
+        "server_connect_host": "198.51.100.20",
+        "server_listen_port": 23002,
+        "client_listen_host": "127.0.0.1",
+        "client_listen_port": 12312,
+        "raw_mode": "faketcp",
+        "cipher_mode": "xor",
+        "password": "u2r_secret",
+        "auto_rule": True,
+    }
+
+    payloads = udp2raw_endpoint_payloads(
+        middleware,
+        local_interface,
+        peer_interface,
+        "198.51.100.10",
+        "198.51.100.20",
+    )
+
+    server_payload = payloads[0][2]
+    assert server_payload["mode"] == "server"
+    assert server_payload["remote_host"] == "127.0.0.1"
+    assert server_payload["remote_port"] == 51821
+
+
+def test_udp2raw_requires_server_side_wireguard_listen_port() -> None:
+    """验证启用 udp2raw 时，运行 server 的 WireGuard 端必须填写 ListenPort。"""
+
+    local_interface = models.WireGuardInterface(id=1, node_id=1, name="wg-a", listen_port=51820)
+    peer_interface = models.WireGuardInterface(id=2, node_id=2, name="wg-b", listen_port=None)
+    middleware = {
+        "type": "udp2raw",
+        "enabled": True,
+        "server_side": "peer",
+        "server_listen_host": "0.0.0.0",
+        "server_connect_host": "198.51.100.20",
+        "server_listen_port": 23002,
+        "server_forward_host": "127.0.0.1",
+        "server_forward_port": 11451,
+        "client_listen_host": "127.0.0.1",
+        "client_listen_port": 12312,
+        "raw_mode": "faketcp",
+        "cipher_mode": "xor",
+        "password": "u2r_secret",
+        "auto_rule": True,
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        udp2raw_endpoint_payloads(
+            middleware,
+            local_interface,
+            peer_interface,
+            "198.51.100.10",
+            "198.51.100.20",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "requires WireGuard listen port" in str(exc_info.value.detail)
 
 
 def test_udp2raw_rejects_domain_as_server_connect_host(monkeypatch) -> None:
@@ -1227,11 +1311,12 @@ def test_udp2raw_rejects_domain_as_server_connect_host(monkeypatch) -> None:
     ("field_name", "value"),
     [
         ("server_listen_host", "example.com"),
+        ("server_forward_host", "forward.example.com"),
         ("client_listen_host", "client.example.com"),
     ],
 )
-def test_udp2raw_normalize_rejects_domain_listen_hosts(field_name: str, value: str) -> None:
-    """验证后端清洗 udp2raw 配置时兜底拒绝 listen host 域名。"""
+def test_udp2raw_normalize_rejects_domain_ip_fields(field_name: str, value: str) -> None:
+    """验证后端清洗 udp2raw 配置时兜底拒绝 udp2raw IP 字段域名。"""
 
     payload = Udp2RawMiddlewareConfig.model_construct(
         enabled=True,
@@ -1239,6 +1324,8 @@ def test_udp2raw_normalize_rejects_domain_listen_hosts(field_name: str, value: s
         server_listen_host="0.0.0.0",
         server_connect_host="198.51.100.20",
         server_listen_port=23002,
+        server_forward_host="127.0.0.1",
+        server_forward_port=11451,
         client_listen_host="127.0.0.1",
         client_listen_port=12312,
         raw_mode="faketcp",

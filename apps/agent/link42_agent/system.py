@@ -6,7 +6,6 @@ import platform
 import shutil
 import socket
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -107,8 +106,7 @@ def apply_wireguard_config(
 
     backup_path: str | None = None
     if target.exists():
-        stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        backup = target.with_name(f"{target.name}.link42-backup-{stamp}")
+        backup = rotate_wireguard_backup(target)
         shutil.copy2(target, backup)
         backup_path = str(backup)
 
@@ -164,6 +162,16 @@ def apply_wireguard_config(
         "service": service_state,
         "restart": restart_result,
     }
+
+
+def rotate_wireguard_backup(target: Path) -> Path:
+    """返回固定备份路径，并清理同接口历史备份，确保最多保留一个备份文件。"""
+
+    backup = target.with_name(f"{target.name}.link42-backup")
+    for old_backup in target.parent.glob(f"{target.name}.link42-backup-*"):
+        old_backup.unlink(missing_ok=True)
+    backup.unlink(missing_ok=True)
+    return backup
 
 
 def read_wireguard_config(payload: dict[str, Any], wireguard_dir: str = DEFAULT_WIREGUARD_DIR) -> dict[str, Any]:

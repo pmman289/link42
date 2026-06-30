@@ -154,6 +154,44 @@ def test_apply_config_restarts_existing_systemd_service(tmp_path: Path, monkeypa
     assert (tmp_path / "wg0.conf").exists()
 
 
+def test_apply_config_keeps_only_one_wireguard_backup(tmp_path: Path, monkeypatch) -> None:
+    """验证同一接口重复下发时只保留一个 Link42 备份文件。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        if command == ["systemctl", "is-active", "wg-quick@wg0.service"]:
+            return command_result(command, stdout="active\n")
+        if command == ["systemctl", "is-enabled", "wg-quick@wg0.service"]:
+            return command_result(command, stdout="enabled\n")
+        if command == ["systemctl", "restart", "wg-quick@wg0.service"]:
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=True)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    target = tmp_path / "wg0.conf"
+    target.write_text("old-config\n", encoding="utf-8")
+    (tmp_path / "wg0.conf.link42-backup-20260101010101").write_text("older\n", encoding="utf-8")
+
+    first = system.apply_wireguard_config(
+        {"interface_name": "wg0", "config": "first-config\n"},
+        wireguard_dir=str(tmp_path),
+    )
+    second = system.apply_wireguard_config(
+        {"interface_name": "wg0", "config": "second-config\n"},
+        wireguard_dir=str(tmp_path),
+    )
+
+    backups = sorted(tmp_path.glob("wg0.conf.link42-backup*"))
+    assert [path.name for path in backups] == ["wg0.conf.link42-backup"]
+    assert backups[0].read_text(encoding="utf-8") == "first-config\n"
+    assert first["backup_path"] == str(tmp_path / "wg0.conf.link42-backup")
+    assert second["backup_path"] == str(tmp_path / "wg0.conf.link42-backup")
+    assert target.read_text(encoding="utf-8") == "second-config\n"
+
+
 def test_apply_config_enables_existing_systemd_service_when_requested(tmp_path: Path, monkeypatch) -> None:
     """验证受管连接下发到已有 service 时会同时设置开机自启。"""
 

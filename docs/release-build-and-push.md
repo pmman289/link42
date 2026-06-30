@@ -205,6 +205,12 @@ https://get.pmman.tech/sh/link42-agent.sh
 https://get.pmman.tech/res/link42
 ```
 
+详细的静态站点发布、验证、节点安装、卸载和回滚流程见：
+
+```text
+docs/agent-public-deployment.md
+```
+
 需要同步发布：
 
 ```text

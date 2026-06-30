@@ -125,8 +125,10 @@ class ManagedLinkCreate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_allowed_ips: list[str] | None = None
     peer_allowed_ips: list[str] | None = None
-    local_endpoint_host: str = Field(min_length=1, max_length=255)
-    peer_endpoint_host: str = Field(min_length=1, max_length=255)
+    local_endpoint_host: str = Field(max_length=255)
+    local_endpoint_port: int | None = None
+    peer_endpoint_host: str = Field(max_length=255)
+    peer_endpoint_port: int | None = None
     local_listen_port: int | None = None
     peer_listen_port: int | None = None
     mtu: int | None = 1420
@@ -141,10 +143,10 @@ class ManagedLinkCreate(BaseModel):
     force_endpoint_mismatch: bool = False
     udp2raw: Udp2RawMiddlewareConfig | None = None
 
-    @field_validator("local_listen_port", "peer_listen_port")
+    @field_validator("local_endpoint_port", "peer_endpoint_port", "local_listen_port", "peer_listen_port")
     @classmethod
     def validate_listen_port(cls, value: int | None) -> int | None:
-        """校验双方监听端口范围。"""
+        """校验双方 Endpoint 和监听端口范围。"""
 
         return _validate_port(value)
 
@@ -283,6 +285,8 @@ class Udp2RawMiddlewareConfig(BaseModel):
     server_listen_host: str = "0.0.0.0"
     server_connect_host: str | None = None
     server_listen_port: int | None = None
+    server_forward_host: str | None = None
+    server_forward_port: int | None = None
     client_listen_host: str = "127.0.0.1"
     client_listen_port: int | None = None
     raw_mode: str = "faketcp"
@@ -297,12 +301,12 @@ class Udp2RawMiddlewareConfig(BaseModel):
             raise ValueError("server_side must be local or peer")
         return value
 
-    @field_validator("server_listen_port", "client_listen_port")
+    @field_validator("server_listen_port", "server_forward_port", "client_listen_port")
     @classmethod
     def validate_udp2raw_ports(cls, value: int | None) -> int | None:
         return _validate_port(value)
 
-    @field_validator("server_listen_host", "server_connect_host", "client_listen_host")
+    @field_validator("server_listen_host", "server_connect_host", "server_forward_host", "client_listen_host")
     @classmethod
     def validate_udp2raw_ip(cls, value: str | None) -> str | None:
         if value is None or not value.strip():
@@ -352,8 +356,10 @@ class ManagedLinkUpdate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_allowed_ips: list[str] | None = None
     peer_allowed_ips: list[str] | None = None
-    local_endpoint_host: str = Field(min_length=1, max_length=255)
-    peer_endpoint_host: str = Field(min_length=1, max_length=255)
+    local_endpoint_host: str = Field(max_length=255)
+    local_endpoint_port: int | None = None
+    peer_endpoint_host: str = Field(max_length=255)
+    peer_endpoint_port: int | None = None
     local_listen_port: int | None = None
     peer_listen_port: int | None = None
     mtu: int | None = 1420
@@ -365,7 +371,7 @@ class ManagedLinkUpdate(BaseModel):
     peer_peer_custom_config: str | None = None
     udp2raw: Udp2RawMiddlewareConfig | None = None
 
-    @field_validator("local_listen_port", "peer_listen_port")
+    @field_validator("local_endpoint_port", "peer_endpoint_port", "local_listen_port", "peer_listen_port")
     @classmethod
     def validate_listen_port(cls, value: int | None) -> int | None:
         return _validate_port(value)

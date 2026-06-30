@@ -470,6 +470,11 @@ def normalize_udp2raw_config(payload: schemas.Udp2RawMiddlewareConfig | None) ->
         if payload.server_connect_host
         else None
     )
+    server_forward_host = (
+        require_udp2raw_ip(payload.server_forward_host.strip(), "udp2raw server forward host")
+        if payload.server_forward_host
+        else None
+    )
     client_listen_host = require_udp2raw_ip(
         payload.client_listen_host.strip() or "127.0.0.1",
         "udp2raw client listen host",
@@ -481,6 +486,8 @@ def normalize_udp2raw_config(payload: schemas.Udp2RawMiddlewareConfig | None) ->
         "server_listen_host": server_listen_host,
         "server_connect_host": server_connect_host,
         "server_listen_port": payload.server_listen_port,
+        "server_forward_host": server_forward_host,
+        "server_forward_port": payload.server_forward_port,
         "client_listen_host": client_listen_host,
         "client_listen_port": payload.client_listen_port,
         "raw_mode": payload.raw_mode,
@@ -524,14 +531,16 @@ def apply_udp2raw_to_peers(
     peer_peer: models.WireGuardPeer,
     local_endpoint: str,
     peer_endpoint: str,
+    local_endpoint_port: int | None = None,
+    peer_endpoint_port: int | None = None,
 ) -> None:
     """根据单向 udp2raw 配置覆盖 WireGuard Peer Endpoint。"""
 
     if not middleware:
         local_peer.endpoint_host = peer_endpoint
-        local_peer.endpoint_port = peer_interface.listen_port
+        local_peer.endpoint_port = peer_endpoint_port or peer_interface.listen_port
         peer_peer.endpoint_host = local_endpoint
-        peer_peer.endpoint_port = local_interface.listen_port
+        peer_peer.endpoint_port = local_endpoint_port or local_interface.listen_port
         return
 
     server_side = middleware["server_side"]
@@ -582,6 +591,11 @@ def udp2raw_endpoint_payloads(
         middleware.get("server_connect_host") or server_public_host,
         "udp2raw server connect host",
     )
+    server_forward_host = require_udp2raw_ip(
+        middleware.get("server_forward_host") or "127.0.0.1",
+        "udp2raw server forward host",
+    )
+    server_forward_port = middleware.get("server_forward_port") or server_interface.listen_port
 
     common = {
         "plugin": "udp2raw",
@@ -596,8 +610,8 @@ def udp2raw_endpoint_payloads(
         "mode": "server",
         "listen_host": middleware["server_listen_host"],
         "listen_port": middleware["server_listen_port"],
-        "remote_host": "127.0.0.1",
-        "remote_port": server_interface.listen_port,
+        "remote_host": server_forward_host,
+        "remote_port": server_forward_port,
     }
     client_payload = {
         **common,
@@ -1473,7 +1487,17 @@ def create_managed_link(
     set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
     set_extra_object(local_interface, "middleware", udp2raw)
     set_extra_object(peer_interface, "middleware", udp2raw)
-    apply_udp2raw_to_peers(udp2raw, local_interface, peer_interface, local_peer, peer_peer, local_endpoint, peer_endpoint)
+    apply_udp2raw_to_peers(
+        udp2raw,
+        local_interface,
+        peer_interface,
+        local_peer,
+        peer_peer,
+        local_endpoint,
+        peer_endpoint,
+        payload.local_endpoint_port,
+        payload.peer_endpoint_port,
+    )
     db.add_all([local_peer, peer_peer])
     db.flush()
     if replace_local:
@@ -1583,7 +1607,17 @@ def update_managed_link(
     set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
     set_extra_object(local_interface, "middleware", udp2raw)
     set_extra_object(peer_interface, "middleware", udp2raw)
-    apply_udp2raw_to_peers(udp2raw, local_interface, peer_interface, local_peer, peer_peer, local_endpoint, peer_endpoint)
+    apply_udp2raw_to_peers(
+        udp2raw,
+        local_interface,
+        peer_interface,
+        local_peer,
+        peer_peer,
+        local_endpoint,
+        peer_endpoint,
+        payload.local_endpoint_port,
+        payload.peer_endpoint_port,
+    )
 
     enqueue_udp2raw_tasks(db, udp2raw, local_interface, peer_interface, local_endpoint, peer_endpoint)
     if enqueue_apply_config(db, local_interface):

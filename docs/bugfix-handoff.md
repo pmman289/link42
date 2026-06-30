@@ -195,14 +195,14 @@ udp2raw 是单向传输中间层，不是双向对等插件。它的模型是：
 ```text
 WireGuard UDP -> udp2raw client 本地 UDP 监听端口
 udp2raw client -> raw TCP/faketcp/icmp -> udp2raw server IP:port
-udp2raw server -> 转回 UDP -> server 本机 WireGuard ListenPort
+udp2raw server -> 转回 UDP -> server_forward_host:server_forward_port
 ```
 
 关键语义：
 
-- 只有 udp2raw server 侧需要 WireGuard `ListenPort`。
+- udp2raw server 侧必须填写 WireGuard `ListenPort`，这是启用 udp2raw server 的硬校验。
 - udp2raw client 侧 WireGuard 可以被动运行，`ListenPort` 可为空。
-- server 侧 udp2raw 转发到本机 `127.0.0.1:<server_wireguard_listen_port>`。
+- server 侧 udp2raw 的 `-r` 来自 `server_forward_host:server_forward_port`，通常是 `127.0.0.1:<server_wireguard_listen_port>`。
 - client 侧本地监听 `client_listen_host:client_listen_port`，WireGuard Peer Endpoint 指向这里。
 - client 连接 server 使用的是 udp2raw 表单中的 `server_connect_host:server_listen_port`。
 - udp2raw 的 IP 参数必须是 IPv4/IPv6 字面量，不能填写域名；受管连接普通 Endpoint 可以支持域名，但启用 udp2raw 时被插件接管。

@@ -74,6 +74,8 @@ type Udp2RawMiddleware = {
   server_listen_host: string;
   server_connect_host: string | null;
   server_listen_port: number;
+  server_forward_host: string | null;
+  server_forward_port: number | null;
   client_listen_host: string;
   client_listen_port: number;
   raw_mode: string;
@@ -165,9 +167,9 @@ const AUTH_TOKEN_KEY = "link42.authToken";
 const AUTH_EXPIRED_EVENT = "link42:auth-expired";
 
 function splitList(value: string): string[] {
-  // 将输入框中的逗号分隔内容转换成 API 需要的数组。
+  // 将输入框中的逗号或换行分隔内容转换成 API 需要的数组；不要按冒号切分，IPv6 会用到 "::"。
   return value
-    .split(",")
+    .split(/[,\n]+/)
     .map((item) => item.trim())
     .filter(Boolean);
 }
@@ -483,6 +485,8 @@ function RouteModeSelect({
 function Udp2RawFields({
   enabled,
   serverSide,
+  localListenPort,
+  peerListenPort,
   defaults,
   disabled,
   onEnabledChange,
@@ -490,11 +494,27 @@ function Udp2RawFields({
 }: {
   enabled: boolean;
   serverSide: "local" | "peer";
+  localListenPort?: number | null;
+  peerListenPort?: number | null;
   defaults?: Partial<Udp2RawMiddleware> | null;
   disabled?: boolean;
   onEnabledChange: (value: boolean) => void;
   onServerSideChange: (value: "local" | "peer") => void;
 }) {
+  const serverWireGuardListenPort = serverSide === "local" ? localListenPort : peerListenPort;
+  const forwardPortDefault = defaults?.server_forward_port || serverWireGuardListenPort || "";
+  function handleEnabledChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const nextEnabled = event.currentTarget.checked;
+    onEnabledChange(nextEnabled);
+    if (nextEnabled) {
+      const form = event.currentTarget.form;
+      const mtuInput = form?.elements.namedItem("mtu");
+      if (mtuInput instanceof HTMLInputElement) {
+        mtuInput.value = "1300";
+      }
+    }
+  }
+
   return (
     <>
       <label className="checkField wideField">
@@ -503,8 +523,9 @@ function Udp2RawFields({
           type="checkbox"
           checked={enabled}
           disabled={disabled}
-          onChange={(event) => onEnabledChange(event.currentTarget.checked)}
+          onChange={handleEnabledChange}
         />
+        <input type="hidden" name="udp2raw_enabled_state" value={enabled ? "on" : ""} disabled={disabled} />
         <span>启用 udp2raw 连接中间层</span>
       </label>
       {enabled && (
@@ -528,6 +549,19 @@ function Udp2RawFields({
           </Field>
           <Field label="server 监听端口" hint="client 要连接的 udp2raw raw 端口。">
             <input name="udp2raw_server_listen_port" defaultValue={defaults?.server_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
+          </Field>
+          <Field label="server 转发目的 IP" hint="udp2raw server 解包后 UDP 转发到的地址；通常是 127.0.0.1，必须是 IP。">
+            <input name="udp2raw_server_forward_host" defaultValue={defaults?.server_forward_host || "127.0.0.1"} disabled={disabled} />
+          </Field>
+          <Field label="server 转发目的端口" hint="udp2raw server 解包后 UDP 转发到的端口；通常等于 server 侧 WireGuard ListenPort。">
+            <input
+              key={`udp2raw-forward-port-${serverSide}-${forwardPortDefault}`}
+              name="udp2raw_server_forward_port"
+              defaultValue={forwardPortDefault}
+              inputMode="numeric"
+              required={enabled}
+              disabled={disabled}
+            />
           </Field>
           <Field label="client 本地 UDP 监听 IP" hint="WireGuard Endpoint 会指向这个本地 UDP 地址；通常是 127.0.0.1。">
             <input name="udp2raw_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} />
@@ -558,8 +592,8 @@ function Udp2RawFields({
           </label>
           <div className="empty wideField">
             {serverSide === "peer"
-              ? "本端 WireGuard Endpoint 由 udp2raw client 接管，指向本端 127.0.0.1；对端 udp2raw server 转发到对端 WireGuard ListenPort。"
-              : "对端 WireGuard Endpoint 由 udp2raw client 接管，指向对端 127.0.0.1；本端 udp2raw server 转发到本端 WireGuard ListenPort。"}
+              ? "本端 WireGuard Endpoint 由 udp2raw client 接管；对端 udp2raw server 解包后转发到上面填写的 server 转发目的地址。"
+              : "对端 WireGuard Endpoint 由 udp2raw client 接管；本端 udp2raw server 解包后转发到上面填写的 server 转发目的地址。"}
           </div>
         </>
       )}
@@ -567,15 +601,25 @@ function Udp2RawFields({
   );
 }
 
-function readUdp2RawForm(form: FormData): Record<string, unknown> | null {
-  const enabled = form.get("udp2raw_enabled") === "on";
+function readUdp2RawForm(
+  form: FormData,
+  localListenPort?: number | null,
+  peerListenPort?: number | null,
+): Record<string, unknown> | null {
+  const enabled = form.get("udp2raw_enabled") === "on" || form.get("udp2raw_enabled_state") === "on";
   if (!enabled) return null;
+  const serverSide = String(form.get("udp2raw_server_side") || "peer");
+  const serverForwardPort =
+    optionalInt(form.get("udp2raw_server_forward_port")) ??
+    (serverSide === "local" ? localListenPort ?? null : peerListenPort ?? null);
   return {
     enabled: true,
-    server_side: String(form.get("udp2raw_server_side") || "peer"),
+    server_side: serverSide,
     server_listen_host: String(form.get("udp2raw_server_listen_host") || "0.0.0.0").trim(),
     server_connect_host: String(form.get("udp2raw_server_connect_host") || "").trim() || null,
     server_listen_port: optionalInt(form.get("udp2raw_server_listen_port")),
+    server_forward_host: String(form.get("udp2raw_server_forward_host") || "127.0.0.1").trim(),
+    server_forward_port: serverForwardPort,
     client_listen_host: String(form.get("udp2raw_client_listen_host") || "127.0.0.1").trim(),
     client_listen_port: optionalInt(form.get("udp2raw_client_listen_port")),
     raw_mode: String(form.get("udp2raw_raw_mode") || "faketcp"),
@@ -590,12 +634,17 @@ function validateUdp2RawForm(udp2raw: Record<string, unknown> | null, localListe
   const serverSide = String(udp2raw.server_side);
   const serverListenHost = String(udp2raw.server_listen_host || "");
   const serverConnectHost = String(udp2raw.server_connect_host || "");
+  const serverForwardHost = String(udp2raw.server_forward_host || "");
   const clientListenHost = String(udp2raw.client_listen_host || "");
-  if (!isValidPort(Number(udp2raw.server_listen_port) || null) || !isValidPort(Number(udp2raw.client_listen_port) || null)) {
-    throw new Error("udp2raw server 端口和 client 本地 UDP 监听端口必须填写 1-65535 之间的整数");
+  if (
+    !isValidPort(Number(udp2raw.server_listen_port) || null) ||
+    !isValidPort(Number(udp2raw.server_forward_port) || null) ||
+    !isValidPort(Number(udp2raw.client_listen_port) || null)
+  ) {
+    throw new Error("udp2raw server 监听端口、server 转发目的端口和 client 本地 UDP 监听端口必须填写 1-65535 之间的整数");
   }
-  if (!isProbablyIpAddress(serverListenHost) || !isProbablyIpAddress(clientListenHost)) {
-    throw new Error("udp2raw 监听地址必须填写 IP，不能填写域名");
+  if (!isProbablyIpAddress(serverListenHost) || !isProbablyIpAddress(serverForwardHost) || !isProbablyIpAddress(clientListenHost)) {
+    throw new Error("udp2raw 监听地址和转发目的地址必须填写 IP，不能填写域名");
   }
   if (!isProbablyIpAddress(serverConnectHost)) {
     throw new Error("udp2raw server 对外地址必须填写 IP，不能填写域名");
@@ -695,13 +744,15 @@ function App() {
   const editLocalEndpointOptions = endpointOptionsFrom(
     null,
     selectedLocalEndpoints,
-    managedLink?.peer_peer.endpoint_host,
+    managedLink?.peer_peer.endpoint_host || selectedLocalEndpoints[0],
   );
   const editPeerEndpointOptions = endpointOptionsFrom(
     null,
     selectedManagedLinkPeerEndpoints,
-    managedLink?.local_peer.endpoint_host,
+    managedLink?.local_peer.endpoint_host || selectedManagedLinkPeerEndpoints[0],
   );
+  const editLocalEndpointDefault = managedLink?.peer_peer.endpoint_host || selectedLocalEndpoints[0] || "";
+  const editPeerEndpointDefault = managedLink?.local_peer.endpoint_host || selectedManagedLinkPeerEndpoints[0] || "";
 
   function notify(type: Toast["type"], text: string) {
     // 右上角 toast 避免把所有消息堆在主页主流程里。
@@ -1248,10 +1299,12 @@ function App() {
     const peerAllowedIps = splitList(String(form.get("peer_allowed_ips") || ""));
     const localEndpointHost = String(form.get("local_endpoint_host") || "").trim();
     const peerEndpointHost = String(form.get("peer_endpoint_host") || "").trim();
+    const localEndpointPort = optionalInt(form.get("local_endpoint_port"));
+    const peerEndpointPort = optionalInt(form.get("peer_endpoint_port"));
     const localListenPort = optionalInt(form.get("local_listen_port"));
     const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
-    const udp2raw = readUdp2RawForm(form);
+    const udp2raw = readUdp2RawForm(form, localListenPort, peerListenPort);
     if (!peerNodeId || peerNodeId === selectedNodeId) {
       throw new Error("请选择另一个在线受管节点");
     }
@@ -1263,6 +1316,9 @@ function App() {
     }
     if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
       throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
+    }
+    if (!isValidPort(localEndpointPort) || !isValidPort(peerEndpointPort)) {
+      throw new Error("双方 Endpoint 端口必须留空，或填写 1-65535 之间的整数");
     }
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
@@ -1287,7 +1343,9 @@ function App() {
           local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
           peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
           local_endpoint_host: localEndpointHost,
+          local_endpoint_port: localEndpointPort,
           peer_endpoint_host: peerEndpointHost,
+          peer_endpoint_port: peerEndpointPort,
           local_listen_port: localListenPort,
           peer_listen_port: peerListenPort,
           mtu,
@@ -1383,9 +1441,11 @@ function App() {
     const peerAllowedIps = splitList(String(form.get("peer_allowed_ips") || ""));
     const localListenPort = optionalInt(form.get("local_listen_port"));
     const peerListenPort = optionalInt(form.get("peer_listen_port"));
+    const localEndpointPort = optionalInt(form.get("local_endpoint_port"));
+    const peerEndpointPort = optionalInt(form.get("peer_endpoint_port"));
     const keepalive = Number(form.get("persistent_keepalive")) || null;
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
-    const udp2raw = readUdp2RawForm(form);
+    const udp2raw = readUdp2RawForm(form, localListenPort, peerListenPort);
     if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
       throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32, fd42::1/64");
     }
@@ -1394,6 +1454,9 @@ function App() {
     }
     if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
       throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
+    }
+    if (!isValidPort(localEndpointPort) || !isValidPort(peerEndpointPort)) {
+      throw new Error("双方 Endpoint 端口必须留空，或填写 1-65535 之间的整数");
     }
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
@@ -1412,7 +1475,9 @@ function App() {
         local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
         peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
         local_endpoint_host: String(form.get("local_endpoint_host") || "").trim(),
+        local_endpoint_port: localEndpointPort,
         peer_endpoint_host: String(form.get("peer_endpoint_host") || "").trim(),
+        peer_endpoint_port: peerEndpointPort,
         local_listen_port: localListenPort,
         peer_listen_port: peerListenPort,
         mtu,
@@ -1989,6 +2054,15 @@ function App() {
                   locked={udp2rawEnabled}
                 />
               </Field>
+              <Field label="本端 Endpoint 端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。udp2raw 启用时由中间层接管。">
+                <input
+                  name="local_endpoint_port"
+                  placeholder="51820"
+                  defaultValue={replaceLocalConfig?.listen_port || ""}
+                  inputMode="numeric"
+                  disabled={!selectedNodeOnline || udp2rawEnabled}
+                />
+              </Field>
               <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址。">
                 <EndpointSelect
                   key={`managed-peer-endpoint-${replaceLocalConfigId || "none"}-${managedPeerEndpointDefault}`}
@@ -1998,6 +2072,15 @@ function App() {
                   options={managedPeerEndpointOptions}
                   disabled={!selectedNodeOnline}
                   locked={udp2rawEnabled}
+                />
+              </Field>
+              <Field label="对端 Endpoint 端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。udp2raw 启用时由中间层接管。">
+                <input
+                  name="peer_endpoint_port"
+                  placeholder="51821"
+                  defaultValue={replacePeerConfig?.listen_port || ""}
+                  inputMode="numeric"
+                  disabled={!selectedNodeOnline || udp2rawEnabled}
                 />
               </Field>
               <Field label="本端隧道 IP" hint="CIDR 格式，例如 10.42.0.1/32。">
@@ -2033,11 +2116,13 @@ function App() {
               <Udp2RawFields
                 enabled={udp2rawEnabled}
                 serverSide={udp2rawServerSide}
+                localListenPort={replaceLocalConfig?.listen_port}
+                peerListenPort={replacePeerConfig?.listen_port}
                 disabled={!selectedNodeOnline}
                 onEnabledChange={setUdp2rawEnabled}
                 onServerSideChange={setUdp2rawServerSide}
               />
-              <Field label="MTU" hint="双方链路 MTU，默认 1420。">
+              <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                 <input name="mtu" placeholder="1420" defaultValue={replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
               <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
@@ -2276,24 +2361,40 @@ function App() {
                   </Field>
                   <Field label="本端入口地址" hint="对端连接本节点时使用。">
                     <EndpointSelect
-                      key={`edit-local-endpoint-${managedLink.peer_peer.endpoint_host || ""}`}
+                      key={`edit-local-endpoint-${editLocalEndpointDefault}`}
                       name="local_endpoint_host"
-                      defaultValue={managedLink.peer_peer.endpoint_host || ""}
+                      defaultValue={editLocalEndpointDefault}
                       placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
                       options={editLocalEndpointOptions}
                       disabled={!selectedNodeOnline}
                       locked={udp2rawEnabled}
                     />
                   </Field>
+                  <Field label="本端 Endpoint 端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。udp2raw 启用时由中间层接管。">
+                    <input
+                      name="local_endpoint_port"
+                      defaultValue={managedLink.peer_peer.endpoint_port || managedLink.local_interface.listen_port || ""}
+                      inputMode="numeric"
+                      disabled={!selectedNodeOnline || udp2rawEnabled}
+                    />
+                  </Field>
                   <Field label="对端入口地址" hint="本端连接对端节点时使用。">
                     <EndpointSelect
-                      key={`edit-peer-endpoint-${managedLink.local_peer.endpoint_host || ""}`}
+                      key={`edit-peer-endpoint-${editPeerEndpointDefault}`}
                       name="peer_endpoint_host"
-                      defaultValue={managedLink.local_peer.endpoint_host || ""}
+                      defaultValue={editPeerEndpointDefault}
                       placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
                       options={editPeerEndpointOptions}
                       disabled={!selectedNodeOnline}
                       locked={udp2rawEnabled}
+                    />
+                  </Field>
+                  <Field label="对端 Endpoint 端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。udp2raw 启用时由中间层接管。">
+                    <input
+                      name="peer_endpoint_port"
+                      defaultValue={managedLink.local_peer.endpoint_port || managedLink.peer_interface.listen_port || ""}
+                      inputMode="numeric"
+                      disabled={!selectedNodeOnline || udp2rawEnabled}
                     />
                   </Field>
                   <Field label="本端监听端口" hint="可选；留空表示不写 ListenPort。">
@@ -2305,12 +2406,14 @@ function App() {
                   <Udp2RawFields
                     enabled={udp2rawEnabled}
                     serverSide={udp2rawServerSide}
+                    localListenPort={managedLink.local_interface.listen_port}
+                    peerListenPort={managedLink.peer_interface.listen_port}
                     defaults={managedLink.middleware}
                     disabled={!selectedNodeOnline}
                     onEnabledChange={setUdp2rawEnabled}
                     onServerSideChange={setUdp2rawServerSide}
                   />
-                  <Field label="MTU" hint="双方链路 MTU，默认 1420。">
+                  <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                     <input name="mtu" defaultValue={managedLink.local_interface.mtu || managedLink.peer_interface.mtu || 1420} disabled={!selectedNodeOnline} />
                   </Field>
                   <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
