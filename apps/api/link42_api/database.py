@@ -157,28 +157,29 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("agent_tasks", task_columns, "started_at", "DATETIME")
             add_column("agent_tasks", task_columns, "finished_at", "DATETIME")
 
-        # 先清理历史遗留的重复对端，保留每个配置最早创建的一条记录。
-        connection.execute(
-            text(
-                """
-                DELETE FROM wg_peers
-                WHERE id NOT IN (
-                    SELECT MIN(id)
-                    FROM wg_peers
-                    GROUP BY interface_id
+        if table_exists("wg_peers"):
+            # 先清理历史遗留的重复对端，保留每个配置最早创建的一条记录。
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM wg_peers
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM wg_peers
+                        GROUP BY interface_id
+                    )
+                    """
                 )
-                """
             )
-        )
-        # 再补唯一索引，让旧 SQLite 库也能在数据库层阻止重复对端。
-        connection.execute(
-            text(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_wg_peer_interface_id
-                ON wg_peers(interface_id)
-                """
+            # 再补唯一索引，让旧 SQLite 库也能在数据库层阻止重复对端。
+            connection.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_wg_peer_interface_id
+                    ON wg_peers(interface_id)
+                    """
+                )
             )
-        )
         has_import_candidates_table = connection.scalar(
             text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'import_candidates'")
         )
@@ -224,6 +225,44 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS link_monitors (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    node_id INTEGER NOT NULL,
+                    interface_id INTEGER,
+                    name VARCHAR(80) NOT NULL,
+                    target_host VARCHAR(255) NOT NULL,
+                    interval_seconds INTEGER DEFAULT 10,
+                    retention_days INTEGER DEFAULT 7,
+                    enabled BOOLEAN DEFAULT 1,
+                    next_due_at DATETIME,
+                    last_checked_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_node_id ON link_monitors(node_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_interface_id ON link_monitors(interface_id)"))
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS link_monitor_samples (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    monitor_id INTEGER NOT NULL,
+                    checked_at DATETIME NOT NULL,
+                    success BOOLEAN NOT NULL,
+                    latency_ms FLOAT,
+                    error TEXT
+                )
+                """
+            )
+        )
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_monitor_id ON link_monitor_samples(monitor_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_checked_at ON link_monitor_samples(checked_at)"))
         if node_columns:
             fallback_columns = [name for name in ["public_ip", "management_ip", "hostname"] if name in node_columns]
             if fallback_columns:

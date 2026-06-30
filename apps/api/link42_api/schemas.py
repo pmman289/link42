@@ -200,6 +200,112 @@ class InterfaceUpdate(BaseModel):
         return _validate_cidrs(values)
 
 
+class LinkMonitorSummary(BaseModel):
+    monitor_id: int
+    target_host: str
+    last_latency_ms: float | None = None
+    avg_latency_ms: float | None = None
+    min_latency_ms: float | None = None
+    max_latency_ms: float | None = None
+    jitter_ms: float | None = None
+    packet_loss: float
+    stability_score: int
+    status: str
+    sample_count: int
+    last_checked_at: datetime | None = None
+
+
+class LinkMonitorCreate(BaseModel):
+    target_host: str = Field(min_length=1, max_length=255)
+    name: str | None = Field(default=None, max_length=80)
+    interval_seconds: int = 10
+    retention_days: int = 7
+    enabled: bool = True
+
+    @field_validator("target_host")
+    @classmethod
+    def validate_target_host(cls, value: str) -> str:
+        cleaned = value.strip()
+        try:
+            ipaddress.ip_address(cleaned)
+        except ValueError as exc:
+            raise ValueError("monitor target must be an IPv4 or IPv6 address") from exc
+        return cleaned
+
+    @field_validator("interval_seconds")
+    @classmethod
+    def validate_interval(cls, value: int) -> int:
+        if not 1 <= value <= 300:
+            raise ValueError("interval_seconds must be between 1 and 300")
+        return value
+
+    @field_validator("retention_days")
+    @classmethod
+    def validate_retention(cls, value: int) -> int:
+        if not 1 <= value <= 90:
+            raise ValueError("retention_days must be between 1 and 90")
+        return value
+
+
+class LinkMonitorUpdate(LinkMonitorCreate):
+    pass
+
+
+class LinkMonitorRead(BaseModel):
+    id: int
+    node_id: int
+    interface_id: int | None
+    name: str
+    target_host: str
+    interval_seconds: int
+    retention_days: int
+    enabled: bool
+    next_due_at: datetime | None
+    last_checked_at: datetime | None
+    summary: LinkMonitorSummary | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class LinkMonitorSampleRead(BaseModel):
+    checked_at: datetime
+    success: bool
+    latency_ms: float | None = None
+    error: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class LinkMonitorSamplesResponse(BaseModel):
+    monitor: LinkMonitorRead
+    summary: LinkMonitorSummary | None
+    samples: list[LinkMonitorSampleRead]
+
+
+class AgentLinkMonitorRead(BaseModel):
+    id: int
+    target_host: str
+    timeout_seconds: float
+
+
+class AgentLinkMonitorPollResponse(BaseModel):
+    monitors: list[AgentLinkMonitorRead]
+
+
+class AgentLinkMonitorResultItem(BaseModel):
+    monitor_id: int
+    checked_at: datetime | None = None
+    success: bool
+    latency_ms: float | None = None
+    error: str | None = None
+
+
+class AgentLinkMonitorResultRequest(BaseModel):
+    node_id: int
+    token: str
+    results: list[AgentLinkMonitorResultItem]
+
+
 class InterfaceRead(BaseModel):
     id: int
     node_id: int
@@ -220,6 +326,7 @@ class InterfaceRead(BaseModel):
     primary_peer_endpoint_host: str | None = None
     primary_peer_endpoint_port: int | None = None
     primary_peer_allowed_ips: list[str] = Field(default_factory=list)
+    monitor_summary: LinkMonitorSummary | None = None
     warnings: list[str]
 
     model_config = {"from_attributes": True}

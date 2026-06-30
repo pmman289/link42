@@ -531,6 +531,7 @@ textarea {
 .configRow {
   border: 1px solid #dbe2e7;
   border-radius: 8px;
+  gap: 12px;
 }
 
 .configRow:not(:disabled):hover {
@@ -572,6 +573,105 @@ textarea {
   border-color: #9cc8a8;
   background: #eef8f1;
   color: #25633a;
+}
+
+.configRowMetrics {
+  display: inline-flex !important;
+  grid-auto-flow: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: fit-content;
+}
+
+.monitorSummary {
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(54px, auto);
+  gap: 6px;
+  min-height: 34px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border-color: #cbd5dc;
+  background: #f7f8f9;
+  color: #53636d;
+}
+
+.monitorSummary span {
+  display: grid;
+  gap: 0;
+  text-align: center;
+}
+
+.monitorSummary strong {
+  font-size: 12px;
+  line-height: 1.1;
+}
+
+.monitorSummary small {
+  font-size: 10px;
+  color: currentColor;
+  opacity: 0.76;
+}
+
+.monitorSummary.healthy {
+  border-color: #9cc8a8;
+  background: #eef8f1;
+  color: #25633a;
+}
+
+.monitorSummary.warning {
+  border-color: #d8c27d;
+  background: #fff8df;
+  color: #806414;
+}
+
+.monitorSummary.critical {
+  border-color: #ddb0ad;
+  background: #fff0ef;
+  color: #963b35;
+}
+
+.monitorModal {
+  width: min(1120px, 100%);
+}
+
+.monitorToolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.monitorStats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.monitorStats span {
+  display: grid;
+  gap: 3px;
+  border: 1px solid #dbe2e7;
+  border-radius: 8px;
+  background: #f8fafb;
+  padding: 10px;
+}
+
+.monitorStats strong {
+  font-size: 18px;
+}
+
+.monitorStats small {
+  color: #667781;
+}
+
+.monitorChart {
+  border: 1px solid #dbe2e7;
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px 4px 4px;
 }
 
 .peerList {
@@ -756,6 +856,20 @@ textarea {
 
   .connectionActions {
     grid-template-columns: 1fr;
+  }
+
+  .configRow {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .configRowMetrics,
+  .monitorSummary {
+    width: 100%;
+  }
+
+  .monitorStats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .modalBackdrop {

@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from link42_common.connection_types import TASK_REQUIREMENTS, WIREGUARD_TASKS
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from link42_common.security import generate_token, hash_token, verify_token
@@ -54,6 +54,7 @@ SETTING_ADMIN_USERNAME = "admin_username"
 SETTING_ADMIN_PASSWORD_HASH = "admin_password_hash"
 SETTING_ADMIN_SESSION_HASH = "admin_session_hash"
 SETTING_CONTROLLER_URL = "controller_url"
+MONITOR_SUMMARY_WINDOW = timedelta(hours=1)
 
 def mount_web_panel() -> None:
     """按配置挂载前端静态文件，让主控镜像可以单端口运行。"""
@@ -699,6 +700,135 @@ def get_wireguard_config_or_404(config_id: int, db: Session) -> models.WireGuard
     if config is None:
         raise HTTPException(status_code=404, detail="wireguard config not found")
     return config
+
+
+def parse_monitor_window(value: str | None) -> timedelta:
+    """解析前端图表窗口参数。"""
+
+    mapping = {
+        "1h": timedelta(hours=1),
+        "6h": timedelta(hours=6),
+        "1d": timedelta(days=1),
+        "7d": timedelta(days=7),
+        "30d": timedelta(days=30),
+    }
+    return mapping.get(value or "1h", timedelta(hours=1))
+
+
+def monitor_status(latency_ms: float | None, packet_loss: float, stability_score: int, sample_count: int) -> str:
+    """把监测指标归类为前端颜色状态。"""
+
+    if sample_count == 0:
+        return "unknown"
+    if packet_loss > 0.05 or stability_score < 70 or (latency_ms is not None and latency_ms > 180):
+        return "critical"
+    if packet_loss > 0.01 or stability_score < 90 or (latency_ms is not None and latency_ms > 80):
+        return "warning"
+    return "healthy"
+
+
+def summarize_monitor(
+    db: Session,
+    monitor: models.LinkMonitor,
+    window: timedelta = MONITOR_SUMMARY_WINDOW,
+) -> schemas.LinkMonitorSummary:
+    """基于最近窗口样本计算链路摘要。"""
+
+    since = datetime.utcnow() - window
+    samples = list(
+        db.scalars(
+            select(models.LinkMonitorSample)
+            .where(models.LinkMonitorSample.monitor_id == monitor.id, models.LinkMonitorSample.checked_at >= since)
+            .order_by(models.LinkMonitorSample.checked_at)
+        )
+    )
+    sample_count = len(samples)
+    if not samples:
+        return schemas.LinkMonitorSummary(
+            monitor_id=monitor.id,
+            target_host=monitor.target_host,
+            packet_loss=0,
+            stability_score=0,
+            status="unknown",
+            sample_count=0,
+            last_checked_at=monitor.last_checked_at,
+        )
+    successes = [sample for sample in samples if sample.success and sample.latency_ms is not None]
+    latencies = [float(sample.latency_ms) for sample in successes if sample.latency_ms is not None]
+    packet_loss = (sample_count - len(successes)) / sample_count
+    avg_latency = sum(latencies) / len(latencies) if latencies else None
+    min_latency = min(latencies) if latencies else None
+    max_latency = max(latencies) if latencies else None
+    jitter = (
+        sum(abs(current - previous) for previous, current in zip(latencies, latencies[1:])) / (len(latencies) - 1)
+        if len(latencies) > 1
+        else 0.0 if latencies else None
+    )
+    last_sample = samples[-1]
+    last_latency = float(last_sample.latency_ms) if last_sample.success and last_sample.latency_ms is not None else None
+    latency_penalty = min((avg_latency or 0) / 20, 20)
+    jitter_penalty = min((jitter or 0) / 5, 20)
+    stability = max(0, min(100, round(100 - packet_loss * 100 - latency_penalty - jitter_penalty)))
+    return schemas.LinkMonitorSummary(
+        monitor_id=monitor.id,
+        target_host=monitor.target_host,
+        last_latency_ms=last_latency,
+        avg_latency_ms=avg_latency,
+        min_latency_ms=min_latency,
+        max_latency_ms=max_latency,
+        jitter_ms=jitter,
+        packet_loss=packet_loss,
+        stability_score=stability,
+        status=monitor_status(last_latency, packet_loss, stability, sample_count),
+        sample_count=sample_count,
+        last_checked_at=last_sample.checked_at,
+    )
+
+
+def interface_monitor(db: Session, interface_id: int) -> models.LinkMonitor | None:
+    """读取配置绑定的第一个链路监测目标。"""
+
+    return db.scalar(
+        select(models.LinkMonitor)
+        .where(models.LinkMonitor.interface_id == interface_id)
+        .order_by(models.LinkMonitor.id)
+        .limit(1)
+    )
+
+
+def interface_read(db: Session, interface: models.WireGuardInterface) -> schemas.InterfaceRead:
+    """把 WireGuard 配置转成带监测摘要的响应。"""
+
+    result = schemas.InterfaceRead.model_validate(interface)
+    monitor = interface_monitor(db, interface.id)
+    result.monitor_summary = summarize_monitor(db, monitor) if monitor else None
+    return result
+
+
+def monitor_read(db: Session, monitor: models.LinkMonitor, window: timedelta = MONITOR_SUMMARY_WINDOW) -> schemas.LinkMonitorRead:
+    """把监测目标转成带摘要的响应。"""
+
+    result = schemas.LinkMonitorRead.model_validate(monitor)
+    result.summary = summarize_monitor(db, monitor, window)
+    return result
+
+
+def suggested_monitor_target(interface: models.WireGuardInterface) -> str:
+    """根据对端 AllowedIPs 和隧道地址推断默认监测 IP。"""
+
+    values = []
+    for peer in interface.peers or []:
+        values.extend(peer.allowed_ips or [])
+    values.extend(interface.primary_peer_allowed_ips)
+    for value in values:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            continue
+        if network.num_addresses == 1:
+            return str(network.network_address)
+        return str(network.network_address + 1)
+    return ""
 
 
 def ensure_unique_interface_name(
@@ -1506,9 +1636,9 @@ def create_managed_link(
 
 @app.get("/api/nodes/{node_id}/wireguard/interfaces", response_model=list[schemas.InterfaceRead])
 @app.get("/api/nodes/{node_id}/wireguard/configs", response_model=list[schemas.InterfaceRead])
-def list_interfaces(node_id: int, db: Session = Depends(get_db)) -> list[models.WireGuardInterface]:
+def list_interfaces(node_id: int, db: Session = Depends(get_db)) -> list[schemas.InterfaceRead]:
     """列出指定节点上的 WireGuard 点对点配置。"""
-    return list(
+    interfaces = list(
         db.scalars(
             select(models.WireGuardInterface)
             .options(selectinload(models.WireGuardInterface.peers))
@@ -1516,11 +1646,12 @@ def list_interfaces(node_id: int, db: Session = Depends(get_db)) -> list[models.
             .order_by(models.WireGuardInterface.name)
         )
     )
+    return [interface_read(db, interface) for interface in interfaces]
 
 
 @app.get("/api/wireguard/interfaces/{interface_id}", response_model=schemas.InterfaceRead)
 @app.get("/api/wireguard/configs/{interface_id}", response_model=schemas.InterfaceRead)
-def get_interface(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
+def get_interface(interface_id: int, db: Session = Depends(get_db)) -> schemas.InterfaceRead:
     """读取单个 WireGuard 点对点配置。"""
     interface = db.scalar(
         select(models.WireGuardInterface)
@@ -1529,7 +1660,122 @@ def get_interface(interface_id: int, db: Session = Depends(get_db)) -> models.Wi
     )
     if interface is None:
         raise HTTPException(status_code=404, detail="interface not found")
-    return interface
+    return interface_read(db, interface)
+
+
+@app.get("/api/wireguard/configs/{interface_id}/link-monitor", response_model=schemas.LinkMonitorRead | None)
+def get_interface_link_monitor(interface_id: int, db: Session = Depends(get_db)) -> schemas.LinkMonitorRead | None:
+    """读取配置绑定的链路监测目标。"""
+
+    get_wireguard_config_or_404(interface_id, db)
+    monitor = interface_monitor(db, interface_id)
+    return monitor_read(db, monitor) if monitor else None
+
+
+@app.post("/api/wireguard/configs/{interface_id}/link-monitor", response_model=schemas.LinkMonitorRead)
+def upsert_interface_link_monitor(
+    interface_id: int,
+    payload: schemas.LinkMonitorCreate,
+    db: Session = Depends(get_db),
+) -> schemas.LinkMonitorRead:
+    """创建或覆盖配置的链路监测目标。"""
+
+    interface = db.scalar(
+        select(models.WireGuardInterface)
+        .options(selectinload(models.WireGuardInterface.peers))
+        .where(models.WireGuardInterface.id == interface_id)
+    )
+    if interface is None:
+        raise HTTPException(status_code=404, detail="interface not found")
+    require_online_node(db, interface.node_id)
+    monitor = interface_monitor(db, interface_id)
+    now = datetime.utcnow()
+    name = (payload.name or f"{interface.name} latency").strip()
+    if monitor is None:
+        monitor = models.LinkMonitor(
+            node_id=interface.node_id,
+            interface_id=interface.id,
+            name=name,
+            target_host=payload.target_host,
+            interval_seconds=payload.interval_seconds,
+            retention_days=payload.retention_days,
+            enabled=payload.enabled,
+            next_due_at=now if payload.enabled else None,
+        )
+        db.add(monitor)
+    else:
+        monitor.name = name
+        monitor.target_host = payload.target_host
+        monitor.interval_seconds = payload.interval_seconds
+        monitor.retention_days = payload.retention_days
+        monitor.enabled = payload.enabled
+        monitor.next_due_at = now if payload.enabled else None
+    db.commit()
+    db.refresh(monitor)
+    return monitor_read(db, monitor)
+
+
+@app.patch("/api/link-monitors/{monitor_id}", response_model=schemas.LinkMonitorRead)
+def update_link_monitor(
+    monitor_id: int,
+    payload: schemas.LinkMonitorUpdate,
+    db: Session = Depends(get_db),
+) -> schemas.LinkMonitorRead:
+    """修改链路监测目标。"""
+
+    monitor = db.get(models.LinkMonitor, monitor_id)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="link monitor not found")
+    require_online_node(db, monitor.node_id)
+    monitor.name = (payload.name or monitor.name).strip()
+    monitor.target_host = payload.target_host
+    monitor.interval_seconds = payload.interval_seconds
+    monitor.retention_days = payload.retention_days
+    monitor.enabled = payload.enabled
+    monitor.next_due_at = datetime.utcnow() if payload.enabled else None
+    db.commit()
+    db.refresh(monitor)
+    return monitor_read(db, monitor)
+
+
+@app.delete("/api/link-monitors/{monitor_id}")
+def delete_link_monitor(monitor_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+    """删除链路监测目标及历史样本。"""
+
+    monitor = db.get(models.LinkMonitor, monitor_id)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="link monitor not found")
+    db.delete(monitor)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.get("/api/link-monitors/{monitor_id}/samples", response_model=schemas.LinkMonitorSamplesResponse)
+def get_link_monitor_samples(
+    monitor_id: int,
+    window: str | None = "1h",
+    db: Session = Depends(get_db),
+) -> schemas.LinkMonitorSamplesResponse:
+    """读取链路监测历史样本，用于前端绘图。"""
+
+    monitor = db.get(models.LinkMonitor, monitor_id)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="link monitor not found")
+    parsed_window = parse_monitor_window(window)
+    since = datetime.utcnow() - parsed_window
+    samples = list(
+        db.scalars(
+            select(models.LinkMonitorSample)
+            .where(models.LinkMonitorSample.monitor_id == monitor_id, models.LinkMonitorSample.checked_at >= since)
+            .order_by(models.LinkMonitorSample.checked_at)
+        )
+    )
+    summary = summarize_monitor(db, monitor, parsed_window)
+    return schemas.LinkMonitorSamplesResponse(
+        monitor=monitor_read(db, monitor, parsed_window),
+        summary=summary,
+        samples=[schemas.LinkMonitorSampleRead.model_validate(sample) for sample in samples],
+    )
 
 
 @app.get("/api/wireguard/configs/{interface_id}/managed-link", response_model=schemas.ManagedLinkRead)
@@ -2349,6 +2595,80 @@ def agent_task_result(
             elif task.type == driver.tasks.status:
                 interface.runtime_status = payload.result.get("runtime_status") or interface.runtime_status
 
+    db.commit()
+    return {"status": "recorded"}
+
+
+@app.post("/api/agent/link-monitors/poll", response_model=schemas.AgentLinkMonitorPollResponse)
+def agent_link_monitor_poll(
+    payload: schemas.AgentPollRequest,
+    db: Session = Depends(get_db),
+) -> schemas.AgentLinkMonitorPollResponse:
+    """Agent 拉取当前到期的链路监测目标。"""
+
+    node = require_agent(db, payload.node_id, payload.token)
+    update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
+    now = datetime.utcnow()
+    monitors = list(
+        db.scalars(
+            select(models.LinkMonitor)
+            .where(
+                models.LinkMonitor.node_id == payload.node_id,
+                models.LinkMonitor.enabled.is_(True),
+                or_(models.LinkMonitor.next_due_at.is_(None), models.LinkMonitor.next_due_at <= now),
+            )
+            .order_by(models.LinkMonitor.id)
+            .limit(10)
+        )
+    )
+    for monitor in monitors:
+        monitor.next_due_at = now + timedelta(seconds=monitor.interval_seconds)
+    node.status = "online"
+    node.last_seen_at = now
+    db.commit()
+    return schemas.AgentLinkMonitorPollResponse(
+        monitors=[
+            schemas.AgentLinkMonitorRead(
+                id=monitor.id,
+                target_host=monitor.target_host,
+                timeout_seconds=max(1.0, min(3.0, float(monitor.interval_seconds) * 0.8)),
+            )
+            for monitor in monitors
+        ]
+    )
+
+
+@app.post("/api/agent/link-monitors/result")
+def agent_link_monitor_result(
+    payload: schemas.AgentLinkMonitorResultRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    """Agent 上报链路监测结果。"""
+
+    require_agent(db, payload.node_id, payload.token)
+    now = datetime.utcnow()
+    for item in payload.results:
+        monitor = db.get(models.LinkMonitor, item.monitor_id)
+        if monitor is None or monitor.node_id != payload.node_id:
+            continue
+        checked_at = item.checked_at or now
+        db.add(
+            models.LinkMonitorSample(
+                monitor_id=monitor.id,
+                checked_at=checked_at,
+                success=item.success,
+                latency_ms=item.latency_ms if item.success else None,
+                error=item.error,
+            )
+        )
+        monitor.last_checked_at = checked_at
+        cutoff = now - timedelta(days=monitor.retention_days)
+        db.execute(
+            delete(models.LinkMonitorSample).where(
+                models.LinkMonitorSample.monitor_id == monitor.id,
+                models.LinkMonitorSample.checked_at < cutoff,
+            )
+        )
     db.commit()
     return {"status": "recorded"}
 

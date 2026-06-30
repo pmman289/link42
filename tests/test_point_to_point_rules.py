@@ -24,6 +24,8 @@ from link42_api.main import (
     delete_managed_link,
     delete_node,
     agent_poll,
+    agent_link_monitor_poll,
+    agent_link_monitor_result,
     agent_register,
     agent_task_result,
     build_agent_upgrade_plan,
@@ -61,7 +63,10 @@ from link42_api.schemas import (
     PeerCreate,
     AgentPollRequest,
     AgentRegisterRequest,
+    AgentLinkMonitorResultItem,
+    AgentLinkMonitorResultRequest,
     AgentUpgradeRequest,
+    LinkMonitorCreate,
     Udp2RawMiddlewareConfig,
 )
 from link42_common.security import hash_token, verify_token
@@ -1213,6 +1218,81 @@ def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeyp
     assert node.agent_version == "0.1.0"
     assert node.agent_capabilities == ["service:systemd", "wg_quick_import", "wireguard"]
     assert [task.type for task in response.tasks] == ["wireguard.import_scan"]
+
+
+def test_link_monitor_agent_poll_and_result_updates_summary(monkeypatch) -> None:
+    """验证链路监测目标会被 Agent 拉取、上报并生成摘要。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+    monkeypatch.setattr(api_main, "refresh_node_runtime_status", lambda node: None)
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        session.add(node)
+        session.flush()
+        interface = models.WireGuardInterface(
+            node_id=node.id,
+            name="wg0",
+            tunnel_ips=["10.42.0.1/32"],
+            runtime_status="running",
+        )
+        session.add(interface)
+        session.commit()
+
+        monitor = api_main.upsert_interface_link_monitor(
+            interface.id,
+            LinkMonitorCreate(target_host="10.42.0.2", interval_seconds=10, retention_days=7, enabled=True),
+            session,
+        )
+        poll = agent_link_monitor_poll(AgentPollRequest(node_id=node.id, token="token"), session)
+        assert [item.id for item in poll.monitors] == [monitor.id]
+
+        agent_link_monitor_result(
+            AgentLinkMonitorResultRequest(
+                node_id=node.id,
+                token="token",
+                results=[
+                    AgentLinkMonitorResultItem(monitor_id=monitor.id, success=True, latency_ms=21.5),
+                    AgentLinkMonitorResultItem(monitor_id=monitor.id, success=False, error="timeout"),
+                ],
+            ),
+            session,
+        )
+        summary = api_main.summarize_monitor(session, session.get(models.LinkMonitor, monitor.id))
+        listed = api_main.list_interfaces(node.id, session)
+
+    assert summary.sample_count == 2
+    assert summary.last_latency_ms is None
+    assert summary.packet_loss == 0.5
+    assert listed[0].monitor_summary is not None
+    assert listed[0].monitor_summary.monitor_id == monitor.id
+
+
+def test_sqlite_migration_creates_link_monitor_tables(monkeypatch, tmp_path) -> None:
+    """验证旧 SQLite 启动迁移会补齐链路监测表。"""
+
+    import link42_api.database as database
+
+    db_path = tmp_path / "old.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE nodes (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(80) NOT NULL)"))
+
+    monkeypatch.setattr(database, "engine", engine)
+    database.ensure_sqlite_point_to_point_constraints()
+
+    with engine.begin() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type = 'table'")).fetchall()
+        }
+
+    assert "link_monitors" in tables
+    assert "link_monitor_samples" in tables
 
 
 def test_import_scan_request_rejects_openwrt_uci_node(monkeypatch) -> None:

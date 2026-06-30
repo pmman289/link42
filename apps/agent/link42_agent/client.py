@@ -71,6 +71,17 @@ class AgentClient:
         payload = {**self.auth_payload(), "status": status, "result": result}
         self._post_json(f"/api/agent/tasks/{task_id}/result", payload)
 
+    def poll_link_monitors(self, capabilities: Optional[list[str]] = None, platform: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+        """拉取到期的链路监测目标。"""
+
+        payload = {**self.auth_payload(), **self.agent_payload(capabilities, platform)}
+        return self._post_json("/api/agent/link-monitors/poll", payload)["monitors"]
+
+    def report_link_monitor_results(self, results: list[dict[str, Any]]) -> None:
+        """上报链路监测结果。"""
+
+        self._post_json("/api/agent/link-monitors/result", {**self.auth_payload(), "results": results})
+
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
         http_request = request.Request(

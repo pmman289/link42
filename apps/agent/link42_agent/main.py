@@ -10,6 +10,7 @@ from link42_common.version import AGENT_VERSION
 from .client import AgentClient, AgentHttpError
 from .config import AgentConfig
 from .config import load_config_from_env
+from .link_monitor import probe_latency
 from .system import (
     get_agent_platform,
     get_hostname,
@@ -24,6 +25,7 @@ def build_capabilities() -> list[str]:
     service_manager = get_service_manager_name()
     capabilities = [
         "wireguard",
+        "link.monitor",
         f"service:{service_manager}",
     ]
     if service_manager != "openwrt-uci":
@@ -78,6 +80,13 @@ def run_once(client: AgentClient, config: Union[AgentConfig, str]) -> None:
                 "failed",
                 {"error": str(exc), "traceback": traceback.format_exc()},
             )
+    if hasattr(client, "poll_link_monitors") and hasattr(client, "report_link_monitor_results"):
+        monitor_results = []
+        for monitor in client.poll_link_monitors(capabilities, platform):
+            probe = probe_latency(monitor["target_host"], float(monitor.get("timeout_seconds") or 2))
+            monitor_results.append({"monitor_id": monitor["id"], **probe})
+        if monitor_results:
+            client.report_link_monitor_results(monitor_results)
 
 
 def main() -> None:

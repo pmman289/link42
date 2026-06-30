@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -91,6 +91,10 @@ class WireGuardInterface(TimestampMixin, Base):
         back_populates="interface",
         cascade="all, delete-orphan",
         foreign_keys="WireGuardPeer.interface_id",
+    )
+    link_monitors: Mapped[list[LinkMonitor]] = relationship(
+        back_populates="interface",
+        cascade="all, delete-orphan",
     )
 
     @property
@@ -235,6 +239,44 @@ class AgentTask(TimestampMixin, Base):
 
     node: Mapped[Node] = relationship(back_populates="tasks")
     change_plan: Mapped[ChangePlan | None] = relationship(back_populates="tasks")
+
+
+class LinkMonitor(TimestampMixin, Base):
+    """从节点本机发起的链路延迟监测目标。"""
+
+    __tablename__ = "link_monitors"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
+    interface_id: Mapped[int | None] = mapped_column(ForeignKey("wg_interfaces.id"), index=True, nullable=True)
+    name: Mapped[str] = mapped_column(String(80))
+    target_host: Mapped[str] = mapped_column(String(255))
+    interval_seconds: Mapped[int] = mapped_column(Integer, default=10)
+    retention_days: Mapped[int] = mapped_column(Integer, default=7)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    interface: Mapped[WireGuardInterface | None] = relationship(back_populates="link_monitors")
+    samples: Mapped[list[LinkMonitorSample]] = relationship(
+        back_populates="monitor",
+        cascade="all, delete-orphan",
+    )
+
+
+class LinkMonitorSample(Base):
+    """单次链路探测结果。"""
+
+    __tablename__ = "link_monitor_samples"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    monitor_id: Mapped[int] = mapped_column(ForeignKey("link_monitors.id"), index=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    success: Mapped[bool] = mapped_column(Boolean)
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    monitor: Mapped[LinkMonitor] = relationship(back_populates="samples")
 
 
 class SystemSetting(TimestampMixin, Base):

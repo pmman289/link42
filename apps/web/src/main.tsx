@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Check, ChevronDown, ChevronRight, GitBranch, LogOut, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
+import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
 import "./styles.css";
@@ -41,7 +42,50 @@ type ConfigItem = {
   primary_peer_endpoint_host: string | null;
   primary_peer_endpoint_port: number | null;
   primary_peer_allowed_ips: string[];
+  monitor_summary: LinkMonitorSummary | null;
   warnings: string[];
+};
+
+type LinkMonitorSummary = {
+  monitor_id: number;
+  target_host: string;
+  last_latency_ms: number | null;
+  avg_latency_ms: number | null;
+  min_latency_ms: number | null;
+  max_latency_ms: number | null;
+  jitter_ms: number | null;
+  packet_loss: number;
+  stability_score: number;
+  status: "healthy" | "warning" | "critical" | "unknown";
+  sample_count: number;
+  last_checked_at: string | null;
+};
+
+type LinkMonitor = {
+  id: number;
+  node_id: number;
+  interface_id: number | null;
+  name: string;
+  target_host: string;
+  interval_seconds: number;
+  retention_days: number;
+  enabled: boolean;
+  next_due_at: string | null;
+  last_checked_at: string | null;
+  summary: LinkMonitorSummary | null;
+};
+
+type LinkMonitorSample = {
+  checked_at: string;
+  success: boolean;
+  latency_ms: number | null;
+  error: string | null;
+};
+
+type LinkMonitorSamplesResponse = {
+  monitor: LinkMonitor;
+  summary: LinkMonitorSummary | null;
+  samples: LinkMonitorSample[];
 };
 
 type PeerItem = {
@@ -314,6 +358,33 @@ function statusLabel(status: string): string {
   return labels[status] || status;
 }
 
+function monitorTone(status: string | undefined) {
+  if (status === "healthy") return "healthy";
+  if (status === "warning") return "warning";
+  if (status === "critical") return "critical";
+  return "unknown";
+}
+
+function formatLatency(value: number | null | undefined) {
+  return typeof value === "number" ? `${Math.round(value)}ms` : "--";
+}
+
+function formatLoss(value: number | null | undefined) {
+  return typeof value === "number" ? `${(value * 100).toFixed(value > 0.01 ? 1 : 0)}%` : "--";
+}
+
+function firstIpFromCidrs(values: string[]) {
+  for (const value of values) {
+    const text = value.split("/")[0]?.trim();
+    if (text && isProbablyIpAddress(text)) return text;
+  }
+  return "";
+}
+
+function suggestedMonitorTarget(config: ConfigItem, peer: PeerItem | null) {
+  return firstIpFromCidrs(peer?.allowed_ips || []) || firstIpFromCidrs(config.primary_peer_allowed_ips || []) || "";
+}
+
 function isValidPort(value: number | null): boolean {
   // UDP 端口范围校验，空值表示不填写。
   return value === null || (Number.isInteger(value) && value >= 1 && value <= 65535);
@@ -334,6 +405,41 @@ function isProbablyIpAddress(value: string): boolean {
 function isValidCidrs(values: string[]): boolean {
   // 用浏览器内置 URL/IP 能力不足，这里做轻量 CIDR 形态校验，后续可替换为严格解析器。
   return values.every((value) => /^([0-9a-fA-F:.]+)\/\d{1,3}$/.test(value));
+}
+
+function MonitorSummaryButton({
+  summary,
+  onClick,
+}: {
+  summary: LinkMonitorSummary | null;
+  onClick: (event: React.MouseEvent<HTMLSpanElement>) => void;
+}) {
+  const tone = monitorTone(summary?.status);
+  return (
+    <span
+      className={`monitorSummary ${tone}`}
+      role="button"
+      tabIndex={0}
+      onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick(event as unknown as React.MouseEvent<HTMLSpanElement>);
+        }
+      }}
+      title="查看链路延迟统计"
+    >
+      {summary ? (
+        <>
+          <span><strong>{formatLatency(summary.last_latency_ms)}</strong><small>延迟</small></span>
+          <span><strong>{formatLoss(summary.packet_loss)}</strong><small>丢包</small></span>
+          <span><strong>{summary.stability_score}</strong><small>稳定</small></span>
+        </>
+      ) : (
+        <span><strong>未监测</strong><small>点击配置</small></span>
+      )}
+    </span>
+  );
 }
 
 function isProbablyWireGuardKey(value: FormDataEntryValue | null): boolean {
@@ -543,7 +649,7 @@ function RouteModeSelect({
   disabled?: boolean;
 }) {
   return (
-    <select name="table_name" defaultValue={defaultValue || ""} disabled={disabled}>
+    <select name="table_name" defaultValue={defaultValue ?? "off"} disabled={disabled}>
       <option value="">自动生成路由（默认）</option>
       <option value="off">不自动生成路由（Table=off）</option>
     </select>
@@ -637,7 +743,7 @@ function Udp2RawFields({
           <Field label="client 本地监听地址" hint="WireGuard Endpoint 会被接管到这个本地 UDP 地址。">
             <input name="udp2raw_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} />
           </Field>
-          <Field label="client 本地监听端口" hint="WireGuard 把 UDP 发到这里，再由 udp2raw 封装发往 server。">
+          <Field label="client 本地监听端口" hint="填写本节点 WireGuard 连接对端接口时要使用的本地 udp2raw UDP 端口；本端 Peer Endpoint 会被接管到 127.0.0.1:此端口。">
             <input name="udp2raw_client_listen_port" defaultValue={defaults?.client_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
           <Field label="传输模式" hint="faketcp 伪装性更强；udp 更直接；icmp 仅在明确需要时使用。">
@@ -758,10 +864,14 @@ function App() {
   const [forceEndpointMismatch, setForceEndpointMismatch] = useState(false);
   const [udp2rawEnabled, setUdp2rawEnabled] = useState(false);
   const [udp2rawServerSide, setUdp2rawServerSide] = useState<"local" | "peer">("peer");
+  const [managedCreateMtu, setManagedCreateMtu] = useState("1420");
   const [peerNodeConfigs, setPeerNodeConfigs] = useState<ConfigItem[]>([]);
   const [importCandidatesExpanded, setImportCandidatesExpanded] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deleteNodeConfig, setDeleteNodeConfig] = useState(false);
+  const [monitorDialogConfigId, setMonitorDialogConfigId] = useState<number | null>(null);
+  const [monitorWindow, setMonitorWindow] = useState("1h");
+  const [monitorDetail, setMonitorDetail] = useState<LinkMonitorSamplesResponse | null>(null);
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) || null,
     [nodes, selectedNodeId],
@@ -769,6 +879,10 @@ function App() {
   const selectedConfig = useMemo(
     () => configs.find((item) => item.id === selectedConfigId) || null,
     [configs, selectedConfigId],
+  );
+  const monitorDialogConfig = useMemo(
+    () => configs.find((item) => item.id === monitorDialogConfigId) || null,
+    [configs, monitorDialogConfigId],
   );
   const selectedNodeOnline = selectedNode ? isNodeSelectable(selectedNode) : false;
   const editingNode = useMemo(
@@ -839,6 +953,26 @@ function App() {
     }, type === "error" ? 6000 : 3800);
   }
 
+  function resetManagedLinkDraft(overrides: { replaceLocalConfigId?: number | null } = {}) {
+    setManagedPeerNodeId(null);
+    setReplaceLocalConfigId(overrides.replaceLocalConfigId ?? null);
+    setReplacePeerConfigId(null);
+    setForceEndpointMismatch(false);
+    setUdp2rawEnabled(false);
+    setUdp2rawServerSide("peer");
+    setManagedCreateMtu("1420");
+  }
+
+  function closeCreateDialog() {
+    setCreateDialog(null);
+    resetManagedLinkDraft();
+  }
+
+  function openManagedCreateDialog(overrides: { replaceLocalConfigId?: number | null } = {}) {
+    resetManagedLinkDraft(overrides);
+    setCreateDialog("managed");
+  }
+
   function clearAuthenticatedState() {
     window.localStorage.removeItem(AUTH_TOKEN_KEY);
     setAuthToken("");
@@ -861,8 +995,11 @@ function App() {
     setForceEndpointMismatch(false);
     setUdp2rawEnabled(false);
     setUdp2rawServerSide("peer");
+    setManagedCreateMtu("1420");
     setPeerNodeConfigs([]);
     setSettingsOpen(false);
+    setMonitorDialogConfigId(null);
+    setMonitorDetail(null);
   }
 
   async function runAction(action: () => Promise<void>) {
@@ -965,6 +1102,42 @@ function App() {
     setManagedLink(data);
   }
 
+  async function refreshMonitorDetail(configId: number, windowValue = monitorWindow) {
+    const monitor = await api<LinkMonitor | null>(`/api/wireguard/configs/${configId}/link-monitor`);
+    if (!monitor) {
+      setMonitorDetail(null);
+      return;
+    }
+    const detail = await api<LinkMonitorSamplesResponse>(`/api/link-monitors/${monitor.id}/samples?window=${encodeURIComponent(windowValue)}`);
+    setMonitorDetail(detail);
+  }
+
+  async function saveLinkMonitor(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!monitorDialogConfig || !selectedNodeId) return;
+    const form = new FormData(event.currentTarget);
+    await api<LinkMonitor>(`/api/wireguard/configs/${monitorDialogConfig.id}/link-monitor`, {
+      method: "POST",
+      body: JSON.stringify({
+        target_host: String(form.get("target_host") || "").trim(),
+        interval_seconds: optionalInt(form.get("interval_seconds")) ?? 10,
+        retention_days: optionalInt(form.get("retention_days")) ?? 7,
+        enabled: form.get("enabled") === "on",
+      }),
+    });
+    await refreshMonitorDetail(monitorDialogConfig.id);
+    await refreshConfigs(selectedNodeId, selectedConfigId);
+    notify("success", "链路监测已保存。");
+  }
+
+  async function deleteLinkMonitor() {
+    if (!monitorDetail || !monitorDialogConfig || !selectedNodeId) return;
+    await api<{ status: string }>(`/api/link-monitors/${monitorDetail.monitor.id}`, { method: "DELETE" });
+    setMonitorDetail(null);
+    await refreshConfigs(selectedNodeId, selectedConfigId);
+    notify("success", "链路监测已删除。");
+  }
+
   async function refreshImportCandidates(nodeId: number) {
     // 刷新当前节点的 wg-quick 导入候选。
     const data = await api<ImportCandidate[]>(`/api/nodes/${nodeId}/wireguard/import-candidates`);
@@ -1065,6 +1238,16 @@ function App() {
     setUdp2rawEnabled(Boolean(managedLink.middleware.enabled));
     setUdp2rawServerSide(managedLink.middleware.server_side || "peer");
   }, [managedLink?.middleware]);
+
+  useEffect(() => {
+    if (!monitorDialogConfigId) return;
+    refreshMonitorDetail(monitorDialogConfigId, monitorWindow).catch((error) => notify("error", error.message));
+  }, [monitorDialogConfigId, monitorWindow]);
+
+  useEffect(() => {
+    if (createDialog !== "managed" || udp2rawEnabled) return;
+    setManagedCreateMtu(String(replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420));
+  }, [createDialog, replaceLocalConfig?.mtu, replacePeerConfig?.mtu, udp2rawEnabled]);
 
   useEffect(() => {
     if (!selectedNodeId || !selectedConfigId || !selectedNodeOnline) return;
@@ -2056,13 +2239,7 @@ function App() {
               </div>
               <button
                 className="iconButton"
-                onClick={() => {
-                  setCreateDialog(null);
-                  setManagedPeerNodeId(null);
-                  setReplaceLocalConfigId(null);
-                  setReplacePeerConfigId(null);
-                  setForceEndpointMismatch(false);
-                }}
+                onClick={closeCreateDialog}
               >
                 <X size={18} />
               </button>
@@ -2204,15 +2381,25 @@ function App() {
                 localListenPort={replaceLocalConfig?.listen_port}
                 peerListenPort={replacePeerConfig?.listen_port}
                 disabled={!selectedNodeOnline}
-                onEnabledChange={setUdp2rawEnabled}
+                onEnabledChange={(enabled) => {
+                  setUdp2rawEnabled(enabled);
+                  if (enabled) setManagedCreateMtu("1300");
+                }}
                 onServerSideChange={setUdp2rawServerSide}
               />
               <FormSection title="链路参数" hint="Table=off 是 DN42 常用默认值；启用中间层时 MTU 默认降到 1300，但仍可手动调整。">
               <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
-                <input name="mtu" placeholder="1420" defaultValue={replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
+                <input
+                  name="mtu"
+                  placeholder="1420"
+                  value={managedCreateMtu}
+                  onChange={(event) => setManagedCreateMtu(event.currentTarget.value)}
+                  inputMode="numeric"
+                  disabled={!selectedNodeOnline}
+                />
               </Field>
               <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
-                <RouteModeSelect defaultValue={replaceLocalConfig?.table_name || replacePeerConfig?.table_name || ""} disabled={!selectedNodeOnline} />
+                <RouteModeSelect defaultValue={replaceLocalConfig?.table_name || replacePeerConfig?.table_name || "off"} disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
               <FormSection title="高级配置" hint="这些内容会原样追加到对应的 [Interface] 或 [Peer] 区块，请只填写 WireGuard 支持的配置行。">
@@ -2310,13 +2497,7 @@ function App() {
                         <button
                           type="button"
                           disabled={!selectedNodeOnline || nodes.filter((item) => item.id !== node.id && isNodeSelectable(item)).length === 0}
-                          onClick={() => {
-                            setManagedPeerNodeId(null);
-                            setReplaceLocalConfigId(null);
-                            setReplacePeerConfigId(null);
-                            setForceEndpointMismatch(false);
-                            setCreateDialog("managed");
-                          }}
+                          onClick={() => openManagedCreateDialog()}
                         >
                           <GitBranch size={16} /> 创建受管连接
                         </button>
@@ -2385,8 +2566,18 @@ function App() {
                               <strong>{item.name}</strong>
                               <small>{item.source}{item.managed ? " / managed" : " / unmanaged"}</small>
                             </span>
-                            <span className={`statusBadge ${item.runtime_status === "running" ? "online" : ""}`}>
-                              {statusLabel(item.runtime_status)}
+                            <span className="configRowMetrics">
+                              <span className={`statusBadge ${item.runtime_status === "running" ? "online" : ""}`}>
+                                {statusLabel(item.runtime_status)}
+                              </span>
+                              <MonitorSummaryButton
+                                summary={item.monitor_summary}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setMonitorDialogConfigId(item.id);
+                                  setMonitorWindow("1h");
+                                }}
+                              />
                             </span>
                           </button>
                         ))
@@ -2635,13 +2826,9 @@ function App() {
                         className="secondary"
                         disabled={!selectedNodeOnline}
                         onClick={() => {
-                          setReplaceLocalConfigId(selectedConfig.id);
-                          setReplacePeerConfigId(null);
-                          setManagedPeerNodeId(null);
-                          setForceEndpointMismatch(false);
                           setSelectedConfigId(null);
                           setPlan(null);
-                          setCreateDialog("managed");
+                          openManagedCreateDialog({ replaceLocalConfigId: selectedConfig.id });
                         }}
                       >
                         <GitBranch size={16} /> 导入为受管连接
@@ -2691,6 +2878,110 @@ function App() {
                 </div>
               )}
             </section>
+          </section>
+        </div>
+      )}
+
+      {monitorDialogConfig && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel monitorModal" role="dialog" aria-modal="true" aria-labelledby="monitor-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="monitor-title"><LineChartIcon size={18} /> 链路延迟统计</h2>
+                <p className="muted">{selectedNode?.name || "节点"} / {monitorDialogConfig.name}</p>
+              </div>
+              <button
+                className="iconButton"
+                onClick={() => {
+                  setMonitorDialogConfigId(null);
+                  setMonitorDetail(null);
+                }}
+              >
+                <X size={18} />
+              </button>
+            </header>
+            <form
+              key={`monitor-${monitorDialogConfig.id}-${monitorDetail?.monitor.id || "new"}`}
+              className="gridForm describedForm"
+              onSubmit={(event) => void runAction(() => saveLinkMonitor(event))}
+            >
+              <Field label="目标 IP" hint="从当前节点 Agent 发起 ping；建议填写对端隧道 IP，第一版只支持 IP。">
+                <input
+                  name="target_host"
+                  placeholder="10.42.0.2"
+                  defaultValue={monitorDetail?.monitor.target_host || suggestedMonitorTarget(monitorDialogConfig, peer)}
+                  required
+                />
+              </Field>
+              <Field label="刷新频率" hint="1-300 秒，默认 10 秒。">
+                <input name="interval_seconds" inputMode="numeric" defaultValue={monitorDetail?.monitor.interval_seconds || 10} required />
+              </Field>
+              <Field label="保留时间" hint="历史样本保留天数，例如 1、7、30。">
+                <select name="retention_days" defaultValue={monitorDetail?.monitor.retention_days || 7}>
+                  <option value="1">1 天</option>
+                  <option value="7">7 天</option>
+                  <option value="30">30 天</option>
+                  <option value="90">90 天</option>
+                </select>
+              </Field>
+              <label className="checkField">
+                <input name="enabled" type="checkbox" defaultChecked={monitorDetail?.monitor.enabled ?? true} />
+                <span>启用监测</span>
+              </label>
+              <div className="actionRow wideField">
+                <button type="submit"><Check size={16} /> 保存监测</button>
+                {monitorDetail && (
+                  <button type="button" className="danger" onClick={() => void runAction(deleteLinkMonitor)}>
+                    删除监测
+                  </button>
+                )}
+              </div>
+            </form>
+
+            <div className="monitorToolbar">
+              {["1h", "6h", "1d", "7d", "30d"].map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  className={monitorWindow === item ? "" : "secondary"}
+                  onClick={() => setMonitorWindow(item)}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+
+            {monitorDetail?.summary ? (
+              <>
+                <div className="monitorStats">
+                  <span><strong>{formatLatency(monitorDetail.summary.last_latency_ms)}</strong><small>当前延迟</small></span>
+                  <span><strong>{formatLatency(monitorDetail.summary.avg_latency_ms)}</strong><small>平均延迟</small></span>
+                  <span><strong>{formatLatency(monitorDetail.summary.jitter_ms)}</strong><small>抖动</small></span>
+                  <span><strong>{formatLoss(monitorDetail.summary.packet_loss)}</strong><small>丢包率</small></span>
+                  <span><strong>{monitorDetail.summary.stability_score}</strong><small>稳定度</small></span>
+                </div>
+                <div className="monitorChart">
+                  <ResponsiveContainer width="100%" height={280}>
+                    <LineChart
+                      data={monitorDetail.samples.map((sample) => ({
+                        time: new Date(sample.checked_at).toLocaleString(),
+                        latency: sample.success ? sample.latency_ms : null,
+                        status: sample.success ? "ok" : sample.error || "loss",
+                      }))}
+                      margin={{ top: 10, right: 18, bottom: 4, left: 0 }}
+                    >
+                      <CartesianGrid stroke="#dce4e8" strokeDasharray="3 3" />
+                      <XAxis dataKey="time" tick={{ fontSize: 11 }} minTickGap={42} />
+                      <YAxis tick={{ fontSize: 11 }} unit="ms" />
+                      <Tooltip />
+                      <Line type="monotone" dataKey="latency" name="延迟" stroke="#216f86" strokeWidth={2} dot={false} connectNulls={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </>
+            ) : (
+              <div className="empty">尚无监测数据。保存监测后，Agent 会按刷新频率上报延迟样本。</div>
+            )}
           </section>
         </div>
       )}

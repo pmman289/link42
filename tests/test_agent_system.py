@@ -5,7 +5,7 @@ import subprocess
 from typing import Any
 
 from link42_common.connection_types import WIREGUARD_TASKS
-from link42_agent import main, middleware, service_manager, system, upgrade
+from link42_agent import link_monitor, main, middleware, service_manager, system, upgrade
 from link42_agent.client import AgentHttpError
 from link42_agent.config import AgentConfig
 from link42_agent.task_handlers import TASK_HANDLERS
@@ -815,6 +815,49 @@ def test_run_once_reports_service_manager_capability(monkeypatch, tmp_path: Path
     assert "service:systemd" in seen_capabilities
     assert "agent.self_upgrade" in seen_capabilities
     assert "middleware.udp2raw.systemd" in seen_capabilities
+
+
+def test_run_once_polls_and_reports_link_monitors(monkeypatch, tmp_path: Path) -> None:
+    """验证 Agent 每轮会执行到期链路监测并上报结果。"""
+
+    reported: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def heartbeat(self, capabilities: list[str], platform: dict[str, Any]) -> None:
+            assert "link.monitor" in capabilities
+
+        def poll_tasks(self, capabilities: list[str], platform: dict[str, Any]) -> list[dict[str, Any]]:
+            return []
+
+        def poll_link_monitors(self, capabilities: list[str], platform: dict[str, Any]) -> list[dict[str, Any]]:
+            return [{"id": 7, "target_host": "10.42.0.2", "timeout_seconds": 1}]
+
+        def report_link_monitor_results(self, results: list[dict[str, Any]]) -> None:
+            reported.extend(results)
+
+    use_service_binaries(monkeypatch, systemd=True)
+    monkeypatch.setattr(system, "run_command", lambda command, allow_failure: command_result(command))
+    monkeypatch.setattr(main, "probe_latency", lambda target, timeout: {"success": True, "latency_ms": 12.3, "error": None, "checked_at": "2026-06-30T00:00:00"})
+
+    main.run_once(FakeClient(), str(tmp_path))
+
+    assert reported == [{"monitor_id": 7, "success": True, "latency_ms": 12.3, "error": None, "checked_at": "2026-06-30T00:00:00"}]
+
+
+def test_probe_latency_parses_ping_time(monkeypatch) -> None:
+    """验证 Agent 能从 ping 输出中解析延迟。"""
+
+    monkeypatch.setattr(link_monitor.shutil, "which", lambda binary: "/bin/ping" if binary == "ping" else None)
+    monkeypatch.setattr(
+        link_monitor,
+        "run_command",
+        lambda command, allow_failure: command_result(command, stdout="64 bytes from 10.42.0.2: icmp_seq=1 ttl=64 time=23.4 ms\n"),
+    )
+
+    result = link_monitor.probe_latency("10.42.0.2", 1)
+
+    assert result["success"] is True
+    assert result["latency_ms"] == 23.4
 
 
 def test_agent_platform_reports_musl_libc(monkeypatch) -> None:
