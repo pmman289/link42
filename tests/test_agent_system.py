@@ -152,6 +152,18 @@ def test_agent_install_script_openwrt_checks_split_python_https_packages() -> No
     assert "python3-codecs" in script
 
 
+def test_agent_install_script_explicit_env_overrides_existing_env_file() -> None:
+    """验证覆盖安装时命令行传入的新节点凭据优先于旧 agent.env。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+
+    assert 'INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"' in script
+    assert '. "$ENV_FILE"' in script
+    assert 'LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"' in script
+    assert script.index('INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"') < script.index('. "$ENV_FILE"')
+    assert script.index('. "$ENV_FILE"') < script.index('LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"')
+
+
 def test_udp2raw_remove_last_instance_deletes_config_file(tmp_path: Path) -> None:
     """验证删除 udp2raw 最后一个实例时移除配置文件，而不是留下 0 字节文件。"""
 
