@@ -169,6 +169,18 @@ install_packages() {
   elif command -v opkg >/dev/null 2>&1; then
     missing_packages=""
     command -v python3 >/dev/null 2>&1 || missing_packages="$missing_packages python3"
+    if ! python3 - <<'PY' >/dev/null 2>&1
+import ssl
+PY
+    then
+      missing_packages="$missing_packages python3-openssl"
+    fi
+    if ! python3 - <<'PY' >/dev/null 2>&1
+import encodings.idna
+PY
+    then
+      missing_packages="$missing_packages python3-codecs"
+    fi
     command -v wg >/dev/null 2>&1 || missing_packages="$missing_packages wireguard-tools"
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
       missing_packages="$missing_packages curl"

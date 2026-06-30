@@ -104,6 +104,17 @@ def test_agent_install_script_openwrt_init_defines_rc_common_hooks() -> None:
     assert "status_service()" in script
 
 
+def test_agent_install_script_openwrt_checks_split_python_https_packages() -> None:
+    """验证 OpenWrt 安装脚本会补齐 Python HTTPS/IDNA 所需拆分包。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+
+    assert "import ssl" in script
+    assert "python3-openssl" in script
+    assert "import encodings.idna" in script
+    assert "python3-codecs" in script
+
+
 def test_udp2raw_remove_last_instance_deletes_config_file(tmp_path: Path) -> None:
     """验证删除 udp2raw 最后一个实例时移除配置文件，而不是留下 0 字节文件。"""
 
