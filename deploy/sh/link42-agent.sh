@@ -9,6 +9,11 @@ BIN_PATH="${LINK42_AGENT_BIN:-/usr/local/bin/link42-agent}"
 ENV_DIR="${LINK42_ENV_DIR:-/etc/link42}"
 ENV_FILE="$ENV_DIR/agent.env"
 SERVICE_NAME="link42-agent"
+MIDDLEWARE_DIR="$ENV_DIR/middleware"
+UDP2RAW_CONFIG_DIR="$MIDDLEWARE_DIR/udp2raw"
+UDP2RAW_BIN="${LINK42_UDP2RAW_BIN:-/usr/local/bin/udp2raw}"
+UDP2RAW_LIBEXEC="/usr/local/libexec/link42-udp2raw-systemd"
+KEEP_MIDDLEWARE="${LINK42_KEEP_MIDDLEWARE:-0}"
 POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"
 WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"
 DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"
@@ -87,6 +92,50 @@ uninstall_openwrt_service() {
   fi
 }
 
+uninstall_udp2raw_systemd() {
+  if command -v systemctl >/dev/null 2>&1; then
+    for unit in $(systemctl list-units --all 'link42-udp2raw-*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}'); do
+      [ -n "$unit" ] || continue
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+      systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    done
+    for unit in $(systemctl list-unit-files 'link42-udp2raw-*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}'); do
+      [ -n "$unit" ] || continue
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+      systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    done
+  fi
+  rm -f /etc/systemd/system/link42-udp2raw-server@.service
+  rm -f /etc/systemd/system/link42-udp2raw-client@.service
+  rm -f "$UDP2RAW_LIBEXEC"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+uninstall_udp2raw_openwrt() {
+  for script in /etc/init.d/link42-udp2raw-*; do
+    [ -e "$script" ] || continue
+    "$script" stop >/dev/null 2>&1 || true
+    "$script" disable >/dev/null 2>&1 || true
+    rm -f "$script"
+  done
+}
+
+uninstall_middleware() {
+  if [ "$KEEP_MIDDLEWARE" = "1" ]; then
+    log "keeping Link42 middleware because LINK42_KEEP_MIDDLEWARE=1"
+    return
+  fi
+
+  uninstall_udp2raw_systemd
+  uninstall_udp2raw_openwrt
+  rm -rf "$UDP2RAW_CONFIG_DIR"
+  rmdir "$MIDDLEWARE_DIR" >/dev/null 2>&1 || true
+  rm -f "$UDP2RAW_BIN"
+  log "removed Link42 middleware services and udp2raw assets"
+}
+
 uninstall_agent() {
   detect_service_backend
   if [ "$SERVICE_BACKEND" = "systemd" ]; then
@@ -99,6 +148,7 @@ uninstall_agent() {
     log "service manager not found; removing files only"
   fi
 
+  uninstall_middleware
   rm -f "$BIN_PATH"
   rm -f "$ENV_FILE"
   rmdir "$ENV_DIR" >/dev/null 2>&1 || true

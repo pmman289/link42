@@ -251,12 +251,20 @@ sudo sh -s -- uninstall
 /etc/link42/agent.env
 /opt/link42-agent
 link42-agent systemd/OpenRC 服务
+Link42 管理的 udp2raw 中间层服务、配置和资产
 ```
 
 卸载不会删除：
 
 ```text
 /etc/wireguard
+```
+
+如需保留 Link42 管理的 udp2raw 中间层资产，可显式设置：
+
+```bash
+curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
+sudo env LINK42_KEEP_MIDDLEWARE=1 sh -s -- uninstall
 ```
 
 ## systemd 节点检查命令

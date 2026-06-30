@@ -164,6 +164,24 @@ def test_agent_install_script_explicit_env_overrides_existing_env_file() -> None
     assert script.index('. "$ENV_FILE"') < script.index('LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"')
 
 
+def test_agent_uninstall_script_removes_link42_udp2raw_middleware() -> None:
+    """验证 Agent 卸载会清理 Link42 管理的 udp2raw 中间层残留。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+
+    assert "uninstall_middleware()" in script
+    assert "uninstall_udp2raw_systemd" in script
+    assert "uninstall_udp2raw_openwrt" in script
+    assert "systemctl list-units --all 'link42-udp2raw-*.service'" in script
+    assert "rm -f /etc/systemd/system/link42-udp2raw-server@.service" in script
+    assert "rm -f /etc/systemd/system/link42-udp2raw-client@.service" in script
+    assert "for script in /etc/init.d/link42-udp2raw-*;" in script
+    assert 'rm -rf "$UDP2RAW_CONFIG_DIR"' in script
+    assert 'rm -f "$UDP2RAW_BIN"' in script
+    assert "LINK42_KEEP_MIDDLEWARE=1" in script
+    assert script.index("uninstall_middleware()") < script.index('rm -f "$BIN_PATH"')
+
+
 def test_udp2raw_remove_last_instance_deletes_config_file(tmp_path: Path) -> None:
     """验证删除 udp2raw 最后一个实例时移除配置文件，而不是留下 0 字节文件。"""
 

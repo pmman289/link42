@@ -88,8 +88,15 @@ curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_SERVER_UR
 curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall
 ```
 
-卸载会停止并删除 Agent 服务、二进制和 `/etc/link42/agent.env`，不会删除
-`/etc/wireguard` 下的 WireGuard 配置。
+卸载会停止并删除 Agent 服务、二进制、`/etc/link42/agent.env`，并默认清理
+Link42 管理的 udp2raw 中间层服务、配置和资产。卸载不会删除 `/etc/wireguard`
+下的 WireGuard 配置。
+
+如需保留 udp2raw 中间层资产：
+
+```bash
+curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_KEEP_MIDDLEWARE=1 sh -s -- uninstall
+```
 
 ## OpenWrt ARM
 
