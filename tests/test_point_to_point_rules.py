@@ -1272,6 +1272,34 @@ def test_link_monitor_agent_poll_and_result_updates_summary(monkeypatch) -> None
     assert listed[0].monitor_summary.monitor_id == monitor.id
 
 
+def test_link_monitor_samples_rejects_invalid_window(monkeypatch) -> None:
+    """验证链路监测历史窗口只接受固定枚举。"""
+
+    import link42_api.main as api_main
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        monitor = models.LinkMonitor(
+            node_id=1,
+            interface_id=None,
+            name="latency",
+            target_host="10.42.0.2",
+            interval_seconds=10,
+            retention_days=7,
+            enabled=True,
+        )
+        session.add(monitor)
+        session.commit()
+        session.refresh(monitor)
+
+        with pytest.raises(HTTPException) as exc_info:
+            api_main.get_link_monitor_samples(monitor.id, "bad", session)
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "invalid monitor window"
+
+
 def test_sqlite_migration_creates_link_monitor_tables(monkeypatch, tmp_path) -> None:
     """验证旧 SQLite 启动迁移会补齐链路监测表。"""
 

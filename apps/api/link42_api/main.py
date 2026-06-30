@@ -712,7 +712,10 @@ def parse_monitor_window(value: str | None) -> timedelta:
         "7d": timedelta(days=7),
         "30d": timedelta(days=30),
     }
-    return mapping.get(value or "1h", timedelta(hours=1))
+    key = value or "1h"
+    if key not in mapping:
+        raise HTTPException(status_code=422, detail="invalid monitor window")
+    return mapping[key]
 
 
 def monitor_status(latency_ms: float | None, packet_loss: float, stability_score: int, sample_count: int) -> str:
