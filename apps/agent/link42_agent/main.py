@@ -3,34 +3,19 @@ from __future__ import annotations
 import sys
 import time
 import traceback
-from typing import Any
+from typing import Any, Union
 
 from link42_common.version import AGENT_VERSION
 
 from .client import AgentClient
 from .config import AgentConfig
 from .config import load_config_from_env
-from .middleware import (
-    apply_udp2raw,
-    delete_udp2raw,
-    install_middleware,
-    start_udp2raw,
-    status_udp2raw,
-    stop_udp2raw,
-)
 from .system import (
-    apply_wireguard_config,
-    delete_wireguard_config,
     get_agent_platform,
     get_hostname,
     get_service_manager_name,
-    read_wireguard_config,
-    scan_wg_quick_configs,
-    get_wireguard_status,
-    start_wireguard_interface,
-    stop_wireguard_interface,
 )
-from .upgrade import self_upgrade
+from .task_handlers import execute_registered_task
 
 
 def build_capabilities() -> list[str]:
@@ -39,15 +24,23 @@ def build_capabilities() -> list[str]:
     service_manager = get_service_manager_name()
     capabilities = [
         "wireguard",
-        "wg_quick_import",
-        "middleware",
-        "middleware.install",
-        "middleware.udp2raw",
-        "agent.self_upgrade",
         f"service:{service_manager}",
     ]
+    if service_manager != "openwrt-uci":
+        capabilities.append("wg_quick_import")
+    if service_manager in ["systemd", "openwrt-uci"]:
+        capabilities.extend([
+            "middleware",
+            "middleware.install",
+            "middleware.udp2raw",
+        ])
     if service_manager == "systemd":
+        capabilities.extend([
+            "agent.self_upgrade",
+        ])
         capabilities.append("middleware.udp2raw.systemd")
+    if service_manager == "openwrt-uci":
+        capabilities.append("middleware.udp2raw.openwrt-procd")
     return capabilities
 
 
@@ -56,41 +49,10 @@ def execute_task(task: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
 
     task_type = task["type"]
     payload = task.get("payload", {})
-    dry_run = config.dry_run
-
-    if task_type == "wireguard.import_scan":
-        return {"candidates": scan_wg_quick_configs(config.wireguard_dir)}
-    if task_type == "wireguard.apply_config":
-        return apply_wireguard_config(payload, config.wireguard_dir, dry_run=dry_run)
-    if task_type == "wireguard.read_config":
-        return read_wireguard_config(payload, config.wireguard_dir)
-    if task_type == "wireguard.status":
-        return get_wireguard_status(payload)
-    if task_type == "wireguard.start_interface":
-        return start_wireguard_interface(payload, dry_run=dry_run)
-    if task_type == "wireguard.stop_interface":
-        return stop_wireguard_interface(payload, dry_run=dry_run)
-    if task_type == "wireguard.delete_config":
-        return delete_wireguard_config(payload, config.wireguard_dir, dry_run=dry_run)
-    if task_type == "middleware.install":
-        return install_middleware(payload, config, dry_run=dry_run)
-    if task_type == "middleware.udp2raw.apply":
-        return apply_udp2raw(payload, dry_run=dry_run)
-    if task_type == "middleware.udp2raw.start":
-        return start_udp2raw(payload, dry_run=dry_run)
-    if task_type == "middleware.udp2raw.stop":
-        return stop_udp2raw(payload, dry_run=dry_run)
-    if task_type == "middleware.udp2raw.delete":
-        return delete_udp2raw(payload, dry_run=dry_run)
-    if task_type == "middleware.udp2raw.status":
-        return status_udp2raw(payload)
-    if task_type == "agent.self_upgrade":
-        return self_upgrade(payload, config, dry_run=dry_run)
-
-    raise ValueError(f"unsupported task type: {task_type}")
+    return execute_registered_task(task_type, payload, config)
 
 
-def run_once(client: AgentClient, config: AgentConfig | str) -> None:
+def run_once(client: AgentClient, config: Union[AgentConfig, str]) -> None:
     """执行一次心跳、拉取任务和处理任务的循环。"""
 
     if isinstance(config, str):

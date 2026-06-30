@@ -90,3 +90,40 @@ curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall
 
 卸载会停止并删除 Agent 服务、二进制和 `/etc/link42/agent.env`，不会删除
 `/etc/wireguard` 下的 WireGuard 配置。
+
+## OpenWrt ARM
+
+OpenWrt ARM/aarch64 第一阶段不使用 glibc PyInstaller 二进制。安装脚本会在检测到
+OpenWrt UCI/procd 后下载源码包：
+
+```text
+https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
+```
+
+源码包由下面命令生成：
+
+```bash
+scripts/agent/build-source.sh
+```
+
+目标机要求：
+
+- `python3`
+- `curl` 或 `wget`
+- `wireguard-tools`
+- `uci`
+- `ifup`
+- `/etc/rc.common`
+
+安装后会写入：
+
+```text
+/opt/link42-agent/src
+/usr/local/bin/link42-agent
+/etc/init.d/link42-agent
+/etc/link42/agent.env
+```
+
+OpenWrt Agent 使用 UCI 写入 WireGuard 配置，不依赖 `/etc/wireguard/*.conf` 或
+`wg-quick`。目前 OpenWrt 节点只上报基础 WireGuard/UCI 能力，不上报
+`agent.self_upgrade` 和 systemd 版 udp2raw 中间层能力。

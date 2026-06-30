@@ -11,6 +11,10 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+if [[ ! -f "$SRC_DIR/link42-agent-source.tar.gz" ]]; then
+  "$ROOT_DIR/scripts/agent/build-source.sh" >/dev/null
+fi
+
 if [[ -f "$SRC_DIR/manifest.json" ]]; then
   cp "$SRC_DIR/manifest.json" "$OUT_DIR/manifest.json"
   while IFS= read -r file; do

@@ -302,6 +302,14 @@ ifup <iface>
 
 OpenWrt/家庭路由器测试尤其谨慎，不要破坏用户现有网络。
 
+OpenWrt udp2raw/faketcp 检查重点：
+
+- Link42 不应插入 `iptables -I INPUT -p tcp --dport <server_listen_port> -j DROP` 这类 direct DROP 规则；这会吞掉 faketcp SYN。
+- OpenWrt/procd 后端只应启动 udp2raw，并由 udp2raw 自身 `-a` 处理必要规则。
+- OpenWrt 作为 udp2raw server 时，测试前确认用户已在实际入口 zone 手动放行 `server_listen_port` 对应 TCP 端口。
+- 若 client 日志持续 `rst==1`，检查是否存在错误的 direct DROP/ACCEPT 顺序、udp2raw 自身自动规则、上游 NAT/端口转发和入口 zone。
+- 若 client 无 RST 但无握手，检查 zone 放行、上游 NAT/端口转发、server 监听地址和抓包入站情况。
+
 ## Dry Run
 
 Agent 支持：

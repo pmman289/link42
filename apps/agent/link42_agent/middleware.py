@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
-
-import httpx
+from typing import Any, Optional
+from urllib import request
 
 from .config import AgentConfig
+from .service_manager import OpenWrtUciManager, detect_service_manager
 from .system import run_command
 
 
@@ -18,6 +19,7 @@ UDP2RAW_CONFIG_DIR = Path("/etc/link42/middleware/udp2raw")
 UDP2RAW_LIBEXEC = Path("/usr/local/libexec/link42-udp2raw-systemd")
 UDP2RAW_SERVER_UNIT = Path("/etc/systemd/system/link42-udp2raw-server@.service")
 UDP2RAW_CLIENT_UNIT = Path("/etc/systemd/system/link42-udp2raw-client@.service")
+OPENWRT_INIT_DIR = Path("/etc/init.d")
 
 
 def install_middleware(payload: dict[str, Any], config: AgentConfig, dry_run: bool = False) -> dict[str, Any]:
@@ -39,11 +41,7 @@ def apply_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, A
         return {"changed": False, "dry_run": True, "args": args, "config_file": str(config_file)}
     ensure_udp2raw_layout()
     upsert_instance(config_file, instance, args)
-    commands = [
-        run_command(["systemctl", "daemon-reload"], False),
-        run_command(["systemctl", "enable", unit_name(mode, instance)], False),
-        run_command(["systemctl", "restart", unit_name(mode, instance)], False),
-    ]
+    commands = apply_service(mode, instance, payload)
     return {"changed": True, "mode": mode, "instance": instance, "config_file": str(config_file), "commands": commands}
 
 
@@ -62,35 +60,34 @@ def delete_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, 
         return {"changed": False, "dry_run": True, "instance": instance, "modes": modes}
     results: list[dict[str, Any]] = []
     for mode in modes:
-        results.append(run_command(["systemctl", "disable", "--now", unit_name(mode, instance)], True))
+        results.extend(delete_service(mode, instance))
         remove_instance(config_file_for_mode(mode), instance)
-    results.append(run_command(["systemctl", "daemon-reload"], False))
+    results.extend(reload_services())
     return {"changed": True, "instance": instance, "modes": modes, "commands": results}
 
 
 def status_udp2raw(payload: dict[str, Any]) -> dict[str, Any]:
     instance = payload["instance"]
-    return {
-        mode: run_command(["systemctl", "is-active", unit_name(mode, instance)], True)
-        for mode in payload_modes(payload)
-    }
+    return {mode: service_status(mode, instance) for mode in payload_modes(payload)}
 
 
 def install_udp2raw(config: AgentConfig, dry_run: bool = False) -> dict[str, Any]:
-    """从主控下载匹配架构的 udp2raw 二进制并安装 systemd 单元。"""
+    """从主控下载匹配架构的 udp2raw 二进制并安装本机服务后端。"""
 
-    if not shutil.which("systemctl"):
-        raise RuntimeError("udp2raw middleware currently requires systemd")
+    backend = udp2raw_service_backend()
+    if backend not in ["systemd", "openwrt-procd"]:
+        raise RuntimeError("udp2raw middleware requires systemd or OpenWrt procd")
     asset = detect_udp2raw_asset()
     if dry_run:
-        return {"changed": False, "dry_run": True, "asset": asset}
+        return {"changed": False, "dry_run": True, "asset": asset, "backend": backend}
     ensure_udp2raw_layout()
     download_asset(config, asset, UDP2RAW_BIN)
     UDP2RAW_BIN.chmod(0o755)
-    write_wrapper()
-    write_units()
-    result = run_command(["systemctl", "daemon-reload"], False)
-    return {"changed": True, "asset": asset, "binary": str(UDP2RAW_BIN), "daemon_reload": result}
+    if backend == "systemd":
+        write_wrapper()
+        write_units()
+    result = reload_services()
+    return {"changed": True, "asset": asset, "binary": str(UDP2RAW_BIN), "backend": backend, "service_reload": result}
 
 
 def detect_udp2raw_asset() -> str:
@@ -119,24 +116,26 @@ def machine_endian() -> str:
 
 def download_asset(config: AgentConfig, asset: str, target: Path) -> None:
     url = f"/api/agent/plugins/udp2raw/assets/{asset}"
-    with httpx.Client(base_url=config.server_url, timeout=60) as client:
-        with client.stream("GET", url) as response:
-            response.raise_for_status()
-            fd, tmp_name = tempfile.mkstemp(prefix="udp2raw-", dir=str(target.parent))
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    for chunk in response.iter_bytes():
-                        handle.write(chunk)
-                Path(tmp_name).replace(target)
-            finally:
-                if Path(tmp_name).exists():
-                    Path(tmp_name).unlink()
+    fd, tmp_name = tempfile.mkstemp(prefix="udp2raw-", dir=str(target.parent))
+    try:
+        with request.urlopen(f"{config.server_url}{url}", timeout=60) as response:
+            with os.fdopen(fd, "wb") as handle:
+                shutil.copyfileobj(response, handle)
+        Path(tmp_name).replace(target)
+    finally:
+        if Path(tmp_name).exists():
+            Path(tmp_name).unlink()
 
 
 def ensure_udp2raw_layout() -> None:
+    backend = udp2raw_service_backend()
+    UDP2RAW_BIN.parent.mkdir(parents=True, exist_ok=True)
     UDP2RAW_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    UDP2RAW_LIBEXEC.parent.mkdir(parents=True, exist_ok=True)
-    UDP2RAW_SERVER_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    if backend == "systemd":
+        UDP2RAW_LIBEXEC.parent.mkdir(parents=True, exist_ok=True)
+        UDP2RAW_SERVER_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    if backend == "openwrt-procd":
+        OPENWRT_INIT_DIR.mkdir(parents=True, exist_ok=True)
     for name in ["server", "client"]:
         path = UDP2RAW_CONFIG_DIR / name
         if not path.exists():
@@ -200,8 +199,14 @@ def build_udp2raw_args(payload: dict[str, Any]) -> str:
         f"--cipher-mode {cipher_mode}",
     ]
     if payload.get("auto_rule", True):
-        args.append("-a")
+        args.append(auto_rule_arg())
     return " ".join(args)
+
+
+def auto_rule_arg() -> str:
+    """Return the udp2raw firewall helper flag for the local service backend."""
+
+    return "-a"
 
 
 def shell_quote(value: str) -> str:
@@ -216,6 +221,196 @@ def config_file_for_mode(mode: str) -> Path:
 
 def unit_name(mode: str, instance: str) -> str:
     return f"link42-udp2raw-{mode}@{instance}.service"
+
+
+def init_name(mode: str, instance: str) -> str:
+    validate_instance_name(instance)
+    return f"link42-udp2raw-{mode}-{instance}"
+
+
+def init_path(mode: str, instance: str) -> Path:
+    return OPENWRT_INIT_DIR / init_name(mode, instance)
+
+
+def validate_instance_name(instance: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", instance):
+        raise ValueError("udp2raw instance contains unsupported characters")
+    return instance
+
+
+def udp2raw_service_backend() -> str:
+    manager = detect_service_manager(run_command)
+    if isinstance(manager, OpenWrtUciManager):
+        return "openwrt-procd"
+    if shutil.which("systemctl"):
+        return "systemd"
+    return "unsupported"
+
+
+def service_command(mode: str, instance: str, action: str) -> list[str]:
+    if udp2raw_service_backend() == "openwrt-procd":
+        return [str(init_path(mode, instance)), action]
+    return ["systemctl", action, unit_name(mode, instance)]
+
+
+def apply_service(mode: str, instance: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if udp2raw_service_backend() == "openwrt-procd":
+        write_openwrt_init(mode, instance)
+        return run_openwrt_service_commands(
+            [
+                [str(init_path(mode, instance)), "enable"],
+                [str(init_path(mode, instance)), "restart"],
+            ],
+            allow_failure=False,
+        )
+    return [
+        run_command(["systemctl", "daemon-reload"], False),
+        run_command(["systemctl", "enable", unit_name(mode, instance)], False),
+        run_command(["systemctl", "restart", unit_name(mode, instance)], False),
+    ]
+
+
+def delete_service(mode: str, instance: str) -> list[dict[str, Any]]:
+    if udp2raw_service_backend() == "openwrt-procd":
+        path = init_path(mode, instance)
+        results = run_openwrt_service_commands(
+            [
+                [str(path), "stop"],
+                [str(path), "disable"],
+            ],
+            allow_failure=True,
+        )
+        path.unlink(missing_ok=True)
+        return results
+    return [run_command(["systemctl", "disable", "--now", unit_name(mode, instance)], True)]
+
+
+def reload_services() -> list[dict[str, Any]]:
+    if udp2raw_service_backend() == "systemd":
+        return [run_command(["systemctl", "daemon-reload"], False)]
+    return []
+
+
+def service_status(mode: str, instance: str) -> dict[str, Any]:
+    if udp2raw_service_backend() == "openwrt-procd":
+        return normalize_openwrt_result(run_command([str(init_path(mode, instance)), "status"], True))
+    return run_command(["systemctl", "is-active", unit_name(mode, instance)], True)
+
+
+def run_openwrt_service_commands(commands: list[list[str]], allow_failure: bool) -> list[dict[str, Any]]:
+    return [normalize_openwrt_result(run_command(command, allow_failure)) for command in commands]
+
+
+def normalize_openwrt_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Drop rc.common's misleading successful stderr noise from task results."""
+
+    stderr = str(result.get("stderr") or "")
+    if result.get("returncode") == 0 and stderr.strip().rstrip(".") == "Command failed: Not found":
+        return {**result, "stderr": ""}
+    return result
+
+
+def payload_from_config(mode: str, instance: str) -> Optional[dict[str, Any]]:
+    args = instance_args_from_config(config_file_for_mode(mode), instance)
+    if not args:
+        return None
+    return parse_udp2raw_args(mode, instance, args)
+
+
+def instance_args_from_config(path: Path, instance: str) -> Optional[str]:
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split(maxsplit=1)
+        key = parts[0].removesuffix("=") if parts else ""
+        if key == instance and len(parts) > 1:
+            return parts[1]
+    return None
+
+
+def parse_udp2raw_args(mode: str, instance: str, args: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {"mode": mode, "instance": instance, "auto_rule": "-a" in args or "--keep-rule" in args}
+    tokens = args.split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-l"):
+            payload["listen_host"], payload["listen_port"] = split_host_port(token[2:])
+        elif token.startswith("-r"):
+            payload["remote_host"], payload["remote_port"] = split_host_port(token[2:])
+        elif token == "--raw-mode" and index + 1 < len(tokens):
+            payload["raw_mode"] = tokens[index + 1]
+            index += 1
+        index += 1
+    return payload
+
+
+def split_host_port(value: str) -> tuple[str, int]:
+    if value.startswith("[") and "]:" in value:
+        host, port = value[1:].rsplit("]:", 1)
+        return host, int(port)
+    host, port = value.rsplit(":", 1)
+    return host, int(port)
+
+
+def write_openwrt_init(mode: str, instance: str) -> None:
+    path = init_path(mode, instance)
+    config = config_file_for_mode(mode)
+    awk_script = (
+        "NF && $1 !~ /^#/ { "
+        'key=$1; sub(/=$/, "", key); '
+        "if (key == name) { "
+        'sub(/^[[:space:]]*[^[:space:]=]+[[:space:]]*=?[[:space:]]*/, ""); '
+        "print; found=1; exit "
+        "} "
+        "} END { if (!found) exit 1 }"
+    )
+    path.write_text(
+        f"""#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+MODE={shell_quote(mode)}
+INSTANCE={shell_quote(instance)}
+CONFIG={shell_quote(str(config))}
+UDP2RAW_BIN={shell_quote(str(UDP2RAW_BIN))}
+
+start_service() {{
+  procd_open_instance "$MODE-$INSTANCE"
+  procd_set_param command /bin/sh -c 'set -eu
+bin="$3"
+line=$(awk -v name="$1" '"'"'{awk_script}'"'"' "$2")
+eval "set -- $line"
+exec "$bin" "$@"' -- "$INSTANCE" "$CONFIG" "$UDP2RAW_BIN"
+  procd_set_param respawn 10 5 5
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_close_instance
+}}
+
+stop_service() {{
+  return 0
+}}
+
+reload_service() {{
+  stop
+  start
+}}
+
+status_service() {{
+  if service_running "$MODE-$INSTANCE"; then
+    echo "running"
+    return 0
+  fi
+  echo "inactive"
+  return 3
+}}
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
 
 
 def upsert_instance(path: Path, instance: str, args: str) -> None:
@@ -251,9 +446,11 @@ def service_action(payload: dict[str, Any], action: str, dry_run: bool = False) 
     modes = payload_modes(payload)
     for mode in modes:
         if dry_run:
-            commands.append({"command": ["systemctl", action, unit_name(mode, instance)], "dry_run": True})
+            commands.append({"command": service_command(mode, instance, action), "dry_run": True})
             continue
-        result = run_command(["systemctl", action, unit_name(mode, instance)], True)
+        result = run_command(service_command(mode, instance, action), True)
+        if udp2raw_service_backend() == "openwrt-procd":
+            result = normalize_openwrt_result(result)
         commands.append(result)
         changed = changed or result["returncode"] == 0
     return {"changed": changed, "instance": instance, "modes": modes, "commands": commands}

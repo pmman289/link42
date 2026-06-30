@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Tuple
 
 from link42_wireguard import parse_wg_quick
 
@@ -297,7 +297,7 @@ class UnsupportedServiceManager(ServiceManager):
         raise RuntimeError("WireGuard service management is unsupported on this host")
 
 
-def _split_endpoint(endpoint: str | None) -> tuple[str | None, int | None]:
+def _split_endpoint(endpoint: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
     if not endpoint:
         return None, None
     if endpoint.startswith("[") and "]:" in endpoint:

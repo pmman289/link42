@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from link42_common.connection_types import TASK_REQUIREMENTS, WIREGUARD_TASKS
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -20,6 +21,7 @@ from link42_common.version import AGENT_VERSION, CONTROLLER_VERSION
 
 from . import models, schemas
 from .config import settings
+from .connection_drivers import connection_driver_for_interface
 from .database import get_db, init_db
 from .wireguard_service import (
     build_apply_plan,
@@ -51,24 +53,6 @@ SETTING_ADMIN_USERNAME = "admin_username"
 SETTING_ADMIN_PASSWORD_HASH = "admin_password_hash"
 SETTING_ADMIN_SESSION_HASH = "admin_session_hash"
 SETTING_CONTROLLER_URL = "controller_url"
-
-TASK_REQUIREMENTS = {
-    "wireguard.import_scan": {"min_agent_version": "0.1.0", "capabilities": ["wg_quick_import"]},
-    "wireguard.apply_config": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
-    "wireguard.read_config": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
-    "wireguard.status": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
-    "wireguard.start_interface": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
-    "wireguard.stop_interface": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
-    "wireguard.delete_config": {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
-    "middleware.install": {"min_agent_version": "0.2.0", "capabilities": ["middleware.install"]},
-    "middleware.udp2raw.apply": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
-    "middleware.udp2raw.start": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
-    "middleware.udp2raw.stop": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
-    "middleware.udp2raw.delete": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
-    "middleware.udp2raw.status": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
-    "agent.self_upgrade": {"min_agent_version": "0.2.0", "capabilities": ["agent.self_upgrade"]},
-}
-
 
 def mount_web_panel() -> None:
     """按配置挂载前端静态文件，让主控镜像可以单端口运行。"""
@@ -264,6 +248,16 @@ def agent_satisfies_task(node: models.Node, task_type: str) -> bool:
         return False
     capabilities = set(node.agent_capabilities or ["wireguard", "wg_quick_import"])
     return all(capability in capabilities for capability in requirement.get("capabilities", []))
+
+
+def node_uses_openwrt_uci(node: models.Node | None) -> bool:
+    """判断节点是否使用 OpenWrt UCI WireGuard 后端。"""
+
+    if node is None:
+        return False
+    platform = node.agent_platform or {}
+    capabilities = set(node.agent_capabilities or [])
+    return platform.get("service_manager") == "openwrt-uci" or "service:openwrt-uci" in capabilities
 
 
 def require_task_supported(node: models.Node, task_type: str) -> None:
@@ -515,12 +509,10 @@ def managed_link_middleware(interface: models.WireGuardInterface) -> dict | None
 
 
 def require_udp2raw_supported(node: models.Node) -> None:
-    """要求节点 Agent 支持 systemd udp2raw 中间层。"""
+    """要求节点 Agent 支持 udp2raw 中间层。"""
 
     for task_type in ["middleware.install", "middleware.udp2raw.apply"]:
         require_task_supported(node, task_type)
-    if "service:systemd" not in set(node.agent_capabilities or []):
-        raise HTTPException(status_code=409, detail="udp2raw middleware currently requires systemd agent")
 
 
 def apply_udp2raw_to_peers(
@@ -942,16 +934,12 @@ def enqueue_apply_config(
 ) -> bool:
     """幂等下发某个受管接口配置。"""
 
+    driver = connection_driver_for_interface(interface)
     return enqueue_interface_task_once(
         db,
         interface,
-        "wireguard.apply_config",
-        payload_extra={
-            "config": render_interface_config(interface),
-            "managed": True,
-            "enable_on_boot": enable_on_boot,
-            "auto_start": True,
-        },
+        driver.tasks.apply_config,
+        payload_extra=driver.build_apply_payload(interface, enable_on_boot=enable_on_boot),
     )
 
 
@@ -981,9 +969,10 @@ def endpoint_points_to_node(endpoint_host: str | None, node: models.Node) -> boo
 def queue_replace_interface(db: Session, interface: models.WireGuardInterface) -> None:
     """替换旧配置时先请求 Agent 停止并删除节点文件，再删除数据库记录。"""
 
-    enqueue_interface_task_once(db, interface, "wireguard.stop_interface")
+    driver = connection_driver_for_interface(interface)
+    enqueue_interface_task_once(db, interface, driver.tasks.stop)
     if should_delete_node_config_file(interface):
-        enqueue_interface_task_once(db, interface, "wireguard.delete_config")
+        enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
     mark_import_candidate_available_for_interface(db, interface)
     db.delete(interface)
 
@@ -1654,7 +1643,8 @@ def start_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict
             })
     for interface in [local_interface, peer_interface]:
         if interface.runtime_status not in ["running", "starting"]:
-            if enqueue_interface_task_once(db, interface, "wireguard.start_interface"):
+            driver = connection_driver_for_interface(interface)
+            if enqueue_interface_task_once(db, interface, driver.tasks.start):
                 interface.runtime_status = "starting"
     db.commit()
     return {
@@ -1676,7 +1666,8 @@ def stop_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[
     middleware = managed_link_middleware(local_interface)
     for interface in [local_interface, peer_interface]:
         if interface.runtime_status not in ["stopped", "stopping"]:
-            if enqueue_interface_task_once(db, interface, "wireguard.stop_interface"):
+            driver = connection_driver_for_interface(interface)
+            if enqueue_interface_task_once(db, interface, driver.tasks.stop):
                 interface.runtime_status = "stopping"
     if middleware:
         for interface in [local_interface, peer_interface]:
@@ -1695,7 +1686,11 @@ def stop_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[
 
 
 @app.delete("/api/wireguard/configs/{interface_id}/managed-link")
-def delete_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+def delete_managed_link(
+    interface_id: int,
+    db: Session = Depends(get_db),
+    delete_node_config: bool = False,
+) -> dict[str, str]:
     """同时删除受管连接双方；必须先断开双方接口。"""
 
     local_interface, peer_interface, _, _ = get_managed_link_bundle(db, interface_id)
@@ -1705,14 +1700,15 @@ def delete_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dic
         raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
     middleware = managed_link_middleware(local_interface)
     for interface in [local_interface, peer_interface]:
-        if middleware:
+        if middleware and delete_node_config:
             enqueue_interface_task_once(db, interface, "middleware.udp2raw.delete", {
                 "plugin": "udp2raw",
                 "instance": udp2raw_instance_name(local_interface, peer_interface),
             })
         mark_import_candidate_available_for_interface(db, interface)
-        if should_delete_node_config_file(interface):
-            enqueue_interface_task_once(db, interface, "wireguard.delete_config")
+        if delete_node_config and should_delete_node_config_file(interface):
+            driver = connection_driver_for_interface(interface)
+            enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
         db.delete(interface)
     db.commit()
     return {"status": "deleted"}
@@ -1824,12 +1820,13 @@ def plan_apply(interface_id: int, db: Session = Depends(get_db)) -> models.Chang
         new_config = render_interface_config(interface)
     old_config = interface.deployed_config or ""
     diff = build_diff(old_config, new_config, fromfile=f"{interface.name}.current", tofile=f"{interface.name}.link42")
+    driver = connection_driver_for_interface(interface)
     plan = models.ChangePlan(
         title=f"Apply WireGuard interface {interface.name}",
         summary=f"Deploy WireGuard config for node {interface.node_id} interface {interface.name}",
         affected_node_ids=[interface.node_id],
         diff=diff,
-        payload={"task_type": "wireguard.apply_config", "task_payload": build_apply_plan(interface)},
+        payload={"task_type": driver.tasks.apply_config, "task_payload": build_apply_plan(interface)},
     )
     db.add(plan)
     db.commit()
@@ -1843,7 +1840,8 @@ def refresh_deployed_config(interface_id: int, db: Session = Depends(get_db)) ->
 
     interface = get_wireguard_config_or_404(interface_id, db)
     require_online_node(db, interface.node_id)
-    enqueue_interface_task_once(db, interface, "wireguard.read_config")
+    driver = connection_driver_for_interface(interface)
+    enqueue_interface_task_once(db, interface, driver.tasks.read_config)
     db.commit()
     db.refresh(interface)
     return interface
@@ -1855,7 +1853,8 @@ def refresh_interface_status(interface_id: int, db: Session = Depends(get_db)) -
 
     interface = get_wireguard_config_or_404(interface_id, db)
     require_online_node(db, interface.node_id)
-    enqueue_interface_task_once(db, interface, "wireguard.status")
+    driver = connection_driver_for_interface(interface)
+    enqueue_interface_task_once(db, interface, driver.tasks.status)
     db.commit()
     db.refresh(interface)
     return interface
@@ -1866,14 +1865,15 @@ def start_interface(interface_id: int, db: Session = Depends(get_db)) -> models.
     """创建启动 WireGuard 接口的 Agent 任务。"""
 
     interface = get_wireguard_config_or_404(interface_id, db)
-    require_online_node(db, interface.node_id)
+    node = require_online_node(db, interface.node_id)
     if interface.source == "managed-node":
         raise HTTPException(status_code=400, detail="use managed link operation")
-    if not interface.deployed_config:
+    if not interface.deployed_config and not node_uses_openwrt_uci(node):
         raise HTTPException(status_code=400, detail="wireguard config must be deployed before start")
     if interface.runtime_status in ["running", "starting"]:
         return interface
-    if enqueue_interface_task_once(db, interface, "wireguard.start_interface"):
+    driver = connection_driver_for_interface(interface)
+    if enqueue_interface_task_once(db, interface, driver.tasks.start):
         interface.runtime_status = "starting"
     db.commit()
     db.refresh(interface)
@@ -1890,7 +1890,8 @@ def stop_interface(interface_id: int, db: Session = Depends(get_db)) -> models.W
         raise HTTPException(status_code=400, detail="use managed link operation")
     if interface.runtime_status in ["stopped", "stopping"]:
         return interface
-    if enqueue_interface_task_once(db, interface, "wireguard.stop_interface"):
+    driver = connection_driver_for_interface(interface)
+    if enqueue_interface_task_once(db, interface, driver.tasks.stop):
         interface.runtime_status = "stopping"
     db.commit()
     db.refresh(interface)
@@ -1898,7 +1899,11 @@ def stop_interface(interface_id: int, db: Session = Depends(get_db)) -> models.W
 
 
 @app.delete("/api/wireguard/configs/{interface_id}")
-def delete_interface(interface_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+def delete_interface(
+    interface_id: int,
+    db: Session = Depends(get_db),
+    delete_node_config: bool = False,
+) -> dict[str, str]:
     """删除 WireGuard 配置；运行中的配置必须先关闭。"""
 
     interface = get_wireguard_config_or_404(interface_id, db)
@@ -1912,8 +1917,9 @@ def delete_interface(interface_id: int, db: Session = Depends(get_db)) -> dict[s
     if interface.runtime_status in ["running", "starting", "stopping"]:
         raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
     mark_import_candidate_available_for_interface(db, interface)
-    if should_delete_node_config_file(interface):
-        enqueue_interface_task_once(db, interface, "wireguard.delete_config")
+    if delete_node_config and should_delete_node_config_file(interface):
+        driver = connection_driver_for_interface(interface)
+        enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
     db.delete(interface)
     db.commit()
     return {"status": "deleted"}
@@ -1972,12 +1978,15 @@ def get_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.Chang
 def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.TaskRequestResult:
     """直接创建扫描现有 wg-quick 配置的 Agent 任务。"""
 
-    require_online_node(db, node_id)
+    node = require_online_node(db, node_id)
+    if node_uses_openwrt_uci(node):
+        raise HTTPException(status_code=409, detail="OpenWrt UCI nodes do not support wg-quick import scan")
+    require_task_supported(node, WIREGUARD_TASKS.import_scan)
 
     existing = db.scalar(
         select(models.AgentTask).where(
             models.AgentTask.node_id == node_id,
-            models.AgentTask.type == "wireguard.import_scan",
+            models.AgentTask.type == WIREGUARD_TASKS.import_scan,
             models.AgentTask.status.in_(["pending", "running"]),
         )
     )
@@ -1990,7 +1999,7 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
 
     task = models.AgentTask(
         node_id=node_id,
-        type="wireguard.import_scan",
+        type=WIREGUARD_TASKS.import_scan,
         payload={"node_id": node_id},
     )
     db.add(task)
@@ -2173,13 +2182,14 @@ def take_over_imported_interface(interface_id: int, db: Session = Depends(get_db
 
     new_config = render_interface_config(interface)
     diff = build_diff("", new_config, fromfile=f"{interface.name}.imported", tofile=f"{interface.name}.link42")
+    driver = connection_driver_for_interface(interface)
     plan = models.ChangePlan(
         title=f"Take over WireGuard interface {interface.name}",
         summary=f"Back up and replace imported config for node {interface.node_id} interface {interface.name}",
         affected_node_ids=[interface.node_id],
         diff=diff,
         payload={
-            "task_type": "wireguard.apply_config",
+            "task_type": driver.tasks.apply_config,
             "task_payload": build_apply_payload_from_config(interface, new_config),
             "post_confirm": {"set_interface_managed": interface.id},
         },
@@ -2267,7 +2277,7 @@ def agent_task_result(
             plan.status = "succeeded" if payload.status == "succeeded" else "failed"
 
     # import_scan 的结果由 Agent 返回候选配置，API 在这里转存为 ImportCandidate。
-    if task.type == "wireguard.import_scan" and payload.status == "succeeded":
+    if task.type == WIREGUARD_TASKS.import_scan and payload.status == "succeeded":
         candidates = payload.result.get("candidates", [])
         scanned_paths = {candidate["path"] for candidate in candidates if candidate.get("path")}
         imported_interface_names = existing_interface_names(db, payload.node_id)
@@ -2318,17 +2328,23 @@ def agent_task_result(
     if interface_id and payload.status == "succeeded":
         interface = db.get(models.WireGuardInterface, interface_id)
         if interface is not None:
-            if task.type == "wireguard.apply_config":
+            driver = connection_driver_for_interface(interface)
+            if task.type == driver.tasks.apply_config:
                 # 部署成功后记录节点上的已部署配置，后续 Change Plan diff 才能对比真实基线。
                 interface.deployed_config = task.payload.get("config")
                 interface.runtime_status = "running"
-            elif task.type == "wireguard.read_config":
-                interface.deployed_config = payload.result.get("config") or ""
-            elif task.type == "wireguard.start_interface":
+            elif task.type == driver.tasks.read_config:
+                if not (
+                    payload.result.get("config_backend") == "openwrt-uci"
+                    and payload.result.get("exists") is False
+                    and not payload.result.get("config")
+                ):
+                    interface.deployed_config = payload.result.get("config") or ""
+            elif task.type == driver.tasks.start:
                 interface.runtime_status = "running"
-            elif task.type == "wireguard.stop_interface":
+            elif task.type == driver.tasks.stop:
                 interface.runtime_status = "stopped"
-            elif task.type == "wireguard.status":
+            elif task.type == driver.tasks.status:
                 interface.runtime_status = payload.result.get("runtime_status") or interface.runtime_status
 
     db.commit()

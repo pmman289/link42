@@ -7,7 +7,7 @@ import shutil
 import socket
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from link42_wireguard import parse_wg_quick, parsed_interface_to_dict
 
@@ -45,12 +45,20 @@ def get_service_manager_name() -> str:
 def get_agent_platform() -> dict[str, Any]:
     """返回 Agent 当前运行平台信息，用于主控判断插件和升级资产。"""
 
-    glibc_name, glibc_version = platform.libc_ver()
+    libc_name, libc_version = platform.libc_ver()
+    if platform.system().lower() == "linux" and shutil.which("ldd"):
+        result = run_command(["ldd", "--version"], allow_failure=True)
+        output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".lower()
+        if "musl" in output:
+            libc_name = "musl"
+            libc_version = libc_version if libc_version and libc_version != "2.0" else None
     return {
         "os": platform.system().lower(),
         "arch": platform.machine(),
         "service_manager": get_service_manager_name(),
-        "glibc": glibc_version if glibc_name == "glibc" else None,
+        "libc": libc_name or None,
+        "libc_version": libc_version or None,
+        "glibc": libc_version if libc_name == "glibc" else None,
     }
 
 
@@ -104,7 +112,7 @@ def apply_wireguard_config(
     target.parent.mkdir(parents=True, exist_ok=True)
     service_state = manager.state(interface_name)
 
-    backup_path: str | None = None
+    backup_path: Optional[str] = None
     if target.exists():
         backup = rotate_wireguard_backup(target)
         shutil.copy2(target, backup)
@@ -184,6 +192,7 @@ def read_wireguard_config(payload: dict[str, Any], wireguard_dir: str = DEFAULT_
         return {
             "exists": False,
             "config": "",
+            "config_backend": manager.name,
             "config_path": None,
             "service": manager.state(interface_name),
             "message": "OpenWrt UCI backend does not expose a wg-quick config file",

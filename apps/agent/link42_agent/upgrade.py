@@ -7,9 +7,8 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib import request
 from urllib.parse import urlparse
-
-import httpx
 
 from .config import AgentConfig
 from .system import get_service_manager_name
@@ -71,10 +70,13 @@ def download_file(config: AgentConfig, url: str, target: Path) -> None:
     """使用 Agent token 下载升级二进制。"""
 
     tmp = target.with_suffix(".tmp")
-    with httpx.stream("GET", url, timeout=120) as response:
-        response.raise_for_status()
+    http_request = request.Request(url)
+    with request.urlopen(http_request, timeout=120) as response:
         with tmp.open("wb") as handle:
-            for chunk in response.iter_bytes():
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
                 handle.write(chunk)
     os.chmod(tmp, 0o755)
     tmp.replace(target)

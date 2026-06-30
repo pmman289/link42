@@ -59,6 +59,7 @@ git diff --check
 
 ```bash
 scripts/agent/build-x64.sh
+scripts/agent/build-source.sh
 ```
 
 产物位于：
@@ -71,6 +72,8 @@ dist/agent/link42-agent-linux-x64-<agent_version>.sha256
 dist/agent/link42-agent-linux-x64-glibc2.31-<agent_version>
 dist/agent/link42-agent-linux-x64-glibc2.31-<agent_version>.sha256
 dist/agent/manifest.json
+dist/agent/link42-agent-source.tar.gz
+dist/agent/link42-agent-source.tar.gz.sha256
 ```
 
 检查版本：
@@ -104,7 +107,7 @@ find dist/controller-agent-releases -maxdepth 1 -type f -print
 cat dist/controller-agent-releases/manifest.json
 ```
 
-如果第 2 步已经构建 Agent，`dist/controller-agent-releases` 会包含二进制、sha256 和 manifest。
+如果第 2 步已经构建 Agent，`dist/controller-agent-releases` 会包含二进制、源码包、sha256 和 manifest。
 
 如果没有构建 Agent，该目录只会生成空 release manifest。主控仍可构建和运行，但前端升级计划会回退为手动升级命令，不能一键自升级。
 

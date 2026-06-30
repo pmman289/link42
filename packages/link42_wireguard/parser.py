@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 
 # wg-quick 的 Interface 常见字段白名单；不在白名单里的字段会进入 extras 保留。
@@ -31,11 +31,11 @@ PEER_FIELDS = {
 
 @dataclass
 class ParsedPeer:
-    public_key: str | None = None
-    preshared_key: str | None = None
+    public_key: Optional[str] = None
+    preshared_key: Optional[str] = None
     allowed_ips: list[str] = field(default_factory=list)
-    endpoint: str | None = None
-    persistent_keepalive: int | None = None
+    endpoint: Optional[str] = None
+    persistent_keepalive: Optional[int] = None
     extras: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -43,13 +43,13 @@ class ParsedPeer:
 @dataclass
 class ParsedInterface:
     name: str
-    private_key: str | None = None
+    private_key: Optional[str] = None
     addresses: list[str] = field(default_factory=list)
-    listen_port: int | None = None
+    listen_port: Optional[int] = None
     dns: list[str] = field(default_factory=list)
-    mtu: int | None = None
-    table: str | None = None
-    fwmark: str | None = None
+    mtu: Optional[int] = None
+    table: Optional[str] = None
+    fwmark: Optional[str] = None
     pre_up: list[str] = field(default_factory=list)
     post_up: list[str] = field(default_factory=list)
     pre_down: list[str] = field(default_factory=list)
@@ -62,8 +62,8 @@ class ParsedInterface:
 def parse_wg_quick(content: str, name: str = "wg0") -> ParsedInterface:
     """解析 wg-quick 配置文本，返回结构化接口和 peer 信息。"""
     parsed = ParsedInterface(name=name)
-    section: str | None = None
-    current_peer: ParsedPeer | None = None
+    section: Optional[str] = None
+    current_peer: Optional[ParsedPeer] = None
 
     for line_no, raw_line in enumerate(content.splitlines(), start=1):
         line = raw_line.strip()
@@ -137,7 +137,7 @@ def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _parse_int(value: str, field_name: str, line_no: int, warnings: list[str]) -> int | None:
+def _parse_int(value: str, field_name: str, line_no: int, warnings: list[str]) -> Optional[int]:
     """解析整数字段，失败时把警告写入解析结果而不是直接中断导入。"""
     try:
         return int(value)

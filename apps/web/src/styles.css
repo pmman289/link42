@@ -1,6 +1,6 @@
 :root {
-  color: #16212a;
-  background: #eef3f6;
+  color: #18232b;
+  background: #f3f5f7;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -10,9 +10,7 @@
 
 body {
   margin: 0;
-  background:
-    radial-gradient(circle at 20% 0%, rgba(54, 125, 161, 0.13), transparent 34%),
-    linear-gradient(180deg, #f8fbfc 0%, #eef3f6 42%, #e9eff2 100%);
+  background: #f3f5f7;
 }
 
 button,
@@ -27,9 +25,9 @@ button {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  border: 1px solid #24789a;
+  border: 1px solid #216f86;
   border-radius: 6px;
-  background: #24789a;
+  background: #216f86;
   color: #fff;
   min-height: 36px;
   min-width: fit-content;
@@ -37,12 +35,13 @@ button {
   cursor: pointer;
   white-space: normal;
   line-height: 1.2;
-  transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+  transition: box-shadow 0.16s ease, background 0.16s ease, border-color 0.16s ease;
 }
 
 button:not(:disabled):hover {
-  transform: translateY(-1px);
-  box-shadow: 0 8px 18px rgba(34, 73, 92, 0.12);
+  background: #185b70;
+  border-color: #185b70;
+  box-shadow: 0 5px 14px rgba(27, 47, 59, 0.12);
 }
 
 button:disabled {
@@ -53,33 +52,52 @@ button:disabled {
 button.secondary,
 .iconButton {
   background: #fff;
-  color: #1f4e5f;
-  border-color: #c8d6dc;
+  color: #25515f;
+  border-color: #cfd9df;
+}
+
+button.secondary:not(:disabled):hover,
+.iconButton:not(:disabled):hover {
+  background: #f6f9fa;
+  border-color: #aebfc8;
 }
 
 button.danger {
-  background: #a13d3d;
-  border-color: #a13d3d;
+  background: #a64040;
+  border-color: #a64040;
+}
+
+button.danger:not(:disabled):hover {
+  background: #8b3030;
+  border-color: #8b3030;
 }
 
 input,
 textarea,
 select {
   width: 100%;
-  border: 1px solid #c8d5dc;
+  border: 1px solid #cbd6dd;
   border-radius: 6px;
   background: #fff;
-  min-height: 36px;
+  min-height: 38px;
   padding: 8px 10px;
-  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+  color: #18232b;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
 }
 
 input:focus,
 textarea:focus,
 select:focus {
   outline: none;
-  border-color: #24789a;
-  box-shadow: 0 0 0 3px rgba(36, 120, 154, 0.13);
+  border-color: #216f86;
+  box-shadow: 0 0 0 3px rgba(33, 111, 134, 0.14);
+}
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  background: #eef2f4;
+  color: #65747d;
 }
 
 textarea {
@@ -95,10 +113,10 @@ textarea {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 20px 24px;
-  border-bottom: 1px solid #dbe3e7;
-  background: rgba(255, 255, 255, 0.88);
-  backdrop-filter: blur(14px);
+  padding: 16px 24px;
+  border-bottom: 1px solid #dbe2e7;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(10px);
   position: sticky;
   top: 0;
   z-index: 10;
@@ -106,13 +124,14 @@ textarea {
 
 .topbar h1 {
   margin: 0;
-  font-size: 24px;
+  font-size: 22px;
+  letter-spacing: 0;
 }
 
 .topbar p,
 .muted {
   margin: 4px 0 12px;
-  color: #60717b;
+  color: #667781;
 }
 
 .topbarActions {
@@ -132,8 +151,8 @@ textarea {
   width: min(420px, 100%);
   border: 1px solid rgba(207, 220, 226, 0.88);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 18px 44px rgba(27, 54, 68, 0.14);
+  background: #fff;
+  box-shadow: 0 18px 44px rgba(27, 47, 59, 0.12);
   padding: 22px;
 }
 
@@ -156,7 +175,7 @@ textarea {
   border-radius: 8px;
   border: 1px solid #d7e1e6;
   background: rgba(255, 255, 255, 0.96);
-  box-shadow: 0 14px 34px rgba(16, 33, 42, 0.16);
+  box-shadow: 0 14px 34px rgba(20, 33, 42, 0.14);
   padding: 12px 14px;
   white-space: pre-wrap;
   animation: toastIn 0.22s ease-out;
@@ -171,14 +190,14 @@ textarea {
 }
 
 .toast.info {
-  border-left: 4px solid #24789a;
+  border-left: 4px solid #216f86;
 }
 
 .nodeBoard {
   display: grid;
-  gap: 16px;
-  padding: 16px 24px 24px;
-  max-width: 1180px;
+  gap: 14px;
+  padding: 18px 24px 28px;
+  max-width: 1220px;
   margin: 0 auto;
 }
 
@@ -186,11 +205,11 @@ textarea {
 .nodeCard,
 .modalPanel {
   background: rgba(255, 255, 255, 0.94);
-  border: 1px solid rgba(207, 220, 226, 0.88);
+  border: 1px solid #d9e1e6;
   border-radius: 8px;
   padding: 16px;
   min-width: 0;
-  box-shadow: 0 12px 36px rgba(27, 54, 68, 0.08);
+  box-shadow: 0 10px 28px rgba(30, 45, 55, 0.07);
 }
 
 .nodeCreate {
@@ -207,6 +226,7 @@ textarea {
   gap: 8px;
   margin: 0 0 12px;
   font-size: 18px;
+  letter-spacing: 0;
 }
 
 .nodeCreateForm {
@@ -218,12 +238,13 @@ textarea {
 .stack,
 .gridForm {
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .gridForm {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-bottom: 12px;
+  align-items: start;
 }
 
 .gridForm textarea,
@@ -233,21 +254,21 @@ textarea {
 
 .field {
   display: grid;
-  gap: 6px;
+  gap: 7px;
   align-content: start;
   min-width: 0;
 }
 
 .field > span {
-  color: #24323a;
+  color: #25323a;
   font-size: 13px;
   font-weight: 700;
 }
 
 .field > small {
-  color: #687983;
+  color: #697b86;
   font-size: 12px;
-  line-height: 1.35;
+  line-height: 1.45;
 }
 
 .wideField {
@@ -256,11 +277,13 @@ textarea {
 
 .checkField {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
-  color: #24323a;
+  color: #25323a;
   font-size: 13px;
   font-weight: 600;
+  line-height: 1.35;
+  padding: 8px 0;
 }
 
 .checkField input {
@@ -268,8 +291,69 @@ textarea {
   min-height: auto;
 }
 
+.dangerCheck {
+  border: 1px solid #e5c6c6;
+  border-radius: 6px;
+  background: #fff7f7;
+  color: #7a3030;
+  padding: 10px 12px;
+}
+
 .describedForm {
-  gap: 14px 12px;
+  gap: 14px;
+}
+
+.formSection {
+  display: grid;
+  gap: 14px;
+  border: 1px solid #dce4e8;
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 14px;
+}
+
+.formSectionHeader {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e7edf0;
+}
+
+.formSectionHeader h3 {
+  margin: 0;
+  color: #1e2a32;
+  font-size: 15px;
+  letter-spacing: 0;
+}
+
+.formSectionHeader p {
+  margin: 0;
+  color: #687983;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.formSectionGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 16px;
+  align-items: start;
+}
+
+.middlewareSection {
+  border-color: #cbded8;
+  background: #f8fbf8;
+}
+
+.formNotice {
+  border: 1px solid #d7e7e0;
+  border-left: 3px solid #2f7d59;
+  border-radius: 6px;
+  background: #f2f8f4;
+  color: #426153;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .endpointSelect {
@@ -277,15 +361,16 @@ textarea {
 }
 
 .endpointSelect__control {
-  min-height: 36px;
-  border-color: #c8d5dc !important;
+  min-height: 38px;
+  border-color: #cbd6dd !important;
   border-radius: 6px !important;
   box-shadow: none !important;
+  background: #fff !important;
 }
 
 .endpointSelect__control--is-focused {
-  border-color: #24789a !important;
-  box-shadow: 0 0 0 3px rgba(36, 120, 154, 0.13) !important;
+  border-color: #216f86 !important;
+  box-shadow: 0 0 0 3px rgba(33, 111, 134, 0.14) !important;
 }
 
 .endpointSelect__value-container {
@@ -299,6 +384,8 @@ textarea {
 
 .endpointSelect__menu {
   z-index: 80;
+  border: 1px solid #d6e0e5;
+  box-shadow: 0 14px 28px rgba(25, 42, 52, 0.14) !important;
 }
 
 .endpointSelect__option {
@@ -306,11 +393,11 @@ textarea {
 }
 
 .endpointSelect__option--is-focused {
-  background: #e7f4f8 !important;
+  background: #eef6f7 !important;
 }
 
 .endpointSelect__option--is-selected {
-  background: #24789a !important;
+  background: #216f86 !important;
 }
 
 .endpointSelectOption {
@@ -367,7 +454,7 @@ textarea {
   min-height: 56px;
   justify-content: space-between;
   background: #fff;
-  color: #172026;
+  color: #18232b;
   border: 0;
   border-radius: 0;
   padding: 12px 16px;
@@ -395,12 +482,12 @@ textarea {
 
 .nodeHeader small,
 .configRow small {
-  color: #60717b;
+  color: #667781;
 }
 
 .nodeCard.expanded .nodeBar {
-  background: #ecf7fa;
-  border-bottom: 1px solid #dbe3e7;
+  background: #eef6f7;
+  border-bottom: 1px solid #dbe2e7;
 }
 
 .nodeCard.expanded .nodeHeader,
@@ -419,9 +506,9 @@ textarea {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 14px;
   align-items: center;
-  border: 1px solid #dbe3e7;
+  border: 1px solid #dbe2e7;
   border-radius: 8px;
-  background: #f8fbfc;
+  background: #f8fafb;
   padding: 14px;
 }
 
@@ -442,30 +529,30 @@ textarea {
 }
 
 .configRow {
-  border: 1px solid #dbe3e7;
+  border: 1px solid #dbe2e7;
   border-radius: 8px;
 }
 
 .configRow:not(:disabled):hover {
-  border-color: #9fc4d2;
-  background: #f7fbfc;
+  border-color: #a7c4ce;
+  background: #f7fbfb;
 }
 
 .row {
   width: 100%;
   justify-content: space-between;
   background: #fff;
-  color: #172026;
-  border-color: #dbe3e7;
+  color: #18232b;
+  border-color: #dbe2e7;
 }
 
 .row.active {
-  border-color: #1f6f8b;
-  background: #edf7fb;
+  border-color: #216f86;
+  background: #edf6f7;
 }
 
 .row small {
-  color: #60717b;
+  color: #667781;
 }
 
 .statusBadge {
@@ -513,9 +600,9 @@ textarea {
 
 .candidateToggle {
   justify-content: space-between;
-  border-color: #dbe3e7;
-  background: #f8fbfc;
-  color: #172026;
+  border-color: #dbe2e7;
+  background: #f8fafb;
+  color: #18232b;
 }
 
 .candidateToggle span {
@@ -525,7 +612,7 @@ textarea {
 }
 
 .candidateToggle small {
-  color: #60717b;
+  color: #667781;
 }
 
 .candidate {
@@ -533,7 +620,7 @@ textarea {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
-  border: 1px solid #dbe3e7;
+  border: 1px solid #dbe2e7;
   border-radius: 6px;
   padding: 10px;
 }
@@ -547,28 +634,30 @@ textarea {
 .candidate span,
 .candidate small {
   overflow-wrap: anywhere;
-  color: #60717b;
+  color: #667781;
 }
 
 .peer {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  border: 1px solid #dbe3e7;
+  border: 1px solid #dbe2e7;
   border-radius: 6px;
   padding: 10px;
 }
 
 .empty {
-  border: 1px dashed #cbd5dc;
+  border: 1px dashed #cbd6dd;
   border-radius: 6px;
-  color: #60717b;
+  color: #667781;
+  background: #fbfcfd;
   padding: 12px;
+  line-height: 1.45;
 }
 
 .plan {
   margin-top: 14px;
-  border-top: 1px solid #dbe3e7;
+  border-top: 1px solid #dbe2e7;
   padding-top: 14px;
 }
 
@@ -599,17 +688,17 @@ textarea {
   z-index: 20;
   display: grid;
   place-items: center;
-  background: rgba(16, 24, 32, 0.46);
-  backdrop-filter: blur(6px);
+  background: rgba(18, 28, 36, 0.5);
+  backdrop-filter: blur(5px);
   padding: 24px;
   animation: fadeIn 0.16s ease-out;
 }
 
 .modalPanel {
-  width: min(920px, 100%);
+  width: min(1040px, 100%);
   max-height: calc(100vh - 48px);
   overflow: auto;
-  box-shadow: 0 18px 48px rgba(16, 24, 32, 0.22);
+  box-shadow: 0 22px 56px rgba(16, 24, 32, 0.24);
   padding-top: 0;
   animation: modalIn 0.2s ease-out;
 }
@@ -626,11 +715,11 @@ textarea {
   justify-content: space-between;
   gap: 16px;
   align-items: start;
-  border-bottom: 1px solid #dbe3e7;
+  border-bottom: 1px solid #dbe2e7;
   padding: 16px 0 12px;
   margin-bottom: 14px;
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(12px);
+  background: rgba(255, 255, 255, 0.98);
+  backdrop-filter: blur(10px);
 }
 
 .modalHeader h2 {
@@ -639,7 +728,7 @@ textarea {
 
 .modalSection {
   display: grid;
-  gap: 10px;
+  gap: 12px;
   padding: 14px 0;
   border-bottom: 1px solid #edf1f3;
 }
@@ -651,6 +740,7 @@ textarea {
 .modalSection h3 {
   margin: 0;
   font-size: 15px;
+  letter-spacing: 0;
 }
 
 @media (max-width: 760px) {

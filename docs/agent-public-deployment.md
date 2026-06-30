@@ -40,10 +40,14 @@ Agent 发布分两条线：
       manifest.json
       link42-agent-linux-x64
       link42-agent-linux-x64.sha256
+      link42-agent-source.tar.gz
+      link42-agent-source.tar.gz.sha256
       0.2.0/
         manifest.json
         link42-agent-linux-x64
         link42-agent-linux-x64.sha256
+        link42-agent-source.tar.gz
+        link42-agent-source.tar.gz.sha256
         link42-agent-linux-x64-0.2.0
         link42-agent-linux-x64-0.2.0.sha256
         link42-agent-linux-x64-glibc2.31-0.2.0
@@ -53,6 +57,7 @@ Agent 发布分两条线：
 说明：
 
 - `res/link42/link42-agent-linux-x64` 是 latest 安装入口使用的稳定文件名。
+- `res/link42/link42-agent-source.tar.gz` 是 OpenWrt ARM/aarch64 源码安装入口使用的稳定文件名。
 - `res/link42/<version>/link42-agent-linux-x64` 是固定版本安装入口使用的稳定文件名。
 - 版本化文件保留在版本目录内，便于排查和人工下载。
 - `.sha256` 必须和对应二进制同步发布。
@@ -65,6 +70,7 @@ Agent 发布分两条线：
 ```bash
 git status --short --branch
 scripts/agent/build-x64.sh
+scripts/agent/build-source.sh
 ```
 
 默认脚本使用 `python:3.11-slim-bullseye` 容器构建，避免在过新的系统上构建出依赖

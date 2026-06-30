@@ -328,6 +328,20 @@ min_agent_version = 0.2.0
 capabilities = middleware, middleware.install, middleware.udp2raw, service:systemd
 ```
 
+OpenWrt/procd 节点能力为：
+
+```text
+capabilities = middleware, middleware.install, middleware.udp2raw, service:openwrt-uci, middleware.udp2raw.openwrt-procd
+```
+
+OpenWrt 注意事项：
+
+- Link42 不再额外插入 `iptables -j DROP` 防 RST 规则；OpenWrt/procd 后端只启动 udp2raw，并使用 udp2raw 自身的 `-a` 自动规则。
+- 不要手工添加 `iptables -I INPUT -p tcp --dport <server_listen_port> -j DROP` 这类 direct DROP 规则，它会吞掉 client 发来的 faketcp SYN。
+- Link42 不自动修改 OpenWrt firewall zone，不自动放行 WAN/LAN/DN42 等区域的入站端口。
+- 当 OpenWrt 作为 udp2raw server 时，用户仍需要按实际入口区域手动放行 `server_listen_port`。例如入口来自 WAN，就在对应 WAN zone 放行该 TCP 端口；入口来自自定义 DN42 zone，则在该 zone 放行。
+- 如果 client 日志持续出现 `rst==1`，优先检查是否存在错误的 direct DROP/ACCEPT 顺序、udp2raw 自身自动规则、上游 NAT/端口转发和 OpenWrt firewall zone；如果表现为超时或没有入站包，再检查入口区域是否放行。
+
 插件资产由主控提供，Agent 下载并校验后安装：
 
 ```text

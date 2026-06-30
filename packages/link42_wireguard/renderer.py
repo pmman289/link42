@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Optional
 
 
 def render_wg_quick(interface: dict, peers: Iterable[dict]) -> str:
@@ -43,14 +44,14 @@ def render_wg_quick(interface: dict, peers: Iterable[dict]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _append(lines: list[str], key: str, value: object | None) -> None:
+def _append(lines: list[str], key: str, value: Optional[object]) -> None:
     """追加单值字段，空值不输出。"""
     if value is None or value == "":
         return
     lines.append(f"{key} = {value}")
 
 
-def _append_csv(lines: list[str], key: str, values: object | None) -> None:
+def _append_csv(lines: list[str], key: str, values: Optional[object]) -> None:
     """追加逗号分隔字段，兼容字符串和列表输入。"""
     if not values:
         return
@@ -62,7 +63,7 @@ def _append_csv(lines: list[str], key: str, values: object | None) -> None:
         lines.append(f"{key} = {', '.join(values_list)}")
 
 
-def _append_many(lines: list[str], key: str, values: object | None) -> None:
+def _append_many(lines: list[str], key: str, values: Optional[object]) -> None:
     """追加可重复出现的 wg-quick 字段，例如 PostUp。"""
     if not values:
         return
@@ -72,7 +73,7 @@ def _append_many(lines: list[str], key: str, values: object | None) -> None:
         _append(lines, key, value)
 
 
-def _append_raw(lines: list[str], value: object | None) -> None:
+def _append_raw(lines: list[str], value: Optional[object]) -> None:
     """追加用户自定义 wg-quick 行，保持原始顺序。"""
     if not value:
         return

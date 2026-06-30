@@ -233,6 +233,7 @@ function translateApiDetail(detail: string): string {
     "change plan has no task payload": "部署计划缺少 Agent 任务内容",
     "change plan has no diff": "当前计划没有 diff，无需下发任务",
     "wireguard config must be deployed before start": "WireGuard 配置需要先部署再启动",
+    "OpenWrt UCI nodes do not support wg-quick import scan": "OpenWrt/UCI 节点不支持 wg-quick 文件导入扫描",
     "wireguard interface must be stopped before delete": "删除前必须先断开对应 WireGuard 连接",
     "peer node must be different": "请选择另一个节点作为对端",
     "local node has no endpoint address": "当前节点缺少可作为 Endpoint 的地址",
@@ -256,6 +257,49 @@ function translateApiDetail(detail: string): string {
 function isNodeSelectable(node: NodeItem): boolean {
   // 只有 Agent 在线的节点才允许进入 WireGuard 下级菜单。
   return node.status === "online";
+}
+
+function nodeCapabilities(node: NodeItem | null): Set<string> {
+  return new Set(node?.agent_capabilities || []);
+}
+
+function nodeServiceManager(node: NodeItem | null): string {
+  const serviceManager = String(node?.agent_platform?.service_manager || "");
+  if (serviceManager) return serviceManager;
+  const capabilities = nodeCapabilities(node);
+  if (capabilities.has("service:openwrt-uci")) return "openwrt-uci";
+  if (capabilities.has("service:systemd")) return "systemd";
+  if (capabilities.has("service:openrc")) return "openrc";
+  if (capabilities.has("service:direct-wg-quick")) return "direct-wg-quick";
+  return "";
+}
+
+function nodeSystemLabel(node: NodeItem | null): string {
+  const labels: Record<string, string> = {
+    "openwrt-uci": "OpenWrt / UCI",
+    systemd: "Linux / systemd",
+    openrc: "Linux / OpenRC",
+    "direct-wg-quick": "Linux / wg-quick",
+  };
+  const serviceManager = nodeServiceManager(node);
+  return labels[serviceManager] || serviceManager || "未知服务管理器";
+}
+
+function nodeSupportsWgQuickImport(node: NodeItem | null): boolean {
+  return nodeCapabilities(node).has("wg_quick_import") && nodeServiceManager(node) !== "openwrt-uci";
+}
+
+function importScanUnavailableMessage(node: NodeItem | null, online: boolean): string {
+  if (!online) {
+    return "Agent 在线并上报能力后显示导入扫描。";
+  }
+  if (nodeServiceManager(node) === "openwrt-uci") {
+    return "OpenWrt/UCI 节点不支持 wg-quick 文件导入。";
+  }
+  if (!node?.agent_capabilities?.length) {
+    return "Agent 上报能力后显示可用的导入方式。";
+  }
+  return "当前节点未上报 wg-quick 文件导入能力。";
 }
 
 function statusLabel(status: string): string {
@@ -375,6 +419,30 @@ function Field({
       {children}
       {hint && <small>{hint}</small>}
     </label>
+  );
+}
+
+function FormSection({
+  title,
+  hint,
+  children,
+  tone = "default",
+}: {
+  title: string;
+  hint?: string;
+  children: React.ReactNode;
+  tone?: "default" | "middleware";
+}) {
+  return (
+    <section className={`formSection wideField ${tone === "middleware" ? "middlewareSection" : ""}`}>
+      <div className="formSectionHeader">
+        <h3>{title}</h3>
+        {hint && <p>{hint}</p>}
+      </div>
+      <div className="formSectionGrid">
+        {children}
+      </div>
+    </section>
   );
 }
 
@@ -516,7 +584,11 @@ function Udp2RawFields({
   }
 
   return (
-    <>
+    <FormSection
+      title="udp2raw 连接中间层"
+      hint="client 监听本机 UDP 并封装发往 server；server 收到后解包，再转发到本机 WireGuard UDP 端口。"
+      tone="middleware"
+    >
       <label className="checkField wideField">
         <input
           name="udp2raw_enabled"
@@ -526,11 +598,11 @@ function Udp2RawFields({
           onChange={handleEnabledChange}
         />
         <input type="hidden" name="udp2raw_enabled_state" value={enabled ? "on" : ""} disabled={disabled} />
-        <span>启用 udp2raw 连接中间层</span>
+        <span>启用 udp2raw</span>
       </label>
       {enabled && (
         <>
-          <Field label="udp2raw server 所在节点" hint="server 接收 raw TCP/faketcp/icmp，再转回本机 WireGuard UDP。">
+          <Field label="server 所在节点" hint="server 需要有 WireGuard ListenPort；client 侧 WireGuard 可不写 ListenPort。">
             <select
               name="udp2raw_server_side"
               value={serverSide}
@@ -541,63 +613,62 @@ function Udp2RawFields({
               <option value="local">本端运行 udp2raw server，对端运行 client</option>
             </select>
           </Field>
-          <Field label="server 监听 IP" hint="udp2raw -l 使用的本机 IP；必须是 IP，不能填域名。">
-            <input name="udp2raw_server_listen_host" defaultValue={defaults?.server_listen_host || "0.0.0.0"} disabled={disabled} />
-          </Field>
-          <Field label="server 对外 IP" hint="client 连接 udp2raw server 的 IP；必须是 IP，不能填域名。">
+          <Field label="client 连接 server IP" hint="写入 client 的 -r；必须是 IP，不能填域名。">
             <input name="udp2raw_server_connect_host" defaultValue={defaults?.server_connect_host || ""} placeholder="203.0.113.20" disabled={disabled} />
           </Field>
-          <Field label="server 监听端口" hint="client 要连接的 udp2raw raw 端口。">
+          <Field label="server 监听地址" hint="server 的 -l 地址；通常 0.0.0.0，必须是 IP。">
+            <input name="udp2raw_server_listen_host" defaultValue={defaults?.server_listen_host || "0.0.0.0"} disabled={disabled} />
+          </Field>
+          <Field label="server 监听端口" hint="client 连接的 raw TCP/faketcp/icmp 端口。">
             <input name="udp2raw_server_listen_port" defaultValue={defaults?.server_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
-          <Field label="server 转发目的 IP" hint="udp2raw server 解包后 UDP 转发到的地址；通常是 127.0.0.1，必须是 IP。">
+          <Field label="server 转发到 IP" hint="server 解包后把 UDP 发往这里；通常 127.0.0.1。">
             <input name="udp2raw_server_forward_host" defaultValue={defaults?.server_forward_host || "127.0.0.1"} disabled={disabled} />
           </Field>
-          <Field label="server 转发目的端口" hint="udp2raw server 解包后 UDP 转发到的端口；通常等于 server 侧 WireGuard ListenPort。">
+          <Field label="server 转发到端口" hint="可选；留空则使用 server 侧 WireGuard ListenPort。">
             <input
               key={`udp2raw-forward-port-${serverSide}-${forwardPortDefault}`}
               name="udp2raw_server_forward_port"
               defaultValue={forwardPortDefault}
               inputMode="numeric"
-              required={enabled}
               disabled={disabled}
             />
           </Field>
-          <Field label="client 本地 UDP 监听 IP" hint="WireGuard Endpoint 会指向这个本地 UDP 地址；通常是 127.0.0.1。">
+          <Field label="client 本地监听地址" hint="WireGuard Endpoint 会被接管到这个本地 UDP 地址。">
             <input name="udp2raw_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} />
           </Field>
-          <Field label="client 本地 UDP 监听端口" hint="client 从这里接收 WireGuard UDP 包，再封装发往 server。">
+          <Field label="client 本地监听端口" hint="WireGuard 把 UDP 发到这里，再由 udp2raw 封装发往 server。">
             <input name="udp2raw_client_listen_port" defaultValue={defaults?.client_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
-          <Field label="raw mode">
+          <Field label="传输模式" hint="faketcp 伪装性更强；udp 更直接；icmp 仅在明确需要时使用。">
             <select name="udp2raw_raw_mode" defaultValue={defaults?.raw_mode || "faketcp"} disabled={disabled}>
               <option value="faketcp">faketcp</option>
               <option value="udp">udp</option>
               <option value="icmp">icmp</option>
             </select>
           </Field>
-          <Field label="cipher mode">
+          <Field label="加密模式" hint="xor 开销低；none 不加密；aes128cbc 兼容 udp2raw 原生模式。">
             <select name="udp2raw_cipher_mode" defaultValue={defaults?.cipher_mode || "xor"} disabled={disabled}>
               <option value="xor">xor</option>
               <option value="aes128cbc">aes128cbc</option>
               <option value="none">none</option>
             </select>
           </Field>
-          <Field label="密码" hint="留空由主控自动生成；保存后会复用当前值。">
+          <Field label="共享密码" hint="两端必须一致；留空时主控自动生成并保存。">
             <input name="udp2raw_password" defaultValue={defaults?.password || ""} disabled={disabled} />
           </Field>
           <label className="checkField wideField">
             <input name="udp2raw_auto_rule" type="checkbox" defaultChecked={defaults?.auto_rule ?? true} disabled={disabled} />
-            <span>允许 udp2raw 自动添加 iptables 规则（-a）</span>
+            <span>启用 udp2raw 自动规则（-a）</span>
           </label>
-          <div className="empty wideField">
+          <div className="formNotice wideField">
             {serverSide === "peer"
-              ? "本端 WireGuard Endpoint 由 udp2raw client 接管；对端 udp2raw server 解包后转发到上面填写的 server 转发目的地址。"
-              : "对端 WireGuard Endpoint 由 udp2raw client 接管；本端 udp2raw server 解包后转发到上面填写的 server 转发目的地址。"}
+              ? "本端 Endpoint 会指向本端 udp2raw client；对端 server 解包后转发到对端 WireGuard。OpenWrt 作为 server 时，入口防火墙区域仍需手动放行 server 监听端口。"
+              : "对端 Endpoint 会指向对端 udp2raw client；本端 server 解包后转发到本端 WireGuard。OpenWrt 作为 server 时，入口防火墙区域仍需手动放行 server 监听端口。"}
           </div>
         </>
       )}
-    </>
+    </FormSection>
   );
 }
 
@@ -638,10 +709,12 @@ function validateUdp2RawForm(udp2raw: Record<string, unknown> | null, localListe
   const clientListenHost = String(udp2raw.client_listen_host || "");
   if (
     !isValidPort(Number(udp2raw.server_listen_port) || null) ||
-    !isValidPort(Number(udp2raw.server_forward_port) || null) ||
     !isValidPort(Number(udp2raw.client_listen_port) || null)
   ) {
-    throw new Error("udp2raw server 监听端口、server 转发目的端口和 client 本地 UDP 监听端口必须填写 1-65535 之间的整数");
+    throw new Error("udp2raw server 监听端口和 client 本地 UDP 监听端口必须填写 1-65535 之间的整数");
+  }
+  if (!isValidPort(Number(udp2raw.server_forward_port) || null)) {
+    throw new Error("udp2raw server 转发目的端口必须留空，或填写 1-65535 之间的整数");
   }
   if (!isProbablyIpAddress(serverListenHost) || !isProbablyIpAddress(serverForwardHost) || !isProbablyIpAddress(clientListenHost)) {
     throw new Error("udp2raw 监听地址和转发目的地址必须填写 IP，不能填写域名");
@@ -687,6 +760,8 @@ function App() {
   const [udp2rawServerSide, setUdp2rawServerSide] = useState<"local" | "peer">("peer");
   const [peerNodeConfigs, setPeerNodeConfigs] = useState<ConfigItem[]>([]);
   const [importCandidatesExpanded, setImportCandidatesExpanded] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deleteNodeConfig, setDeleteNodeConfig] = useState(false);
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) || null,
     [nodes, selectedNodeId],
@@ -705,6 +780,7 @@ function App() {
   const isConfigBusy = selectedConfig ? ["starting", "stopping"].includes(selectedConfig.runtime_status) : false;
   const selectedConfigIsManagedLink = selectedConfig?.source === "managed-node";
   const selectedConfigIsUnmanagedImport = selectedConfig?.source === "imported" && !selectedConfig.managed;
+  const selectedNodeSupportsWgQuickImport = nodeSupportsWgQuickImport(selectedNode);
   const hasDeployDiff = Boolean(plan?.diff.trim());
   const selectedPeerNodeOptions = selectedNode
     ? nodes.filter((item) => item.id !== selectedNode.id && isNodeSelectable(item))
@@ -1122,7 +1198,7 @@ function App() {
 
   async function copyAgentCommand() {
     if (!editingNode) return;
-    const command = buildAgentCommand(editingNode);
+    const command = buildAgentCommand(editingNode, controllerUrl);
     if (!command) {
       throw new Error("当前节点没有可查看 token，请先轮换 token");
     }
@@ -1558,8 +1634,7 @@ function App() {
     notify("success", selectedConfigIsManagedLink ? "已创建双方断开任务，等待 Agent 执行。" : isConfigStopped ? "WireGuard 连接已经是已断开状态。" : "断开任务已创建，等待 Agent 执行。");
   }
 
-  async function deleteSelectedConfig() {
-    // 删除配置前做前端确认；后端仍会强制要求接口不是 running。
+  async function openDeleteDialog() {
     if (!selectedConfigId || !selectedNodeId || !selectedConfig) return;
     if (!selectedConfigIsUnmanagedImport && !selectedNodeOnline) {
       throw new Error("Agent 离线，不能删除 WireGuard 配置");
@@ -1567,26 +1642,30 @@ function App() {
     if (!selectedConfigIsUnmanagedImport && !isConfigStopped) {
       throw new Error("删除前必须先断开对应 WireGuard 连接");
     }
-    const confirmText = selectedConfigIsManagedLink
-      ? `确认删除受管连接 ${selectedConfig.name} 及其对端配置？`
-      : selectedConfigIsUnmanagedImport
-        ? `确认删除导入观察记录 ${selectedConfig.name}？这不会删除节点上的 wg-quick 文件。`
-        : `确认删除 WireGuard 配置 ${selectedConfig.name}？`;
-    if (!window.confirm(confirmText)) return;
+    setDeleteNodeConfig(false);
+    setDeleteDialogOpen(true);
+  }
+
+  async function deleteSelectedConfig() {
+    // 默认只删除 Link42 记录；用户勾选后才同步删除节点配置和服务。
+    if (!selectedConfigId || !selectedNodeId || !selectedConfig) return;
+    const query = deleteNodeConfig ? "?delete_node_config=true" : "";
     if (selectedConfigIsManagedLink) {
-      await api<{ status: string }>(`/api/wireguard/configs/${selectedConfigId}/managed-link`, { method: "DELETE" });
+      await api<{ status: string }>(`/api/wireguard/configs/${selectedConfigId}/managed-link${query}`, { method: "DELETE" });
     } else {
-      await api<{ status: string }>(`/api/wireguard/configs/${selectedConfigId}`, { method: "DELETE" });
+      await api<{ status: string }>(`/api/wireguard/configs/${selectedConfigId}${query}`, { method: "DELETE" });
     }
+    setDeleteDialogOpen(false);
+    setDeleteNodeConfig(false);
     setSelectedConfigId(null);
     setPlan(null);
     await refreshConfigs(selectedNodeId, null);
     await refreshImportCandidates(selectedNodeId);
     notify("success", selectedConfigIsManagedLink
-      ? "受管连接双方配置已删除。"
+      ? (deleteNodeConfig ? "受管连接双方记录已删除，并已下发节点配置清理任务。" : "受管连接双方记录已删除，节点配置已保留。")
       : selectedConfigIsUnmanagedImport
         ? "导入观察记录已删除，节点原始配置文件未改动。"
-        : "WireGuard 配置已删除。");
+        : (deleteNodeConfig ? "WireGuard 记录已删除，并已下发节点配置清理任务。" : "WireGuard 记录已删除，节点配置已保留。"));
   }
 
   async function confirmPlan() {
@@ -1826,11 +1905,11 @@ function App() {
                 <div className="empty">该节点创建时未保存明文 token，请轮换后查看。</div>
               )}
               <div className="empty">
-                Agent {editingNode.agent_version || "未知版本"} / {String(editingNode.agent_platform?.service_manager || "未知服务管理器")}
+                Agent {editingNode.agent_version || "未知版本"} / {nodeSystemLabel(editingNode)}
                 <br />
                 {(editingNode.agent_capabilities || []).join(", ") || "尚未上报能力"}
               </div>
-              <pre className="tokenBox">{buildAgentCommand(editingNode) || "轮换 token 后显示 Agent 启动命令。"}</pre>
+              <pre className="tokenBox">{buildAgentCommand(editingNode, controllerUrl) || "轮换 token 后显示 Agent 启动命令。"}</pre>
               <div className="actionRow">
                 <button className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
                 <button className="danger" onClick={() => void runAction(rotateNodeToken)}>轮换 token</button>
@@ -1973,7 +2052,7 @@ function App() {
             <header className="modalHeader">
               <div>
                 <h2 id="managed-link-title"><GitBranch size={18} /> 创建受管连接</h2>
-                <p className="muted">系统会为双方生成密钥，直接部署、启动，并启用 wg-quick 开机自启。</p>
+                <p className="muted">系统会为双方生成密钥，部署并启动连接，同时启用对应节点的服务或开机配置。</p>
               </div>
               <button
                 className="iconButton"
@@ -1993,6 +2072,7 @@ function App() {
               onSubmit={(event) => void runAction(() => createManagedLink(event))}
               className="gridForm describedForm"
             >
+              <FormSection title="节点与导入" hint="选择对端节点；需要接管现有 wg-quick 配置时，在这里指定双方要替换的导入配置。">
               <Field label="对端节点" hint="只能选择当前在线的其它受管节点。">
                 <select
                   name="peer_node_id"
@@ -2037,12 +2117,28 @@ function App() {
                   ))}
                 </select>
               </Field>
+              </FormSection>
+              <FormSection title="接口与隧道地址" hint="接口名写入双方节点；隧道 IP 和 AllowedIPs 支持多个 CIDR，用逗号分隔。">
               <Field label="本端接口名称" hint="当前节点上创建的接口名。">
                 <input name="local_interface_name" placeholder="wg-node-a" defaultValue={replaceLocalConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
               <Field label="对端接口名称" hint="对端节点上创建的接口名；同机双 Agent 测试时必须不同。">
                 <input name="peer_interface_name" placeholder="wg-node-b" defaultValue={replacePeerConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
+              <Field label="本端隧道 IP" hint="本端 WireGuard Address；例如 10.42.0.1/32, fd42::1/64。">
+                <input name="local_tunnel_ips" placeholder="10.42.0.1/32, fd42::1/64" defaultValue={replaceLocalConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="对端隧道 IP" hint="对端 WireGuard Address；例如 10.42.0.2/32, fd42::2/64。">
+                <input name="peer_tunnel_ips" placeholder="10.42.0.2/32, fd42::2/64" defaultValue={replacePeerConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="本端监听端口" hint="可选；留空表示本端 WireGuard 不写 ListenPort。udp2raw server 在本端时必须填写。">
+                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+              </Field>
+              <Field label="对端监听端口" hint="可选；留空表示对端 WireGuard 不写 ListenPort。udp2raw server 在对端时必须填写。">
+                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+              </Field>
+              </FormSection>
+              <FormSection title="直连入口与路由" hint="未启用中间层时，Endpoint 使用这里的入口地址和端口；启用 udp2raw 后相关字段会被接管为只读。">
               <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址。">
                 <EndpointSelect
                   key={`managed-local-endpoint-${replacePeerConfigId || "none"}-${managedLocalEndpointDefault}`}
@@ -2083,12 +2179,6 @@ function App() {
                   disabled={!selectedNodeOnline || udp2rawEnabled}
                 />
               </Field>
-              <Field label="本端隧道 IP" hint="CIDR 格式，例如 10.42.0.1/32。">
-                <input name="local_tunnel_ips" placeholder="10.42.0.1/32, fd42::1/64" defaultValue={replaceLocalConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
-              </Field>
-              <Field label="对端隧道 IP" hint="CIDR 格式，例如 10.42.0.2/32。">
-                <input name="peer_tunnel_ips" placeholder="10.42.0.2/32, fd42::2/64" defaultValue={replacePeerConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
-              </Field>
               <Field label="本端 Peer AllowedIPs" hint="写入当前节点 [Peer]；留空则使用对端隧道 IP。">
                 <input
                   key={`managed-local-allowed-${replaceLocalConfigId || "none"}-${replacePeerConfigId || "none"}-${managedLocalAllowedIpsDefault}`}
@@ -2107,12 +2197,7 @@ function App() {
                   disabled={!selectedNodeOnline}
                 />
               </Field>
-              <Field label="本端监听端口" hint="可选；留空表示不写 ListenPort。">
-                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
-              </Field>
-              <Field label="对端监听端口" hint="可选；留空表示不写 ListenPort。">
-                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
-              </Field>
+              </FormSection>
               <Udp2RawFields
                 enabled={udp2rawEnabled}
                 serverSide={udp2rawServerSide}
@@ -2122,12 +2207,15 @@ function App() {
                 onEnabledChange={setUdp2rawEnabled}
                 onServerSideChange={setUdp2rawServerSide}
               />
+              <FormSection title="链路参数" hint="Table=off 是 DN42 常用默认值；启用中间层时 MTU 默认降到 1300，但仍可手动调整。">
               <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                 <input name="mtu" placeholder="1420" defaultValue={replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
               <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
                 <RouteModeSelect defaultValue={replaceLocalConfig?.table_name || replacePeerConfig?.table_name || ""} disabled={!selectedNodeOnline} />
               </Field>
+              </FormSection>
+              <FormSection title="高级配置" hint="这些内容会原样追加到对应的 [Interface] 或 [Peer] 区块，请只填写 WireGuard 支持的配置行。">
               <Field label="本端 Interface 高级配置" hint="写入当前节点 [Interface] 后，例如 PostUp。不同节点可不同。" wide>
                 <textarea name="local_interface_custom_config" defaultValue={replaceLocalConfig?.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
               </Field>
@@ -2140,6 +2228,7 @@ function App() {
               <Field label="对端 Peer 高级配置" hint="写入对端节点 [Peer] 后。" wide>
                 <textarea name="peer_peer_custom_config" placeholder="AllowedIPs 之外的自定义 Peer 行" disabled={!selectedNodeOnline} />
               </Field>
+              </FormSection>
               {(replaceLocalConfigId || replacePeerConfigId) && (
                 <label className="checkField wideField">
                   <input
@@ -2234,17 +2323,21 @@ function App() {
                       </div>
                     </section>
 
-                    <div className="sectionActions">
-                      <button
-                        className="secondary"
-                        disabled={!selectedNodeOnline}
-                        onClick={() => void runAction(requestImportScan)}
-                      >
-                        <Upload size={16} /> 扫描现有 wg-quick
-                      </button>
-                    </div>
+                    {selectedNodeSupportsWgQuickImport ? (
+                      <div className="sectionActions">
+                        <button
+                          className="secondary"
+                          disabled={!selectedNodeOnline}
+                          onClick={() => void runAction(requestImportScan)}
+                        >
+                          <Upload size={16} /> 扫描现有 wg-quick
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="empty">{importScanUnavailableMessage(selectedNode, selectedNodeOnline)}</div>
+                    )}
 
-                    {importCandidates.length > 0 && (
+                    {selectedNodeSupportsWgQuickImport && importCandidates.length > 0 && (
                       <div className="candidateList">
                         <button
                           type="button"
@@ -2341,68 +2434,72 @@ function App() {
                   onSubmit={(event) => void runAction(() => saveManagedLink(event))}
                   className="gridForm describedForm"
                 >
-                  <Field label="本端接口名称" hint={`当前节点：${selectedNode.name}`}>
-                    <input name="local_interface_name" defaultValue={managedLink.local_interface.name} required disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="对端接口名称" hint={`对端节点：${selectedManagedLinkPeerNode?.name || managedLink.peer_interface.node_id}`}>
-                    <input name="peer_interface_name" defaultValue={managedLink.peer_interface.name} required disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="本端隧道地址" hint="支持多个地址，例如 IPv4 + IPv6，用逗号分隔。">
-                    <input name="local_tunnel_ips" defaultValue={managedLink.local_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="对端隧道地址" hint="支持多个地址，例如 IPv4 + IPv6，用逗号分隔。">
-                    <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="本端 Peer AllowedIPs" hint="写入当前节点 [Peer]，用于声明可经对端到达的地址段。">
-                    <input name="local_allowed_ips" defaultValue={managedLink.local_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="对端 Peer AllowedIPs" hint="写入对端节点 [Peer]，用于声明可经本端到达的地址段。">
-                    <input name="peer_allowed_ips" defaultValue={managedLink.peer_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="本端入口地址" hint="对端连接本节点时使用。">
-                    <EndpointSelect
-                      key={`edit-local-endpoint-${editLocalEndpointDefault}`}
-                      name="local_endpoint_host"
-                      defaultValue={editLocalEndpointDefault}
-                      placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
-                      options={editLocalEndpointOptions}
-                      disabled={!selectedNodeOnline}
-                      locked={udp2rawEnabled}
-                    />
-                  </Field>
-                  <Field label="本端 Endpoint 端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。udp2raw 启用时由中间层接管。">
-                    <input
-                      name="local_endpoint_port"
-                      defaultValue={managedLink.peer_peer.endpoint_port || managedLink.local_interface.listen_port || ""}
-                      inputMode="numeric"
-                      disabled={!selectedNodeOnline || udp2rawEnabled}
-                    />
-                  </Field>
-                  <Field label="对端入口地址" hint="本端连接对端节点时使用。">
-                    <EndpointSelect
-                      key={`edit-peer-endpoint-${editPeerEndpointDefault}`}
-                      name="peer_endpoint_host"
-                      defaultValue={editPeerEndpointDefault}
-                      placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
-                      options={editPeerEndpointOptions}
-                      disabled={!selectedNodeOnline}
-                      locked={udp2rawEnabled}
-                    />
-                  </Field>
-                  <Field label="对端 Endpoint 端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。udp2raw 启用时由中间层接管。">
-                    <input
-                      name="peer_endpoint_port"
-                      defaultValue={managedLink.local_peer.endpoint_port || managedLink.peer_interface.listen_port || ""}
-                      inputMode="numeric"
-                      disabled={!selectedNodeOnline || udp2rawEnabled}
-                    />
-                  </Field>
-                  <Field label="本端监听端口" hint="可选；留空表示不写 ListenPort。">
-                    <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="对端监听端口" hint="可选；留空表示不写 ListenPort。">
-                    <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} disabled={!selectedNodeOnline} />
-                  </Field>
+                  <FormSection title="接口与隧道地址" hint="这里决定双方 WireGuard 接口本身的名称、Address 和可选监听端口。">
+                    <Field label="本端接口名称" hint={`当前节点：${selectedNode.name}`}>
+                      <input name="local_interface_name" defaultValue={managedLink.local_interface.name} required disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="对端接口名称" hint={`对端节点：${selectedManagedLinkPeerNode?.name || managedLink.peer_interface.node_id}`}>
+                      <input name="peer_interface_name" defaultValue={managedLink.peer_interface.name} required disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="本端隧道地址" hint="本端 WireGuard Address；支持多个 CIDR，用逗号分隔。">
+                      <input name="local_tunnel_ips" defaultValue={managedLink.local_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="对端隧道地址" hint="对端 WireGuard Address；支持多个 CIDR，用逗号分隔。">
+                      <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="本端监听端口" hint="可选；留空表示本端 WireGuard 不写 ListenPort。udp2raw server 在本端时必须填写。">
+                      <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="对端监听端口" hint="可选；留空表示对端 WireGuard 不写 ListenPort。udp2raw server 在对端时必须填写。">
+                      <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+                    </Field>
+                  </FormSection>
+                  <FormSection title="直连入口与路由" hint="未启用中间层时，Endpoint 使用这里的入口地址和端口；启用 udp2raw 后会显示为被接管。">
+                    <Field label="本端入口地址" hint="对端连接本节点时使用。">
+                      <EndpointSelect
+                        key={`edit-local-endpoint-${editLocalEndpointDefault}`}
+                        name="local_endpoint_host"
+                        defaultValue={editLocalEndpointDefault}
+                        placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
+                        options={editLocalEndpointOptions}
+                        disabled={!selectedNodeOnline}
+                        locked={udp2rawEnabled}
+                      />
+                    </Field>
+                    <Field label="本端 Endpoint 端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。">
+                      <input
+                        name="local_endpoint_port"
+                        defaultValue={managedLink.peer_peer.endpoint_port || managedLink.local_interface.listen_port || ""}
+                        inputMode="numeric"
+                        disabled={!selectedNodeOnline || udp2rawEnabled}
+                      />
+                    </Field>
+                    <Field label="对端入口地址" hint="本端连接对端节点时使用。">
+                      <EndpointSelect
+                        key={`edit-peer-endpoint-${editPeerEndpointDefault}`}
+                        name="peer_endpoint_host"
+                        defaultValue={editPeerEndpointDefault}
+                        placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
+                        options={editPeerEndpointOptions}
+                        disabled={!selectedNodeOnline}
+                        locked={udp2rawEnabled}
+                      />
+                    </Field>
+                    <Field label="对端 Endpoint 端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。">
+                      <input
+                        name="peer_endpoint_port"
+                        defaultValue={managedLink.local_peer.endpoint_port || managedLink.peer_interface.listen_port || ""}
+                        inputMode="numeric"
+                        disabled={!selectedNodeOnline || udp2rawEnabled}
+                      />
+                    </Field>
+                    <Field label="本端 Peer AllowedIPs" hint="写入当前节点 [Peer]；声明经对端到达的地址段。">
+                      <input name="local_allowed_ips" defaultValue={managedLink.local_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="对端 Peer AllowedIPs" hint="写入对端节点 [Peer]；声明经本端到达的地址段。">
+                      <input name="peer_allowed_ips" defaultValue={managedLink.peer_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
+                    </Field>
+                  </FormSection>
                   <Udp2RawFields
                     enabled={udp2rawEnabled}
                     serverSide={udp2rawServerSide}
@@ -2413,27 +2510,31 @@ function App() {
                     onEnabledChange={setUdp2rawEnabled}
                     onServerSideChange={setUdp2rawServerSide}
                   />
-                  <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
-                    <input name="mtu" defaultValue={managedLink.local_interface.mtu || managedLink.peer_interface.mtu || 1420} disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
-                    <RouteModeSelect defaultValue={managedLink.local_interface.table_name || ""} disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="PersistentKeepalive" hint="双方 Peer 共用；常用 25。">
-                    <input name="persistent_keepalive" placeholder="25" defaultValue={managedLink.local_peer.persistent_keepalive || ""} disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="本端 Interface 高级配置" hint="写入当前节点 [Interface] 后，例如 PostUp。不同节点可不同。" wide>
-                    <textarea name="local_interface_custom_config" defaultValue={managedLink.local_interface.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="本端 Peer 高级配置" hint="写入当前节点 [Peer] 后。" wide>
-                    <textarea name="local_peer_custom_config" defaultValue={managedLink.local_peer.peer_custom_config || ""} placeholder="AllowedIPs 之外的自定义 Peer 行" disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="对端 Interface 高级配置" hint="写入对端节点 [Interface] 后，例如不同的 PostUp。" wide>
-                    <textarea name="peer_interface_custom_config" defaultValue={managedLink.peer_interface.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
-                  </Field>
-                  <Field label="对端 Peer 高级配置" hint="写入对端节点 [Peer] 后。" wide>
-                    <textarea name="peer_peer_custom_config" defaultValue={managedLink.peer_peer.peer_custom_config || ""} placeholder="AllowedIPs 之外的自定义 Peer 行" disabled={!selectedNodeOnline} />
-                  </Field>
+                  <FormSection title="链路参数" hint="Table=off 是 DN42 常用默认值；PersistentKeepalive 会写入双方 Peer。">
+                    <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
+                      <input name="mtu" defaultValue={managedLink.local_interface.mtu || managedLink.peer_interface.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
+                      <RouteModeSelect defaultValue={managedLink.local_interface.table_name || ""} disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="PersistentKeepalive" hint="可选；NAT 场景常用 25。">
+                      <input name="persistent_keepalive" placeholder="25" defaultValue={managedLink.local_peer.persistent_keepalive || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+                    </Field>
+                  </FormSection>
+                  <FormSection title="高级配置" hint="这些内容会原样追加到对应的 [Interface] 或 [Peer] 区块，请只填写 WireGuard 支持的配置行。">
+                    <Field label="本端 Interface 高级配置" hint="写入当前节点 [Interface] 后，例如 PostUp。不同节点可不同。" wide>
+                      <textarea name="local_interface_custom_config" defaultValue={managedLink.local_interface.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="本端 Peer 高级配置" hint="写入当前节点 [Peer] 后。" wide>
+                      <textarea name="local_peer_custom_config" defaultValue={managedLink.local_peer.peer_custom_config || ""} placeholder="AllowedIPs 之外的自定义 Peer 行" disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="对端 Interface 高级配置" hint="写入对端节点 [Interface] 后，例如不同的 PostUp。" wide>
+                      <textarea name="peer_interface_custom_config" defaultValue={managedLink.peer_interface.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
+                    </Field>
+                    <Field label="对端 Peer 高级配置" hint="写入对端节点 [Peer] 后。" wide>
+                      <textarea name="peer_peer_custom_config" defaultValue={managedLink.peer_peer.peer_custom_config || ""} placeholder="AllowedIPs 之外的自定义 Peer 行" disabled={!selectedNodeOnline} />
+                    </Field>
+                  </FormSection>
                   <button type="submit" disabled={!selectedNodeOnline}><Check size={16} /> 保存并下发双方配置</button>
                 </form>
               </section>
@@ -2573,7 +2674,7 @@ function App() {
                     </button>
                   </>
                 )}
-                <button className="danger" disabled={selectedConfigIsUnmanagedImport ? false : (!selectedNodeOnline || isConfigBusy || !isConfigStopped)} onClick={() => void runAction(deleteSelectedConfig)}>
+                <button className="danger" disabled={selectedConfigIsUnmanagedImport ? false : (!selectedNodeOnline || isConfigBusy || !isConfigStopped)} onClick={() => void runAction(openDeleteDialog)}>
                   {selectedConfigIsManagedLink ? "删除双方配置" : selectedConfigIsUnmanagedImport ? "删除观察记录" : "删除配置"}
                 </button>
               </div>
@@ -2590,6 +2691,47 @@ function App() {
                 </div>
               )}
             </section>
+          </section>
+        </div>
+      )}
+
+      {deleteDialogOpen && selectedConfig && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel compactModal" role="dialog" aria-modal="true" aria-labelledby="delete-config-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="delete-config-title">删除配置</h2>
+                <p className="muted">{selectedNode?.name || "节点"} / {selectedConfig.name}</p>
+              </div>
+              <button className="iconButton" onClick={() => setDeleteDialogOpen(false)}>
+                <X size={18} />
+              </button>
+            </header>
+            <div className="stack">
+              <div className="empty">
+                {selectedConfigIsManagedLink
+                  ? "将从 Link42 中删除这条受管连接的双方记录。默认保留节点上的 WireGuard 配置和服务，之后仍可通过导入重新发现。"
+                  : selectedConfigIsUnmanagedImport
+                    ? "将只删除这条导入观察记录，不会修改节点上的原始配置文件或服务。"
+                    : "将从 Link42 中删除这条 WireGuard 记录。默认保留节点上的配置文件和服务，之后仍可通过导入重新发现。"}
+              </div>
+              {!selectedConfigIsUnmanagedImport && (
+                <label className="checkField dangerCheck">
+                  <input
+                    type="checkbox"
+                    checked={deleteNodeConfig}
+                    onChange={(event) => setDeleteNodeConfig(event.currentTarget.checked)}
+                  />
+                  <span>同时删除节点上的 WireGuard 配置文件和服务</span>
+                </label>
+              )}
+              <div className="actionRow">
+                <button className="secondary" onClick={() => setDeleteDialogOpen(false)}>取消</button>
+                <button className="danger" onClick={() => void runAction(deleteSelectedConfig)}>
+                  {deleteNodeConfig ? "删除记录并清理节点" : "仅删除 Link42 记录"}
+                </button>
+              </div>
+            </div>
           </section>
         </div>
       )}

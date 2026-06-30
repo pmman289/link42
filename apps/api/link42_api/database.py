@@ -55,6 +55,108 @@ def ensure_sqlite_point_to_point_constraints() -> None:
         return
 
     with engine.begin() as connection:
+        def table_exists(name: str) -> bool:
+            return bool(
+                connection.scalar(
+                    text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = :name"),
+                    {"name": name},
+                )
+            )
+
+        def table_columns(name: str) -> set[str]:
+            if not table_exists(name):
+                return set()
+            return {
+                row[1]
+                for row in connection.execute(text(f"PRAGMA table_info({name})")).fetchall()
+            }
+
+        def add_column(table: str, columns: set[str], name: str, definition: str) -> None:
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
+                columns.add(name)
+
+        node_columns = table_columns("nodes")
+        if node_columns:
+            add_column("nodes", node_columns, "hostname", "VARCHAR(255)")
+            add_column("nodes", node_columns, "management_ip", "VARCHAR(64)")
+            add_column("nodes", node_columns, "public_ip", "VARCHAR(64)")
+            add_column("nodes", node_columns, "endpoint_ips", "JSON DEFAULT '[]'")
+            add_column("nodes", node_columns, "status", "VARCHAR(32) DEFAULT 'offline'")
+            add_column("nodes", node_columns, "agent_token_hash", "VARCHAR(128) DEFAULT ''")
+            add_column("nodes", node_columns, "agent_token_value", "TEXT")
+            add_column("nodes", node_columns, "agent_version", "VARCHAR(32)")
+            add_column("nodes", node_columns, "agent_protocol_version", "INTEGER")
+            add_column("nodes", node_columns, "agent_capabilities", "JSON DEFAULT '[]'")
+            add_column("nodes", node_columns, "agent_platform", "JSON DEFAULT '{}'")
+            add_column("nodes", node_columns, "agent_update_status", "VARCHAR(32)")
+            add_column("nodes", node_columns, "agent_last_error", "TEXT")
+            add_column("nodes", node_columns, "last_seen_at", "DATETIME")
+
+        interface_columns = table_columns("wg_interfaces")
+        if interface_columns:
+            add_column("wg_interfaces", interface_columns, "node_id", "INTEGER")
+            add_column("wg_interfaces", interface_columns, "tunnel_ips", "JSON DEFAULT '[]'")
+            add_column("wg_interfaces", interface_columns, "listen_port", "INTEGER")
+            add_column("wg_interfaces", interface_columns, "private_key_ref", "VARCHAR(255)")
+            add_column("wg_interfaces", interface_columns, "private_key_value", "TEXT")
+            add_column("wg_interfaces", interface_columns, "public_key", "VARCHAR(128)")
+            add_column("wg_interfaces", interface_columns, "mtu", "INTEGER")
+            add_column("wg_interfaces", interface_columns, "fwmark", "VARCHAR(64)")
+            add_column("wg_interfaces", interface_columns, "table_name", "VARCHAR(64)")
+            add_column("wg_interfaces", interface_columns, "dns", "JSON DEFAULT '[]'")
+            add_column("wg_interfaces", interface_columns, "pre_up", "JSON DEFAULT '[]'")
+            add_column("wg_interfaces", interface_columns, "post_up", "JSON DEFAULT '[]'")
+            add_column("wg_interfaces", interface_columns, "pre_down", "JSON DEFAULT '[]'")
+            add_column("wg_interfaces", interface_columns, "post_down", "JSON DEFAULT '[]'")
+            add_column("wg_interfaces", interface_columns, "source", "VARCHAR(32) DEFAULT 'created'")
+            add_column("wg_interfaces", interface_columns, "managed", "BOOLEAN DEFAULT 1")
+            add_column("wg_interfaces", interface_columns, "enabled", "BOOLEAN DEFAULT 1")
+            add_column("wg_interfaces", interface_columns, "deployed_config", "TEXT")
+            add_column("wg_interfaces", interface_columns, "runtime_status", "VARCHAR(32) DEFAULT 'stopped'")
+            add_column("wg_interfaces", interface_columns, "import_path", "VARCHAR(512)")
+            add_column("wg_interfaces", interface_columns, "extras", "JSON DEFAULT '{}'")
+            add_column("wg_interfaces", interface_columns, "warnings", "JSON DEFAULT '[]'")
+
+        peer_columns = table_columns("wg_peers")
+        if peer_columns:
+            add_column("wg_peers", peer_columns, "peer_node_id", "INTEGER")
+            add_column("wg_peers", peer_columns, "peer_interface_id", "INTEGER")
+            add_column("wg_peers", peer_columns, "name", "VARCHAR(80)")
+            add_column("wg_peers", peer_columns, "public_key", "VARCHAR(128) DEFAULT ''")
+            add_column("wg_peers", peer_columns, "preshared_key_ref", "VARCHAR(255)")
+            add_column("wg_peers", peer_columns, "preshared_key_value", "TEXT")
+            add_column("wg_peers", peer_columns, "endpoint_host", "VARCHAR(255)")
+            add_column("wg_peers", peer_columns, "endpoint_port", "INTEGER")
+            add_column("wg_peers", peer_columns, "allowed_ips", "JSON DEFAULT '[]'")
+            add_column("wg_peers", peer_columns, "persistent_keepalive", "INTEGER")
+            add_column("wg_peers", peer_columns, "source", "VARCHAR(32) DEFAULT 'created'")
+            add_column("wg_peers", peer_columns, "enabled", "BOOLEAN DEFAULT 1")
+            add_column("wg_peers", peer_columns, "extras", "JSON DEFAULT '{}'")
+            add_column("wg_peers", peer_columns, "warnings", "JSON DEFAULT '[]'")
+
+        candidate_columns = table_columns("import_candidates")
+        if candidate_columns:
+            add_column("import_candidates", candidate_columns, "warnings", "JSON DEFAULT '[]'")
+            add_column("import_candidates", candidate_columns, "imported", "BOOLEAN DEFAULT 0")
+
+        plan_columns = table_columns("change_plans")
+        if plan_columns:
+            add_column("change_plans", plan_columns, "status", "VARCHAR(32) DEFAULT 'draft'")
+            add_column("change_plans", plan_columns, "affected_node_ids", "JSON DEFAULT '[]'")
+            add_column("change_plans", plan_columns, "diff", "TEXT DEFAULT ''")
+            add_column("change_plans", plan_columns, "payload", "JSON DEFAULT '{}'")
+            add_column("change_plans", plan_columns, "confirmed_at", "DATETIME")
+
+        task_columns = table_columns("agent_tasks")
+        if task_columns:
+            add_column("agent_tasks", task_columns, "change_plan_id", "INTEGER")
+            add_column("agent_tasks", task_columns, "payload", "JSON DEFAULT '{}'")
+            add_column("agent_tasks", task_columns, "status", "VARCHAR(32) DEFAULT 'pending'")
+            add_column("agent_tasks", task_columns, "result", "JSON")
+            add_column("agent_tasks", task_columns, "started_at", "DATETIME")
+            add_column("agent_tasks", task_columns, "finished_at", "DATETIME")
+
         # 先清理历史遗留的重复对端，保留每个配置最早创建的一条记录。
         connection.execute(
             text(
@@ -77,17 +179,6 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
-        # 旧库补齐部署状态字段，用于生成真实 diff 和限制删除运行中的接口。
-        columns = {
-            row[1]
-            for row in connection.execute(text("PRAGMA table_info(wg_interfaces)")).fetchall()
-        }
-        if "deployed_config" not in columns:
-            connection.execute(text("ALTER TABLE wg_interfaces ADD COLUMN deployed_config TEXT"))
-        if "runtime_status" not in columns:
-            connection.execute(
-                text("ALTER TABLE wg_interfaces ADD COLUMN runtime_status VARCHAR(32) DEFAULT 'stopped'")
-            )
         has_import_candidates_table = connection.scalar(
             text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'import_candidates'")
         )
@@ -133,30 +224,7 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
-        has_nodes_table = connection.scalar(
-            text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'nodes'")
-        )
-        if has_nodes_table:
-            node_columns = {
-                row[1]
-                for row in connection.execute(text("PRAGMA table_info(nodes)")).fetchall()
-            }
-            if "endpoint_ips" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN endpoint_ips JSON DEFAULT '[]'"))
-            if "agent_token_value" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_token_value TEXT"))
-            if "agent_version" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_version VARCHAR(32)"))
-            if "agent_protocol_version" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_protocol_version INTEGER"))
-            if "agent_capabilities" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_capabilities JSON DEFAULT '[]'"))
-            if "agent_platform" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_platform JSON DEFAULT '{}'"))
-            if "agent_update_status" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_update_status VARCHAR(32)"))
-            if "agent_last_error" not in node_columns:
-                connection.execute(text("ALTER TABLE nodes ADD COLUMN agent_last_error TEXT"))
+        if node_columns:
             fallback_columns = [name for name in ["public_ip", "management_ip", "hostname"] if name in node_columns]
             if fallback_columns:
                 fallback_expr = f"COALESCE({', '.join(fallback_columns)})"

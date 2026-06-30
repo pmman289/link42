@@ -4,11 +4,13 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
+from link42_common.connection_types import TASK_REQUIREMENTS, WIREGUARD_TASKS
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
 from link42_api.database import Base
 from link42_api import models
+from link42_api.connection_drivers import connection_driver_for_interface
 from link42_api.main import (
     ADMIN_USERNAME,
     SETTING_ADMIN_PASSWORD_HASH,
@@ -19,6 +21,7 @@ from link42_api.main import (
     create_node,
     confirm_change_plan,
     delete_interface,
+    delete_managed_link,
     delete_node,
     agent_poll,
     agent_register,
@@ -36,9 +39,12 @@ from link42_api.main import (
     normalize_udp2raw_config,
     require_node_endpoint,
     require_online_node,
+    require_udp2raw_supported,
+    request_import_scan,
     set_setting,
     set_unique_peer,
     should_delete_node_config_file,
+    start_interface,
     stop_managed_link,
     update_controller_settings,
     udp2raw_endpoint_payloads,
@@ -97,6 +103,37 @@ def test_render_still_outputs_single_peer_config() -> None:
 
     assert rendered.count("[Peer]") == 1
     assert "PublicKey = peer-public" in rendered
+
+
+def test_wireguard_connection_driver_exposes_standard_tasks() -> None:
+    """验证主控连接驱动先承载现有 WireGuard 任务，后续可替换为其他连接后端。"""
+
+    interface = models.WireGuardInterface(
+        id=1,
+        node_id=1,
+        name="wg0",
+        tunnel_ips=["10.42.0.1/32"],
+        private_key_value="private",
+        managed=True,
+    )
+    interface.peers = [
+        models.WireGuardPeer(
+            interface_id=1,
+            public_key="peer-public",
+            allowed_ips=["10.42.0.2/32"],
+            enabled=True,
+        )
+    ]
+
+    driver = connection_driver_for_interface(interface)
+    payload = driver.build_apply_payload(interface)
+
+    assert driver.type == "wireguard"
+    assert driver.tasks == WIREGUARD_TASKS
+    assert payload["interface_name"] == "wg0"
+    assert payload["managed"] is True
+    assert payload["enable_on_boot"] is True
+    assert WIREGUARD_TASKS.apply_config in TASK_REQUIREMENTS
 
 
 def test_diff_uses_deployed_config_as_baseline() -> None:
@@ -306,6 +343,73 @@ def test_controller_settings_can_change_username_and_password() -> None:
     assert result.username == "new-admin"
     assert old_session_hash is not None
     assert not verify_token("old-session", old_session_hash)
+
+
+def test_openwrt_read_config_keeps_deployed_baseline_and_allows_start(monkeypatch) -> None:
+    """验证 OpenWrt UCI 后端刷新配置时不会把文件式基线清空，且可继续下发启动任务。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="owrt",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["10.0.0.1"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.2.0",
+            agent_capabilities=["wireguard", "wg_quick_import", "service:openwrt-uci"],
+            agent_platform={"service_manager": "openwrt-uci"},
+        )
+        interface = models.WireGuardInterface(
+            node=node,
+            name="l42owrt91",
+            source="created",
+            managed=True,
+            deployed_config="[Interface]\nAddress = 10.42.0.1/32\n",
+            runtime_status="stopped",
+        )
+        read_task = models.AgentTask(
+            node=node,
+            type="wireguard.read_config",
+            status="running",
+            payload={},
+        )
+        session.add_all([node, interface, read_task])
+        session.commit()
+        read_task.payload = {"interface_id": interface.id, "interface_name": interface.name}
+        session.commit()
+
+        agent_task_result(
+            read_task.id,
+            AgentTaskResultRequest(
+                node_id=node.id,
+                token="token",
+                status="succeeded",
+                result={
+                    "exists": False,
+                    "config": "",
+                    "config_backend": "openwrt-uci",
+                    "service": {"runtime_status": "running"},
+                },
+            ),
+            session,
+        )
+        refreshed = session.get(models.WireGuardInterface, interface.id)
+        assert refreshed is not None
+        assert refreshed.deployed_config == "[Interface]\nAddress = 10.42.0.1/32\n"
+
+        refreshed.deployed_config = ""
+        session.commit()
+        start_interface(interface.id, session)
+        tasks = list(session.scalars(select(models.AgentTask).where(models.AgentTask.type == "wireguard.start_interface")))
+
+    assert len(tasks) == 1
+    assert tasks[0].payload["interface_id"] == interface.id
 
 
 def test_api_auth_exemptions_keep_health_login_and_agent_public() -> None:
@@ -764,8 +868,8 @@ def test_delete_unmanaged_imported_observation_without_agent() -> None:
     assert tasks == []
 
 
-def test_managed_imported_config_delete_removes_node_file() -> None:
-    """验证已接管导入配置删除时才应删除节点上的受管文件。"""
+def test_managed_imported_config_can_delete_node_file_when_requested() -> None:
+    """验证已接管导入配置具备节点文件清理资格，但是否清理由删除请求决定。"""
 
     interface = models.WireGuardInterface(
         name="wg0",
@@ -776,6 +880,58 @@ def test_managed_imported_config_delete_removes_node_file() -> None:
     )
 
     assert should_delete_node_config_file(interface) is True
+
+
+def test_delete_managed_config_preserves_node_file_by_default() -> None:
+    """验证删除 Link42 受管记录默认保留节点上的配置和服务，便于重新导入。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        interface = models.WireGuardInterface(
+            node=node,
+            name="wg0",
+            source="created",
+            managed=True,
+            runtime_status="stopped",
+        )
+        session.add_all([node, interface])
+        session.commit()
+        interface_id = interface.id
+
+        result = delete_interface(interface_id, db=session)
+        remaining_interface = session.get(models.WireGuardInterface, interface_id)
+        tasks = list(session.scalars(select(models.AgentTask)))
+
+    assert result == {"status": "deleted"}
+    assert remaining_interface is None
+    assert tasks == []
+
+
+def test_delete_managed_config_removes_node_file_when_requested() -> None:
+    """验证勾选清理节点配置时才下发 wireguard.delete_config 任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        interface = models.WireGuardInterface(
+            node=node,
+            name="wg0",
+            source="created",
+            managed=True,
+            runtime_status="stopped",
+        )
+        session.add_all([node, interface])
+        session.commit()
+        interface_id = interface.id
+
+        result = delete_interface(interface_id, delete_node_config=True, db=session)
+        tasks = list(session.scalars(select(models.AgentTask)))
+
+    assert result == {"status": "deleted"}
+    assert [task.type for task in tasks] == ["wireguard.delete_config"]
 
 
 def test_schema_rejects_invalid_ports_and_cidrs() -> None:
@@ -930,6 +1086,83 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
     assert any("PostUp = ip route add 10.2.0.0/16 dev wg-b" in task.payload["config"] for task in tasks)
 
 
+def test_delete_managed_link_preserves_node_configs_by_default() -> None:
+    """验证删除受管双向链路默认只移除主控记录，不清理节点配置。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        node_b = models.Node(name="node-b", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        local = models.WireGuardInterface(node=node_a, name="wg-a", source="managed-node", managed=True, runtime_status="stopped")
+        peer = models.WireGuardInterface(node=node_b, name="wg-b", source="managed-node", managed=True, runtime_status="stopped")
+        session.add_all([node_a, node_b, local, peer])
+        session.flush()
+        local_peer = models.WireGuardPeer(
+            interface=local,
+            peer_interface_id=peer.id,
+            source="managed-node",
+            public_key="peer-public",
+            allowed_ips=["10.42.0.2/32"],
+        )
+        peer_peer = models.WireGuardPeer(
+            interface=peer,
+            peer_interface_id=local.id,
+            source="managed-node",
+            public_key="local-public",
+            allowed_ips=["10.42.0.1/32"],
+        )
+        session.add_all([local_peer, peer_peer])
+        session.commit()
+        local_id = local.id
+        peer_id = peer.id
+
+        result = delete_managed_link(local_id, db=session)
+        tasks = list(session.scalars(select(models.AgentTask)))
+        remaining = [session.get(models.WireGuardInterface, local_id), session.get(models.WireGuardInterface, peer_id)]
+
+    assert result == {"status": "deleted"}
+    assert remaining == [None, None]
+    assert tasks == []
+
+
+def test_delete_managed_link_removes_node_configs_when_requested() -> None:
+    """验证勾选清理节点配置时，受管双向链路会给双方下发删除任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        node_b = models.Node(name="node-b", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        local = models.WireGuardInterface(node=node_a, name="wg-a", source="managed-node", managed=True, runtime_status="stopped")
+        peer = models.WireGuardInterface(node=node_b, name="wg-b", source="managed-node", managed=True, runtime_status="stopped")
+        session.add_all([node_a, node_b, local, peer])
+        session.flush()
+        session.add_all([
+            models.WireGuardPeer(
+                interface=local,
+                peer_interface_id=peer.id,
+                source="managed-node",
+                public_key="peer-public",
+                allowed_ips=["10.42.0.2/32"],
+            ),
+            models.WireGuardPeer(
+                interface=peer,
+                peer_interface_id=local.id,
+                source="managed-node",
+                public_key="local-public",
+                allowed_ips=["10.42.0.1/32"],
+            ),
+        ])
+        session.commit()
+
+        result = delete_managed_link(local.id, delete_node_config=True, db=session)
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.node_id)))
+
+    assert result == {"status": "deleted"}
+    assert [task.type for task in tasks] == ["wireguard.delete_config", "wireguard.delete_config"]
+
+
 def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeypatch) -> None:
     """验证主控保存 Agent 版本能力，并不会把不支持的任务交给旧 Agent。"""
 
@@ -980,6 +1213,78 @@ def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeyp
     assert node.agent_version == "0.1.0"
     assert node.agent_capabilities == ["service:systemd", "wg_quick_import", "wireguard"]
     assert [task.type for task in response.tasks] == ["wireguard.import_scan"]
+
+
+def test_import_scan_request_rejects_openwrt_uci_node(monkeypatch) -> None:
+    """验证 OpenWrt UCI 节点不会创建 wg-quick 导入扫描任务。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="owrt",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.2.0",
+            agent_capabilities=["wireguard", "service:openwrt-uci"],
+            agent_platform={"service_manager": "openwrt-uci"},
+        )
+        session.add(node)
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            request_import_scan(node.id, session)
+        tasks = list(session.scalars(select(models.AgentTask)))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "OpenWrt UCI nodes do not support wg-quick import scan"
+    assert tasks == []
+
+
+def test_openwrt_udp2raw_capability_allows_middleware_tasks() -> None:
+    """验证支持 udp2raw 的 OpenWrt Agent 可通过主控连接中间层门禁。"""
+
+    node = models.Node(
+        name="owrt",
+        status="online",
+        agent_version="0.2.0",
+        agent_capabilities=[
+            "wireguard",
+            "service:openwrt-uci",
+            "middleware",
+            "middleware.install",
+            "middleware.udp2raw",
+            "middleware.udp2raw.openwrt-procd",
+        ],
+        agent_platform={"service_manager": "openwrt-uci"},
+        last_seen_at=datetime.utcnow(),
+    )
+
+    require_udp2raw_supported(node)
+
+
+def test_openwrt_without_udp2raw_capability_rejects_middleware_tasks() -> None:
+    """验证旧 OpenWrt Agent 即使在线，也不能绕过 udp2raw 能力门禁。"""
+
+    node = models.Node(
+        name="owrt-old",
+        status="online",
+        agent_version="0.2.0",
+        agent_capabilities=["wireguard", "service:openwrt-uci"],
+        agent_platform={"service_manager": "openwrt-uci"},
+        last_seen_at=datetime.utcnow(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        require_udp2raw_supported(node)
+
+    assert exc_info.value.status_code == 409
+    assert "does not support task" in str(exc_info.value.detail)
 
 
 def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_path) -> None:
@@ -1447,3 +1752,60 @@ def test_sqlite_point_to_point_repair_can_create_unique_index(monkeypatch) -> No
     assert "runtime_status" in columns
     assert "endpoint_ips" in node_columns
     assert "agent_token_value" in node_columns
+
+
+def test_sqlite_repair_upgrades_legacy_schema_columns(monkeypatch) -> None:
+    """验证很早期 SQLite 库启动时会补齐当前模型需要的列。"""
+
+    import link42_api.database as database
+
+    engine = create_engine("sqlite:///:memory:")
+    monkeypatch.setattr(database, "engine", engine)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE nodes (id INTEGER PRIMARY KEY, name VARCHAR(80) NOT NULL)"))
+        connection.execute(text("CREATE TABLE wg_interfaces (id INTEGER PRIMARY KEY, node_id INTEGER, name VARCHAR(32) NOT NULL)"))
+        connection.execute(text("CREATE TABLE wg_peers (id INTEGER PRIMARY KEY, interface_id INTEGER NOT NULL)"))
+        connection.execute(text("CREATE TABLE import_candidates (id INTEGER PRIMARY KEY, node_id INTEGER, path VARCHAR(512), interface_name VARCHAR(32), parsed JSON)"))
+        connection.execute(text("CREATE TABLE change_plans (id INTEGER PRIMARY KEY, title VARCHAR(255), summary TEXT)"))
+        connection.execute(text("CREATE TABLE agent_tasks (id INTEGER PRIMARY KEY, node_id INTEGER, type VARCHAR(80))"))
+
+    ensure_sqlite_point_to_point_constraints()
+
+    with engine.connect() as connection:
+        node_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(nodes)")).fetchall()}
+        interface_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(wg_interfaces)")).fetchall()}
+        peer_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(wg_peers)")).fetchall()}
+        candidate_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(import_candidates)")).fetchall()}
+        plan_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(change_plans)")).fetchall()}
+        task_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(agent_tasks)")).fetchall()}
+
+    assert {
+        "endpoint_ips",
+        "agent_version",
+        "agent_capabilities",
+        "agent_platform",
+        "agent_update_status",
+    } <= node_columns
+    assert {
+        "tunnel_ips",
+        "dns",
+        "source",
+        "managed",
+        "enabled",
+        "deployed_config",
+        "runtime_status",
+        "extras",
+        "warnings",
+    } <= interface_columns
+    assert {
+        "peer_node_id",
+        "peer_interface_id",
+        "endpoint_host",
+        "allowed_ips",
+        "enabled",
+        "extras",
+        "warnings",
+    } <= peer_columns
+    assert {"warnings", "imported"} <= candidate_columns
+    assert {"status", "affected_node_ids", "diff", "payload", "confirmed_at"} <= plan_columns
+    assert {"change_plan_id", "payload", "status", "result", "started_at", "finished_at"} <= task_columns

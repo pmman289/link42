@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, Optional
+from urllib import error, request
 
-import httpx
 from link42_common.version import AGENT_PROTOCOL_VERSION, AGENT_VERSION
 
 from .config import AgentConfig
@@ -15,14 +16,13 @@ class AgentClient:
         """保存配置并创建 HTTP client。"""
 
         self.config = config
-        self.client = httpx.Client(base_url=config.server_url, timeout=30)
 
     def auth_payload(self) -> dict[str, Any]:
         """生成每个 Agent 请求都需要携带的认证字段。"""
 
         return {"node_id": self.config.node_id, "token": self.config.token}
 
-    def agent_payload(self, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> dict[str, Any]:
+    def agent_payload(self, capabilities: Optional[list[str]] = None, platform: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """生成 Agent 版本、协议和能力描述。"""
 
         return {
@@ -32,33 +32,49 @@ class AgentClient:
             "platform": platform or {},
         }
 
-    def register(self, hostname: str, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> None:
+    def register(self, hostname: str, capabilities: Optional[list[str]] = None, platform: Optional[dict[str, Any]] = None) -> None:
         """向中心 API 注册当前节点。"""
 
         payload = {**self.auth_payload(), **self.agent_payload(capabilities, platform), "hostname": hostname}
-        self.client.post("/api/agent/register", json=payload).raise_for_status()
+        self._post_json("/api/agent/register", payload)
 
-    def heartbeat(self, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> None:
+    def heartbeat(self, capabilities: Optional[list[str]] = None, platform: Optional[dict[str, Any]] = None) -> None:
         """发送心跳，维持节点在线状态。"""
 
-        self.client.post(
+        self._post_json(
             "/api/agent/heartbeat",
-            json={**self.auth_payload(), **self.agent_payload(capabilities, platform)},
-        ).raise_for_status()
+            {**self.auth_payload(), **self.agent_payload(capabilities, platform)},
+        )
 
-    def poll_tasks(self, capabilities: list[str] | None = None, platform: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def poll_tasks(self, capabilities: Optional[list[str]] = None, platform: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
         """拉取待执行任务。"""
 
         payload = {
             **self.auth_payload(),
             **self.agent_payload(capabilities, platform),
         }
-        response = self.client.post("/api/agent/tasks/poll", json=payload)
-        response.raise_for_status()
-        return response.json()["tasks"]
+        return self._post_json("/api/agent/tasks/poll", payload)["tasks"]
 
     def report_task(self, task_id: int, status: str, result: dict[str, Any]) -> None:
         """上报任务执行结果。"""
 
         payload = {**self.auth_payload(), "status": status, "result": result}
-        self.client.post(f"/api/agent/tasks/{task_id}/result", json=payload).raise_for_status()
+        self._post_json(f"/api/agent/tasks/{task_id}/result", payload)
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        data = json.dumps(payload).encode("utf-8")
+        http_request = request.Request(
+            f"{self.config.server_url}{path}",
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with request.urlopen(http_request, timeout=30) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code} for {path}: {body}") from exc
+        if not body:
+            return {}
+        return json.loads(body)

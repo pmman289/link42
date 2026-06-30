@@ -4,7 +4,9 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from link42_common.connection_types import WIREGUARD_TASKS
 from link42_agent import main, middleware, service_manager, system, upgrade
+from link42_agent.task_handlers import TASK_HANDLERS
 
 
 def command_result(command: list[str], returncode: int = 0, stdout: str = "") -> dict[str, Any]:
@@ -76,6 +78,21 @@ def test_run_command_timeout_returns_result_or_raises(monkeypatch) -> None:
         raise AssertionError("timeout did not raise for required command")
 
 
+def test_agent_task_registry_keeps_wireguard_handlers() -> None:
+    """验证 Agent 标准连接任务通过注册表分发，方便后续扩展非 WireGuard 后端。"""
+
+    for task_type in [
+        WIREGUARD_TASKS.import_scan,
+        WIREGUARD_TASKS.apply_config,
+        WIREGUARD_TASKS.read_config,
+        WIREGUARD_TASKS.status,
+        WIREGUARD_TASKS.start,
+        WIREGUARD_TASKS.stop,
+        WIREGUARD_TASKS.delete_config,
+    ]:
+        assert task_type in TASK_HANDLERS
+
+
 def test_udp2raw_remove_last_instance_deletes_config_file(tmp_path: Path) -> None:
     """验证删除 udp2raw 最后一个实例时移除配置文件，而不是留下 0 字节文件。"""
 
@@ -123,6 +140,177 @@ def test_udp2raw_stop_uses_payload_mode_only(monkeypatch) -> None:
 
     assert result["modes"] == ["server"]
     assert commands == [["systemctl", "stop", "link42-udp2raw-server@link42-1.service"]]
+
+
+def test_udp2raw_apply_uses_openwrt_procd(tmp_path: Path, monkeypatch) -> None:
+    """验证 OpenWrt 节点会为 udp2raw 实例生成 procd init 脚本并重启对应实例。"""
+
+    commands: list[list[str]] = []
+    config_dir = tmp_path / "udp2raw"
+    init_dir = tmp_path / "init.d"
+    binary = tmp_path / "udp2raw-bin"
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "OPENWRT_INIT_DIR", init_dir)
+    monkeypatch.setattr(middleware, "UDP2RAW_BIN", binary)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    result = middleware.apply_udp2raw(
+        {
+            "instance": "link42-1-2",
+            "mode": "server",
+            "listen_host": "0.0.0.0",
+            "listen_port": 23002,
+            "remote_host": "127.0.0.1",
+            "remote_port": 51820,
+            "password": "secret",
+        }
+    )
+    init_script = init_dir / "link42-udp2raw-server-link42-1-2"
+
+    assert result["changed"] is True
+    server_config = (config_dir / "server").read_text(encoding="utf-8")
+    assert server_config.startswith("link42-1-2 -s -l0.0.0.0:23002")
+    assert "-a" in server_config
+    assert "--keep-rule" not in server_config
+    assert init_script.exists()
+    init_content = init_script.read_text(encoding="utf-8")
+    assert "USE_PROCD=1" in init_content
+    assert "status_service()" in init_content
+    assert commands == [
+        [str(init_script), "enable"],
+        [str(init_script), "restart"],
+    ]
+
+
+def test_udp2raw_openwrt_result_drops_successful_rc_common_noise() -> None:
+    """验证 OpenWrt rc.common 成功路径中的固定 stderr 噪音会被清掉。"""
+
+    for stderr in ["Command failed: Not found.\n", "Command failed: Not found\n"]:
+        result = middleware.normalize_openwrt_result(
+            {
+                "command": ["/etc/init.d/link42-udp2raw-server-link42-1", "restart"],
+                "returncode": 0,
+                "stdout": "",
+                "stderr": stderr,
+            }
+        )
+
+        assert result["stderr"] == ""
+
+
+def test_udp2raw_install_uses_openwrt_backend_without_systemd_units(tmp_path: Path, monkeypatch) -> None:
+    """验证 OpenWrt 安装 udp2raw 只安装二进制和目录，不写入 systemd 单元。"""
+
+    commands: list[list[str]] = []
+    config_dir = tmp_path / "udp2raw"
+    init_dir = tmp_path / "init.d"
+    binary = tmp_path / "bin" / "udp2raw"
+    libexec = tmp_path / "libexec" / "link42-udp2raw-systemd"
+    server_unit = tmp_path / "systemd" / "link42-udp2raw-server@.service"
+    client_unit = tmp_path / "systemd" / "link42-udp2raw-client@.service"
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "OPENWRT_INIT_DIR", init_dir)
+    monkeypatch.setattr(middleware, "UDP2RAW_BIN", binary)
+    monkeypatch.setattr(middleware, "UDP2RAW_LIBEXEC", libexec)
+    monkeypatch.setattr(middleware, "UDP2RAW_SERVER_UNIT", server_unit)
+    monkeypatch.setattr(middleware, "UDP2RAW_CLIENT_UNIT", client_unit)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
+    monkeypatch.setattr(middleware, "detect_udp2raw_asset", lambda: "udp2raw_arm")
+
+    def fake_download(config: Any, asset: str, target: Path) -> None:
+        target.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "download_asset", fake_download)
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    result = middleware.install_udp2raw(middleware.AgentConfig(server_url="http://controller", node_id=1, token="t"))
+
+    assert result["changed"] is True
+    assert result["backend"] == "openwrt-procd"
+    assert result["asset"] == "udp2raw_arm"
+    assert binary.exists()
+    assert init_dir.exists()
+    assert not libexec.exists()
+    assert not server_unit.exists()
+    assert not client_unit.exists()
+    assert commands == []
+
+
+def test_udp2raw_delete_uses_openwrt_role_init(tmp_path: Path, monkeypatch) -> None:
+    """验证 OpenWrt 删除 udp2raw 只停止并移除本节点实际角色的 init 脚本和配置。"""
+
+    commands: list[list[str]] = []
+    config_dir = tmp_path / "udp2raw"
+    init_dir = tmp_path / "init.d"
+    config_dir.mkdir()
+    init_dir.mkdir()
+    (config_dir / "client").write_text(
+        "link42-1-2 -c -l127.0.0.1:12312 -r198.51.100.20:23002 --raw-mode faketcp -a\n",
+        encoding="utf-8",
+    )
+    init_script = init_dir / "link42-udp2raw-client-link42-1-2"
+    init_script.write_text("#!/bin/sh /etc/rc.common\n", encoding="utf-8")
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "OPENWRT_INIT_DIR", init_dir)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    result = middleware.delete_udp2raw({"instance": "link42-1-2", "mode": "client"})
+
+    assert result["modes"] == ["client"]
+    assert commands == [
+        [str(init_script), "stop"],
+        [str(init_script), "disable"],
+    ]
+    assert not init_script.exists()
+    assert not (config_dir / "client").exists()
+
+
+def test_udp2raw_openwrt_does_not_insert_direct_iptables_drop(tmp_path: Path, monkeypatch) -> None:
+    """验证 OpenWrt procd 后端不插入会吞掉 faketcp SYN 的 direct DROP 规则。"""
+
+    commands: list[list[str]] = []
+    config_dir = tmp_path / "udp2raw"
+    init_dir = tmp_path / "init.d"
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "OPENWRT_INIT_DIR", init_dir)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    middleware.apply_udp2raw(
+        {
+            "instance": "link42-udp",
+            "mode": "server",
+            "listen_host": "0.0.0.0",
+            "listen_port": 23002,
+            "remote_host": "127.0.0.1",
+            "remote_port": 51820,
+            "password": "secret",
+            "raw_mode": "udp",
+        }
+    )
+
+    assert not any(command and command[0] in {"iptables", "ip6tables"} for command in commands)
 
 
 def test_apply_config_restarts_existing_systemd_service(tmp_path: Path, monkeypatch) -> None:
@@ -506,6 +694,13 @@ def test_openwrt_backend_is_reported_as_agent_capability(monkeypatch, tmp_path: 
     main.run_once(FakeClient(), str(tmp_path))
 
     assert "service:openwrt-uci" in seen_capabilities
+    assert "wireguard" in seen_capabilities
+    assert "wg_quick_import" not in seen_capabilities
+    assert "agent.self_upgrade" not in seen_capabilities
+    assert "middleware.install" in seen_capabilities
+    assert "middleware.udp2raw" in seen_capabilities
+    assert "middleware.udp2raw.openwrt-procd" in seen_capabilities
+    assert "middleware.udp2raw.systemd" not in seen_capabilities
 
 
 def test_run_once_reports_service_manager_capability(monkeypatch, tmp_path: Path) -> None:
@@ -521,15 +716,47 @@ def test_run_once_reports_service_manager_capability(monkeypatch, tmp_path: Path
             seen_capabilities.extend(capabilities or [])
             return []
 
-    use_service_binaries(monkeypatch, systemd=False, openrc=True)
+    use_service_binaries(monkeypatch, systemd=True)
     monkeypatch.setattr(system, "run_command", lambda command, allow_failure: command_result(command))
 
     main.run_once(FakeClient(), str(tmp_path))
 
     assert "wireguard" in seen_capabilities
     assert "wg_quick_import" in seen_capabilities
-    assert "service:openrc" in seen_capabilities
+    assert "service:systemd" in seen_capabilities
     assert "agent.self_upgrade" in seen_capabilities
+    assert "middleware.udp2raw.systemd" in seen_capabilities
+
+
+def test_agent_platform_reports_musl_libc(monkeypatch) -> None:
+    """验证 OpenWrt/musl 平台不会被误报为 glibc 资产。"""
+
+    use_service_binaries(monkeypatch, systemd=False, openrc=False, openwrt=True, wg_quick=False)
+    monkeypatch.setattr(service_manager.Path, "exists", lambda self: str(self) == service_manager.OPENWRT_WIREGUARD_PROTO)
+    monkeypatch.setattr(system.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(system.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(system.platform, "libc_ver", lambda: ("glibc", "2.0"))
+    def fake_which(binary: str) -> str | None:
+        if binary == "ldd":
+            return "/usr/bin/ldd"
+        if binary in {"uci", "ifup", "ifdown"}:
+            return f"/sbin/{binary}"
+        return None
+
+    monkeypatch.setattr(system.shutil, "which", fake_which)
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        if command == ["ldd", "--version"]:
+            return command_result(command, stdout="musl libc (aarch64)\nVersion 1.2.3\n")
+        return command_result(command)
+
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+
+    platform = system.get_agent_platform()
+
+    assert platform["service_manager"] == "openwrt-uci"
+    assert platform["libc"] == "musl"
+    assert platform["glibc"] is None
 
 
 def test_self_upgrade_rejects_foreign_download_url() -> None:

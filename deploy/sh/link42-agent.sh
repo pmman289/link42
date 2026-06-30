@@ -55,6 +55,8 @@ detect_service_backend() {
     SERVICE_BACKEND="systemd"
   elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
     SERVICE_BACKEND="openrc"
+  elif command -v uci >/dev/null 2>&1 && command -v ifup >/dev/null 2>&1 && [ -f /etc/rc.common ]; then
+    SERVICE_BACKEND="openwrt-procd"
   else
     SERVICE_BACKEND="none"
   fi
@@ -77,12 +79,22 @@ uninstall_openrc_service() {
   fi
 }
 
+uninstall_openwrt_service() {
+  if [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+    "/etc/init.d/$SERVICE_NAME" stop >/dev/null 2>&1 || true
+    "/etc/init.d/$SERVICE_NAME" disable >/dev/null 2>&1 || true
+    rm -f "/etc/init.d/$SERVICE_NAME"
+  fi
+}
+
 uninstall_agent() {
   detect_service_backend
   if [ "$SERVICE_BACKEND" = "systemd" ]; then
     uninstall_systemd_service
   elif [ "$SERVICE_BACKEND" = "openrc" ]; then
     uninstall_openrc_service
+  elif [ "$SERVICE_BACKEND" = "openwrt-procd" ]; then
+    uninstall_openwrt_service
   else
     log "service manager not found; removing files only"
   fi
@@ -120,18 +132,27 @@ need_env LINK42_NODE_ID
 need_env LINK42_AGENT_TOKEN
 
 ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64|amd64)
-    AGENT_FILE="link42-agent-linux-x64"
-    ;;
-  *)
-    fail "unsupported architecture '$ARCH'; this installer currently supports x86_64 only"
-    ;;
-esac
+AGENT_INSTALL_MODE="binary"
+if command -v uci >/dev/null 2>&1 && [ -f /etc/rc.common ]; then
+  AGENT_FILE="link42-agent-source.tar.gz"
+  AGENT_INSTALL_MODE="source"
+else
+  case "$ARCH" in
+    x86_64|amd64)
+      AGENT_FILE="link42-agent-linux-x64"
+      ;;
+    aarch64|arm64|armv7l|armv6l)
+      fail "unsupported ARM Linux without OpenWrt source-mode installer"
+      ;;
+    *)
+      fail "unsupported architecture '$ARCH'; this installer currently supports x86_64 and OpenWrt source mode"
+      ;;
+  esac
+fi
 
 detect_service_backend
 if [ "$SERVICE_BACKEND" = "none" ]; then
-  fail "no supported service manager found; install systemd or OpenRC first"
+  fail "no supported service manager found; install systemd, OpenRC, or OpenWrt procd first"
 fi
 
 install_packages() {
@@ -146,8 +167,18 @@ install_packages() {
   elif command -v apk >/dev/null 2>&1; then
     apk add --no-cache ca-certificates curl wireguard-tools
   elif command -v opkg >/dev/null 2>&1; then
-    opkg update
-    opkg install ca-bundle curl wireguard-tools
+    missing_packages=""
+    command -v python3 >/dev/null 2>&1 || missing_packages="$missing_packages python3"
+    command -v wg >/dev/null 2>&1 || missing_packages="$missing_packages wireguard-tools"
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+      missing_packages="$missing_packages curl"
+    fi
+    if [ -z "$missing_packages" ]; then
+      log "OpenWrt dependencies already present; skipping opkg install"
+    else
+      opkg update || log "warning: opkg update failed; continuing because packages may still be installable"
+      opkg install ca-bundle $missing_packages
+    fi
   else
     log "package manager not found; skipping dependency installation"
   fi
@@ -155,6 +186,7 @@ install_packages() {
 
 download_agent() {
   mkdir -p "$INSTALL_DIR"
+  mkdir -p "$(dirname "$BIN_PATH")"
   tmp_file="$(mktemp "${TMPDIR:-/tmp}/link42-agent.XXXXXX")"
   tmp_sha="$(mktemp "${TMPDIR:-/tmp}/link42-agent.sha256.XXXXXX")"
   trap 'rm -f "$tmp_file" "$tmp_sha"' EXIT HUP INT TERM
@@ -190,7 +222,25 @@ download_agent() {
     fi
   fi
 
-  install -m 0755 "$tmp_file" "$BIN_PATH"
+  if [ "$AGENT_INSTALL_MODE" = "source" ]; then
+    rm -rf "$INSTALL_DIR/src"
+    mkdir -p "$INSTALL_DIR/src"
+    tar -xzf "$tmp_file" -C "$INSTALL_DIR/src"
+    cat > "$BIN_PATH" <<EOF
+#!/bin/sh
+set -eu
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  . "$ENV_FILE"
+  set +a
+fi
+export PYTHONPATH="$INSTALL_DIR/src/apps/agent:$INSTALL_DIR/src/packages"
+exec python3 -m link42_agent.main "\$@"
+EOF
+    chmod 0755 "$BIN_PATH"
+  else
+    install -m 0755 "$tmp_file" "$BIN_PATH"
+  fi
   rm -f "$tmp_file" "$tmp_sha"
   trap - EXIT HUP INT TERM
 }
@@ -214,6 +264,8 @@ stop_existing_service() {
     systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
   elif [ "$SERVICE_BACKEND" = "openrc" ]; then
     rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+  elif [ "$SERVICE_BACKEND" = "openwrt-procd" ] && [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+    "/etc/init.d/$SERVICE_NAME" stop >/dev/null 2>&1 || true
   fi
 }
 
@@ -268,6 +320,28 @@ EOF
   rc-service "$SERVICE_NAME" restart
 }
 
+install_openwrt_service() {
+  cat > "/etc/init.d/$SERVICE_NAME" <<EOF
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+  procd_open_instance
+  procd_set_param command $BIN_PATH
+  procd_set_param respawn 10 5 5
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_close_instance
+}
+EOF
+  chmod 0755 "/etc/init.d/$SERVICE_NAME"
+  "/etc/init.d/$SERVICE_NAME" enable
+  "/etc/init.d/$SERVICE_NAME" restart
+}
+
 log "installing dependencies"
 install_packages
 
@@ -287,8 +361,10 @@ write_env_file
 
 if [ "$SERVICE_BACKEND" = "systemd" ]; then
   install_systemd_service
-else
+elif [ "$SERVICE_BACKEND" = "openrc" ]; then
   install_openrc_service
+else
+  install_openwrt_service
 fi
 
 log "installed $SERVICE_NAME using $SERVICE_BACKEND"
