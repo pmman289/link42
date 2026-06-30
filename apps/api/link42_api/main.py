@@ -6,6 +6,7 @@ import ipaddress
 import logging
 from pathlib import Path
 import secrets
+import shlex
 import subprocess
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -347,17 +348,18 @@ def controller_url_for_agent(db: Session) -> str:
 def build_agent_manual_upgrade_command(node: models.Node, target_version: str | None, db: Session) -> str:
     """生成旧 Agent 可执行的覆盖安装命令。"""
 
-    env_parts = [
-        f"LINK42_AGENT_VERSION={target_version or 'latest'}",
-        f"LINK42_RES_BASE_URL={settings.agent_res_base_url}",
-    ]
+    env_values = {
+        "LINK42_AGENT_VERSION": target_version or "latest",
+        "LINK42_RES_BASE_URL": settings.agent_res_base_url,
+    }
     controller_url = controller_url_for_agent(db)
     if controller_url:
-        env_parts.append(f"LINK42_SERVER_URL={controller_url}")
-    env_parts.append(f"LINK42_NODE_ID={node.id}")
+        env_values["LINK42_SERVER_URL"] = controller_url
+    env_values["LINK42_NODE_ID"] = str(node.id)
     if node.agent_token_value:
-        env_parts.append(f"LINK42_AGENT_TOKEN={node.agent_token_value}")
-    return f"curl -fsSL {settings.agent_install_script_url} | sudo env {' '.join(env_parts)} sh"
+        env_values["LINK42_AGENT_TOKEN"] = node.agent_token_value
+    env_parts = [f"{key}={shlex.quote(value)}" for key, value in env_values.items()]
+    return f"curl -fsSL {shlex.quote(settings.agent_install_script_url)} | sudo env {' '.join(env_parts)} sh"
 
 
 def build_agent_upgrade_plan(

@@ -1303,7 +1303,7 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
         node = models.Node(
             name="node-a",
             agent_token_hash="hash",
-            agent_token_value="token",
+            agent_token_value="token&with space",
             status="online",
             agent_version="0.1.0",
             agent_capabilities=["wireguard", "wg_quick_import", "service:systemd"],
@@ -1321,7 +1321,7 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
     assert plan.manual_command is not None
     assert "LINK42_AGENT_VERSION=0.2.0" in plan.manual_command
     assert "LINK42_NODE_ID=" in plan.manual_command
-    assert "LINK42_AGENT_TOKEN=token" in plan.manual_command
+    assert "LINK42_AGENT_TOKEN='token&with space'" in plan.manual_command
 
 
 def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) -> None:

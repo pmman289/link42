@@ -6,6 +6,8 @@ from typing import Any
 
 from link42_common.connection_types import WIREGUARD_TASKS
 from link42_agent import main, middleware, service_manager, system, upgrade
+from link42_agent.client import AgentHttpError
+from link42_agent.config import AgentConfig
 from link42_agent.task_handlers import TASK_HANDLERS
 
 
@@ -91,6 +93,41 @@ def test_agent_task_registry_keeps_wireguard_handlers() -> None:
         WIREGUARD_TASKS.delete_config,
     ]:
         assert task_type in TASK_HANDLERS
+
+
+def test_agent_main_reports_401_without_traceback(monkeypatch, capsys) -> None:
+    """验证 Agent 凭据错误时输出明确提示，而不是持续刷 traceback。"""
+
+    class FakeClient:
+        def __init__(self, config: AgentConfig) -> None:
+            self.config = config
+
+        def register(self, hostname: str, capabilities: list[str], platform: dict[str, Any]) -> None:
+            raise AgentHttpError(401, "/api/agent/register", '{"detail":"invalid agent credentials"}')
+
+    sleep_calls = 0
+
+    def fake_sleep(seconds: int) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "load_config_from_env", lambda: AgentConfig("https://controller", 1, "bad-token"))
+    monkeypatch.setattr(main, "AgentClient", FakeClient)
+    monkeypatch.setattr(main, "get_hostname", lambda: "node-a")
+    monkeypatch.setattr(main, "build_capabilities", lambda: ["wireguard"])
+    monkeypatch.setattr(main, "get_agent_platform", lambda: {})
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+
+    try:
+        main.main()
+    except KeyboardInterrupt:
+        pass
+
+    output = capsys.readouterr().out
+    assert "agent authentication failed" in output
+    assert "Traceback" not in output
 
 
 def test_agent_install_script_openwrt_init_defines_rc_common_hooks() -> None:

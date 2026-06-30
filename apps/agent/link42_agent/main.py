@@ -7,7 +7,7 @@ from typing import Any, Union
 
 from link42_common.version import AGENT_VERSION
 
-from .client import AgentClient
+from .client import AgentClient, AgentHttpError
 from .config import AgentConfig
 from .config import load_config_from_env
 from .system import (
@@ -93,6 +93,15 @@ def main() -> None:
         try:
             client.register(get_hostname(), build_capabilities(), get_agent_platform())
             run_once(client, config)
+        except AgentHttpError as exc:
+            if exc.status_code == 401:
+                print(
+                    "agent authentication failed: invalid node id or token; "
+                    "rotate/copy a fresh deployment command from the controller",
+                    flush=True,
+                )
+            else:
+                print(str(exc), flush=True)
         except Exception:  # noqa: BLE001
             # 中心 API 重启或网络短暂中断时，Agent 保持运行并在下一轮重试。
             print(traceback.format_exc(), flush=True)

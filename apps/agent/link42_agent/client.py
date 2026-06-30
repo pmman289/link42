@@ -9,6 +9,16 @@ from link42_common.version import AGENT_PROTOCOL_VERSION, AGENT_VERSION
 from .config import AgentConfig
 
 
+class AgentHttpError(RuntimeError):
+    """Agent API 请求失败。"""
+
+    def __init__(self, status_code: int, path: str, body: str) -> None:
+        self.status_code = status_code
+        self.path = path
+        self.body = body
+        super().__init__(f"HTTP {status_code} for {path}: {body}")
+
+
 class AgentClient:
     """Agent 访问中心 API 的 HTTP 客户端。"""
 
@@ -74,7 +84,7 @@ class AgentClient:
                 body = response.read().decode("utf-8")
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} for {path}: {body}") from exc
+            raise AgentHttpError(exc.code, path, body) from exc
         if not body:
             return {}
         return json.loads(body)
