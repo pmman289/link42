@@ -74,29 +74,6 @@ docker run -d \
   pmman/link42:latest
 ```
 
-## Docker Compose
-
-也可以使用仓库内的 Compose 文件：
-
-```bash
-docker compose -f deploy/docker-compose.yml up -d
-```
-
-默认服务：
-
-```text
-镜像: pmman/link42:latest
-端口: 8000:8000
-数据卷: link42-runtime:/link42
-```
-
-如需使用宿主机目录而不是 Docker volume，可把 `deploy/docker-compose.yml` 里的 volume 改成：
-
-```yaml
-volumes:
-  - /opt/link42:/link42
-```
-
 ## 离线迁移镜像
 
 导出镜像：
