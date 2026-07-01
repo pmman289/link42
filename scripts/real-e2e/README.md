@@ -9,9 +9,9 @@ Default topology used by the current test bench:
 ```text
 controller: local machine
 local agent: local machine
-remote agent: ssh remote-test-host
-local endpoint: 192.0.2.10
-remote endpoint: 198.51.100.20
+remote agent: ssh vpstest
+local endpoint: 192.168.123.20
+remote endpoint: 172.20.177.22
 ```
 
 ## Configure
@@ -75,13 +75,13 @@ Useful manual checks during middleware testing:
 
 ```bash
 systemctl is-active mimic@enp3s0.service
-ssh remote-test-host 'systemctl is-active mimic@enp1s0.service'
+ssh vpstest 'systemctl is-active mimic@enp1s0.service'
 
 wg show <local-test-interface>
-ssh remote-test-host 'wg show <remote-test-interface>'
+ssh vpstest 'wg show <remote-test-interface>'
 
 find /etc/link42/middleware -maxdepth 4 -type f -ls
-ssh remote-test-host 'find /etc/link42/middleware -maxdepth 4 -type f -ls'
+ssh vpstest 'find /etc/link42/middleware -maxdepth 4 -type f -ls'
 ```
 
 ## Browser Tests

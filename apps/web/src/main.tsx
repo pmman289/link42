@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
 import { Background, MarkerType, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
@@ -1114,6 +1114,7 @@ function App() {
   const [monitorWindow, setMonitorWindow] = useState("1h");
   const [monitorDetail, setMonitorDetail] = useState<LinkMonitorSamplesResponse | null>(null);
   const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
+  const topologyEdgeSelectionRef = useRef<number | null>(null);
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) || null,
     [nodes, selectedNodeId],
@@ -1292,6 +1293,7 @@ function App() {
   const handleTopologyEdgeClick: EdgeMouseHandler = (_event, edge) => {
     const data = edge.data as TopologyEdge | undefined;
     if (!data) return;
+    topologyEdgeSelectionRef.current = data.local_node_id === selectedNodeId ? null : data.local_interface_id;
     setSelectedNodeId(data.local_node_id);
     setSelectedConfigId(data.local_interface_id);
     setPlan(null);
@@ -1650,7 +1652,7 @@ function App() {
       });
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [selectedNodeId, authToken]);
+  }, [selectedNodeId, selectedConfigId, monitorDialogConfigId, monitorWindow, authToken]);
 
   useEffect(() => {
     if (managedPeerNodeId) {
@@ -1664,12 +1666,17 @@ function App() {
   useEffect(() => {
     setImportCandidatesExpanded(false);
     if (selectedNodeId) {
-      setSelectedConfigId(null);
+      const preferredConfigId = topologyEdgeSelectionRef.current;
+      topologyEdgeSelectionRef.current = null;
+      if (!preferredConfigId) {
+        setSelectedConfigId(null);
+      }
       setPlan(null);
       setManagedPeerNodeId(null);
-      refreshConfigs(selectedNodeId, null).catch((error) => notify("error", error.message));
+      refreshConfigs(selectedNodeId, preferredConfigId).catch((error) => notify("error", error.message));
       refreshImportCandidates(selectedNodeId).catch((error) => notify("error", error.message));
     } else {
+      topologyEdgeSelectionRef.current = null;
       setConfigs([]);
       setSelectedConfigId(null);
       setImportCandidates([]);
@@ -2543,7 +2550,7 @@ function App() {
               </button>
             </header>
             <form className="stack" onSubmit={(event) => void runAction(() => saveSettings(event), "settings:save")}>
-              <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.0.2.10:8000。">
+              <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.168.123.20:8000。">
                 <input name="controller_url" defaultValue={controllerUrl} placeholder={DEFAULT_CONTROLLER_URL} required />
               </Field>
               <Field label="用户名">
@@ -2575,7 +2582,7 @@ function App() {
                 <input name="name" placeholder="node-a" required />
               </Field>
               <Field label="主控地址" hint="Agent 安装时连接的 Link42 API 地址。">
-                <input name="controller_url" placeholder="http://192.0.2.10:8000" defaultValue={controllerUrl} required />
+                <input name="controller_url" placeholder="http://192.168.123.20:8000" defaultValue={controllerUrl} required />
               </Field>
               <Field label="入口地址" hint="多个地址用逗号分隔，后续受管连接会从这里选择 Endpoint。" wide>
                 <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" required />

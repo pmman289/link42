@@ -4,8 +4,8 @@
 
 - API 监听：`0.0.0.0:8000`
 - 前端监听：`0.0.0.0:5173`
-- 局域网前端地址：`http://192.0.2.10:5173/`
-- 局域网 API 健康检查：`http://192.0.2.10:8000/api/health`
+- 局域网前端地址：`http://192.168.123.20:5173/`
+- 局域网 API 健康检查：`http://192.168.123.20:8000/api/health`
 
 ## 启动约定
 
@@ -16,7 +16,7 @@
 - Agent 不要直接前台执行后阻塞当前工作流。
 - Agent 应使用 systemd、独立后台会话、或明确可管理的长期进程方式启动。
 - 实机 Agent 环境变量：
-  - `LINK42_SERVER_URL=http://192.0.2.10:8000`
+  - `LINK42_SERVER_URL=http://192.168.123.20:8000`
   - `LINK42_NODE_ID=<节点 ID>`
   - `LINK42_AGENT_TOKEN=<节点 token>`
   - `LINK42_WIREGUARD_DIR=/etc/wireguard`
@@ -25,10 +25,10 @@
 - 当前实测节点：
   - `node_id=2`
   - `name=nodetest`
-  - `agent_token=l42agent_xxx`
+  - `agent_token=l42agent_YGhpdQRV5yBGkWhOo9Rxs9UzCmEqFW8x822OR7ETgsI`
 - 清库后旧 token 全部失效；最近一轮双节点测试曾使用：
-  - `node1=l42agent_xxx`
-  - `node2=l42agent_xxx`
+  - `node1=l42agent_dWpxQBthT_4drtsuK_EDWEbtKXVl937RUchLawszIII`
+  - `node2=l42agent_hfx1eUJL5Gg8mLHTtOsujqRECLalGL5jrwpe_noWjzM`
 - 单机可以模拟两个 Agent，但要避免接口名冲突；真实 `/etc/wireguard` 模式下两个 Agent 会操作同一台机器的同一套 WireGuard 环境。
 
 ## 数据库
@@ -79,7 +79,7 @@
   - `curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall`
 - 安装脚本会尝试安装 `wireguard-tools`，下载 Agent 二进制，并按 systemd 或 OpenRC 注册服务。
 - 卸载脚本会删除 Agent 服务、二进制和 `/etc/link42/agent.env`，不会删除 `/etc/wireguard` 下的配置。
-- OpenWrt/OpenRC 支持仍要谨慎测试；真实家庭路由器环境不能破坏现有网络。
+- OpenWrt/OpenRC 支持仍要谨慎测试；用户提供过 `ssh mrouter` 的家庭路由器环境，但不能破坏上面的现有网络。
 
 ## 主控 Docker 镜像
 

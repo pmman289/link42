@@ -212,9 +212,9 @@ scripts/real-e2e/down.sh
 ```text
 主控：本机
 本机 Agent：本机
-远端 Agent：ssh remote-test-host
-本机入口：192.0.2.10
-远端入口：198.51.100.20
+远端 Agent：ssh vpstest
+本机入口：192.168.123.20
+远端入口：172.20.177.22
 ```
 
 首次使用先复制配置：

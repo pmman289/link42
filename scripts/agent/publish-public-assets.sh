@@ -11,7 +11,7 @@ if [[ -f "$ROOT_DIR/scripts/release.env" ]]; then
 fi
 
 REMOTE_HOST="${LINK42_PUBLIC_HOST:-aligz}"
-REMOTE_ROOT="${LINK42_PUBLIC_ROOT:-/srv/www/get.pmman.tech}"
+REMOTE_ROOT="${LINK42_PUBLIC_ROOT:-/opt/1panel/www/sites/get.pmman.tech/index}"
 PUBLIC_BASE_URL="${LINK42_PUBLIC_BASE_URL:-https://get.pmman.tech}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 

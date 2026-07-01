@@ -16,7 +16,7 @@ fi
 
 DB_PATH="${LINK42_REAL_DB:-$RUN_DIR/link42.db}"
 BASE_URL="${LINK42_REAL_BASE_URL:-http://127.0.0.1:${LINK42_REAL_PORT:-8016}}"
-REMOTE_SSH="${LINK42_REAL_REMOTE_SSH:-remote-test-host}"
+REMOTE_SSH="${LINK42_REAL_REMOTE_SSH:-vpstest}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 
 echo "== processes =="

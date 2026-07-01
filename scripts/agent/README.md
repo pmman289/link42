@@ -46,7 +46,7 @@ SKIP_BUILD=1 scripts/agent/publish-public-assets.sh
 
 ```bash
 LINK42_PUBLIC_HOST=aligz
-LINK42_PUBLIC_ROOT=/srv/www/get.pmman.tech
+LINK42_PUBLIC_ROOT=/opt/1panel/www/sites/get.pmman.tech/index
 LINK42_PUBLIC_BASE_URL=https://get.pmman.tech
 ```
 

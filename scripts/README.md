@@ -20,9 +20,9 @@ cp scripts/release.env.example scripts/release.env
 
 ```bash
 LINK42_PUBLIC_HOST=aligz
-LINK42_PUBLIC_ROOT=/srv/www/get.pmman.tech
+LINK42_PUBLIC_ROOT=/opt/1panel/www/sites/get.pmman.tech/index
 LINK42_PUBLIC_BASE_URL=https://get.pmman.tech
-IMAGE_REPO=your-dockerhub-user/link42
+IMAGE_REPO=pmman/link42
 ```
 
 脚本会自动读取 `scripts/release.env`。命令行环境变量优先级更高：
@@ -43,7 +43,7 @@ scripts/release-all.sh
 
 ```bash
 IMAGE_TAG=20260630-120000 scripts/release-all.sh
-IMAGE_REPO=your-dockerhub-user/link42 scripts/release-all.sh
+IMAGE_REPO=pmman/link42 scripts/release-all.sh
 SKIP_AGENT_PUBLIC=1 scripts/release-all.sh
 SKIP_CONTROLLER=1 scripts/release-all.sh
 ```
