@@ -13,6 +13,7 @@ type NodeItem = {
   management_ip: string | null;
   public_ip: string | null;
   endpoint_ips: string[];
+  github_proxy_url: string | null;
   agent_token_value: string | null;
   agent_version: string | null;
   agent_protocol_version: number | null;
@@ -20,6 +21,7 @@ type NodeItem = {
   agent_platform: Record<string, unknown>;
   agent_update_status: string | null;
   agent_last_error: string | null;
+  middleware_install_status: string | null;
   status: string;
   last_seen_at: string | null;
 };
@@ -108,8 +110,10 @@ type ManagedLink = {
   peer_interface: ConfigItem;
   local_peer: PeerItem;
   peer_peer: PeerItem;
-  middleware: Udp2RawMiddleware | null;
+  middleware: MiddlewareConfig | null;
 };
+
+type MiddlewareConfig = Udp2RawMiddleware | MimicMiddleware;
 
 type Udp2RawMiddleware = {
   type: "udp2raw";
@@ -128,6 +132,18 @@ type Udp2RawMiddleware = {
   auto_rule: boolean;
 };
 
+type MimicMiddleware = {
+  type: "mimic";
+  enabled: boolean;
+  local_bind_interface: string;
+  peer_bind_interface: string;
+  xdp_mode: "auto" | "native" | "skb";
+  link_type: string;
+  handshake_interval: number | null;
+  keepalive_interval: number | null;
+  padding: number | null;
+};
+
 type ChangePlan = {
   id: number;
   title: string;
@@ -143,6 +159,7 @@ type TaskRequestResult = {
   task_id: number | null;
   status: string;
   message: string;
+  result: Record<string, unknown> | null;
 };
 
 type AgentTaskStatus = {
@@ -195,11 +212,8 @@ type Toast = {
   text: string;
 };
 
-// API 基础路径；同端口托管时使用当前 origin，Vite 预览时推断 FastAPI 的 8000 端口。
-const INFERRED_API_BASE =
-  window.location.port === "5173"
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
-    : window.location.origin;
+// API 基础路径；生产由 FastAPI 同源托管，Vite dev 通过 /api proxy 转发。
+const INFERRED_API_BASE = "";
 const API_BASE =
   import.meta.env.VITE_LINK42_API_BASE ||
   INFERRED_API_BASE;
@@ -209,6 +223,9 @@ const DEFAULT_CONTROLLER_URL =
   import.meta.env.VITE_LINK42_CONTROLLER_URL || API_BASE;
 const AUTH_TOKEN_KEY = "link42.authToken";
 const AUTH_EXPIRED_EVENT = "link42:auth-expired";
+const TASK_POLL_INTERVAL_MS = 2000;
+const AGENT_TASK_POLL_LIMIT = 90;
+const SHORT_TASK_POLL_LIMIT = 30;
 
 function splitList(value: string): string[] {
   // 将输入框中的逗号或换行分隔内容转换成 API 需要的数组；不要按冒号切分，IPv6 会用到 "::"。
@@ -331,6 +348,32 @@ function nodeSystemLabel(node: NodeItem | null): string {
 
 function nodeSupportsWgQuickImport(node: NodeItem | null): boolean {
   return nodeCapabilities(node).has("wg_quick_import") && nodeServiceManager(node) !== "openwrt-uci";
+}
+
+function mimicPluginStatus(node: NodeItem | null): { label: string; detail: string; installable: boolean; installed: boolean; rebootRequired: boolean } {
+  const capabilities = nodeCapabilities(node);
+  const platform = node?.agent_platform || {};
+  const middlewareStatus = String(node?.middleware_install_status || "");
+  const rebootRequired = middlewareStatus === "mimic_reboot_required" || platform.mimic_reboot_required === true;
+  if (rebootRequired) {
+    return {
+      label: "需要重启",
+      detail: "mimic 已安装，但 DKMS 模块构建在新内核上；重启节点进入新内核后生效。",
+      installable: false,
+      installed: false,
+      rebootRequired: true,
+    };
+  }
+  if (!node || node.status !== "online") {
+    return { label: "未知", detail: "节点离线，无法判断 mimic 安装状态。", installable: false, installed: false, rebootRequired: false };
+  }
+  if (capabilities.has("middleware.mimic")) {
+    return { label: "已安装", detail: "Agent 已检测到 mimic，可在受管连接中启用。", installable: false, installed: true, rebootRequired: false };
+  }
+  if (capabilities.has("middleware.install.mimic")) {
+    return { label: "可安装", detail: "将从 hack3ric/mimic 官方 GitHub latest release 下载。", installable: true, installed: false, rebootRequired: false };
+  }
+  return { label: "不支持", detail: "需要非 OpenWrt、systemd、Linux kernel > 6.1、Debian/Ubuntu 且 Agent 支持安装器。", installable: false, installed: false, rebootRequired: false };
 }
 
 function importScanUnavailableMessage(node: NodeItem | null, online: boolean): string {
@@ -641,6 +684,98 @@ function EndpointSelect({
   );
 }
 
+function MimicFields({
+  enabled,
+  defaults,
+  localNode,
+  peerNode,
+  disabled,
+  onEnabledChange,
+}: {
+  enabled: boolean;
+  defaults?: Partial<MimicMiddleware> | null;
+  localNode?: NodeItem | null;
+  peerNode?: NodeItem | null;
+  disabled?: boolean;
+  onEnabledChange: (value: boolean) => void;
+}) {
+  const localInterfaces = interfaceOptions(localNode);
+  const peerInterfaces = interfaceOptions(peerNode);
+  function handleEnabledChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const nextEnabled = event.currentTarget.checked;
+    onEnabledChange(nextEnabled);
+    if (nextEnabled) {
+      const mtuInput = event.currentTarget.form?.elements.namedItem("mtu");
+      if (mtuInput instanceof HTMLInputElement) {
+        mtuInput.value = "1408";
+      }
+    }
+  }
+  return (
+    <FormSection
+      title="mimic 透明中间层"
+      hint="mimic 在 Linux 网卡层透明处理 WireGuard UDP 流量，不修改 Endpoint；需要非 OpenWrt、kernel > 6.1 且节点已安装 mimic。"
+      tone="middleware"
+    >
+      <label className="checkField wideField">
+        <input
+          name="mimic_enabled"
+          type="checkbox"
+          checked={enabled}
+          disabled={disabled}
+          onChange={handleEnabledChange}
+        />
+        <input type="hidden" name="mimic_enabled_state" value={enabled ? "on" : ""} disabled={disabled} />
+        <span>启用 mimic</span>
+      </label>
+      {enabled && (
+        <>
+          <Field label="本端出口网卡" hint="选择承载本端 WireGuard Endpoint 流量的物理或上联网卡。">
+            <select name="mimic_local_bind_interface" defaultValue={defaults?.local_bind_interface || localInterfaces[0] || ""} required disabled={disabled}>
+              <option value="">请选择网卡</option>
+              {localInterfaces.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
+          </Field>
+          <Field label="对端出口网卡" hint="选择承载对端 WireGuard Endpoint 流量的物理或上联网卡。">
+            <select name="mimic_peer_bind_interface" defaultValue={defaults?.peer_bind_interface || peerInterfaces[0] || ""} required disabled={disabled}>
+              <option value="">请选择网卡</option>
+              {peerInterfaces.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
+          </Field>
+          <Field label="XDP 模式" hint="默认 skb 兼容性更稳；确认网卡 native XDP 稳定后可切 native。">
+            <select name="mimic_xdp_mode" defaultValue={defaults?.xdp_mode || "skb"} disabled={disabled}>
+              <option value="skb">skb</option>
+              <option value="auto">auto</option>
+              <option value="native">native</option>
+            </select>
+          </Field>
+          <Field label="链路类型" hint="大多数以太网环境保持 eth。">
+            <input name="mimic_link_type" defaultValue={defaults?.link_type || "eth"} disabled={disabled} />
+          </Field>
+          <Field label="Handshake 间隔" hint="映射为 mimic 的 handshake interval；留空使用 mimic 默认值。">
+            <input name="mimic_handshake_interval" defaultValue={defaults?.handshake_interval || ""} inputMode="numeric" disabled={disabled} />
+          </Field>
+          <Field label="Keepalive 时间" hint="映射为 mimic 的 keepalive time；留空使用 mimic 默认值。">
+            <input name="mimic_keepalive_interval" defaultValue={defaults?.keepalive_interval || ""} inputMode="numeric" disabled={disabled} />
+          </Field>
+          <Field label="Padding" hint="范围 0-16；留空不额外指定。">
+            <input name="mimic_padding" defaultValue={defaults?.padding || ""} inputMode="numeric" disabled={disabled} />
+          </Field>
+          <div className="formNotice wideField">
+            mimic 不会把 Endpoint 改为 127.0.0.1；请保持上方双方入口地址为真实可达地址，并确认防火墙放行对应 WireGuard 端口。
+          </div>
+        </>
+      )}
+    </FormSection>
+  );
+}
+
+function interfaceOptions(node?: NodeItem | null): string[] {
+  const platform = node?.agent_platform || {};
+  const values = platform.network_interfaces;
+  return Array.isArray(values) ? values.map((item) => String(item)).filter(Boolean) : [];
+}
+
 function RouteModeSelect({
   defaultValue = "off",
   disabled,
@@ -806,6 +941,40 @@ function readUdp2RawForm(
   };
 }
 
+function readMimicForm(form: FormData): Record<string, unknown> | null {
+  const enabled = form.get("mimic_enabled") === "on" || form.get("mimic_enabled_state") === "on";
+  if (!enabled) return null;
+  return {
+    enabled: true,
+    local_bind_interface: String(form.get("mimic_local_bind_interface") || "").trim(),
+    peer_bind_interface: String(form.get("mimic_peer_bind_interface") || "").trim(),
+    xdp_mode: String(form.get("mimic_xdp_mode") || "skb"),
+    link_type: String(form.get("mimic_link_type") || "eth").trim() || "eth",
+    handshake_interval: optionalInt(form.get("mimic_handshake_interval")),
+    keepalive_interval: optionalInt(form.get("mimic_keepalive_interval")),
+    padding: optionalInt(form.get("mimic_padding")),
+  };
+}
+
+function validateMimicForm(mimic: Record<string, unknown> | null, localListenPort: number | null, peerListenPort: number | null) {
+  if (!mimic) return;
+  if (!mimic.local_bind_interface || !mimic.peer_bind_interface) {
+    throw new Error("mimic 需要选择双方出口网卡");
+  }
+  if (!localListenPort || !peerListenPort) {
+    throw new Error("mimic 透明匹配需要双方 WireGuard ListenPort 都填写");
+  }
+  if (!["auto", "native", "skb"].includes(String(mimic.xdp_mode))) {
+    throw new Error("mimic XDP 模式必须是 auto、native 或 skb");
+  }
+  if (mimic.padding !== null && mimic.padding !== undefined) {
+    const padding = Number(mimic.padding);
+    if (!Number.isInteger(padding) || padding < 0 || padding > 16) {
+      throw new Error("mimic padding 必须在 0-16 之间");
+    }
+  }
+}
+
 function validateUdp2RawForm(udp2raw: Record<string, unknown> | null, localListenPort: number | null, peerListenPort: number | null) {
   if (!udp2raw) return;
   const serverSide = String(udp2raw.server_side);
@@ -842,6 +1011,7 @@ function App() {
   const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_KEY) || "");
   const [authChecked, setAuthChecked] = useState(false);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
+  const [loginError, setLoginError] = useState("");
   const [controllerUrl, setControllerUrl] = useState(DEFAULT_CONTROLLER_URL);
   const [settingsUsername, setSettingsUsername] = useState("pmman");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -862,7 +1032,9 @@ function App() {
   const [replaceLocalConfigId, setReplaceLocalConfigId] = useState<number | null>(null);
   const [replacePeerConfigId, setReplacePeerConfigId] = useState<number | null>(null);
   const [forceEndpointMismatch, setForceEndpointMismatch] = useState(false);
+  const [middlewareType, setMiddlewareType] = useState<"none" | "udp2raw" | "mimic">("none");
   const [udp2rawEnabled, setUdp2rawEnabled] = useState(false);
+  const [mimicEnabled, setMimicEnabled] = useState(false);
   const [udp2rawServerSide, setUdp2rawServerSide] = useState<"local" | "peer">("peer");
   const [managedCreateMtu, setManagedCreateMtu] = useState("1420");
   const [peerNodeConfigs, setPeerNodeConfigs] = useState<ConfigItem[]>([]);
@@ -872,6 +1044,7 @@ function App() {
   const [monitorDialogConfigId, setMonitorDialogConfigId] = useState<number | null>(null);
   const [monitorWindow, setMonitorWindow] = useState("1h");
   const [monitorDetail, setMonitorDetail] = useState<LinkMonitorSamplesResponse | null>(null);
+  const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) || null,
     [nodes, selectedNodeId],
@@ -889,6 +1062,7 @@ function App() {
     () => nodes.find((node) => node.id === editingNodeId) || null,
     [nodes, editingNodeId],
   );
+  const editingNodeMimicStatus = mimicPluginStatus(editingNode);
   const isConfigRunning = selectedConfig?.runtime_status === "running";
   const isConfigStopped = !selectedConfig || ["stopped", "unknown"].includes(selectedConfig.runtime_status);
   const isConfigBusy = selectedConfig ? ["starting", "stopping"].includes(selectedConfig.runtime_status) : false;
@@ -900,11 +1074,32 @@ function App() {
     ? nodes.filter((item) => item.id !== selectedNode.id && isNodeSelectable(item))
     : [];
   const selectedManagedPeerNode = selectedPeerNodeOptions.find((item) => item.id === managedPeerNodeId) || null;
+  const udp2rawActive = middlewareType === "udp2raw" && udp2rawEnabled;
+  const mimicActive = middlewareType === "mimic" && mimicEnabled;
   const selectedLocalEndpoints = selectedNode ? nodeEndpointOptions(selectedNode) : [];
   const selectedPeerEndpoints = selectedManagedPeerNode ? nodeEndpointOptions(selectedManagedPeerNode) : [];
   const selectedManagedLinkPeerNode = managedLink
     ? nodes.find((node) => node.id === managedLink.peer_interface.node_id) || null
     : null;
+  const actionPending = (key: string) => pendingActions.has(key);
+  const nodeActionKey = (nodeId: number | null | undefined, action: string) => `node:${nodeId || "none"}:${action}`;
+  const configActionKey = (configId: number | null | undefined, action: string) => `config:${configId || "none"}:${action}`;
+  const monitorActionKey = (configId: number | null | undefined, action: string) => `monitor:${configId || "none"}:${action}`;
+  const candidateActionKey = (candidateId: number) => `candidate:${candidateId}:import`;
+  const selectedConfigAnyTaskPending = selectedConfigId
+    ? [
+        "create-plan",
+        "refresh-deployed",
+        "start",
+        "stop",
+        "delete",
+        "confirm-plan",
+        "take-over",
+        "save-config",
+        "save-peer",
+        "save-managed-link",
+      ].some((action) => actionPending(configActionKey(selectedConfigId, action)))
+    : false;
   const selectedManagedLinkPeerEndpoints = selectedManagedLinkPeerNode
     ? nodeEndpointOptions(selectedManagedLinkPeerNode)
     : [];
@@ -958,7 +1153,9 @@ function App() {
     setReplaceLocalConfigId(overrides.replaceLocalConfigId ?? null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
+    setMiddlewareType("none");
     setUdp2rawEnabled(false);
+    setMimicEnabled(false);
     setUdp2rawServerSide("peer");
     setManagedCreateMtu("1420");
   }
@@ -993,17 +1190,34 @@ function App() {
     setReplaceLocalConfigId(null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
+    setMiddlewareType("none");
     setUdp2rawEnabled(false);
+    setMimicEnabled(false);
     setUdp2rawServerSide("peer");
     setManagedCreateMtu("1420");
     setPeerNodeConfigs([]);
     setSettingsOpen(false);
     setMonitorDialogConfigId(null);
     setMonitorDetail(null);
+    setPendingActions(new Set());
   }
 
-  async function runAction(action: () => Promise<void>) {
+  function sleep(ms: number) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function runAction(action: () => Promise<void>, key?: string) {
     // 所有用户操作都通过这里展示 API 错误，避免点击后页面无反馈。
+    if (key && pendingActions.has(key)) {
+      return;
+    }
+    if (key) {
+      setPendingActions((items) => {
+        const next = new Set(items);
+        next.add(key);
+        return next;
+      });
+    }
     try {
       await action();
     } catch (error) {
@@ -1012,20 +1226,51 @@ function App() {
         return;
       }
       notify("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      if (key) {
+        setPendingActions((items) => {
+          const next = new Set(items);
+          next.delete(key);
+          return next;
+        });
+      }
     }
+  }
+
+  function holdActionPending(key: string) {
+    setPendingActions((items) => {
+      const next = new Set(items);
+      next.add(key);
+      return next;
+    });
+  }
+
+  function releaseActionPending(key: string) {
+    setPendingActions((items) => {
+      const next = new Set(items);
+      next.delete(key);
+      return next;
+    });
   }
 
   async function login(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const result = await api<LoginResult>("/api/auth/login", {
-      method: "POST",
-      skipAuth: true,
-      body: JSON.stringify({
-        username: form.get("username"),
-        password: form.get("password"),
-      }),
-    });
+    setLoginError("");
+    let result: LoginResult;
+    try {
+      result = await api<LoginResult>("/api/auth/login", {
+        method: "POST",
+        skipAuth: true,
+        body: JSON.stringify({
+          username: form.get("username"),
+          password: form.get("password"),
+        }),
+      });
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message.replace(/^401:\s*/, "") : "登录失败");
+      return;
+    }
     window.localStorage.setItem(AUTH_TOKEN_KEY, result.token);
     setAuthToken(result.token);
     setCurrentUser(result.username);
@@ -1235,8 +1480,16 @@ function App() {
 
   useEffect(() => {
     if (!managedLink?.middleware) return;
-    setUdp2rawEnabled(Boolean(managedLink.middleware.enabled));
-    setUdp2rawServerSide(managedLink.middleware.server_side || "peer");
+    if (managedLink.middleware.type === "udp2raw") {
+      setMiddlewareType("udp2raw");
+      setUdp2rawEnabled(Boolean(managedLink.middleware.enabled));
+      setMimicEnabled(false);
+      setUdp2rawServerSide(managedLink.middleware.server_side || "peer");
+    } else if (managedLink.middleware.type === "mimic") {
+      setMiddlewareType("mimic");
+      setUdp2rawEnabled(false);
+      setMimicEnabled(Boolean(managedLink.middleware.enabled));
+    }
   }, [managedLink?.middleware]);
 
   useEffect(() => {
@@ -1245,9 +1498,9 @@ function App() {
   }, [monitorDialogConfigId, monitorWindow]);
 
   useEffect(() => {
-    if (createDialog !== "managed" || udp2rawEnabled) return;
+    if (createDialog !== "managed" || udp2rawActive || mimicActive) return;
     setManagedCreateMtu(String(replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420));
-  }, [createDialog, replaceLocalConfig?.mtu, replacePeerConfig?.mtu, udp2rawEnabled]);
+  }, [createDialog, replaceLocalConfig?.mtu, replacePeerConfig?.mtu, udp2rawActive, mimicActive]);
 
   useEffect(() => {
     if (!selectedNodeId || !selectedConfigId || !selectedNodeOnline) return;
@@ -1311,6 +1564,7 @@ function App() {
         management_ip: endpointIps[0] || null,
         public_ip: endpointIps[0] || null,
         endpoint_ips: endpointIps,
+        github_proxy_url: null,
       }),
     });
     notify(
@@ -1345,6 +1599,7 @@ function App() {
         hostname: editingNode.hostname,
         management_ip: endpointIps[0] || null,
         public_ip: endpointIps[0] || null,
+        github_proxy_url: String(form.get("github_proxy_url") || "").trim() || null,
       }),
     });
     setNodes((items) => items.map((item) => item.id === updated.id ? updated : item));
@@ -1408,38 +1663,77 @@ function App() {
     if (agentUpgradePlan.upgrade_mode !== "self_upgrade") {
       throw new Error(agentUpgradePlan.reason || "当前节点不能一键升级");
     }
-    const result = await api<TaskRequestResult>(`/api/nodes/${editingNode.id}/agent/upgrade`, {
-      method: "POST",
-      body: JSON.stringify({ target_version: agentUpgradePlan.target_version, force: false }),
-    });
-    notify("success", result.message);
-    await refreshNodes();
-    await refreshAgentUpgradePlan(editingNode.id);
-    if (result.task_id) {
-      void pollAgentUpgradeTask(result.task_id, editingNode.id);
+    const upgradeTaskKey = nodeActionKey(editingNode.id, "agent-upgrade-task");
+    holdActionPending(upgradeTaskKey);
+    try {
+      const result = await api<TaskRequestResult>(`/api/nodes/${editingNode.id}/agent/upgrade`, {
+        method: "POST",
+        body: JSON.stringify({ target_version: agentUpgradePlan.target_version, force: false }),
+      });
+      notify("success", result.message);
+      await refreshNodes();
+      await refreshAgentUpgradePlan(editingNode.id);
+      if (result.task_id) {
+        await pollAgentUpgradeTask(result.task_id, editingNode.id);
+      }
+    } finally {
+      releaseActionPending(upgradeTaskKey);
     }
   }
 
-  async function pollAgentUpgradeTask(taskId: number, nodeId: number) {
-    try {
-      for (let attempt = 0; attempt < 45; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, 2000));
-        const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
-        await refreshNodes();
-        await refreshAgentUpgradePlan(nodeId);
-        if (task.status === "succeeded") {
-          notify("success", "Agent 升级已暂存，等待服务重启后上报新版本。");
-          return;
-        }
-        if (task.status === "failed") {
-          notify("error", `Agent 升级失败：${JSON.stringify(task.result || {})}`);
-          return;
-        }
-      }
-      notify("info", "Agent 升级任务仍在进行，请稍后刷新节点状态。");
-    } catch (error) {
-      notify("error", error instanceof Error ? error.message : String(error));
+  async function requestMimicInstall() {
+    if (!editingNode) return;
+    const status = mimicPluginStatus(editingNode);
+    if (!status.installable) {
+      throw new Error(status.detail);
     }
+    const result = await api<TaskRequestResult>(`/api/nodes/${editingNode.id}/middleware/mimic/install`, {
+      method: "POST",
+    });
+    notify("success", result.message);
+    await refreshNodes();
+    if (result.task_id) {
+      await pollMiddlewareInstallTask(result.task_id, editingNode.id);
+    }
+  }
+
+  async function pollMiddlewareInstallTask(taskId: number, nodeId: number) {
+    for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
+      await sleep(TASK_POLL_INTERVAL_MS);
+      const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
+      await refreshNodes();
+      if (task.status === "succeeded") {
+        if (task.result?.reboot_required) {
+          notify("info", "mimic 已安装，但需要重启节点进入新内核后生效。");
+          return;
+        }
+        notify("success", "mimic 安装任务完成，等待 Agent 心跳刷新能力。");
+        return;
+      }
+      if (task.status === "failed") {
+        notify("error", `mimic 安装失败：${JSON.stringify(task.result || {})}`);
+        return;
+      }
+    }
+    notify("info", "mimic 安装任务仍在进行，请稍后刷新节点状态。");
+  }
+
+  async function pollAgentUpgradeTask(taskId: number, nodeId: number) {
+    for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
+      await sleep(TASK_POLL_INTERVAL_MS);
+      const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
+      await refreshNodes();
+      await refreshAgentUpgradePlan(nodeId);
+      if (task.status === "succeeded") {
+        notify("success", "Agent 升级已暂存，等待服务重启后上报新版本。");
+        return;
+      }
+      if (task.status === "failed") {
+        notify("error", `Agent 升级失败：${JSON.stringify(task.result || {})}`);
+        return;
+      }
+    }
+    notify("info", "Agent 升级任务仍在进行，请稍后刷新节点状态。");
   }
 
   async function saveConfig(event: React.FormEvent<HTMLFormElement>, mode: "create" | "update") {
@@ -1563,7 +1857,8 @@ function App() {
     const localListenPort = optionalInt(form.get("local_listen_port"));
     const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
-    const udp2raw = readUdp2RawForm(form, localListenPort, peerListenPort);
+    const udp2raw = middlewareType === "udp2raw" ? readUdp2RawForm(form, localListenPort, peerListenPort) : null;
+    const mimic = middlewareType === "mimic" ? readMimicForm(form) : null;
     if (!peerNodeId || peerNodeId === selectedNodeId) {
       throw new Error("请选择另一个在线受管节点");
     }
@@ -1586,6 +1881,7 @@ function App() {
       throw new Error("请填写双方用于互联的入口地址");
     }
     validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
+    validateMimicForm(mimic, localListenPort, peerListenPort);
     if (replaceLocalConfigId && !replacePeerConfigId) {
       throw new Error("请选择对端的导入配置覆盖项");
     }
@@ -1617,6 +1913,7 @@ function App() {
           replace_peer_interface_id: replacePeerConfigId,
           force_endpoint_mismatch: forceEndpointMismatch,
           udp2raw,
+          mimic,
         }),
       },
     );
@@ -1627,7 +1924,9 @@ function App() {
     setReplaceLocalConfigId(null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
+    setMiddlewareType("none");
     setUdp2rawEnabled(false);
+    setMimicEnabled(false);
     setUdp2rawServerSide("peer");
     setCreateDialog(null);
     [1000, 2500, 4500].forEach((delay) => {
@@ -1704,7 +2003,8 @@ function App() {
     const peerEndpointPort = optionalInt(form.get("peer_endpoint_port"));
     const keepalive = Number(form.get("persistent_keepalive")) || null;
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
-    const udp2raw = readUdp2RawForm(form, localListenPort, peerListenPort);
+    const udp2raw = middlewareType === "udp2raw" ? readUdp2RawForm(form, localListenPort, peerListenPort) : null;
+    const mimic = middlewareType === "mimic" ? readMimicForm(form) : null;
     if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
       throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32, fd42::1/64");
     }
@@ -1724,6 +2024,7 @@ function App() {
       throw new Error("PersistentKeepalive 必须是 0-65535 之间的整数");
     }
     validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
+    validateMimicForm(mimic, localListenPort, peerListenPort);
     await api<ManagedLink>(`/api/wireguard/configs/${selectedConfigId}/managed-link`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -1747,6 +2048,7 @@ function App() {
         peer_interface_custom_config: form.get("peer_interface_custom_config") || null,
         peer_peer_custom_config: form.get("peer_peer_custom_config") || null,
         udp2raw,
+        mimic,
       }),
     });
     await refreshConfigs(selectedNodeId, selectedConfigId);
@@ -1883,31 +2185,27 @@ function App() {
     await refreshImportCandidates(selectedNodeId);
     setImportCandidatesExpanded(true);
     if (data.task_id) {
-      void pollImportScanTask(data.task_id, selectedNodeId);
+      await pollImportScanTask(data.task_id, selectedNodeId);
     }
   }
 
   async function pollImportScanTask(taskId: number, nodeId: number) {
-    try {
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, 1000));
-        const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
-        await refreshNodes();
-        await refreshConfigs(nodeId, selectedConfigId);
-        await refreshImportCandidates(nodeId);
-        if (task.status === "succeeded") {
-          notify("success", "扫描完成，已刷新现有 wg-quick 候选和节点配置。");
-          return;
-        }
-        if (task.status === "failed") {
-          notify("error", `扫描失败：${JSON.stringify(task.result || {})}`);
-          return;
-        }
+    for (let attempt = 0; attempt < SHORT_TASK_POLL_LIMIT; attempt += 1) {
+      await sleep(1000);
+      const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
+      await refreshNodes();
+      await refreshConfigs(nodeId, selectedConfigId);
+      await refreshImportCandidates(nodeId);
+      if (task.status === "succeeded") {
+        notify("success", "扫描完成，已刷新现有 wg-quick 候选和节点配置。");
+        return;
       }
-      notify("info", "扫描任务仍在执行，页面已刷新；稍后可再次查看。");
-    } catch (error) {
-      notify("error", error instanceof Error ? error.message : String(error));
+      if (task.status === "failed") {
+        notify("error", `扫描失败：${JSON.stringify(task.result || {})}`);
+        return;
+      }
     }
+    notify("info", "扫描任务仍在执行，页面已刷新；稍后可再次查看。");
   }
 
   async function importCandidate(candidateId: number) {
@@ -1954,14 +2252,15 @@ function App() {
         <section className="loginPanel">
           <h1>Link42</h1>
           <p className="muted">主控访问登录</p>
-          <form className="stack" onSubmit={(event) => void runAction(() => login(event))}>
+          <form className="stack" onSubmit={(event) => void runAction(() => login(event), "auth:login")}>
             <Field label="用户名">
-              <input name="username" defaultValue={settingsUsername} autoComplete="username" required />
+              <input name="username" defaultValue={settingsUsername} autoComplete="username" required onChange={() => setLoginError("")} />
             </Field>
             <Field label="密码">
-              <input name="password" type="password" autoComplete="current-password" required />
+              <input name="password" type="password" autoComplete="current-password" required onChange={() => setLoginError("")} />
             </Field>
-            <button type="submit"><Check size={16} /> 登录</button>
+            {loginError && <div className="formError" role="alert">{loginError}</div>}
+            <button type="submit" disabled={actionPending("auth:login")}><Check size={16} /> {actionPending("auth:login") ? "登录中" : "登录"}</button>
           </form>
         </section>
         <div className="toastStack" aria-live="polite">
@@ -2015,7 +2314,7 @@ function App() {
                 <X size={18} />
               </button>
             </header>
-            <form className="stack" onSubmit={(event) => void runAction(() => saveSettings(event))}>
+            <form className="stack" onSubmit={(event) => void runAction(() => saveSettings(event), "settings:save")}>
               <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.168.123.20:8000。">
                 <input name="controller_url" defaultValue={controllerUrl} placeholder={DEFAULT_CONTROLLER_URL} required />
               </Field>
@@ -2025,7 +2324,7 @@ function App() {
               <Field label="新密码" hint="留空表示不修改密码。">
                 <input name="new_password" type="password" autoComplete="new-password" />
               </Field>
-              <button type="submit"><Check size={16} /> 保存设置</button>
+              <button type="submit" disabled={actionPending("settings:save")}><Check size={16} /> {actionPending("settings:save") ? "保存中" : "保存设置"}</button>
             </form>
           </section>
         </div>
@@ -2043,7 +2342,7 @@ function App() {
                 <X size={18} />
               </button>
             </header>
-            <form onSubmit={(event) => void runAction(() => createNode(event))} className="gridForm">
+            <form onSubmit={(event) => void runAction(() => createNode(event), "node:create")} className="gridForm">
               <Field label="节点名称" hint="用于在控制台识别这个 Agent。">
                 <input name="name" placeholder="node-a" required />
               </Field>
@@ -2053,7 +2352,7 @@ function App() {
               <Field label="入口地址" hint="多个地址用逗号分隔，后续受管连接会从这里选择 Endpoint。" wide>
                 <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" required />
               </Field>
-              <button type="submit"><Plus size={16} /> 创建节点</button>
+              <button type="submit" disabled={actionPending("node:create")}><Plus size={16} /> {actionPending("node:create") ? "创建中" : "创建节点"}</button>
             </form>
           </section>
         </div>
@@ -2071,15 +2370,35 @@ function App() {
                 <X size={18} />
               </button>
             </header>
-            <form key={`node-edit-${editingNode.id}`} onSubmit={(event) => void runAction(() => saveNode(event))} className="gridForm">
+            <form key={`node-edit-${editingNode.id}`} onSubmit={(event) => void runAction(() => saveNode(event), nodeActionKey(editingNode.id, "save"))} className="gridForm">
               <Field label="节点名称" hint="修改后会同步显示在节点列表。">
                 <input name="name" placeholder="node-a" defaultValue={editingNode.name} required />
               </Field>
               <Field label="入口地址" hint="多个地址用逗号分隔；受管连接会校验所选地址属于节点。" wide>
                 <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" defaultValue={nodeEndpointOptions(editingNode).join(", ")} required />
               </Field>
-              <button type="submit"><Check size={16} /> 保存节点</button>
+              <Field label="GitHub 代理 URL" hint="Agent 安装 GitHub release 插件时使用；留空则直连 GitHub。" wide>
+                <input name="github_proxy_url" placeholder="https://gh-proxy.example.com/" defaultValue={editingNode.github_proxy_url || ""} />
+              </Field>
+              <button type="submit" disabled={actionPending(nodeActionKey(editingNode.id, "save"))}><Check size={16} /> {actionPending(nodeActionKey(editingNode.id, "save")) ? "保存中" : "保存节点"}</button>
             </form>
+            <section className="modalSection">
+              <h3>中间层插件</h3>
+              <div className="pluginStatus">
+                <div>
+                  <strong>mimic</strong>
+                  <p className="muted">{editingNodeMimicStatus.detail}</p>
+                  <small>状态：{editingNodeMimicStatus.label} / 来源：GitHub latest release</small>
+                </div>
+                <button
+                  className="secondary"
+                  disabled={!editingNodeMimicStatus.installable || actionPending(nodeActionKey(editingNode.id, "mimic-install"))}
+                  onClick={() => void runAction(requestMimicInstall, nodeActionKey(editingNode.id, "mimic-install"))}
+                >
+                  <Upload size={16} /> {editingNodeMimicStatus.rebootRequired ? "需要重启后生效" : actionPending(nodeActionKey(editingNode.id, "mimic-install")) ? "安装中" : "安装 latest"}
+                </button>
+              </div>
+            </section>
             <section className="modalSection">
               <h3>Agent token</h3>
               {editingNode.agent_token_value ? (
@@ -2095,7 +2414,7 @@ function App() {
               <pre className="tokenBox">{buildAgentCommand(editingNode, controllerUrl) || "轮换 token 后显示 Agent 启动命令。"}</pre>
               <div className="actionRow">
                 <button className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
-                <button className="danger" onClick={() => void runAction(rotateNodeToken)}>轮换 token</button>
+                <button className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "rotate-token"))} onClick={() => void runAction(rotateNodeToken, nodeActionKey(editingNode.id, "rotate-token"))}>轮换 token</button>
               </div>
             </section>
             <section className="modalSection">
@@ -2124,13 +2443,17 @@ function App() {
                   <div className="actionRow">
                     <button
                       className="secondary"
-                      onClick={() => void runAction(() => refreshAgentUpgradePlan(editingNode.id))}
+                      disabled={actionPending(nodeActionKey(editingNode.id, "refresh-upgrade-plan"))}
+                      onClick={() => void runAction(() => refreshAgentUpgradePlan(editingNode.id), nodeActionKey(editingNode.id, "refresh-upgrade-plan"))}
                     >
-                      <RefreshCw size={16} /> 刷新升级计划
+                      <RefreshCw size={16} /> {actionPending(nodeActionKey(editingNode.id, "refresh-upgrade-plan")) ? "刷新中" : "刷新升级计划"}
                     </button>
                     {agentUpgradePlan.upgrade_mode === "self_upgrade" ? (
-                      <button onClick={() => void runAction(requestAgentUpgrade)}>
-                        <Upload size={16} /> 一键升级
+                      <button
+                        disabled={actionPending(nodeActionKey(editingNode.id, "agent-upgrade")) || actionPending(nodeActionKey(editingNode.id, "agent-upgrade-task"))}
+                        onClick={() => void runAction(requestAgentUpgrade, nodeActionKey(editingNode.id, "agent-upgrade"))}
+                      >
+                        <Upload size={16} /> {actionPending(nodeActionKey(editingNode.id, "agent-upgrade")) || actionPending(nodeActionKey(editingNode.id, "agent-upgrade-task")) ? "升级中" : "一键升级"}
                       </button>
                     ) : (
                       <button className="secondary" disabled={!agentUpgradePlan.manual_command} onClick={() => void runAction(copyAgentUpgradeCommand)}>
@@ -2150,7 +2473,7 @@ function App() {
             <section className="modalSection dangerZone">
               <h3>删除节点</h3>
               <p className="muted">只有节点下所有 WireGuard 配置都已删除时，才允许删除节点。</p>
-              <button className="danger" onClick={() => void runAction(deleteEditingNode)}>
+              <button className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "delete"))} onClick={() => void runAction(deleteEditingNode, nodeActionKey(editingNode.id, "delete"))}>
                 删除节点
               </button>
             </section>
@@ -2172,7 +2495,7 @@ function App() {
             </header>
             <form
               key={`create-config-modal-${selectedNode.id}`}
-              onSubmit={(event) => void runAction(() => saveConfig(event, "create"))}
+              onSubmit={(event) => void runAction(() => saveConfig(event, "create"), nodeActionKey(selectedNode.id, "create-config"))}
               className="gridForm describedForm"
             >
               <Field label="接口名称" hint="节点上的 wg-quick 接口名，例如 wg0。">
@@ -2223,7 +2546,7 @@ function App() {
               <Field label="Peer 高级配置" hint="逐行写入 [Peer] 后，例如自定义标记行。不会做语义校验。" wide>
                 <textarea name="peer_custom_config" placeholder="自定义 Peer 行" disabled={!selectedNodeOnline} />
               </Field>
-	              <button type="submit" disabled={!selectedNodeOnline}><Plus size={16} /> 添加配置</button>
+	              <button type="submit" disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNode.id, "create-config"))}><Plus size={16} /> {actionPending(nodeActionKey(selectedNode.id, "create-config")) ? "添加中" : "添加配置"}</button>
             </form>
           </section>
         </div>
@@ -2246,7 +2569,7 @@ function App() {
             </header>
             <form
               key={`create-managed-link-modal-${selectedNode.id}`}
-              onSubmit={(event) => void runAction(() => createManagedLink(event))}
+              onSubmit={(event) => void runAction(() => createManagedLink(event), nodeActionKey(selectedNode.id, "create-managed-link"))}
               className="gridForm describedForm"
             >
               <FormSection title="节点与导入" hint="选择对端节点；需要接管现有 wg-quick 配置时，在这里指定双方要替换的导入配置。">
@@ -2315,7 +2638,7 @@ function App() {
                 <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
-              <FormSection title="直连入口与路由" hint="未启用中间层时，Endpoint 使用这里的入口地址和端口；启用 udp2raw 后相关字段会被接管为只读。">
+              <FormSection title="直连入口与路由" hint="直连和 mimic 使用这里的真实 Endpoint；只有 udp2raw 会把 Endpoint 接管到本地 client。">
               <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址。">
                 <EndpointSelect
                   key={`managed-local-endpoint-${replacePeerConfigId || "none"}-${managedLocalEndpointDefault}`}
@@ -2324,7 +2647,7 @@ function App() {
                   placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
                   options={managedLocalEndpointOptions}
                   disabled={!selectedNodeOnline}
-                  locked={udp2rawEnabled}
+                  locked={udp2rawActive}
                 />
               </Field>
               <Field label="本端 Endpoint 端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。udp2raw 启用时由中间层接管。">
@@ -2333,7 +2656,7 @@ function App() {
                   placeholder="51820"
                   defaultValue={replaceLocalConfig?.listen_port || ""}
                   inputMode="numeric"
-                  disabled={!selectedNodeOnline || udp2rawEnabled}
+                  disabled={!selectedNodeOnline || udp2rawActive}
                 />
               </Field>
               <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址。">
@@ -2344,7 +2667,7 @@ function App() {
                   placeholder={selectedPeerEndpoints[0] || "203.0.113.20"}
                   options={managedPeerEndpointOptions}
                   disabled={!selectedNodeOnline}
-                  locked={udp2rawEnabled}
+                  locked={udp2rawActive}
                 />
               </Field>
               <Field label="对端 Endpoint 端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。udp2raw 启用时由中间层接管。">
@@ -2353,7 +2676,7 @@ function App() {
                   placeholder="51821"
                   defaultValue={replacePeerConfig?.listen_port || ""}
                   inputMode="numeric"
-                  disabled={!selectedNodeOnline || udp2rawEnabled}
+                  disabled={!selectedNodeOnline || udp2rawActive}
                 />
               </Field>
               <Field label="本端 Peer AllowedIPs" hint="写入当前节点 [Peer]；留空则使用对端隧道 IP。">
@@ -2375,20 +2698,54 @@ function App() {
                 />
               </Field>
               </FormSection>
-              <Udp2RawFields
-                enabled={udp2rawEnabled}
-                serverSide={udp2rawServerSide}
-                localListenPort={replaceLocalConfig?.listen_port}
-                peerListenPort={replacePeerConfig?.listen_port}
-                disabled={!selectedNodeOnline}
-                onEnabledChange={(enabled) => {
-                  setUdp2rawEnabled(enabled);
-                  if (enabled) setManagedCreateMtu("1300");
-                }}
-                onServerSideChange={setUdp2rawServerSide}
-              />
+              <FormSection title="连接中间层" hint="udp2raw 通过本地代理接管 Endpoint；mimic 在网卡层透明处理真实 Endpoint 流量。">
+                <Field label="中间层类型" hint="OpenWrt 当前只支持 udp2raw；mimic 需要非 OpenWrt Linux kernel > 6.1 且已安装 mimic。">
+                  <select
+                    value={middlewareType}
+                    disabled={!selectedNodeOnline}
+                    onChange={(event) => {
+                      const next = event.currentTarget.value as "none" | "udp2raw" | "mimic";
+                      setMiddlewareType(next);
+                      setUdp2rawEnabled(next === "udp2raw");
+                      setMimicEnabled(next === "mimic");
+                      if (next === "udp2raw") setManagedCreateMtu("1300");
+                      if (next === "mimic") setManagedCreateMtu("1408");
+                    }}
+                  >
+                    <option value="none">不使用中间层</option>
+                    <option value="udp2raw">udp2raw</option>
+                    <option value="mimic">mimic</option>
+                  </select>
+                </Field>
+              </FormSection>
+              {middlewareType === "udp2raw" && (
+                <Udp2RawFields
+                  enabled={udp2rawEnabled}
+                  serverSide={udp2rawServerSide}
+                  localListenPort={replaceLocalConfig?.listen_port}
+                  peerListenPort={replacePeerConfig?.listen_port}
+                  disabled={!selectedNodeOnline}
+                  onEnabledChange={(enabled) => {
+                    setUdp2rawEnabled(enabled);
+                    if (enabled) setManagedCreateMtu("1300");
+                  }}
+                  onServerSideChange={setUdp2rawServerSide}
+                />
+              )}
+              {middlewareType === "mimic" && (
+                <MimicFields
+                  enabled={mimicEnabled}
+                  localNode={selectedNode}
+                  peerNode={selectedManagedPeerNode}
+                  disabled={!selectedNodeOnline}
+                  onEnabledChange={(enabled) => {
+                    setMimicEnabled(enabled);
+                    if (enabled) setManagedCreateMtu("1408");
+                  }}
+                />
+              )}
               <FormSection title="链路参数" hint="Table=off 是 DN42 常用默认值；启用中间层时 MTU 默认降到 1300，但仍可手动调整。">
-              <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
+              <Field label="MTU" hint={udp2rawActive ? "启用 udp2raw 时建议降低 MTU；已自动填入 1300，可手动修改。" : mimicActive ? "启用 mimic 时建议将 IPv6 WireGuard MTU 降到 1408，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                 <input
                   name="mtu"
                   placeholder="1420"
@@ -2428,9 +2785,14 @@ function App() {
               )}
               <button
                 type="submit"
-                disabled={!selectedNodeOnline || selectedPeerNodeOptions.length === 0 || Boolean(replaceLocalConfigId && !replacePeerConfigId)}
+                disabled={
+                  !selectedNodeOnline ||
+                  selectedPeerNodeOptions.length === 0 ||
+                  Boolean(replaceLocalConfigId && !replacePeerConfigId) ||
+                  actionPending(nodeActionKey(selectedNode.id, "create-managed-link"))
+                }
               >
-                <GitBranch size={16} /> 创建并启动双方连接
+                <GitBranch size={16} /> {actionPending(nodeActionKey(selectedNode.id, "create-managed-link")) ? "创建中" : "创建并启动双方连接"}
               </button>
             </form>
           </section>
@@ -2508,10 +2870,10 @@ function App() {
                       <div className="sectionActions">
                         <button
                           className="secondary"
-                          disabled={!selectedNodeOnline}
-                          onClick={() => void runAction(requestImportScan)}
+                          disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNodeId, "import-scan"))}
+                          onClick={() => void runAction(requestImportScan, nodeActionKey(selectedNodeId, "import-scan"))}
                         >
-                          <Upload size={16} /> 扫描现有 wg-quick
+                          <Upload size={16} /> {actionPending(nodeActionKey(selectedNodeId, "import-scan")) ? "扫描中" : "扫描现有 wg-quick"}
                         </button>
                       </div>
                     ) : (
@@ -2539,10 +2901,10 @@ function App() {
                               {candidate.warnings.length > 0 && <small>{candidate.warnings.join("; ")}</small>}
                             </div>
                             <button
-                              disabled={candidate.imported || !selectedNodeOnline}
-                              onClick={() => void runAction(() => importCandidate(candidate.id))}
+                              disabled={candidate.imported || !selectedNodeOnline || actionPending(candidateActionKey(candidate.id))}
+                              onClick={() => void runAction(() => importCandidate(candidate.id), candidateActionKey(candidate.id))}
                             >
-                              {candidate.imported ? "已导入" : "导入"}
+                              {candidate.imported ? "已导入" : actionPending(candidateActionKey(candidate.id)) ? "导入中" : "导入"}
                             </button>
                           </div>
                         ))}
@@ -2622,7 +2984,7 @@ function App() {
                 <h3>受管连接</h3>
                 <form
                   key={`managed-edit-${selectedConfig.id}-${managedLink.peer_interface.id}`}
-                  onSubmit={(event) => void runAction(() => saveManagedLink(event))}
+                  onSubmit={(event) => void runAction(() => saveManagedLink(event), configActionKey(selectedConfig.id, "save-managed-link"))}
                   className="gridForm describedForm"
                 >
                   <FormSection title="接口与隧道地址" hint="这里决定双方 WireGuard 接口本身的名称、Address 和可选监听端口。">
@@ -2645,7 +3007,7 @@ function App() {
                       <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="直连入口与路由" hint="未启用中间层时，Endpoint 使用这里的入口地址和端口；启用 udp2raw 后会显示为被接管。">
+                  <FormSection title="直连入口与路由" hint="直连和 mimic 使用这里的真实 Endpoint；只有 udp2raw 会把 Endpoint 接管到本地 client。">
                     <Field label="本端入口地址" hint="对端连接本节点时使用。">
                       <EndpointSelect
                         key={`edit-local-endpoint-${editLocalEndpointDefault}`}
@@ -2654,7 +3016,7 @@ function App() {
                         placeholder={selectedLocalEndpoints[0] || "203.0.113.10"}
                         options={editLocalEndpointOptions}
                         disabled={!selectedNodeOnline}
-                        locked={udp2rawEnabled}
+                        locked={udp2rawActive}
                       />
                     </Field>
                     <Field label="本端 Endpoint 端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。">
@@ -2662,7 +3024,7 @@ function App() {
                         name="local_endpoint_port"
                         defaultValue={managedLink.peer_peer.endpoint_port || managedLink.local_interface.listen_port || ""}
                         inputMode="numeric"
-                        disabled={!selectedNodeOnline || udp2rawEnabled}
+                        disabled={!selectedNodeOnline || udp2rawActive}
                       />
                     </Field>
                     <Field label="对端入口地址" hint="本端连接对端节点时使用。">
@@ -2673,7 +3035,7 @@ function App() {
                         placeholder={selectedManagedLinkPeerEndpoints[0] || "203.0.113.20"}
                         options={editPeerEndpointOptions}
                         disabled={!selectedNodeOnline}
-                        locked={udp2rawEnabled}
+                        locked={udp2rawActive}
                       />
                     </Field>
                     <Field label="对端 Endpoint 端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。">
@@ -2681,7 +3043,7 @@ function App() {
                         name="peer_endpoint_port"
                         defaultValue={managedLink.local_peer.endpoint_port || managedLink.peer_interface.listen_port || ""}
                         inputMode="numeric"
-                        disabled={!selectedNodeOnline || udp2rawEnabled}
+                        disabled={!selectedNodeOnline || udp2rawActive}
                       />
                     </Field>
                     <Field label="本端 Peer AllowedIPs" hint="写入当前节点 [Peer]；声明经对端到达的地址段。">
@@ -2691,18 +3053,48 @@ function App() {
                       <input name="peer_allowed_ips" defaultValue={managedLink.peer_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <Udp2RawFields
-                    enabled={udp2rawEnabled}
-                    serverSide={udp2rawServerSide}
-                    localListenPort={managedLink.local_interface.listen_port}
-                    peerListenPort={managedLink.peer_interface.listen_port}
-                    defaults={managedLink.middleware}
-                    disabled={!selectedNodeOnline}
-                    onEnabledChange={setUdp2rawEnabled}
-                    onServerSideChange={setUdp2rawServerSide}
-                  />
+                  <FormSection title="连接中间层" hint="udp2raw 通过本地代理接管 Endpoint；mimic 在网卡层透明处理真实 Endpoint 流量。">
+                    <Field label="中间层类型" hint="mimic 需要双方节点为非 OpenWrt Linux kernel > 6.1 且已安装 mimic。">
+                      <select
+                        value={middlewareType}
+                        disabled={!selectedNodeOnline}
+                        onChange={(event) => {
+                          const next = event.currentTarget.value as "none" | "udp2raw" | "mimic";
+                          setMiddlewareType(next);
+                          setUdp2rawEnabled(next === "udp2raw");
+                          setMimicEnabled(next === "mimic");
+                        }}
+                      >
+                        <option value="none">不使用中间层</option>
+                        <option value="udp2raw">udp2raw</option>
+                        <option value="mimic">mimic</option>
+                      </select>
+                    </Field>
+                  </FormSection>
+                  {middlewareType === "udp2raw" && (
+                    <Udp2RawFields
+                      enabled={udp2rawEnabled}
+                      serverSide={udp2rawServerSide}
+                      localListenPort={managedLink.local_interface.listen_port}
+                      peerListenPort={managedLink.peer_interface.listen_port}
+                      defaults={managedLink.middleware?.type === "udp2raw" ? managedLink.middleware : null}
+                      disabled={!selectedNodeOnline}
+                      onEnabledChange={setUdp2rawEnabled}
+                      onServerSideChange={setUdp2rawServerSide}
+                    />
+                  )}
+                  {middlewareType === "mimic" && (
+                    <MimicFields
+                      enabled={mimicEnabled}
+                      defaults={managedLink.middleware?.type === "mimic" ? managedLink.middleware : null}
+                      localNode={selectedNode}
+                      peerNode={selectedManagedLinkPeerNode}
+                      disabled={!selectedNodeOnline}
+                      onEnabledChange={setMimicEnabled}
+                    />
+                  )}
                   <FormSection title="链路参数" hint="Table=off 是 DN42 常用默认值；PersistentKeepalive 会写入双方 Peer。">
-                    <Field label="MTU" hint={udp2rawEnabled ? "启用连接中间层时建议降低 MTU；已自动填入 1300，可手动修改。" : "双方链路 MTU，默认 1420。"}>
+                    <Field label="MTU" hint={udp2rawActive ? "启用 udp2raw 时建议降低 MTU；可手动修改。" : mimicActive ? "启用 mimic 时建议将 IPv6 WireGuard MTU 降到 1408，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                       <input name="mtu" defaultValue={managedLink.local_interface.mtu || managedLink.peer_interface.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
                     </Field>
                     <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
@@ -2726,7 +3118,9 @@ function App() {
                       <textarea name="peer_peer_custom_config" defaultValue={managedLink.peer_peer.peer_custom_config || ""} placeholder="AllowedIPs 之外的自定义 Peer 行" disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <button type="submit" disabled={!selectedNodeOnline}><Check size={16} /> 保存并下发双方配置</button>
+                  <button type="submit" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfig.id, "save-managed-link"))}>
+                    <Check size={16} /> {actionPending(configActionKey(selectedConfig.id, "save-managed-link")) ? "下发中" : "保存并下发双方配置"}
+                  </button>
                 </form>
               </section>
             ) : (
@@ -2735,7 +3129,7 @@ function App() {
                   <h3>WireGuard 配置</h3>
                   <form
                     key={`edit-${selectedConfig.id}`}
-                    onSubmit={(event) => void runAction(() => saveConfig(event, "update"))}
+                    onSubmit={(event) => void runAction(() => saveConfig(event, "update"), configActionKey(selectedConfig.id, "save-config"))}
                     className="gridForm describedForm"
                   >
                     <Field label="接口名称" hint="节点上的 wg-quick 接口名，例如 wg0。">
@@ -2762,7 +3156,9 @@ function App() {
                     <Field label="Interface 高级配置" hint="逐行写入 [Interface] 后，例如 PostUp/PostDown。不会做语义校验。" wide>
                       <textarea name="interface_custom_config" placeholder="PostUp = ..." defaultValue={selectedConfig.interface_custom_config || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <button type="submit" disabled={!selectedNodeOnline}><Check size={16} /> 保存配置修改</button>
+                    <button type="submit" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfig.id, "save-config"))}>
+                      <Check size={16} /> {actionPending(configActionKey(selectedConfig.id, "save-config")) ? "保存中" : "保存配置修改"}
+                    </button>
                   </form>
                 </section>
 
@@ -2770,7 +3166,7 @@ function App() {
                   <h3>唯一对端</h3>
                   <form
                     key={`${selectedConfigId || "none"}-${peer?.id || "new"}`}
-                    onSubmit={(event) => void runAction(() => savePeer(event))}
+                    onSubmit={(event) => void runAction(() => savePeer(event), configActionKey(selectedConfig.id, "save-peer"))}
                     className="gridForm describedForm"
                   >
                     <Field label="对端名称" hint="可选，仅用于界面识别。">
@@ -2797,7 +3193,9 @@ function App() {
                     <Field label="Peer 高级配置" hint="逐行写入 [Peer] 后，例如自定义标记行。不会做语义校验。" wide>
                       <textarea name="peer_custom_config" placeholder="自定义 Peer 行" defaultValue={peer?.peer_custom_config || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <button type="submit" disabled={!selectedNodeOnline}><Check size={16} /> 保存唯一对端</button>
+                    <button type="submit" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfig.id, "save-peer"))}>
+                      <Check size={16} /> {actionPending(configActionKey(selectedConfig.id, "save-peer")) ? "保存中" : "保存唯一对端"}
+                    </button>
                   </form>
                   <div className="peerList">
                     {peer ? (
@@ -2819,8 +3217,8 @@ function App() {
                 <>
                   {selectedConfigIsUnmanagedImport && (
                     <>
-                      <button className="secondary" disabled={!selectedNodeOnline} onClick={() => void runAction(takeOverConfig)}>
-                        <Upload size={16} /> 接管导入配置
+                  <button className="secondary" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfigId, "take-over"))} onClick={() => void runAction(takeOverConfig, configActionKey(selectedConfigId, "take-over"))}>
+                    <Upload size={16} /> {actionPending(configActionKey(selectedConfigId, "take-over")) ? "接管中" : "接管导入配置"}
                       </button>
                       <button
                         className="secondary"
@@ -2836,8 +3234,8 @@ function App() {
                     </>
                   )}
                   {!selectedConfigIsUnmanagedImport && (
-                    <button disabled={!selectedNodeOnline} onClick={() => void runAction(createApplyPlan)}>
-                      <GitBranch size={16} /> 生成部署计划
+                    <button disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfigId, "create-plan"))} onClick={() => void runAction(createApplyPlan, configActionKey(selectedConfigId, "create-plan"))}>
+                      <GitBranch size={16} /> {actionPending(configActionKey(selectedConfigId, "create-plan")) ? "生成中" : "生成部署计划"}
                     </button>
                   )}
                 </>
@@ -2847,21 +3245,21 @@ function App() {
               )}
               <div className="actionRow">
                 {!selectedConfigIsManagedLink && !selectedConfigIsUnmanagedImport && (
-                  <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy} onClick={() => void runAction(refreshDeployedConfig)}>
-                    <RefreshCw size={16} /> 同步节点配置
+                  <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || actionPending(configActionKey(selectedConfigId, "refresh-deployed"))} onClick={() => void runAction(refreshDeployedConfig, configActionKey(selectedConfigId, "refresh-deployed"))}>
+                    <RefreshCw size={16} /> {actionPending(configActionKey(selectedConfigId, "refresh-deployed")) ? "同步中" : "同步节点配置"}
                   </button>
                 )}
                 {!selectedConfigIsUnmanagedImport && (
                   <>
-                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigRunning} onClick={() => void runAction(startSelectedConfig)}>
-                      {selectedConfig.runtime_status === "starting" ? "启动中" : selectedConfigIsManagedLink ? "启动双方连接" : "启动连接"}
+                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigRunning || actionPending(configActionKey(selectedConfigId, "start"))} onClick={() => void runAction(startSelectedConfig, configActionKey(selectedConfigId, "start"))}>
+                      {actionPending(configActionKey(selectedConfigId, "start")) || selectedConfig.runtime_status === "starting" ? "启动中" : selectedConfigIsManagedLink ? "启动双方连接" : "启动连接"}
                     </button>
-                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigStopped} onClick={() => void runAction(stopSelectedConfig)}>
-                      {selectedConfig.runtime_status === "stopping" ? "断开中" : selectedConfigIsManagedLink ? "断开双方连接" : "断开连接"}
+                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigStopped || actionPending(configActionKey(selectedConfigId, "stop"))} onClick={() => void runAction(stopSelectedConfig, configActionKey(selectedConfigId, "stop"))}>
+                      {actionPending(configActionKey(selectedConfigId, "stop")) || selectedConfig.runtime_status === "stopping" ? "断开中" : selectedConfigIsManagedLink ? "断开双方连接" : "断开连接"}
                     </button>
                   </>
                 )}
-                <button className="danger" disabled={selectedConfigIsUnmanagedImport ? false : (!selectedNodeOnline || isConfigBusy || !isConfigStopped)} onClick={() => void runAction(openDeleteDialog)}>
+                <button className="danger" disabled={selectedConfigIsUnmanagedImport ? selectedConfigAnyTaskPending : (!selectedNodeOnline || isConfigBusy || !isConfigStopped || selectedConfigAnyTaskPending)} onClick={() => void runAction(openDeleteDialog)}>
                   {selectedConfigIsManagedLink ? "删除双方配置" : selectedConfigIsUnmanagedImport ? "删除观察记录" : "删除配置"}
                 </button>
               </div>
@@ -2872,8 +3270,8 @@ function App() {
                   <p className="muted">计划状态：{plan.status}{plan.task_status ? ` / 任务：${plan.task_status}` : ""}</p>
                   <pre>{plan.diff || "此计划没有配置 diff。"}</pre>
                   {plan.task_result && <pre>{JSON.stringify(plan.task_result, null, 2)}</pre>}
-                  <button disabled={!selectedNodeOnline || plan.status !== "draft" || !hasDeployDiff} onClick={() => void runAction(confirmPlan)}>
-                    <Check size={16} /> 确认执行
+                  <button disabled={!selectedNodeOnline || plan.status !== "draft" || !hasDeployDiff || actionPending(configActionKey(selectedConfigId, "confirm-plan"))} onClick={() => void runAction(confirmPlan, configActionKey(selectedConfigId, "confirm-plan"))}>
+                    <Check size={16} /> {actionPending(configActionKey(selectedConfigId, "confirm-plan")) ? "执行中" : "确认执行"}
                   </button>
                 </div>
               )}
@@ -2903,7 +3301,7 @@ function App() {
             <form
               key={`monitor-${monitorDialogConfig.id}-${monitorDetail?.monitor.id || "new"}`}
               className="gridForm describedForm"
-              onSubmit={(event) => void runAction(() => saveLinkMonitor(event))}
+              onSubmit={(event) => void runAction(() => saveLinkMonitor(event), monitorActionKey(monitorDialogConfig.id, "save"))}
             >
               <Field label="目标 IP" hint="从当前节点 Agent 发起 ping；建议填写对端隧道 IP，第一版只支持 IP。">
                 <input
@@ -2929,10 +3327,17 @@ function App() {
                 <span>启用监测</span>
               </label>
               <div className="actionRow wideField">
-                <button type="submit"><Check size={16} /> 保存监测</button>
+                <button type="submit" disabled={actionPending(monitorActionKey(monitorDialogConfig.id, "save"))}>
+                  <Check size={16} /> {actionPending(monitorActionKey(monitorDialogConfig.id, "save")) ? "保存中" : "保存监测"}
+                </button>
                 {monitorDetail && (
-                  <button type="button" className="danger" onClick={() => void runAction(deleteLinkMonitor)}>
-                    删除监测
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={actionPending(monitorActionKey(monitorDialogConfig.id, "delete"))}
+                    onClick={() => void runAction(deleteLinkMonitor, monitorActionKey(monitorDialogConfig.id, "delete"))}
+                  >
+                    {actionPending(monitorActionKey(monitorDialogConfig.id, "delete")) ? "删除中" : "删除监测"}
                   </button>
                 )}
               </div>
@@ -3018,8 +3423,14 @@ function App() {
               )}
               <div className="actionRow">
                 <button className="secondary" onClick={() => setDeleteDialogOpen(false)}>取消</button>
-                <button className="danger" onClick={() => void runAction(deleteSelectedConfig)}>
-                  {deleteNodeConfig ? "删除记录并清理节点" : "仅删除 Link42 记录"}
+                <button
+                  className="danger"
+                  disabled={actionPending(configActionKey(selectedConfig.id, "delete"))}
+                  onClick={() => void runAction(deleteSelectedConfig, configActionKey(selectedConfig.id, "delete"))}
+                >
+                  {actionPending(configActionKey(selectedConfig.id, "delete"))
+                    ? "删除中"
+                    : deleteNodeConfig ? "删除记录并清理节点" : "仅删除 Link42 记录"}
                 </button>
               </div>
             </div>

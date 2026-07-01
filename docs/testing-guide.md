@@ -142,7 +142,43 @@ npm run build --prefix apps/web
 git diff --check
 ```
 
-当前没有 Playwright/E2E 测试。复杂 UI bug 修复后应做人工路径验证：
+复杂 UI bug 修复后应做浏览器 E2E 或人工路径验证。仓库提供了一个持久化 Playwright 运行环境，避免每次测试都在 `/tmp` 重新安装 npm 包和下载 Chromium。
+
+首次在本机准备 Playwright：
+
+```bash
+scripts/e2e/bootstrap-playwright.sh
+```
+
+默认缓存位置：
+
+```text
+Playwright npm runtime: ~/.cache/link42/e2e
+Chromium browser cache: ~/.cache/ms-playwright
+```
+
+之后运行任意 Playwright 脚本：
+
+```bash
+scripts/e2e/run-playwright.sh /tmp/link42-e2e/my-ui-test.js
+```
+
+脚本里可直接使用：
+
+```js
+const { chromium } = require("playwright");
+```
+
+建议使用临时 SQLite 和默认前端 API 推断端口，避免污染真实数据：
+
+```bash
+LINK42_DATABASE_URL=sqlite:////tmp/link42-e2e-api.db \
+  .venv/bin/uvicorn link42_api.main:app --host 127.0.0.1 --port 8000 --no-access-log
+
+npm run dev --prefix apps/web -- --host 127.0.0.1 --port 5173
+```
+
+Playwright 脚本建议覆盖：
 
 - 登录过期后是否立刻回登录页。
 - 节点设置弹窗是否能查看/轮换 token。
@@ -153,6 +189,87 @@ git diff --check
 - udp2raw server 对外地址和监听地址是否拒绝域名，只允许 IP。
 - udp2raw 开启后，上方被接管的 Endpoint 参数是否不可编辑。
 - 监听端口为空时前端和后端是否都允许。
+- 链路监测摘要是否可点击，弹窗是否回显目标 IP，图表是否渲染，窗口切换是否可用。
+
+测试结束后清理临时进程、数据库和脚本输出，不要清理持久 Playwright 缓存：
+
+```bash
+rm -rf /tmp/link42-e2e /tmp/link42-e2e-api.db
+```
+
+### 跨机器真实 E2E 环境
+
+针对 mimic、udp2raw、Agent 安装/卸载这类必须看真实进程、systemd、`/etc/wireguard` 和数据面的测试，优先使用仓库内沉淀的跨机器脚本：
+
+```bash
+scripts/real-e2e/up.sh
+scripts/real-e2e/status.sh
+scripts/real-e2e/down.sh
+```
+
+默认测试拓扑是：
+
+```text
+主控：本机
+本机 Agent：本机
+远端 Agent：ssh vpstest
+本机入口：192.168.123.20
+远端入口：172.20.177.22
+```
+
+首次使用先复制配置：
+
+```bash
+cp scripts/real-e2e/env.example /tmp/link42-real-e2e.env
+```
+
+按实际测试接口补充清理名单，例如：
+
+```bash
+LINK42_REAL_LOCAL_WG_IFACES="l42mim0 l42u2r0"
+LINK42_REAL_REMOTE_WG_IFACES="l42mim1 l42u2r1"
+LINK42_REAL_LOCAL_MIMIC_IFACES="enp3s0"
+LINK42_REAL_REMOTE_MIMIC_IFACES="enp1s0"
+```
+
+启动：
+
+```bash
+npm run build --prefix apps/web
+scripts/real-e2e/up.sh
+```
+
+脚本会：
+
+- 启动临时 SQLite 主控，数据库和日志位于 `/tmp/link42-real-e2e`。
+- 创建本机和远端两个节点。
+- 本机直接运行当前源码 Agent。
+- 把当前 `apps/agent` 和 `packages` 打包到远端，并用远端 `python3` 启动 Agent。
+- 等待两个节点 online。
+
+查看状态：
+
+```bash
+scripts/real-e2e/status.sh
+```
+
+清理：
+
+```bash
+scripts/real-e2e/down.sh
+```
+
+如果本轮测试通过主控安装了 mimic 包，并希望恢复到未安装状态：
+
+```bash
+LINK42_REAL_PURGE_MIMIC=1 scripts/real-e2e/down.sh
+```
+
+注意：
+
+- 清理脚本只删除配置里列出的 WireGuard 测试接口和 mimic bind interface 配置，避免误删现场。
+- Link42 udp2raw 测试资产和服务模板会按 Link42 路径清理。
+- 不要把生产接口名写进 `LINK42_REAL_*_WG_IFACES`。
 
 ### Docker 和发布
 
@@ -309,6 +426,19 @@ OpenWrt udp2raw/faketcp 检查重点：
 - OpenWrt 作为 udp2raw server 时，测试前确认用户已在实际入口 zone 手动放行 `server_listen_port` 对应 TCP 端口。
 - 若 client 日志持续 `rst==1`，检查是否存在错误的 direct DROP/ACCEPT 顺序、udp2raw 自身自动规则、上游 NAT/端口转发和入口 zone。
 - 若 client 无 RST 但无握手，检查 zone 放行、上游 NAT/端口转发、server 监听地址和抓包入站情况。
+
+Linux mimic 检查重点：
+
+- Agent 版本应为 `0.5.2` 或更高；`0.5.0` 生成过错误 mimic 配置，`0.5.1` 安装依赖和配置文件权限处理不完整，均不应用于运行 mimic。
+- 未安装 mimic 时只应上报 `middleware.install.mimic`，不应上报 `middleware.mimic`。
+- mimic 半安装状态，例如 `dpkg-query` 显示 `iU`、`iF`，或缺少 `mimic` 用户、`mimic@.service`、`modinfo mimic` 失败时，不应上报 `middleware.mimic`。
+- 安装任务应使用 GitHub latest release，并能通过节点配置的 GitHub 代理下载。
+- 安装任务应预装 `dkms`、`dwarves`、`bubblewrap`，并按顺序尝试 `linux-headers-$(uname -r)`、cloud kernel 对应 headers、发行版通用 headers；精确 headers 不存在时不应提前中断，最终以 mimic runtime health 判断 DKMS/module 是否可用。
+- 安装失败后 `agent_platform.has_mimic` 应为 false；如仅有二进制但健康检查不通过，只能看到 `mimic_binary_present=true`。
+- `/etc/mimic/<iface>.conf` 不应包含 `ingress_ifname`、`egress_ifname`、`handshake_interval`、`keepalive_interval`。
+- mimic filter 应为官方格式，例如 `filter = remote=203.0.113.20:51821`；IPv6 应为 `filter = remote=[2001:db8::20]:51821`。
+- 启用 mimic 的受管连接 Endpoint 必须是 IP 字面量；域名应在主控侧 400 拒绝。
+- mimic 不应把 WireGuard Endpoint 改成 `127.0.0.1`，应保持真实端点。
 
 ## Dry Run
 

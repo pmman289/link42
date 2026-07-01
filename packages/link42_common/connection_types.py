@@ -44,6 +44,11 @@ TASK_REQUIREMENTS = {
     "middleware.udp2raw.stop": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
     "middleware.udp2raw.delete": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
     "middleware.udp2raw.status": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
+    "middleware.mimic.apply": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
+    "middleware.mimic.start": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
+    "middleware.mimic.stop": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
+    "middleware.mimic.delete": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
+    "middleware.mimic.status": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
     "agent.self_upgrade": {"min_agent_version": "0.2.0", "capabilities": ["agent.self_upgrade"]},
 }
 

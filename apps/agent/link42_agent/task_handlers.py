@@ -7,10 +7,15 @@ from link42_common.connection_types import WIREGUARD_TASKS
 from .config import AgentConfig
 from .middleware import (
     apply_udp2raw,
+    apply_mimic,
+    delete_mimic,
     delete_udp2raw,
     install_middleware,
+    start_mimic,
     start_udp2raw,
+    status_mimic,
     status_udp2raw,
+    stop_mimic,
     stop_udp2raw,
 )
 from .system import (
@@ -66,6 +71,11 @@ TASK_HANDLERS: dict[str, TaskHandler] = {
     "middleware.udp2raw.stop": lambda payload, config: stop_udp2raw(payload, dry_run=_dry_run(config)),
     "middleware.udp2raw.delete": lambda payload, config: delete_udp2raw(payload, dry_run=_dry_run(config)),
     "middleware.udp2raw.status": lambda payload, config: status_udp2raw(payload),
+    "middleware.mimic.apply": lambda payload, config: apply_mimic(payload, dry_run=_dry_run(config)),
+    "middleware.mimic.start": lambda payload, config: start_mimic(payload, dry_run=_dry_run(config)),
+    "middleware.mimic.stop": lambda payload, config: stop_mimic(payload, dry_run=_dry_run(config)),
+    "middleware.mimic.delete": lambda payload, config: delete_mimic(payload, dry_run=_dry_run(config)),
+    "middleware.mimic.status": lambda payload, config: status_mimic(payload),
     "agent.self_upgrade": lambda payload, config: self_upgrade(payload, config, dry_run=_dry_run(config)),
 }
 

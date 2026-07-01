@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -80,6 +81,42 @@ def test_run_command_timeout_returns_result_or_raises(monkeypatch) -> None:
         raise AssertionError("timeout did not raise for required command")
 
 
+def test_run_command_strips_pyinstaller_library_path(monkeypatch) -> None:
+    """验证 PyInstaller 私有 LD_LIBRARY_PATH 不会污染 apt/dpkg 等子进程。"""
+
+    seen: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any):
+        seen["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIabc123")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    system.run_command(["dpkg-deb", "--version"], allow_failure=False)
+
+    assert "LD_LIBRARY_PATH" not in seen["env"]
+
+
+def test_run_command_restores_original_library_path(monkeypatch) -> None:
+    """验证存在 LD_LIBRARY_PATH_ORIG 时会恢复给子进程使用。"""
+
+    seen: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any):
+        seen["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIabc123")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/usr/local/lib")
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    system.run_command(["dpkg-deb", "--version"], allow_failure=False)
+
+    assert seen["env"]["LD_LIBRARY_PATH"] == "/usr/local/lib"
+
+
 def test_agent_task_registry_keeps_wireguard_handlers() -> None:
     """验证 Agent 标准连接任务通过注册表分发，方便后续扩展非 WireGuard 后端。"""
 
@@ -93,6 +130,397 @@ def test_agent_task_registry_keeps_wireguard_handlers() -> None:
         WIREGUARD_TASKS.delete_config,
     ]:
         assert task_type in TASK_HANDLERS
+
+    for task_type in [
+        "middleware.mimic.apply",
+        "middleware.mimic.start",
+        "middleware.mimic.stop",
+        "middleware.mimic.delete",
+        "middleware.mimic.status",
+    ]:
+        assert task_type in TASK_HANDLERS
+
+
+def test_mimic_capability_requires_systemd_kernel_newer_than_61_and_binary(monkeypatch) -> None:
+    """验证 mimic 能力只在非 OpenWrt、systemd、kernel > 6.1 且已安装 mimic 时上报。"""
+
+    monkeypatch.setattr(main, "get_service_manager_name", lambda: "systemd")
+    monkeypatch.setattr(
+        main,
+        "get_agent_platform",
+        lambda: {
+            "service_manager": "systemd",
+            "kernel_version": "6.6.12",
+            "is_openwrt": False,
+            "os": "linux",
+            "arch": "x86_64",
+            "distro_id": "debian",
+            "has_mimic": True,
+        },
+    )
+    monkeypatch.setattr(
+        main.shutil,
+        "which",
+        lambda binary: f"/usr/bin/{binary}" if binary in {"mimic", "dpkg", "apt-get"} else None,
+    )
+
+    assert "middleware.mimic" in main.build_capabilities()
+
+    monkeypatch.setattr(
+        main,
+        "get_agent_platform",
+        lambda: {
+            "service_manager": "systemd",
+            "kernel_version": "6.1.90",
+            "is_openwrt": False,
+            "os": "linux",
+            "arch": "x86_64",
+            "distro_id": "debian",
+            "has_mimic": True,
+        },
+    )
+    assert "middleware.mimic" not in main.build_capabilities()
+
+    monkeypatch.setattr(
+        main,
+        "get_agent_platform",
+        lambda: {
+            "service_manager": "systemd",
+            "kernel_version": "6.6.12",
+            "is_openwrt": True,
+            "os": "linux",
+            "arch": "x86_64",
+            "distro_id": "debian",
+            "has_mimic": True,
+        },
+    )
+    assert "middleware.mimic" not in main.build_capabilities()
+
+
+def test_mimic_apply_renders_systemd_config(tmp_path: Path, monkeypatch) -> None:
+    """验证 mimic apply 写入 Link42 管理片段并重启对应 mimic@网卡服务。"""
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(middleware, "MIMIC_CONFIG_DIR", tmp_path / "link42-mimic")
+    monkeypatch.setattr(middleware, "MIMIC_SYSTEM_CONFIG_DIR", tmp_path / "mimic")
+    monkeypatch.setattr(middleware, "mimic_service_backend", lambda: "systemd")
+    monkeypatch.setattr(middleware.shutil, "which", lambda binary: "/usr/bin/mimic" if binary == "mimic" else None)
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    result = middleware.apply_mimic(
+        {
+            "instance": "link42-1-2",
+            "bind_interface": "eth0",
+            "local_host": "203.0.113.10",
+            "local_port": 51820,
+            "peer_host": "203.0.113.20",
+            "peer_port": 51821,
+            "xdp_mode": "skb",
+            "link_type": "eth",
+        }
+    )
+    config = (tmp_path / "mimic" / "eth0.conf").read_text(encoding="utf-8")
+
+    assert result["changed"] is True
+    assert "filter = remote=203.0.113.20:51821" in config
+    assert "xdp_mode = skb" in config
+    assert "ingress_ifname" not in config
+    assert "egress_ifname" not in config
+    assert commands == [
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "enable", "mimic@eth0.service"],
+        ["systemctl", "restart", "mimic@eth0.service"],
+    ]
+
+
+def test_mimic_snippet_uses_official_filter_format_for_ipv6() -> None:
+    """验证 mimic filter 使用官方 local/remote 格式，IPv6 地址带方括号。"""
+
+    snippet = middleware.build_mimic_snippet(
+        {
+            "instance": "link42-1-2",
+            "bind_interface": "eth0",
+            "peer_host": "2001:db8::20",
+            "peer_port": 51821,
+            "filter_origin": "remote",
+            "xdp_mode": "skb",
+            "link_type": "eth",
+            "handshake_interval": 5,
+            "keepalive_interval": 60,
+            "padding": 8,
+        }
+    )
+
+    assert "link_type = eth" in snippet
+    assert "xdp_mode = skb" in snippet
+    assert "handshake = 5:" in snippet
+    assert "keepalive = 60:::" in snippet
+    assert "padding = 8" in snippet
+    assert "filter = remote=[2001:db8::20]:51821" in snippet
+    assert "handshake_interval" not in snippet
+    assert "keepalive_interval" not in snippet
+
+
+def test_mimic_runtime_ready_rejects_half_installed_package(monkeypatch) -> None:
+    """验证 mimic 半安装状态不会上报 runtime capability。"""
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
+            package = command[-1]
+            return command_result(command, stdout="iF " if package == "mimic-dkms" else "ii ")
+        if command == ["systemctl", "cat", "mimic@.service"]:
+            return command_result(command)
+        if command == ["id", "-u", "mimic"]:
+            return command_result(command)
+        if command == ["modinfo", "mimic"]:
+            return command_result(command, returncode=1)
+        if command == ["mimic", "--version"]:
+            return command_result(command, stdout="mimic 0.7.1\n")
+        return command_result(command)
+
+    monkeypatch.setattr(system.shutil, "which", lambda binary: "/usr/bin/mimic" if binary == "mimic" else None)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+
+    health = system.mimic_runtime_health()
+
+    assert health["ready"] is False
+    assert system.mimic_runtime_ready() is False
+
+
+def test_mimic_runtime_ready_accepts_complete_install(monkeypatch) -> None:
+    """验证 mimic 包、unit、用户、模块和版本都正常时才上报 runtime capability。"""
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
+            return command_result(command, stdout="ii ")
+        if command in [
+            ["systemctl", "cat", "mimic@.service"],
+            ["id", "-u", "mimic"],
+            ["modinfo", "mimic"],
+        ]:
+            return command_result(command)
+        if command == ["mimic", "--version"]:
+            return command_result(command, stdout="mimic 0.7.1\n")
+        return command_result(command)
+
+    monkeypatch.setattr(system.shutil, "which", lambda binary: "/usr/bin/mimic" if binary == "mimic" else None)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+
+    health = system.mimic_runtime_health()
+
+    assert health["ready"] is True
+    assert system.mimic_runtime_ready() is True
+
+
+def test_mimic_reboot_required_when_dkms_built_for_new_kernel() -> None:
+    """验证 DKMS 已为新内核构建但当前内核未加载模块时提示重启。"""
+
+    health = {
+        "ready": False,
+        "checks": {
+            "binary": True,
+            "packages": {"mimic": "ii", "mimic-dkms": "ii"},
+            "systemd_unit": True,
+            "user": True,
+            "module": False,
+            "dkms_status": "mimic/0.7.1, 6.12.94+deb13-amd64, x86_64: installed",
+        },
+    }
+
+    assert middleware.mimic_reboot_required(health) is True
+
+
+def test_agent_platform_has_mimic_uses_runtime_health(monkeypatch) -> None:
+    """验证 platform.has_mimic 不再被半安装二进制误导。"""
+
+    monkeypatch.setattr(system, "get_service_manager_name", lambda: "systemd")
+    monkeypatch.setattr(system.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(system.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(system.platform, "release", lambda: "6.8.0")
+    monkeypatch.setattr(system.platform, "libc_ver", lambda: ("glibc", "2.39"))
+    monkeypatch.setattr(system, "read_os_release", lambda: {"ID": "ubuntu", "VERSION_CODENAME": "noble"})
+    monkeypatch.setattr(system, "network_interfaces", lambda: ["enp3s0"])
+
+    def fake_which(binary: str) -> str | None:
+        if binary in {"mimic", "systemctl", "ldd", "apt-get"}:
+            return f"/usr/bin/{binary}"
+        return None
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        if command == ["ldd", "--version"]:
+            return command_result(command, stdout="ldd (Ubuntu GLIBC 2.39)\n")
+        if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
+            return command_result(command, stdout="iF " if command[-1] == "mimic-dkms" else "ii ")
+        if command == ["mimic", "--version"]:
+            return command_result(command, stdout="mimic 0.7.1\n")
+        return command_result(command, returncode=1)
+
+    monkeypatch.setattr(system.shutil, "which", fake_which)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+
+    platform_info = system.get_agent_platform()
+
+    assert platform_info["mimic_binary_present"] is True
+    assert platform_info["has_mimic"] is False
+    assert platform_info["mimic_runtime_ready"] is False
+
+
+def test_mimic_install_dependencies_include_headers_and_bubblewrap(monkeypatch) -> None:
+    """验证 mimic 安装基础依赖不再被特定 kernel headers 包阻断。"""
+
+    monkeypatch.setattr(middleware.platform, "release", lambda: "6.8.0-64-generic")
+
+    assert middleware.mimic_install_dependency_packages() == [
+        "dkms",
+        "dwarves",
+        "bubblewrap",
+    ]
+    assert middleware.mimic_kernel_header_package_groups() == [
+        ["linux-headers-6.8.0-64-generic"],
+        ["linux-headers-amd64"],
+    ]
+
+
+def test_mimic_cloud_kernel_headers_try_generic_fallback() -> None:
+    """验证 cloud kernel 精确 headers 不存在时会继续尝试发行版通用 headers。"""
+
+    assert middleware.mimic_kernel_header_package_groups("6.12.85+deb13-cloud-amd64", "x86_64") == [
+        ["linux-headers-6.12.85+deb13-cloud-amd64"],
+        ["linux-headers-cloud-amd64"],
+        ["linux-headers-amd64"],
+    ]
+
+
+def test_mimic_apt_dependency_install_repairs_dpkg_and_retries(monkeypatch) -> None:
+    """验证基础依赖安装遇到 dpkg 半配置错误时会自动修复并重试。"""
+
+    commands: list[list[str]] = []
+    install_attempts = 0
+
+    def fake_run_command(
+        command: list[str],
+        allow_failure: bool,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        nonlocal install_attempts
+        commands.append(command)
+        if command[:3] == ["apt-get", "install", "-y"] and "dkms" in command:
+            install_attempts += 1
+            if install_attempts == 1:
+                return {
+                    "command": command,
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "E: Sub-process /usr/bin/dpkg returned an error code (1)\n",
+                }
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+
+    recorded: list[dict[str, Any]] = []
+    result = middleware.run_apt_command_with_repair(
+        recorded,
+        ["apt-get", "install", "-y", "dkms", "dwarves", "bubblewrap"],
+        {"DEBIAN_FRONTEND": "noninteractive"},
+    )
+
+    assert result["returncode"] == 0
+    assert install_attempts == 2
+    assert commands == [
+        ["apt-get", "install", "-y", "dkms", "dwarves", "bubblewrap"],
+        ["dpkg", "--configure", "-a"],
+        ["apt-get", "-f", "install", "-y"],
+        ["apt-get", "install", "-y", "dkms", "dwarves", "bubblewrap"],
+    ]
+
+
+def test_mimic_layout_and_system_config_permissions(tmp_path: Path, monkeypatch) -> None:
+    """验证 /etc/mimic 和配置文件权限不受 root umask 影响。"""
+
+    config_dir = tmp_path / "link42-mimic"
+    system_config_dir = tmp_path / "mimic"
+    monkeypatch.setattr(middleware, "MIMIC_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "MIMIC_SYSTEM_CONFIG_DIR", system_config_dir)
+
+    old_umask = os.umask(0o077)
+    try:
+        middleware.ensure_mimic_layout()
+        config_path = system_config_dir / "enp3s0.conf"
+        middleware.write_mimic_system_config(config_path, "filter = remote=203.0.113.20:51821\n")
+    finally:
+        os.umask(old_umask)
+
+    assert oct(system_config_dir.stat().st_mode & 0o777) == "0o755"
+    assert oct(config_path.stat().st_mode & 0o777) == "0o644"
+
+
+def test_mimic_installer_selects_official_release_assets() -> None:
+    """验证 mimic 安装器按发行版代号和架构选择官方 deb 资产。"""
+
+    release = {
+        "assets": [
+            {"name": "bookworm_mimic-dkms_0.1.0_amd64.deb"},
+            {"name": "bookworm_mimic_0.1.0_amd64.deb"},
+            {"name": "bookworm_mimic-dkms_0.1.0_arm64.deb"},
+            {"name": "bookworm_mimic_0.1.0_arm64.deb"},
+            {"name": "noble_mimic_0.1.0_amd64.deb"},
+        ]
+    }
+
+    selected = middleware.select_mimic_release_assets(release, "bookworm", "amd64")
+
+    assert [asset["name"] for asset in selected] == [
+        "bookworm_mimic-dkms_0.1.0_amd64.deb",
+        "bookworm_mimic_0.1.0_amd64.deb",
+    ]
+
+
+def test_mimic_github_proxy_wraps_download_url() -> None:
+    """验证 GitHub 代理 URL 会直接前缀包装官方 GitHub URL。"""
+
+    assert (
+        middleware.proxied_url("https://github.com/hack3ric/mimic/releases/download/v1/a.deb", "https://gh.example.com/")
+        == "https://gh.example.com/https://github.com/hack3ric/mimic/releases/download/v1/a.deb"
+    )
+    assert middleware.validate_proxy_url(" https://gh.example.com ") == "https://gh.example.com/"
+
+
+def test_mimic_fetch_release_falls_back_to_proxy(monkeypatch) -> None:
+    """验证直连 GitHub API 失败时会尝试用户配置的代理。"""
+
+    requested_urls: list[str] = []
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"tag_name":"v1.0.0","prerelease":false,"assets":[]}'
+
+    def fake_urlopen(request_obj: Any, timeout: int) -> FakeResponse:
+        url = request_obj.full_url
+        requested_urls.append(url)
+        if url.startswith("https://api.github.com/"):
+            raise OSError("blocked")
+        return FakeResponse()
+
+    monkeypatch.setattr(middleware.request, "urlopen", fake_urlopen)
+
+    release = middleware.fetch_github_release("hack3ric/mimic", False, "https://gh.example.com/")
+
+    assert release["tag_name"] == "v1.0.0"
+    assert requested_urls == [
+        "https://api.github.com/repos/hack3ric/mimic/releases/latest",
+        "https://gh.example.com/https://api.github.com/repos/hack3ric/mimic/releases/latest",
+    ]
 
 
 def test_agent_main_reports_401_without_traceback(monkeypatch, capsys) -> None:
@@ -164,19 +592,23 @@ def test_agent_install_script_explicit_env_overrides_existing_env_file() -> None
     assert script.index('. "$ENV_FILE"') < script.index('LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"')
 
 
-def test_agent_uninstall_script_removes_link42_udp2raw_middleware() -> None:
-    """验证 Agent 卸载会清理 Link42 管理的 udp2raw 中间层残留。"""
+def test_agent_uninstall_script_removes_link42_middleware() -> None:
+    """验证 Agent 卸载会清理 Link42 管理的中间层残留。"""
 
     script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
 
     assert "uninstall_middleware()" in script
     assert "uninstall_udp2raw_systemd" in script
     assert "uninstall_udp2raw_openwrt" in script
+    assert "uninstall_mimic_systemd" in script
     assert "systemctl list-units --all 'link42-udp2raw-*.service'" in script
     assert "rm -f /etc/systemd/system/link42-udp2raw-server@.service" in script
     assert "rm -f /etc/systemd/system/link42-udp2raw-client@.service" in script
     assert "for script in /etc/init.d/link42-udp2raw-*;" in script
+    assert 'systemctl disable --now "mimic@$iface.service"' in script
+    assert 'rm -f "$MIMIC_SYSTEM_CONFIG_DIR/$iface.conf"' in script
     assert 'rm -rf "$UDP2RAW_CONFIG_DIR"' in script
+    assert 'rm -rf "$MIMIC_CONFIG_DIR"' in script
     assert 'rm -f "$UDP2RAW_BIN"' in script
     assert "LINK42_KEEP_MIDDLEWARE=1" in script
     assert script.index("uninstall_middleware()") < script.index('rm -f "$BIN_PATH"')

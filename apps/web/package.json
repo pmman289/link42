@@ -1,6 +1,6 @@
 {
   "name": "link42-web",
-  "version": "0.2.1",
+  "version": "0.4.4",
   "private": true,
   "type": "module",
   "scripts": {

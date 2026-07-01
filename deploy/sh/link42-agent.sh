@@ -13,6 +13,8 @@ MIDDLEWARE_DIR="$ENV_DIR/middleware"
 UDP2RAW_CONFIG_DIR="$MIDDLEWARE_DIR/udp2raw"
 UDP2RAW_BIN="${LINK42_UDP2RAW_BIN:-/usr/local/bin/udp2raw}"
 UDP2RAW_LIBEXEC="/usr/local/libexec/link42-udp2raw-systemd"
+MIMIC_CONFIG_DIR="$MIDDLEWARE_DIR/mimic"
+MIMIC_SYSTEM_CONFIG_DIR="${LINK42_MIMIC_SYSTEM_CONFIG_DIR:-/etc/mimic}"
 KEEP_MIDDLEWARE="${LINK42_KEEP_MIDDLEWARE:-0}"
 POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"
 WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"
@@ -122,6 +124,23 @@ uninstall_udp2raw_openwrt() {
   done
 }
 
+uninstall_mimic_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return
+  fi
+
+  for config in "$MIMIC_CONFIG_DIR"/*; do
+    [ -e "$config" ] || continue
+    iface="$(basename "$config")"
+    [ -n "$iface" ] || continue
+    systemctl disable --now "mimic@$iface.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "mimic@$iface.service" >/dev/null 2>&1 || true
+    rm -f "$MIMIC_SYSTEM_CONFIG_DIR/$iface.conf"
+  done
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 uninstall_middleware() {
   if [ "$KEEP_MIDDLEWARE" = "1" ]; then
     log "keeping Link42 middleware because LINK42_KEEP_MIDDLEWARE=1"
@@ -130,10 +149,12 @@ uninstall_middleware() {
 
   uninstall_udp2raw_systemd
   uninstall_udp2raw_openwrt
+  uninstall_mimic_systemd
   rm -rf "$UDP2RAW_CONFIG_DIR"
+  rm -rf "$MIMIC_CONFIG_DIR"
   rmdir "$MIDDLEWARE_DIR" >/dev/null 2>&1 || true
   rm -f "$UDP2RAW_BIN"
-  log "removed Link42 middleware services and udp2raw assets"
+  log "removed Link42 middleware services and assets"
 }
 
 uninstall_agent() {

@@ -34,6 +34,7 @@ class Node(TimestampMixin, Base):
     management_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     public_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     endpoint_ips: Mapped[list[str]] = mapped_column(JSON, default=list)
+    github_proxy_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     agent_token_hash: Mapped[str] = mapped_column(String(128))
     agent_token_value: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -43,6 +44,7 @@ class Node(TimestampMixin, Base):
     agent_platform: Mapped[dict] = mapped_column(JSON, default=dict)
     agent_update_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     agent_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    middleware_install_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     interfaces: Mapped[list[WireGuardInterface]] = relationship(

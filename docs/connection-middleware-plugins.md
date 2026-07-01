@@ -342,7 +342,99 @@ OpenWrt 注意事项：
 - 当 OpenWrt 作为 udp2raw server 时，用户仍需要按实际入口区域手动放行 `server_listen_port`。例如入口来自 WAN，就在对应 WAN zone 放行该 TCP 端口；入口来自自定义 DN42 zone，则在该 zone 放行。
 - 如果 client 日志持续出现 `rst==1`，优先检查是否存在错误的 direct DROP/ACCEPT 顺序、udp2raw 自身自动规则、上游 NAT/端口转发和 OpenWrt firewall zone；如果表现为超时或没有入站包，再检查入口区域是否放行。
 
-插件资产由主控提供，Agent 下载并校验后安装：
+## mimic 第一版约定
+
+`mimic` 插件用于 Linux 网卡层透明处理 WireGuard UDP 流量，不修改 WireGuard
+Endpoint。它适合大流量场景的透明伪装，但对内核和系统环境要求更高。
+
+第一版 `mimic` 插件约定：
+
+- 仅支持非 OpenWrt 的 Linux systemd 节点。
+- Linux kernel 必须大于 6.1。
+- 仅支持 Debian/Ubuntu，架构为 `amd64` 或 `arm64`。
+- 节点必须具备 `dpkg` 和 `apt-get`。
+- 未安装时 Agent 只上报 `middleware.install.mimic`；安装后必须通过 dpkg 包状态、systemd unit、`mimic` 用户、内核模块和 `mimic --version` 健康检查，才上报 `middleware.mimic`。
+- 受管连接启用 mimic 时，双方 WireGuard 都必须填写 ListenPort，因为 mimic 需要按真实 WireGuard 四元组生成透明 filter。
+- mimic 不接管 Endpoint 字段，用户仍需填写双方真实可达入口地址和端口。
+- 默认建议 WireGuard MTU 为 1408，用户可手动覆盖。
+
+能力门禁：
+
+```text
+min_agent_version = 0.5.2
+install capability = middleware.install, middleware.install.mimic, service:systemd
+runtime capability = middleware.mimic, service:systemd
+```
+
+mimic 安装流程：
+
+1. 用户在节点设置中填写可选 `GitHub 代理 URL`。
+2. 用户点击 mimic 插件安装按钮。
+3. 主控创建 `middleware.install` 任务，payload 固定为：
+
+```json
+{
+  "plugin": "mimic",
+  "source": "github_latest",
+  "repo": "hack3ric/mimic",
+  "allow_prerelease": false,
+  "github_proxy_url": "https://gh-proxy.example.com/"
+}
+```
+
+4. Agent 访问 `https://api.github.com/repos/hack3ric/mimic/releases/latest`。
+5. 如果直连失败且配置了代理，Agent 使用代理 URL 前缀包装 GitHub API 和 release asset 下载 URL。
+6. Agent 按系统代号和架构选择官方 release 资产，例如：
+
+```text
+bookworm_mimic-dkms_<version>_amd64.deb
+bookworm_mimic_<version>_amd64.deb
+bookworm_mimic-dkms_<version>_amd64.deb.sha256
+bookworm_mimic_<version>_amd64.deb.sha256
+```
+
+7. Agent 以 `DEBIAN_FRONTEND=noninteractive` 执行安装命令，并使用较长命令超时。
+8. Agent 会预装 `dkms`、`dwarves`、`bubblewrap`，并依次尝试安装精确内核 headers、cloud kernel headers 和发行版通用 headers；其中 `dwarves` 提供 DKMS 常见依赖 `pahole`。如果当前源缺少精确 headers，安装流程不会提前中断，最终由 runtime health 检查确认 DKMS/module 是否可用。
+9. Agent 校验 sha256 后执行 `dpkg -i`，必要时执行 `apt-get -f install -y`、`dpkg --configure -a` 做恢复。
+10. 安装完成后执行健康检查；未通过时任务失败，且后续心跳不应上报 `middleware.mimic`。
+11. 健康检查通过后执行 `systemctl daemon-reload` 和 `mimic --version`，后续心跳刷新能力。
+
+节点配置文件：
+
+```text
+/etc/link42/middleware/mimic/<bind_interface>/<instance>.conf
+/etc/mimic/<bind_interface>.conf
+mimic@<bind_interface>.service
+```
+
+字段接管：
+
+```text
+无
+```
+
+真实连接配置：
+
+```text
+local_bind_interface
+peer_bind_interface
+xdp_mode
+link_type
+filter = remote=<peer_endpoint_ip>:<peer_endpoint_port>
+handshake = <interval>:
+keepalive = <time>:::
+padding = <bytes>
+```
+
+注意：
+
+- Link42 渲染到 `/etc/mimic/<interface>.conf` 的配置只使用 mimic 0.7.x 官方支持键，例如 `link_type`、`xdp_mode`、`filter`、`handshake`、`keepalive`、`padding`。
+- 不再生成 `ingress_ifname`、`egress_ifname`、`handshake_interval`、`keepalive_interval` 等 mimic 不支持的键。
+- mimic filter 只接受 IP 字面量。IPv6 会渲染为 `[addr]:port`。
+- mimic padding 按官方 `MAX_PADDING_LEN` 限制为 `0-16`。
+- 当前 Link42 使用 `remote=<peer endpoint>` 生成 filter，以减少本机公网地址/NAT 场景中 `local=<public endpoint>` 不匹配的风险。
+
+udp2raw 插件资产由主控提供，Agent 下载并校验后安装：
 
 ```text
 /usr/local/bin/udp2raw

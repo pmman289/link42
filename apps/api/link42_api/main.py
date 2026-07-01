@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta
 import ipaddress
 import logging
+import re
 from pathlib import Path
 import secrets
 import shlex
@@ -232,7 +233,15 @@ def update_agent_metadata(
         node.agent_protocol_version = protocol_version
     if capabilities:
         node.agent_capabilities = sorted(set(capabilities))
+        if "middleware.mimic" in set(capabilities):
+            node.middleware_install_status = "mimic_ready"
     if platform:
+        current_platform = dict(platform)
+        if "middleware.mimic" in set(node.agent_capabilities or []):
+            current_platform.pop("mimic_reboot_required", None)
+        elif node.middleware_install_status == "mimic_reboot_required":
+            current_platform["mimic_reboot_required"] = True
+        platform = current_platform
         node.agent_platform = platform
     if node.agent_update_status in {None, "queued", "staged", "restarting", "healthy", "failed", "rolled_back"}:
         if not previous_version or previous_version != agent_version or node.agent_update_status in {None, "healthy"}:
@@ -504,6 +513,16 @@ def require_udp2raw_ip(value: str, field_name: str) -> str:
     return value
 
 
+def require_mimic_ip(value: str, field_name: str) -> str:
+    """mimic filter 使用 IP 字面量，IPv6 由 Agent 渲染为方括号格式。"""
+
+    try:
+        ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an IP address for mimic") from exc
+    return value
+
+
 def managed_link_middleware(interface: models.WireGuardInterface) -> dict | None:
     """读取受管连接绑定的中间层配置。"""
 
@@ -516,6 +535,111 @@ def require_udp2raw_supported(node: models.Node) -> None:
 
     for task_type in ["middleware.install", "middleware.udp2raw.apply"]:
         require_task_supported(node, task_type)
+
+
+def normalize_mimic_config(payload: schemas.MimicMiddlewareConfig | None) -> dict | None:
+    """清洗 mimic 插件配置，未启用时返回 None。"""
+
+    if payload is None or not payload.enabled:
+        return None
+    if not payload.local_bind_interface:
+        raise HTTPException(status_code=400, detail="mimic local bind interface is required")
+    if not payload.peer_bind_interface:
+        raise HTTPException(status_code=400, detail="mimic peer bind interface is required")
+    return {
+        "type": "mimic",
+        "enabled": True,
+        "local_bind_interface": payload.local_bind_interface.strip(),
+        "peer_bind_interface": payload.peer_bind_interface.strip(),
+        "xdp_mode": payload.xdp_mode,
+        "link_type": payload.link_type,
+        "handshake_interval": payload.handshake_interval,
+        "keepalive_interval": payload.keepalive_interval,
+        "padding": payload.padding,
+    }
+
+
+def normalize_middleware_config(
+    udp2raw_payload: schemas.Udp2RawMiddlewareConfig | None,
+    mimic_payload: schemas.MimicMiddlewareConfig | None,
+) -> dict | None:
+    """统一清洗连接中间层配置；一次只能启用一种中间层。"""
+
+    udp2raw = normalize_udp2raw_config(udp2raw_payload)
+    mimic = normalize_mimic_config(mimic_payload)
+    if udp2raw and mimic:
+        raise HTTPException(status_code=400, detail="only one middleware can be enabled")
+    return udp2raw or mimic
+
+
+def parse_kernel_major_minor(value: object) -> tuple[int, int]:
+    match = re.match(r"(\d+)\.(\d+)", str(value or ""))
+    if not match:
+        return (0, 0)
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def node_supports_mimic_platform(node: models.Node) -> tuple[bool, str | None]:
+    platform = node.agent_platform or {}
+    if platform.get("is_openwrt") or node_uses_openwrt_uci(node):
+        return False, "mimic is not supported on OpenWrt nodes"
+    if str(platform.get("os") or "linux").lower() != "linux":
+        return False, "mimic requires Linux nodes"
+    if str(platform.get("service_manager") or "").lower() != "systemd":
+        return False, "mimic requires systemd managed Linux nodes"
+    kernel = platform.get("kernel_version") or platform.get("kernel")
+    if parse_kernel_major_minor(kernel) <= (6, 1):
+        return False, "mimic requires Linux kernel newer than 6.1"
+    return True, None
+
+
+def require_mimic_supported(node: models.Node) -> None:
+    supported, reason = node_supports_mimic_platform(node)
+    if not supported:
+        raise HTTPException(status_code=409, detail=reason or "node does not support mimic middleware")
+    require_task_supported(node, "middleware.mimic.apply")
+
+
+def require_mimic_install_supported(node: models.Node) -> None:
+    supported, reason = node_supports_mimic_platform(node)
+    if not supported:
+        raise HTTPException(status_code=409, detail=reason or "node does not support installing mimic")
+    require_task_supported(node, "middleware.install")
+    capabilities = set(node.agent_capabilities or [])
+    if "middleware.install.mimic" not in capabilities:
+        raise HTTPException(status_code=409, detail="node does not support installing mimic")
+
+
+def apply_middleware_to_peers(
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_peer: models.WireGuardPeer,
+    peer_peer: models.WireGuardPeer,
+    local_endpoint: str,
+    peer_endpoint: str,
+    local_endpoint_port: int | None = None,
+    peer_endpoint_port: int | None = None,
+) -> None:
+    """根据中间层类型更新 WireGuard Peer Endpoint。"""
+
+    if middleware and middleware.get("type") == "udp2raw":
+        apply_udp2raw_to_peers(
+            middleware,
+            local_interface,
+            peer_interface,
+            local_peer,
+            peer_peer,
+            local_endpoint,
+            peer_endpoint,
+            local_endpoint_port,
+            peer_endpoint_port,
+        )
+        return
+    local_peer.endpoint_host = peer_endpoint
+    local_peer.endpoint_port = peer_endpoint_port or peer_interface.listen_port
+    peer_peer.endpoint_host = local_endpoint
+    peer_peer.endpoint_port = local_endpoint_port or local_interface.listen_port
 
 
 def apply_udp2raw_to_peers(
@@ -647,6 +771,191 @@ def enqueue_udp2raw_tasks(
         peer_endpoint,
     ):
         enqueue_interface_task_once(db, interface, task_type, payload)
+
+
+def middleware_instance_name(local_interface: models.WireGuardInterface, peer_interface: models.WireGuardInterface) -> str:
+    return udp2raw_instance_name(local_interface, peer_interface)
+
+
+def mimic_endpoint_payloads(
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_endpoint: str,
+    peer_endpoint: str,
+    local_endpoint_port: int | None = None,
+    peer_endpoint_port: int | None = None,
+) -> list[tuple[models.WireGuardInterface, str, dict]]:
+    """生成双方 mimic Agent payload；mimic 透明处理真实 WireGuard Endpoint。"""
+
+    if not middleware or middleware.get("type") != "mimic":
+        return []
+    if local_interface.listen_port is None or peer_interface.listen_port is None:
+        raise HTTPException(status_code=400, detail="mimic requires WireGuard listen port on both sides")
+    local_endpoint = require_mimic_ip(local_endpoint, "mimic local endpoint")
+    peer_endpoint = require_mimic_ip(peer_endpoint, "mimic peer endpoint")
+    local_peer_port = peer_endpoint_port or peer_interface.listen_port
+    peer_peer_port = local_endpoint_port or local_interface.listen_port
+    instance = middleware_instance_name(local_interface, peer_interface)
+    common = {
+        "plugin": "mimic",
+        "instance": instance,
+        "xdp_mode": middleware["xdp_mode"],
+        "link_type": middleware["link_type"],
+        "handshake_interval": middleware.get("handshake_interval"),
+        "keepalive_interval": middleware.get("keepalive_interval"),
+        "padding": middleware.get("padding"),
+    }
+    return [
+        (
+            local_interface,
+            "middleware.mimic.apply",
+            {
+                **common,
+                "bind_interface": middleware["local_bind_interface"],
+                "local_host": local_endpoint,
+                "local_port": local_interface.listen_port,
+                "peer_host": peer_endpoint,
+                "peer_port": local_peer_port,
+                "filter_origin": "remote",
+            },
+        ),
+        (
+            peer_interface,
+            "middleware.mimic.apply",
+            {
+                **common,
+                "bind_interface": middleware["peer_bind_interface"],
+                "local_host": peer_endpoint,
+                "local_port": peer_interface.listen_port,
+                "peer_host": local_endpoint,
+                "peer_port": peer_peer_port,
+                "filter_origin": "remote",
+            },
+        ),
+    ]
+
+
+def enqueue_mimic_tasks(
+    db: Session,
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_endpoint: str,
+    peer_endpoint: str,
+    local_endpoint_port: int | None = None,
+    peer_endpoint_port: int | None = None,
+) -> None:
+    """为启用 mimic 的受管连接下发配置任务。"""
+
+    if not middleware or middleware.get("type") != "mimic":
+        return
+    for interface in [local_interface, peer_interface]:
+        node = db.get(models.Node, interface.node_id)
+        if node is not None:
+            require_mimic_supported(node)
+    for interface, task_type, payload in mimic_endpoint_payloads(
+        middleware,
+        local_interface,
+        peer_interface,
+        local_endpoint,
+        peer_endpoint,
+        local_endpoint_port,
+        peer_endpoint_port,
+    ):
+        enqueue_interface_task_once(db, interface, task_type, payload)
+
+
+def enqueue_middleware_tasks(
+    db: Session,
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_endpoint: str,
+    peer_endpoint: str,
+    local_endpoint_port: int | None = None,
+    peer_endpoint_port: int | None = None,
+) -> None:
+    if not middleware:
+        return
+    if middleware.get("type") == "udp2raw":
+        enqueue_udp2raw_tasks(db, middleware, local_interface, peer_interface, local_endpoint, peer_endpoint)
+        return
+    if middleware.get("type") == "mimic":
+        enqueue_mimic_tasks(
+            db,
+            middleware,
+            local_interface,
+            peer_interface,
+            local_endpoint,
+            peer_endpoint,
+            local_endpoint_port,
+            peer_endpoint_port,
+        )
+        return
+    raise HTTPException(status_code=400, detail="unsupported middleware type")
+
+
+def enqueue_middleware_cleanup_tasks(
+    db: Session,
+    old_middleware: dict | None,
+    new_middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+) -> None:
+    """中间层禁用或切换时，按旧配置清理节点上的服务和配置。"""
+
+    if not old_middleware or old_middleware == new_middleware:
+        return
+    for action in ["stop", "delete"]:
+        for interface, task_type, payload in middleware_task_payloads(
+            old_middleware,
+            local_interface,
+            peer_interface,
+            action,
+        ):
+            enqueue_interface_task_once(db, interface, task_type, payload)
+
+
+def middleware_task_payloads(
+    middleware: dict | None,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    action: str,
+) -> list[tuple[models.WireGuardInterface, str, dict]]:
+    if not middleware:
+        return []
+    instance = middleware_instance_name(local_interface, peer_interface)
+    if middleware.get("type") == "udp2raw":
+        server_side = middleware.get("server_side") or "peer"
+        local_mode = "server" if server_side == "local" else "client"
+        peer_mode = "client" if server_side == "local" else "server"
+        return [
+            (
+                local_interface,
+                f"middleware.udp2raw.{action}",
+                {"plugin": "udp2raw", "instance": instance, "mode": local_mode},
+            ),
+            (
+                peer_interface,
+                f"middleware.udp2raw.{action}",
+                {"plugin": "udp2raw", "instance": instance, "mode": peer_mode},
+            ),
+        ]
+    if middleware.get("type") == "mimic":
+        return [
+            (
+                local_interface,
+                f"middleware.mimic.{action}",
+                {"plugin": "mimic", "instance": instance, "bind_interface": middleware["local_bind_interface"]},
+            ),
+            (
+                peer_interface,
+                f"middleware.mimic.{action}",
+                {"plugin": "mimic", "instance": instance, "bind_interface": middleware["peer_bind_interface"]},
+            ),
+        ]
+    raise HTTPException(status_code=400, detail="unsupported middleware type")
 
 
 def require_online_node(db: Session, node_id: int) -> models.Node:
@@ -1367,6 +1676,7 @@ def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> s
         management_ip=payload.management_ip,
         public_ip=payload.public_ip,
         endpoint_ips=payload.endpoint_ips,
+        github_proxy_url=payload.github_proxy_url,
         status="offline",
         agent_token_hash=hash_token(token),
         agent_token_value=token,
@@ -1399,6 +1709,7 @@ def update_node(
     node.management_ip = payload.management_ip
     node.public_ip = payload.public_ip
     node.endpoint_ips = payload.endpoint_ips
+    node.github_proxy_url = payload.github_proxy_url
     db.commit()
     db.refresh(node)
     return node
@@ -1467,6 +1778,40 @@ def rotate_agent_token(node_id: int, db: Session = Depends(get_db)) -> schemas.N
     return schemas.NodeCreateResult(node=node, agent_token=token)
 
 
+@app.post("/api/nodes/{node_id}/middleware/{plugin}/install", response_model=schemas.TaskRequestResult)
+def install_node_middleware(
+    node_id: int,
+    plugin: str,
+    db: Session = Depends(get_db),
+) -> schemas.TaskRequestResult:
+    """为节点创建中间层插件安装任务。"""
+
+    node = require_online_node(db, node_id)
+    if plugin != "mimic":
+        raise HTTPException(status_code=404, detail="middleware plugin not found")
+    if "middleware.mimic" in set(node.agent_capabilities or []):
+        node.middleware_install_status = "mimic_ready"
+        return schemas.TaskRequestResult(task_id=None, status="succeeded", message="mimic already installed")
+    require_mimic_install_supported(node)
+    task = models.AgentTask(
+        node_id=node.id,
+        type="middleware.install",
+        status="pending",
+        payload={
+            "plugin": "mimic",
+            "source": "github_latest",
+            "repo": "hack3ric/mimic",
+            "allow_prerelease": False,
+            "github_proxy_url": node.github_proxy_url,
+        },
+    )
+    db.add(task)
+    node.middleware_install_status = "mimic_installing"
+    db.commit()
+    db.refresh(task)
+    return schemas.TaskRequestResult(task_id=task.id, status=task.status, message="mimic install task queued")
+
+
 @app.post("/api/nodes/{node_id}/wireguard/interfaces", response_model=schemas.InterfaceRead)
 @app.post("/api/nodes/{node_id}/wireguard/configs", response_model=schemas.InterfaceRead)
 def create_interface(
@@ -1531,7 +1876,7 @@ def create_managed_link(
         payload.peer_endpoint_host,
         "peer endpoint address is not registered on node",
     )
-    udp2raw = normalize_udp2raw_config(payload.udp2raw)
+    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
 
     peer_interface_name = payload.peer_interface_name or payload.local_interface_name
     ensure_unique_interface_name(
@@ -1609,10 +1954,10 @@ def create_managed_link(
     set_extra_value(peer_interface, "custom_config", payload.peer_interface_custom_config)
     set_extra_value(local_peer, "custom_config", payload.local_peer_custom_config)
     set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
-    set_extra_object(local_interface, "middleware", udp2raw)
-    set_extra_object(peer_interface, "middleware", udp2raw)
-    apply_udp2raw_to_peers(
-        udp2raw,
+    set_extra_object(local_interface, "middleware", middleware)
+    set_extra_object(peer_interface, "middleware", middleware)
+    apply_middleware_to_peers(
+        middleware,
         local_interface,
         peer_interface,
         local_peer,
@@ -1628,7 +1973,16 @@ def create_managed_link(
         queue_replace_interface(db, replace_local)
     if replace_peer:
         queue_replace_interface(db, replace_peer)
-    enqueue_udp2raw_tasks(db, udp2raw, local_interface, peer_interface, local_endpoint, peer_endpoint)
+    enqueue_middleware_tasks(
+        db,
+        middleware,
+        local_interface,
+        peer_interface,
+        local_endpoint,
+        peer_endpoint,
+        payload.local_endpoint_port,
+        payload.peer_endpoint_port,
+    )
     enqueue_apply_config(db, local_interface)
     enqueue_apply_config(db, peer_interface)
     db.commit()
@@ -1804,6 +2158,7 @@ def update_managed_link(
     """编辑受管节点连接，并直接下发双方配置。"""
 
     local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
+    old_middleware = managed_link_middleware(local_interface)
     local_node = require_online_node(db, local_interface.node_id)
     peer_node = require_online_node(db, peer_interface.node_id)
     local_endpoint = require_node_endpoint(
@@ -1816,7 +2171,7 @@ def update_managed_link(
         payload.peer_endpoint_host,
         "peer endpoint address is not registered on node",
     )
-    udp2raw = normalize_udp2raw_config(payload.udp2raw)
+    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
     ensure_unique_interface_name(db, local_interface.node_id, payload.local_interface_name, local_interface.id)
     ensure_unique_interface_name(db, peer_interface.node_id, payload.peer_interface_name, peer_interface.id)
 
@@ -1845,10 +2200,10 @@ def update_managed_link(
     set_extra_value(peer_interface, "custom_config", payload.peer_interface_custom_config)
     set_extra_value(local_peer, "custom_config", payload.local_peer_custom_config)
     set_extra_value(peer_peer, "custom_config", payload.peer_peer_custom_config)
-    set_extra_object(local_interface, "middleware", udp2raw)
-    set_extra_object(peer_interface, "middleware", udp2raw)
-    apply_udp2raw_to_peers(
-        udp2raw,
+    set_extra_object(local_interface, "middleware", middleware)
+    set_extra_object(peer_interface, "middleware", middleware)
+    apply_middleware_to_peers(
+        middleware,
         local_interface,
         peer_interface,
         local_peer,
@@ -1859,7 +2214,17 @@ def update_managed_link(
         payload.peer_endpoint_port,
     )
 
-    enqueue_udp2raw_tasks(db, udp2raw, local_interface, peer_interface, local_endpoint, peer_endpoint)
+    enqueue_middleware_cleanup_tasks(db, old_middleware, middleware, local_interface, peer_interface)
+    enqueue_middleware_tasks(
+        db,
+        middleware,
+        local_interface,
+        peer_interface,
+        local_endpoint,
+        peer_endpoint,
+        payload.local_endpoint_port,
+        payload.peer_endpoint_port,
+    )
     if enqueue_apply_config(db, local_interface):
         local_interface.runtime_status = "starting"
     if enqueue_apply_config(db, peer_interface):
@@ -1887,11 +2252,8 @@ def start_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict
     require_online_node(db, peer_interface.node_id)
     middleware = managed_link_middleware(local_interface)
     if middleware:
-        for interface in [local_interface, peer_interface]:
-            enqueue_interface_task_once(db, interface, "middleware.udp2raw.start", {
-                "plugin": "udp2raw",
-                "instance": udp2raw_instance_name(local_interface, peer_interface),
-            })
+        for interface, task_type, task_payload in middleware_task_payloads(middleware, local_interface, peer_interface, "start"):
+            enqueue_interface_task_once(db, interface, task_type, task_payload)
     for interface in [local_interface, peer_interface]:
         if interface.runtime_status not in ["running", "starting"]:
             driver = connection_driver_for_interface(interface)
@@ -1921,11 +2283,8 @@ def stop_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[
             if enqueue_interface_task_once(db, interface, driver.tasks.stop):
                 interface.runtime_status = "stopping"
     if middleware:
-        for interface in [local_interface, peer_interface]:
-            enqueue_interface_task_once(db, interface, "middleware.udp2raw.stop", {
-                "plugin": "udp2raw",
-                "instance": udp2raw_instance_name(local_interface, peer_interface),
-            })
+        for interface, task_type, task_payload in middleware_task_payloads(middleware, local_interface, peer_interface, "stop"):
+            enqueue_interface_task_once(db, interface, task_type, task_payload)
     db.commit()
     return {
         "local_interface": local_interface,
@@ -1952,10 +2311,9 @@ def delete_managed_link(
     middleware = managed_link_middleware(local_interface)
     for interface in [local_interface, peer_interface]:
         if middleware and delete_node_config:
-            enqueue_interface_task_once(db, interface, "middleware.udp2raw.delete", {
-                "plugin": "udp2raw",
-                "instance": udp2raw_instance_name(local_interface, peer_interface),
-            })
+            for target_interface, task_type, task_payload in middleware_task_payloads(middleware, local_interface, peer_interface, "delete"):
+                if target_interface.id == interface.id:
+                    enqueue_interface_task_once(db, target_interface, task_type, task_payload)
         mark_import_candidate_available_for_interface(db, interface)
         if delete_node_config and should_delete_node_config_file(interface):
             driver = connection_driver_for_interface(interface)
@@ -2521,6 +2879,21 @@ def agent_task_result(
             node.agent_last_error = str(payload.result.get("error") or payload.result)
         else:
             node.agent_last_error = None
+
+    if task.type == "middleware.install" and node is not None and (task.payload or {}).get("plugin") == "mimic":
+        if payload.status == "succeeded":
+            if payload.result.get("reboot_required"):
+                node.middleware_install_status = "mimic_reboot_required"
+                platform = dict(node.agent_platform or {})
+                platform["mimic_reboot_required"] = True
+                node.agent_platform = platform
+            else:
+                node.middleware_install_status = "mimic_ready"
+                platform = dict(node.agent_platform or {})
+                platform.pop("mimic_reboot_required", None)
+                node.agent_platform = platform
+        elif payload.status == "failed":
+            node.middleware_install_status = "mimic_failed"
 
     if task.change_plan_id:
         plan = db.get(models.ChangePlan, task.change_plan_id)

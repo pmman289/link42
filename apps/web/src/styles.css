@@ -161,6 +161,17 @@ textarea {
   font-size: 26px;
 }
 
+.formError {
+  border: 1px solid #f0b8b8;
+  border-left: 4px solid #b64646;
+  border-radius: 8px;
+  background: #fff4f3;
+  color: #8d2d2d;
+  padding: 10px 12px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
 .toastStack {
   position: fixed;
   top: 82px;
@@ -841,6 +852,25 @@ textarea {
   margin: 0;
   font-size: 15px;
   letter-spacing: 0;
+}
+
+.pluginStatus {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid #dce6ea;
+  border-radius: 8px;
+  background: #f9fbfc;
+  padding: 12px;
+}
+
+.pluginStatus p {
+  margin: 4px 0 8px;
+}
+
+.pluginStatus small {
+  color: #64747d;
 }
 
 @media (max-width: 760px) {

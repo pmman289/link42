@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -45,6 +46,9 @@ def get_service_manager_name() -> str:
 def get_agent_platform() -> dict[str, Any]:
     """返回 Agent 当前运行平台信息，用于主控判断插件和升级资产。"""
 
+    service_manager = get_service_manager_name()
+    release = platform.release()
+    os_release = read_os_release()
     libc_name, libc_version = platform.libc_ver()
     if platform.system().lower() == "linux" and shutil.which("ldd"):
         result = run_command(["ldd", "--version"], allow_failure=True)
@@ -52,14 +56,122 @@ def get_agent_platform() -> dict[str, Any]:
         if "musl" in output:
             libc_name = "musl"
             libc_version = libc_version if libc_version and libc_version != "2.0" else None
+    mimic_binary_present = bool(shutil.which("mimic"))
+    mimic_health = mimic_runtime_health() if mimic_binary_present and service_manager == "systemd" else {"ready": False}
     return {
         "os": platform.system().lower(),
         "arch": platform.machine(),
-        "service_manager": get_service_manager_name(),
+        "service_manager": service_manager,
         "libc": libc_name or None,
         "libc_version": libc_version or None,
         "glibc": libc_version if libc_name == "glibc" else None,
+        "kernel": release,
+        "kernel_version": release,
+        "kernel_major": parse_kernel_version(release)[0],
+        "kernel_minor": parse_kernel_version(release)[1],
+        "is_openwrt": service_manager == "openwrt-uci",
+        "has_systemd": bool(shutil.which("systemctl")),
+        "has_mimic": bool(mimic_health["ready"]),
+        "mimic_binary_present": mimic_binary_present,
+        "mimic_runtime_ready": bool(mimic_health["ready"]),
+        "network_interfaces": network_interfaces(),
+        "distro_id": os_release.get("ID"),
+        "distro_version_id": os_release.get("VERSION_ID"),
+        "distro_codename": os_release.get("VERSION_CODENAME") or os_release.get("UBUNTU_CODENAME"),
+        "package_manager": "apt" if shutil.which("apt-get") else None,
     }
+
+
+def mimic_runtime_ready() -> bool:
+    """判断 mimic 是否真正处于可运行状态，而不是只存在半安装二进制。"""
+
+    return bool(mimic_runtime_health()["ready"])
+
+
+def mimic_runtime_health() -> dict[str, Any]:
+    checks: dict[str, Any] = {
+        "binary": bool(shutil.which("mimic")),
+        "packages": {},
+        "systemd_unit": False,
+        "user": False,
+        "module": False,
+        "dkms_status": None,
+        "version": None,
+    }
+    if not checks["binary"]:
+        return {"ready": False, "checks": checks}
+    for package in ["mimic", "mimic-dkms"]:
+        result = run_command(["dpkg-query", "-W", "-f=${db:Status-Abbrev}", package], True)
+        status = str(result.get("stdout") or "").strip()
+        checks["packages"][package] = status
+    checks["systemd_unit"] = run_command(["systemctl", "cat", "mimic@.service"], True)["returncode"] == 0
+    checks["user"] = run_command(["id", "-u", "mimic"], True)["returncode"] == 0
+    checks["module"] = run_command(["modinfo", "mimic"], True)["returncode"] == 0
+    dkms_result = run_command(["dkms", "status", "-m", "mimic"], True)
+    checks["dkms_status"] = str(dkms_result.get("stdout") or dkms_result.get("stderr") or "").strip() or None
+    version_result = run_command(["mimic", "--version"], True)
+    checks["version"] = str(version_result.get("stdout") or version_result.get("stderr") or "").strip() or None
+    packages_ready = all(status == "ii" for status in checks["packages"].values())
+    ready = (
+        bool(checks["binary"])
+        and packages_ready
+        and bool(checks["systemd_unit"])
+        and bool(checks["user"])
+        and bool(checks["module"])
+        and version_result["returncode"] == 0
+    )
+    return {"ready": ready, "checks": checks}
+
+
+def read_os_release(path: str = "/etc/os-release") -> dict[str, str]:
+    """读取 /etc/os-release 中的发行版信息。"""
+
+    target = Path(path)
+    if not target.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in target.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value.strip().strip('"')
+    return values
+
+
+def parse_kernel_version(release: str) -> tuple[int, int, int]:
+    """解析 Linux kernel release 的前三段数字。"""
+
+    match = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", release)
+    if not match:
+        return (0, 0, 0)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+
+
+def kernel_at_least(release: str, major: int, minor: int) -> bool:
+    """判断内核版本是否达到指定 major/minor。"""
+
+    current = parse_kernel_version(release)
+    return current[:2] >= (major, minor)
+
+
+def kernel_newer_than(release: str, major: int, minor: int) -> bool:
+    """判断内核 major/minor 是否严格高于指定版本。"""
+
+    current = parse_kernel_version(release)
+    return current[:2] > (major, minor)
+
+
+def network_interfaces() -> list[str]:
+    """返回可用于中间层绑定的普通网络接口名。"""
+
+    sys_class_net = Path("/sys/class/net")
+    if not sys_class_net.exists():
+        return []
+    return sorted(
+        item.name
+        for item in sys_class_net.iterdir()
+        if item.name != "lo" and not item.name.startswith(("wg", "tun", "tap"))
+    )
 
 
 def scan_wg_quick_configs(wireguard_dir: str = DEFAULT_WIREGUARD_DIR) -> list[dict[str, Any]]:
@@ -288,28 +400,38 @@ def get_wg_quick_service_state(interface_name: str) -> dict[str, Any]:
     return detect_service_manager(run_command).state(interface_name)
 
 
-def run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+def run_command(
+    command: list[str],
+    allow_failure: bool,
+    *,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """执行系统命令，并返回可上报给 API 的结构化结果。"""
 
-    timeout = command_timeout_seconds()
+    effective_timeout = timeout if timeout is not None else command_timeout_seconds()
+    effective_env = subprocess_env()
+    if env:
+        effective_env.update(env)
     try:
         completed = subprocess.run(
             command,
             check=False,
             text=True,
             capture_output=True,
-            timeout=timeout,
+            timeout=effective_timeout,
+            env=effective_env,
         )
     except subprocess.TimeoutExpired as exc:
         result = {
             "command": command,
             "returncode": 124,
             "stdout": exc.stdout or "",
-            "stderr": f"command timed out after {timeout:g}s",
-            "timeout": timeout,
+            "stderr": f"command timed out after {effective_timeout:g}s",
+            "timeout": effective_timeout,
         }
         if not allow_failure:
-            raise RuntimeError(f"command timed out after {timeout:g}s: {' '.join(command)}") from exc
+            raise RuntimeError(f"command timed out after {effective_timeout:g}s: {' '.join(command)}") from exc
         return result
     result = {
         "command": command,
@@ -320,3 +442,17 @@ def run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
     if completed.returncode != 0 and not allow_failure:
         raise RuntimeError(f"command failed: {' '.join(command)}\n{completed.stderr}")
     return result
+
+
+def subprocess_env() -> dict[str, str]:
+    """返回执行系统命令使用的环境，避免 PyInstaller 私有库污染子进程。"""
+
+    effective_env = os.environ.copy()
+    original_library_path = effective_env.pop("LD_LIBRARY_PATH_ORIG", None)
+    library_path = effective_env.get("LD_LIBRARY_PATH")
+    if library_path and "/_MEI" in library_path:
+        if original_library_path:
+            effective_env["LD_LIBRARY_PATH"] = original_library_path
+        else:
+            effective_env.pop("LD_LIBRARY_PATH", None)
+    return effective_env

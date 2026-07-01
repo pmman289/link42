@@ -82,6 +82,7 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("nodes", node_columns, "management_ip", "VARCHAR(64)")
             add_column("nodes", node_columns, "public_ip", "VARCHAR(64)")
             add_column("nodes", node_columns, "endpoint_ips", "JSON DEFAULT '[]'")
+            add_column("nodes", node_columns, "github_proxy_url", "VARCHAR(500)")
             add_column("nodes", node_columns, "status", "VARCHAR(32) DEFAULT 'offline'")
             add_column("nodes", node_columns, "agent_token_hash", "VARCHAR(128) DEFAULT ''")
             add_column("nodes", node_columns, "agent_token_value", "TEXT")
@@ -91,6 +92,7 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("nodes", node_columns, "agent_platform", "JSON DEFAULT '{}'")
             add_column("nodes", node_columns, "agent_update_status", "VARCHAR(32)")
             add_column("nodes", node_columns, "agent_last_error", "TEXT")
+            add_column("nodes", node_columns, "middleware_install_status", "VARCHAR(64)")
             add_column("nodes", node_columns, "last_seen_at", "DATETIME")
 
         interface_columns = table_columns("wg_interfaces")

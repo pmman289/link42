@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import pytest
 from fastapi import HTTPException
 from link42_common.connection_types import TASK_REQUIREMENTS, WIREGUARD_TASKS
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
@@ -33,22 +34,28 @@ from link42_api.main import (
     ensure_unique_interface_name,
     get_controller_settings,
     get_setting,
+    install_node_middleware,
     mark_import_candidate_available_for_interface,
     is_node_online,
     is_api_auth_exempt,
     list_import_candidates,
     login,
+    mimic_endpoint_payloads,
     normalize_udp2raw_config,
+    normalize_middleware_config,
     require_node_endpoint,
+    require_mimic_supported,
     require_online_node,
     require_udp2raw_supported,
     request_import_scan,
+    require_mimic_install_supported,
     set_setting,
     set_unique_peer,
     should_delete_node_config_file,
     start_interface,
     stop_managed_link,
     update_controller_settings,
+    update_managed_link,
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
 )
@@ -59,6 +66,8 @@ from link42_api.schemas import (
     InterfaceRead,
     LoginRequest,
     ManagedLinkCreate,
+    ManagedLinkUpdate,
+    MimicMiddlewareConfig,
     NodeCreate,
     PeerCreate,
     AgentPollRequest,
@@ -992,6 +1001,162 @@ def test_create_node_stores_viewable_agent_token() -> None:
     assert node.agent_token_value == result.agent_token
 
 
+def test_create_node_stores_github_proxy_url() -> None:
+    """验证节点级 GitHub 代理地址会保存，供 Agent 安装 GitHub release 插件使用。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        result = create_node(
+            NodeCreate(
+                name="node-a",
+                endpoint_ips=["198.51.100.10"],
+                github_proxy_url="https://gh.example.com/",
+            ),
+            session,
+        )
+        node = session.get(models.Node, result.node.id)
+
+    assert node is not None
+    assert node.github_proxy_url == "https://gh.example.com/"
+
+
+def test_mimic_install_task_uses_github_latest_and_node_proxy() -> None:
+    """验证主控安装 mimic 时下发官方 GitHub latest release 和节点代理 URL。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            github_proxy_url="https://gh.example.com/",
+            agent_version="0.5.2",
+            agent_capabilities=[
+                "wireguard",
+                "middleware",
+                "middleware.install",
+                "middleware.install.mimic",
+                "service:systemd",
+            ],
+            agent_platform={
+                "os": "linux",
+                "service_manager": "systemd",
+                "kernel_version": "6.6.12",
+                "is_openwrt": False,
+            },
+        )
+        session.add(node)
+        session.commit()
+
+        result = install_node_middleware(node.id, "mimic", session)
+        task = session.get(models.AgentTask, result.task_id)
+        install_status = session.get(models.Node, node.id).middleware_install_status
+
+    assert result.status == "pending"
+    assert task is not None
+    assert task.type == "middleware.install"
+    assert task.payload == {
+        "plugin": "mimic",
+        "source": "github_latest",
+        "repo": "hack3ric/mimic",
+        "allow_prerelease": False,
+        "github_proxy_url": "https://gh.example.com/",
+    }
+    assert install_status == "mimic_installing"
+
+
+def test_mimic_install_reboot_required_is_persisted_across_heartbeat() -> None:
+    """验证 mimic 安装成功但需重启时，主控保留节点需要重启提示。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash=hash_token("token"),
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.8",
+            agent_capabilities=["wireguard", "middleware.install.mimic", "service:systemd"],
+            agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.12.85"},
+        )
+        session.add(node)
+        session.commit()
+        task = models.AgentTask(
+            node_id=node.id,
+            type="middleware.install",
+            status="running",
+            payload={"plugin": "mimic"},
+        )
+        session.add(task)
+        session.commit()
+
+        agent_task_result(
+            task.id,
+            AgentTaskResultRequest(
+                node_id=node.id,
+                token="token",
+                status="succeeded",
+                result={"plugin": "mimic", "installed": True, "reboot_required": True},
+            ),
+            session,
+        )
+
+        refreshed = session.get(models.Node, node.id)
+        assert refreshed.middleware_install_status == "mimic_reboot_required"
+        assert refreshed.agent_platform["mimic_reboot_required"] is True
+
+        agent_register(
+            AgentRegisterRequest(
+                node_id=node.id,
+                token="token",
+                agent_version="0.5.8",
+                capabilities=["wireguard", "middleware.install.mimic", "service:systemd"],
+                platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.12.85"},
+            ),
+            session,
+        )
+
+        refreshed = session.get(models.Node, node.id)
+        assert refreshed.middleware_install_status == "mimic_reboot_required"
+        assert refreshed.agent_platform["mimic_reboot_required"] is True
+
+        agent_register(
+            AgentRegisterRequest(
+                node_id=node.id,
+                token="token",
+                agent_version="0.5.8",
+                capabilities=["wireguard", "middleware.install.mimic", "middleware.mimic", "service:systemd"],
+                platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.12.94"},
+            ),
+            session,
+        )
+
+        refreshed = session.get(models.Node, node.id)
+        assert refreshed.middleware_install_status == "mimic_ready"
+        assert "mimic_reboot_required" not in refreshed.agent_platform
+
+
+def test_mimic_install_requires_plugin_specific_capability() -> None:
+    """验证旧 Agent 只有通用 middleware.install 时不能安装 mimic。"""
+
+    node = models.Node(
+        name="node-a",
+        agent_version="0.5.2",
+        agent_capabilities=["wireguard", "middleware", "middleware.install", "service:systemd"],
+        agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12"},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        require_mimic_install_supported(node)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "node does not support installing mimic"
+
+
 def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch) -> None:
     """验证受管节点互联会一次创建双方配置和互指 peer。"""
 
@@ -1300,6 +1465,281 @@ def test_link_monitor_samples_rejects_invalid_window(monkeypatch) -> None:
     assert exc_info.value.detail == "invalid monitor window"
 
 
+def test_mimic_requires_non_openwrt_kernel_newer_than_61_and_capability() -> None:
+    """验证主控侧 mimic 门禁不只相信表单，必须满足平台和能力要求。"""
+
+    node = models.Node(
+        name="node-a",
+        agent_version="0.5.2",
+        agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+        agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12", "is_openwrt": False},
+    )
+    require_mimic_supported(node)
+
+    old_kernel = models.Node(
+        name="node-b",
+        agent_version="0.5.2",
+        agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+        agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.1.90", "is_openwrt": False},
+    )
+    with pytest.raises(HTTPException) as old_exc:
+        require_mimic_supported(old_kernel)
+    assert old_exc.value.status_code == 409
+    assert old_exc.value.detail == "mimic requires Linux kernel newer than 6.1"
+
+    openwrt = models.Node(
+        name="node-c",
+        agent_version="0.5.2",
+        agent_capabilities=["wireguard", "middleware.mimic", "service:openwrt-uci"],
+        agent_platform={"os": "linux", "service_manager": "openwrt-uci", "kernel_version": "6.6.12", "is_openwrt": True},
+    )
+    with pytest.raises(HTTPException) as openwrt_exc:
+        require_mimic_supported(openwrt)
+    assert openwrt_exc.value.status_code == 409
+    assert openwrt_exc.value.detail == "mimic is not supported on OpenWrt nodes"
+
+
+def test_mimic_payloads_keep_wireguard_endpoint_direct() -> None:
+    """验证 mimic 生成透明 filter 任务，不像 udp2raw 一样接管 WireGuard Endpoint。"""
+
+    middleware = normalize_middleware_config(
+        None,
+        MimicMiddlewareConfig(
+            enabled=True,
+            local_bind_interface="eth0",
+            peer_bind_interface="eth1",
+            xdp_mode="skb",
+        ),
+    )
+    local = models.WireGuardInterface(id=1, node_id=1, name="wg-a", listen_port=51820)
+    peer = models.WireGuardInterface(id=2, node_id=2, name="wg-b", listen_port=51821)
+
+    payloads = mimic_endpoint_payloads(
+        middleware,
+        local,
+        peer,
+        "203.0.113.10",
+        "203.0.113.20",
+    )
+
+    assert middleware is not None
+    assert middleware["type"] == "mimic"
+    assert [task_type for _, task_type, _ in payloads] == ["middleware.mimic.apply", "middleware.mimic.apply"]
+    assert payloads[0][2]["bind_interface"] == "eth0"
+    assert payloads[0][2]["local_host"] == "203.0.113.10"
+    assert payloads[0][2]["peer_host"] == "203.0.113.20"
+    assert payloads[0][2]["filter_origin"] == "remote"
+    assert payloads[1][2]["bind_interface"] == "eth1"
+
+
+def test_mimic_rejects_domain_endpoint_for_filter_generation() -> None:
+    """验证 mimic filter 只接受 IP 字面量，避免 Agent 生成无效配置。"""
+
+    middleware = normalize_middleware_config(
+        None,
+        MimicMiddlewareConfig(
+            enabled=True,
+            local_bind_interface="eth0",
+            peer_bind_interface="eth1",
+        ),
+    )
+    local = models.WireGuardInterface(id=1, node_id=1, name="wg-a", listen_port=51820)
+    peer = models.WireGuardInterface(id=2, node_id=2, name="wg-b", listen_port=51821)
+
+    with pytest.raises(HTTPException) as exc_info:
+        mimic_endpoint_payloads(
+            middleware,
+            local,
+            peer,
+            "203.0.113.10",
+            "vpn.example.com",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "mimic peer endpoint must be an IP address for mimic"
+
+
+def test_create_managed_link_with_mimic_enqueues_mimic_tasks(monkeypatch) -> None:
+    """验证创建受管连接启用 mimic 时下发 mimic 任务且保留真实 Endpoint。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.2",
+            agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+            agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12", "is_openwrt": False},
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.2",
+            agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+            agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12", "is_openwrt": False},
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        result = create_managed_link(
+            node_a.id,
+            ManagedLinkCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=51821,
+                mimic=MimicMiddlewareConfig(
+                    enabled=True,
+                    local_bind_interface="eth0",
+                    peer_bind_interface="eth1",
+                    xdp_mode="skb",
+                ),
+            ),
+            session,
+        )
+        local_peer = session.scalar(
+            select(models.WireGuardPeer).where(models.WireGuardPeer.interface_id == result.local_interface.id)
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.type, models.AgentTask.node_id)))
+
+    assert local_peer is not None
+    assert local_peer.endpoint_host == "198.51.100.20"
+    assert local_peer.endpoint_port == 51821
+    assert [task.type for task in tasks].count("middleware.mimic.apply") == 2
+    assert [task.type for task in tasks].count("wireguard.apply_config") == 2
+    mimic_payloads = [task.payload for task in tasks if task.type == "middleware.mimic.apply"]
+    assert {payload["bind_interface"] for payload in mimic_payloads} == {"eth0", "eth1"}
+
+
+def test_update_managed_link_disabling_mimic_enqueues_cleanup_tasks(monkeypatch) -> None:
+    """验证编辑受管连接禁用 mimic 时会清理节点上的旧 mimic 服务和配置。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.2",
+            agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+            agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12", "is_openwrt": False},
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.2",
+            agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+            agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12", "is_openwrt": False},
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        result = create_managed_link(
+            node_a.id,
+            ManagedLinkCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=51821,
+                mimic=MimicMiddlewareConfig(enabled=True, local_bind_interface="eth0", peer_bind_interface="eth1"),
+            ),
+            session,
+        )
+        session.query(models.AgentTask).delete()
+        session.commit()
+
+        update_managed_link(
+            result.local_interface.id,
+            ManagedLinkUpdate(
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=51821,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.type, models.AgentTask.node_id)))
+        local_interface = session.get(models.WireGuardInterface, result.local_interface.id)
+
+    assert local_interface is not None
+    assert "middleware" not in (local_interface.extras or {})
+    assert [task.type for task in tasks].count("middleware.mimic.stop") == 2
+    assert [task.type for task in tasks].count("middleware.mimic.delete") == 2
+    assert [task.type for task in tasks].count("wireguard.apply_config") == 2
+    cleanup_payloads = [task.payload for task in tasks if task.type in {"middleware.mimic.stop", "middleware.mimic.delete"}]
+    assert {payload["bind_interface"] for payload in cleanup_payloads} == {"eth0", "eth1"}
+
+
+def test_middleware_config_rejects_udp2raw_and_mimic_together() -> None:
+    """验证一次只能启用一种连接中间层。"""
+
+    with pytest.raises(HTTPException) as exc_info:
+        normalize_middleware_config(
+            Udp2RawMiddlewareConfig(enabled=True, server_listen_port=30000, client_listen_port=30001),
+            MimicMiddlewareConfig(enabled=True, local_bind_interface="eth0", peer_bind_interface="eth1"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "only one middleware can be enabled"
+
+
+def test_mimic_padding_rejects_out_of_range_value() -> None:
+    """验证 mimic padding 遵守官方 MAX_PADDING_LEN=16。"""
+
+    with pytest.raises(ValidationError) as exc_info:
+        MimicMiddlewareConfig(
+            enabled=True,
+            local_bind_interface="eth0",
+            peer_bind_interface="eth1",
+            padding=30,
+        )
+
+    assert "mimic padding must be between 0 and 16" in str(exc_info.value)
+
+
 def test_sqlite_migration_creates_link_monitor_tables(monkeypatch, tmp_path) -> None:
     """验证旧 SQLite 启动迁移会补齐链路监测表。"""
 
@@ -1478,10 +1918,13 @@ def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) 
 
         result = request_agent_upgrade(node.id, AgentUpgradeRequest(), session)
         task = session.scalar(select(models.AgentTask).where(models.AgentTask.node_id == node.id))
+        node_after = session.get(models.Node, node.id)
 
     assert result.task_id is not None
+    assert result.status == "pending"
     assert task is not None
     assert task.type == "agent.self_upgrade"
+    assert node_after.agent_update_status == "queued"
     assert task.payload["target_version"] == "0.2.1"
     assert task.payload["download_url"] == "http://controller:8000/api/agent/releases/0.2.1/download?platform=linux-x64-glibc2.31"
     assert task.payload["sha256"] == "abc123"
@@ -1582,6 +2025,100 @@ def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> 
     assert tasks[2].payload["remote_port"] == 11451
     assert tasks[3].payload["mode"] == "client"
     assert tasks[3].payload["remote_host"] == "198.51.100.20"
+
+
+def test_update_managed_link_disabling_udp2raw_enqueues_cleanup_tasks(monkeypatch) -> None:
+    """验证编辑受管连接禁用 udp2raw 时会清理节点上的旧 udp2raw 服务和配置。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+    monkeypatch.setattr(api_main, "generate_token", lambda prefix: f"{prefix}_secret")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    capabilities = [
+        "wireguard",
+        "service:systemd",
+        "middleware",
+        "middleware.install",
+        "middleware.udp2raw",
+    ]
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            agent_version="0.5.2",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            agent_version="0.5.2",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        result = create_managed_link(
+            node_a.id,
+            ManagedLinkCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=None,
+                peer_listen_port=51821,
+                udp2raw=Udp2RawMiddlewareConfig(
+                    enabled=True,
+                    server_side="peer",
+                    server_connect_host="198.51.100.20",
+                    server_listen_port=23002,
+                    client_listen_port=12312,
+                ),
+            ),
+            session,
+        )
+        session.query(models.AgentTask).delete()
+        session.commit()
+
+        update_managed_link(
+            result.local_interface.id,
+            ManagedLinkUpdate(
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=None,
+                peer_listen_port=51821,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.type, models.AgentTask.node_id)))
+        local_interface = session.get(models.WireGuardInterface, result.local_interface.id)
+
+    assert local_interface is not None
+    assert "middleware" not in (local_interface.extras or {})
+    assert [task.type for task in tasks].count("middleware.udp2raw.stop") == 2
+    assert [task.type for task in tasks].count("middleware.udp2raw.delete") == 2
+    assert [task.type for task in tasks].count("wireguard.apply_config") == 2
+    cleanup_payloads = [task.payload for task in tasks if task.type in {"middleware.udp2raw.stop", "middleware.udp2raw.delete"}]
+    assert {payload["mode"] for payload in cleanup_payloads} == {"client", "server"}
 
 
 def test_udp2raw_defaults_server_forward_to_wireguard_listen_port() -> None:
@@ -1889,6 +2426,7 @@ def test_sqlite_repair_upgrades_legacy_schema_columns(monkeypatch) -> None:
 
     assert {
         "endpoint_ips",
+        "github_proxy_url",
         "agent_version",
         "agent_capabilities",
         "agent_platform",

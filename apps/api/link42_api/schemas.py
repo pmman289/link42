@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import ipaddress
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -24,12 +25,32 @@ def _validate_cidrs(values: list[str]) -> list[str]:
     return values
 
 
+def _validate_optional_http_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if any(char.isspace() or char in "'\"" for char in value):
+        raise ValueError("URL must not contain whitespace or quotes")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL must start with http:// or https://")
+    return value
+
+
 class NodeCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     hostname: str | None = None
     management_ip: str | None = None
     public_ip: str | None = None
     endpoint_ips: list[str] = Field(min_length=1)
+    github_proxy_url: str | None = Field(default=None, max_length=500)
+
+    @field_validator("github_proxy_url")
+    @classmethod
+    def validate_github_proxy_url(cls, value: str | None) -> str | None:
+        return _validate_optional_http_url(value)
 
 
 class NodeUpdate(BaseModel):
@@ -38,6 +59,12 @@ class NodeUpdate(BaseModel):
     hostname: str | None = None
     management_ip: str | None = None
     public_ip: str | None = None
+    github_proxy_url: str | None = Field(default=None, max_length=500)
+
+    @field_validator("github_proxy_url")
+    @classmethod
+    def validate_github_proxy_url(cls, value: str | None) -> str | None:
+        return _validate_optional_http_url(value)
 
 
 class NodeRead(BaseModel):
@@ -47,6 +74,7 @@ class NodeRead(BaseModel):
     management_ip: str | None
     public_ip: str | None
     endpoint_ips: list[str]
+    github_proxy_url: str | None = None
     agent_token_value: str | None
     agent_version: str | None = None
     agent_protocol_version: int | None = None
@@ -54,6 +82,7 @@ class NodeRead(BaseModel):
     agent_platform: dict[str, Any] = Field(default_factory=dict)
     agent_update_status: str | None = None
     agent_last_error: str | None = None
+    middleware_install_status: str | None = None
     status: str
     last_seen_at: datetime | None
 
@@ -142,6 +171,7 @@ class ManagedLinkCreate(BaseModel):
     replace_peer_interface_id: int | None = None
     force_endpoint_mismatch: bool = False
     udp2raw: Udp2RawMiddlewareConfig | None = None
+    mimic: MimicMiddlewareConfig | None = None
 
     @field_validator("local_endpoint_port", "peer_endpoint_port", "local_listen_port", "peer_listen_port")
     @classmethod
@@ -439,6 +469,48 @@ class Udp2RawMiddlewareConfig(BaseModel):
         return value
 
 
+class MimicMiddlewareConfig(BaseModel):
+    enabled: bool = False
+    local_bind_interface: str | None = None
+    peer_bind_interface: str | None = None
+    xdp_mode: str = "skb"
+    link_type: str = "eth"
+    handshake_interval: int | None = None
+    keepalive_interval: int | None = None
+    padding: int | None = None
+
+    @field_validator("local_bind_interface", "peer_bind_interface")
+    @classmethod
+    def validate_interface_name(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return value
+        value = value.strip()
+        if not all(char.isalnum() or char in "_.:-" for char in value):
+            raise ValueError("mimic interface name contains unsupported characters")
+        return value
+
+    @field_validator("xdp_mode")
+    @classmethod
+    def validate_xdp_mode(cls, value: str) -> str:
+        if value not in ["auto", "native", "skb"]:
+            raise ValueError("xdp_mode must be auto, native, or skb")
+        return value
+
+    @field_validator("handshake_interval", "keepalive_interval")
+    @classmethod
+    def validate_optional_non_negative(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("mimic numeric options must be non-negative")
+        return value
+
+    @field_validator("padding")
+    @classmethod
+    def validate_padding(cls, value: int | None) -> int | None:
+        if value is not None and not 0 <= value <= 16:
+            raise ValueError("mimic padding must be between 0 and 16")
+        return value
+
+
 class ManagedLinkCreateResult(BaseModel):
     local_interface: InterfaceRead
     peer_interface: InterfaceRead
@@ -477,6 +549,7 @@ class ManagedLinkUpdate(BaseModel):
     peer_interface_custom_config: str | None = None
     peer_peer_custom_config: str | None = None
     udp2raw: Udp2RawMiddlewareConfig | None = None
+    mimic: MimicMiddlewareConfig | None = None
 
     @field_validator("local_endpoint_port", "peer_endpoint_port", "local_listen_port", "peer_listen_port")
     @classmethod
@@ -536,6 +609,7 @@ class TaskRequestResult(BaseModel):
     task_id: int | None
     status: str
     message: str
+    result: dict[str, Any] | None = None
 
 
 class AgentReleaseAsset(BaseModel):
