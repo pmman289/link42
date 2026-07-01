@@ -1189,7 +1189,9 @@ def build_topology(db: Session) -> schemas.TopologyRead:
                 name=node.name,
                 status=node.status,
                 hostname=node.hostname,
+                region=node.region,
                 endpoint_ips=node.endpoint_ips or [],
+                topology_endpoint=node.topology_endpoint,
                 agent_version=node.agent_version,
                 agent_platform=node.agent_platform or {},
                 topology_x=node.topology_x,
@@ -1758,9 +1760,11 @@ def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> s
     node = models.Node(
         name=payload.name,
         hostname=payload.hostname,
+        region=(payload.region or "").strip() or None,
         management_ip=payload.management_ip,
         public_ip=payload.public_ip,
         endpoint_ips=payload.endpoint_ips,
+        topology_endpoint=(payload.topology_endpoint or "").strip() or (payload.endpoint_ips[0] if payload.endpoint_ips else None),
         github_proxy_url=payload.github_proxy_url,
         status="offline",
         agent_token_hash=hash_token(token),
@@ -1791,9 +1795,11 @@ def update_node(
 
     node.name = payload.name
     node.hostname = payload.hostname
+    node.region = (payload.region or "").strip() or None
     node.management_ip = payload.management_ip
     node.public_ip = payload.public_ip
     node.endpoint_ips = payload.endpoint_ips
+    node.topology_endpoint = (payload.topology_endpoint or "").strip() or (payload.endpoint_ips[0] if payload.endpoint_ips else None)
     node.github_proxy_url = payload.github_proxy_url
     db.commit()
     db.refresh(node)
@@ -1846,12 +1852,27 @@ def update_node_topology_position(
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
+    if (payload.x is None) != (payload.y is None):
+        raise HTTPException(status_code=400, detail="topology x and y must be provided together")
     node.topology_x = payload.x
     node.topology_y = payload.y
     node.topology_locked = True if payload.locked is None else payload.locked
     db.commit()
     db.refresh(node)
     return node
+
+
+@app.post("/api/topology/layout/reset", response_model=schemas.TopologyRead)
+def reset_topology_layout(db: Session = Depends(get_db)) -> schemas.TopologyRead:
+    """清空所有自定义拓扑坐标，让前端回到自动布局。"""
+
+    nodes = list(db.scalars(select(models.Node)))
+    for node in nodes:
+        node.topology_x = None
+        node.topology_y = None
+        node.topology_locked = False
+    db.commit()
+    return build_topology(db)
 
 
 @app.delete("/api/nodes/{node_id}")

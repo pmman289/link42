@@ -79,9 +79,11 @@ def ensure_sqlite_point_to_point_constraints() -> None:
         node_columns = table_columns("nodes")
         if node_columns:
             add_column("nodes", node_columns, "hostname", "VARCHAR(255)")
+            add_column("nodes", node_columns, "region", "VARCHAR(80)")
             add_column("nodes", node_columns, "management_ip", "VARCHAR(64)")
             add_column("nodes", node_columns, "public_ip", "VARCHAR(64)")
             add_column("nodes", node_columns, "endpoint_ips", "JSON DEFAULT '[]'")
+            add_column("nodes", node_columns, "topology_endpoint", "VARCHAR(255)")
             add_column("nodes", node_columns, "github_proxy_url", "VARCHAR(500)")
             add_column("nodes", node_columns, "topology_x", "FLOAT")
             add_column("nodes", node_columns, "topology_y", "FLOAT")

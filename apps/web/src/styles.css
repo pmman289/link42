@@ -255,6 +255,14 @@ textarea {
   gap: 16px;
 }
 
+.topologyToolbar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .topologyMeta {
   display: inline-flex;
   align-items: center;
@@ -283,6 +291,11 @@ textarea {
   display: grid;
   place-items: center;
   margin: 0;
+}
+
+.topologyCanvas .react-flow__attribution,
+.topologyCanvas .react-flow__controls {
+  display: none;
 }
 
 .topologyFlowNode {

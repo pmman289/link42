@@ -42,9 +42,11 @@ def _validate_optional_http_url(value: str | None) -> str | None:
 class NodeCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     hostname: str | None = None
+    region: str | None = Field(default=None, max_length=80)
     management_ip: str | None = None
     public_ip: str | None = None
     endpoint_ips: list[str] = Field(min_length=1)
+    topology_endpoint: str | None = Field(default=None, max_length=255)
     github_proxy_url: str | None = Field(default=None, max_length=500)
 
     @field_validator("github_proxy_url")
@@ -57,8 +59,10 @@ class NodeUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     endpoint_ips: list[str] = Field(min_length=1)
     hostname: str | None = None
+    region: str | None = Field(default=None, max_length=80)
     management_ip: str | None = None
     public_ip: str | None = None
+    topology_endpoint: str | None = Field(default=None, max_length=255)
     github_proxy_url: str | None = Field(default=None, max_length=500)
 
     @field_validator("github_proxy_url")
@@ -71,9 +75,11 @@ class NodeRead(BaseModel):
     id: int
     name: str
     hostname: str | None
+    region: str | None = None
     management_ip: str | None
     public_ip: str | None
     endpoint_ips: list[str]
+    topology_endpoint: str | None = None
     github_proxy_url: str | None = None
     topology_x: float | None = None
     topology_y: float | None = None
@@ -249,8 +255,8 @@ class LinkMonitorSummary(BaseModel):
 
 
 class TopologyPositionUpdate(BaseModel):
-    x: float
-    y: float
+    x: float | None = None
+    y: float | None = None
     locked: bool | None = None
 
 
@@ -259,7 +265,9 @@ class TopologyNode(BaseModel):
     name: str
     status: str
     hostname: str | None = None
+    region: str | None = None
     endpoint_ips: list[str] = Field(default_factory=list)
+    topology_endpoint: str | None = None
     agent_version: str | None = None
     agent_platform: dict[str, Any] = Field(default_factory=dict)
     topology_x: float | None = None

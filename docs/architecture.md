@@ -1,43 +1,55 @@
-# Link42 Architecture Outline
+# Link42 架构与开发状态
 
-## 1. Project Goal
+本文用于恢复项目上下文、辅助后续开发和 bug 修复。当前产品描述统一为：
 
-Link42 is a lightweight internal network panel for managing nodes and WireGuard
-connections between them.
+> Link42 是 WireGuard 点对点链路管理面板，偏向 DN42、家庭网络和小型内网场景。
 
-The first release only covers:
+## 1. 当前开发进度
 
-- Adding and managing nodes.
-- Managing point-to-point WireGuard link configs.
-- Deploying WireGuard configuration through node agents after user confirmation.
-- Importing existing `wg-quick` configurations into Link42 as managed links.
-- Creating fully managed node-to-node WireGuard links where Link42 generates
-  both key pairs and keeps both endpoints consistent.
+截至当前提交，Link42 已从最初的“节点 + WireGuard 配置管理”推进到以下阶段：
 
-The first release does not cover:
+- 主控可用 Docker 部署，同端口托管 FastAPI API 和 React/Vite 构建产物。
+- Web 面板已实现单用户登录、节点管理、节点地域、节点入口地址、拓扑展示地址和主控访问地址设置。
+- 节点 Agent 已支持 Linux systemd、OpenRC 和 OpenWrt UCI/procd 后端。
+- WireGuard 按点对点虚拟网线建模：一个受管配置最多一个 Peer，受管双向链路由两端配置组成。
+- 已支持导入现有 `wg-quick` 配置、手动连接、受管双向连接、保留节点文件删除、受管配置双端启动/停止/删除。
+- 已支持连接中间层插件：
+  - `udp2raw`：Linux systemd 与 OpenWrt/procd 路径，单向 client -> server 封装。
+  - `mimic`：非 OpenWrt Linux、kernel > 6.1、GitHub latest release 安装，透明中间层。
+- 已支持链路延迟监测：Agent 定期探测，主控记录样本，前端展示当前延迟、丢包率、稳定度和历史曲线。
+- 已支持首页拓扑图：根据节点和受管链路自动渲染，节点可拖动保存位置，可一键还原自动布局。
+- 当前重点仍在前端拓扑/节点交互细节、真实系统兼容、mimic/udp2raw 边界和测试回归。
 
-- GRE/IPIP/VXLAN management.
-- Complex monitoring, alerting, or SLA scoring.
-- Redis, message queues, Prometheus, or distributed schedulers.
-- Multi-tenant enterprise permission models.
-- Kubernetes deployment.
+## 2. 产品边界
 
-The system is designed for small private or internal environments where simple
-deployment, readable code, and controlled network changes matter more than large
-scale automation.
+当前已覆盖：
 
-Product concept clarification:
+- 添加、编辑、删除节点。
+- 管理点对点 WireGuard 链路配置。
+- 通过节点 Agent 部署、启动、停止、读取、删除 WireGuard 配置。
+- 导入现有 `wg-quick` 配置，并防止重复导入已接管接口。
+- 创建完全受管的节点间 WireGuard 双向链路。
+- 对链路启用 udp2raw 或 mimic 中间层。
+- 对指定对端 IP 做延迟、丢包率和稳定度监测。
+- 在首页展示节点拓扑和链路状态。
 
-- Link42 treats one WireGuard config as one virtual cable.
-- One virtual cable connects exactly two endpoints.
-- One node can own many virtual cables, so the node detail page should show many
-  WireGuard configs.
-- A managed WireGuard config should contain exactly one `[Peer]`.
-- Multi-peer WireGuard configs may be imported for observation, but they are not
-  the first-release management target.
-- A manually managed config connects to a non-Link42 peer and uses change plans.
-- A Link42-managed node-to-node link owns two configs, one on each node, and
-  direct operations must update both sides together.
+当前不覆盖或暂不建议扩展：
+
+- GRE/IPIP/VXLAN 等非 WireGuard 连接方式的完整实现。
+- 多租户、RBAC、企业级权限体系。
+- Redis、消息队列、Prometheus、分布式调度。
+- Kubernetes 部署。
+- 多 Peer hub-spoke 作为受管配置直接管理。
+
+产品模型约束：
+
+- Link42 把一个 WireGuard 配置视为一根虚拟网线的一端。
+- 一根受管虚拟网线只连接两个端点。
+- 一个节点可以拥有多根虚拟网线，因此节点详情页展示多个 WireGuard 配置。
+- 受管 WireGuard 配置应含 exactly one `[Peer]`；草稿阶段允许暂时没有 Peer。
+- 多 Peer `wg-quick` 配置可以导入为观察记录，但不应直接作为受管配置部署。
+- 手动配置连接非 Link42 对端，使用 Change Plan + diff 确认。
+- Link42 受管节点间链路拥有两端配置，编辑、启动、停止、删除必须尽量保持双端一致。
 
 ## 2. Architecture
 
@@ -747,3 +759,72 @@ because imported environments may already contain unusual but working configs.
   必须用注释说明对应的安全决策。
 - 代码标识符可以继续使用英文，以保持工程一致性；但注释和 docstring
   应使用中文。
+
+## 13. 当前开发交接说明（2026-07-02）
+
+本轮开发集中在首页拓扑图、节点展示字段和交互修复，目的是让后续协作者清楚当前做到哪里、为什么这样做。
+
+### 已完成的拓扑相关能力
+
+- 后端 `nodes` 表新增：
+  - `region`：节点地域，用于拓扑节点卡片展示。
+  - `topology_endpoint`：拓扑图展示地址，由用户在节点设置中选择或输入。
+  - `topology_x` / `topology_y` / `topology_locked`：保存用户拖动后的拓扑位置。
+- 后端新增/调整接口：
+  - `GET /api/topology`：返回拓扑节点和受管链路。
+  - `PATCH /api/nodes/{node_id}/topology-position`：保存节点拖动坐标。
+  - `POST /api/topology/layout/reset`：清空所有自定义坐标，恢复自动布局。
+- 前端首页新增拓扑面板：
+  - 根据节点和受管 WireGuard 双向链路自动渲染。
+  - 节点卡片仅显示节点名称、节点地域和拓扑展示地址。
+  - 链路标签仅显示当前延迟和丢包率；稳定度通过线条颜色表达。
+  - 节点可以拖动并保存位置。
+  - 提供“还原拓扑”按钮，清空自定义位置。
+  - 隐藏 React Flow 迷你地图、控制按钮和 attribution，避免右下角空白/干扰。
+- 点击拓扑节点会展开对应节点卡片并滚动到节点位置。
+- 点击拓扑链路会展开本端节点并滚动到对应 WireGuard 配置行。
+
+### 拓扑实现取舍
+
+曾尝试根据节点相对方位动态计算上下左右连接点，并用直角线连接；实测视觉效果较差，且容易因 React Flow handle 细节导致连线消失。因此当前实现恢复为 React Flow 默认曲线边，只保留链路状态颜色、动画和标签。
+
+后续如果继续优化连线，应优先用 React Flow 官方自定义 edge/node 组件实现，并配合真实浏览器截图验证，避免只靠 TypeScript 构建通过。
+
+### 当前已知状态
+
+- 拓扑图仍属于第一版可用状态，不是最终视觉设计。
+- 节点位置保存依赖前端本地草稿 + 后端坐标持久化：拖动中使用草稿坐标预览，保存成功后由 `/api/topology` 返回的坐标接管。
+- 右上角刷新按钮会刷新：节点、拓扑、当前展开节点配置、当前配置 peer/受管连接详情、打开中的链路监测弹窗。
+- 节点拓扑展示地址使用统一 `EndpointSelect` 组件，选项主文本应显示真实地址，来源标签显示“节点地址 / 当前配置 / 原始 Endpoint”。
+
+### 最近验证命令
+
+本轮变更完成后已执行：
+
+```bash
+npm run build --prefix apps/web
+.venv/bin/pytest -q tests/test_point_to_point_rules.py
+.venv/bin/pytest -q
+git diff --check
+```
+
+测试结果：`126 passed`，仅有既有 DeprecationWarning。
+
+### 当前开发主控验收方式
+
+可用临时演示库 `/tmp/link42-topology-demo.db` 启动开发主控：
+
+```bash
+PYTHONPATH=apps/api:apps/agent:packages \
+LINK42_DATABASE_URL=sqlite:////tmp/link42-topology-demo.db \
+LINK42_WEB_DIST_DIR=/root/repo/link42/apps/web/dist \
+LINK42_AGENT_OFFLINE_AFTER_SECONDS=3600 \
+.venv/bin/uvicorn link42_api.main:app --host 0.0.0.0 --port 8000 --no-access-log
+```
+
+当前演示登录信息：
+
+```text
+用户名：pmman
+密码：pmman-demo
+```

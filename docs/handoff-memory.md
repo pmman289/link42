@@ -4,7 +4,7 @@
 
 ## 当前产品状态
 
-- Link42 是轻量级内网 WireGuard 节点和点对点链路管理面板。
+- Link42 是 WireGuard 点对点链路管理面板，当前偏向 DN42、家庭网络和小型内网场景。
 - 当前架构为中心 FastAPI + SQLite、React/Vite 前端、Python 节点 Agent。
 - 产品核心规则：一个 WireGuard 配置等同一根点对点虚拟网线；每个受管配置在部署前必须只有一个对端。
 - 前端主流程已经调整为层级结构：先看节点列表，点击在线节点后展开该节点的 WireGuard 配置列表，点击具体配置后打开配置和 peer 操作窗口。
@@ -91,14 +91,10 @@
 
 ## 当前未完成或刚提出的需求
 
-- 最新用户需求：把主控做成 Docker 镜像，并给出打包镜像脚本，预留配置文件目录供映射。
-- 建议实现方向：
-  - 增加 controller Dockerfile，多阶段构建前端并安装 FastAPI 后端。
-  - 容器默认监听 `0.0.0.0:8000`。
-  - 默认数据库建议放在 `/data/link42.db`，配置目录建议预留 `/config`。
-  - 后端可增加可选 `LINK42_WEB_DIST_DIR`，让 FastAPI 在同端口托管构建后的 React 静态文件。
-  - 增加 `scripts/controller/build-image.sh`，默认构建 `pmman/link42:latest`。
-  - 更新 `deploy/docker-compose.yml`，使用镜像或 build，并映射 `/data` 和 `/config`。
+- 当前刚完成的需求：统一项目描述为“WireGuard 点对点链路管理面板”，并同步 README、页面左上角文案、架构文档和交接记忆。
+- 当前主要开发焦点：拓扑图交互细节、前端体验、真实节点兼容性、udp2raw/mimic 中间层稳定性和测试回归。
+- 拓扑图已具备节点拖动、坐标保存、还原布局、链路延迟/丢包展示、点击节点/链路跳转等基础能力；当前连线样式已回退为 React Flow 默认曲线，不再使用动态边连接点。
+- 后续如果继续优化拓扑视觉，应使用官方自定义 edge/node 组件并做浏览器截图验证。
 
 ## 当前验证结果
 

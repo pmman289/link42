@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
-import { Background, Controls, MiniMap, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
+import { Background, MarkerType, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import CreatableSelect from "react-select/creatable";
@@ -12,9 +12,11 @@ type NodeItem = {
   id: number;
   name: string;
   hostname: string | null;
+  region: string | null;
   management_ip: string | null;
   public_ip: string | null;
   endpoint_ips: string[];
+  topology_endpoint: string | null;
   github_proxy_url: string | null;
   topology_x: number | null;
   topology_y: number | null;
@@ -100,7 +102,9 @@ type TopologyNode = {
   name: string;
   status: string;
   hostname: string | null;
+  region: string | null;
   endpoint_ips: string[];
+  topology_endpoint: string | null;
   agent_version: string | null;
   agent_platform: Record<string, unknown>;
   topology_x: number | null;
@@ -454,23 +458,6 @@ function formatLoss(value: number | null | undefined) {
   return typeof value === "number" ? `${(value * 100).toFixed(value > 0.01 ? 1 : 0)}%` : "--";
 }
 
-function middlewareLabel(value: string | null | undefined) {
-  if (value === "udp2raw") return "udp2raw";
-  if (value === "mimic") return "mimic";
-  return "直连";
-}
-
-function topologyNodeSystemLabel(node: TopologyNode): string {
-  const serviceManager = String(node.agent_platform?.service_manager || "");
-  const labels: Record<string, string> = {
-    "openwrt-uci": "OpenWrt / UCI",
-    systemd: "Linux / systemd",
-    openrc: "Linux / OpenRC",
-    "direct-wg-quick": "Linux / wg-quick",
-  };
-  return labels[serviceManager] || serviceManager || "未知系统";
-}
-
 function topologyEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "unknown" {
   if (edge.local_status !== "running" || edge.peer_status !== "running") return "critical";
   const statuses = [edge.local_monitor?.status, edge.peer_monitor?.status].filter(Boolean);
@@ -482,8 +469,12 @@ function topologyEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical
 
 function topologyEdgeSummary(edge: TopologyEdge) {
   const summary = edge.local_monitor || edge.peer_monitor;
-  if (!summary) return "未监测";
+  if (!summary) return "-- / --";
   return `${formatLatency(summary.last_latency_ms)} / ${formatLoss(summary.packet_loss)}`;
+}
+
+function topologyNodeEndpoint(node: TopologyNode) {
+  return node.topology_endpoint || node.endpoint_ips[0] || node.hostname || "未配置地址";
 }
 
 function firstIpFromCidrs(values: string[]) {
@@ -598,10 +589,16 @@ function endpointOptionsFrom(
   currentHost?: string | null,
 ): EndpointOption[] {
   return uniqueEndpointOptions([
-    ...(importedHost ? [{ value: importedHost, label: "原始 Endpoint", source: "imported" as const }] : []),
-    ...(currentHost ? [{ value: currentHost, label: "当前配置", source: "current" as const }] : []),
-    ...nodeHosts.map((host) => ({ value: host, label: "节点地址", source: "node" as const })),
+    ...(importedHost ? [{ value: importedHost, label: importedHost, source: "imported" as const }] : []),
+    ...(currentHost ? [{ value: currentHost, label: currentHost, source: "current" as const }] : []),
+    ...nodeHosts.map((host) => ({ value: host, label: host, source: "node" as const })),
   ]);
+}
+
+function endpointSourceLabel(source: EndpointOption["source"]) {
+  if (source === "imported") return "原始 Endpoint";
+  if (source === "current") return "当前配置";
+  return "节点地址";
 }
 
 function buildAgentCommand(node: NodeItem, controllerUrl: string = DEFAULT_CONTROLLER_URL): string {
@@ -739,7 +736,7 @@ function EndpointSelect({
         formatOptionLabel={(option) => (
           <div className="endpointSelectOption">
             <span>{option.value}</span>
-            <small>{option.label}</small>
+            <small>{endpointSourceLabel(option.source)}</small>
           </div>
         )}
       />
@@ -1087,6 +1084,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
+  const [topologyDraftPositions, setTopologyDraftPositions] = useState<Record<number, { x: number; y: number }>>({});
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
   const [configs, setConfigs] = useState<ConfigItem[]>([]);
   const [selectedConfigId, setSelectedConfigId] = useState<number | null>(null);
@@ -1214,8 +1212,9 @@ function App() {
     const radius = Math.max(180, Math.min(340, count * 42));
     return topology.nodes.map((node, index) => {
       const angle = (Math.PI * 2 * index) / count - Math.PI / 2;
-      const x = node.topology_x ?? 420 + Math.cos(angle) * radius;
-      const y = node.topology_y ?? 260 + Math.sin(angle) * radius;
+      const draft = topologyDraftPositions[node.id];
+      const x = draft?.x ?? node.topology_x ?? 420 + Math.cos(angle) * radius;
+      const y = draft?.y ?? node.topology_y ?? 260 + Math.sin(angle) * radius;
       const online = node.status === "online";
       return {
         id: String(node.id),
@@ -1227,9 +1226,8 @@ function App() {
                 <strong>{node.name}</strong>
                 <span className={online ? "statusDot online" : "statusDot"} />
               </div>
-              <small>{topologyNodeSystemLabel(node)}</small>
-              <span>{node.endpoint_ips[0] || node.hostname || "未配置入口"}</span>
-              {node.agent_version && <em>Agent {node.agent_version}</em>}
+              <small>{node.region || "未设置地域"}</small>
+              <span>{topologyNodeEndpoint(node)}</span>
             </div>
           ),
         },
@@ -1237,7 +1235,7 @@ function App() {
         className: online ? "topologyFlowNode online" : "topologyFlowNode",
       };
     });
-  }, [topology.nodes]);
+  }, [topology.nodes, topologyDraftPositions]);
   const topologyFlowEdges = useMemo<FlowEdge[]>(() =>
     topology.edges.map((edge) => {
       const tone = topologyEdgeTone(edge);
@@ -1245,9 +1243,10 @@ function App() {
         id: edge.id,
         source: String(edge.local_node_id),
         target: String(edge.peer_node_id),
-        label: `${edge.local_interface_name} -> ${edge.peer_interface_name} / ${middlewareLabel(edge.middleware_type)} / ${topologyEdgeSummary(edge)}`,
+        label: topologyEdgeSummary(edge),
         animated: edge.local_status === "running" && edge.peer_status === "running",
         className: `topologyEdge ${tone}`,
+        markerEnd: { type: MarkerType.ArrowClosed },
         data: edge,
       };
     }),
@@ -1259,22 +1258,49 @@ function App() {
     setSelectedConfigId(null);
     setPlan(null);
     setImportCandidatesExpanded(false);
+    window.setTimeout(() => {
+      document.querySelector(`[data-node-id="${nodeId}"]`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 180);
   };
 
   const handleTopologyNodeDragStop: OnNodeDrag = (_event, node) => {
     const nodeId = Number(node.id);
     void runAction(
-      () => saveTopologyPosition(nodeId, node.position.x, node.position.y),
+      async () => {
+        await saveTopologyPosition(nodeId, node.position.x, node.position.y);
+        setTopologyDraftPositions((current) => {
+          const next = { ...current };
+          delete next[nodeId];
+          return next;
+        });
+      },
       nodeActionKey(nodeId, "topology-position"),
     );
+  };
+
+  const handleTopologyNodeDrag: OnNodeDrag = (_event, node) => {
+    const nodeId = Number(node.id);
+    setTopologyDraftPositions((current) => ({
+      ...current,
+      [nodeId]: { x: node.position.x, y: node.position.y },
+    }));
   };
 
   const handleTopologyEdgeClick: EdgeMouseHandler = (_event, edge) => {
     const data = edge.data as TopologyEdge | undefined;
     if (!data) return;
     setSelectedNodeId(data.local_node_id);
-    setSelectedConfigId(null);
+    setSelectedConfigId(data.local_interface_id);
     setPlan(null);
+    window.setTimeout(() => {
+      document.querySelector(`[data-config-id="${data.local_interface_id}"]`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }, 180);
   };
 
   function notify(type: Toast["type"], text: string) {
@@ -1314,6 +1340,7 @@ function App() {
     setCurrentUser(null);
     setNodes([]);
     setTopology({ nodes: [], edges: [] });
+    setTopologyDraftPositions({});
     setSelectedNodeId(null);
     setConfigs([]);
     setSelectedConfigId(null);
@@ -1465,6 +1492,16 @@ function App() {
 
   async function refreshHome() {
     await Promise.all([refreshNodes(), refreshTopology()]);
+    if (selectedNodeId) {
+      await refreshConfigs(selectedNodeId, selectedConfigId);
+    }
+    if (selectedConfigId) {
+      await refreshPeer(selectedConfigId).catch(() => undefined);
+      await refreshManagedLink(selectedConfigId).catch(() => undefined);
+    }
+    if (monitorDialogConfigId) {
+      await refreshMonitorDetail(monitorDialogConfigId).catch(() => undefined);
+    }
   }
 
   async function saveTopologyPosition(nodeId: number, x: number, y: number) {
@@ -1487,6 +1524,21 @@ function App() {
           : node,
       ),
     );
+  }
+
+  async function resetTopologyLayout() {
+    const data = await api<TopologyResponse>("/api/topology/layout/reset", { method: "POST" });
+    setTopologyDraftPositions({});
+    setTopology(data);
+    setNodes((current) =>
+      current.map((node) => ({
+        ...node,
+        topology_x: null,
+        topology_y: null,
+        topology_locked: false,
+      })),
+    );
+    notify("success", "拓扑位置已还原为自动布局。");
   }
 
   async function refreshConfigs(nodeId: number, preferredConfigId?: number | null) {
@@ -1731,9 +1783,11 @@ function App() {
       body: JSON.stringify({
         name: form.get("name"),
         hostname: null,
+        region: String(form.get("region") || "").trim() || null,
         management_ip: endpointIps[0] || null,
         public_ip: endpointIps[0] || null,
         endpoint_ips: endpointIps,
+        topology_endpoint: String(form.get("topology_endpoint") || "").trim() || endpointIps[0] || null,
         github_proxy_url: null,
       }),
     });
@@ -1748,6 +1802,7 @@ function App() {
     formElement.reset();
     setNodeCreateOpen(false);
     await refreshNodes();
+    await refreshTopology();
     setSelectedNodeId(null);
   }
 
@@ -1767,12 +1822,15 @@ function App() {
         name: form.get("name"),
         endpoint_ips: endpointIps,
         hostname: editingNode.hostname,
+        region: String(form.get("region") || "").trim() || null,
         management_ip: endpointIps[0] || null,
         public_ip: endpointIps[0] || null,
+        topology_endpoint: String(form.get("topology_endpoint") || "").trim() || endpointIps[0] || null,
         github_proxy_url: String(form.get("github_proxy_url") || "").trim() || null,
       }),
     });
     setNodes((items) => items.map((item) => item.id === updated.id ? updated : item));
+    await refreshTopology();
     notify("success", "节点信息已保存。");
   }
 
@@ -2449,7 +2507,7 @@ function App() {
       <header className="topbar">
         <div>
           <h1>Link42</h1>
-          <p>轻量 WireGuard 点对点链路管理 / {currentUser || "pmman"}</p>
+          <p>WireGuard 点对点链路管理面板 / {currentUser || "pmman"}</p>
         </div>
         <div className="topbarActions">
           <button className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
@@ -2522,6 +2580,12 @@ function App() {
               <Field label="入口地址" hint="多个地址用逗号分隔，后续受管连接会从这里选择 Endpoint。" wide>
                 <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" required />
               </Field>
+              <Field label="节点地域" hint="拓扑图展示的地域，例如 广州 / 东京 / HomeLab。">
+                <input name="region" placeholder="广州" />
+              </Field>
+              <Field label="拓扑展示地址" hint="拓扑图展示的本机地址；留空使用第一个入口地址。">
+                <input name="topology_endpoint" placeholder="10.10.0.1" />
+              </Field>
               <button type="submit" disabled={actionPending("node:create")}><Plus size={16} /> {actionPending("node:create") ? "创建中" : "创建节点"}</button>
             </form>
           </section>
@@ -2544,8 +2608,19 @@ function App() {
               <Field label="节点名称" hint="修改后会同步显示在节点列表。">
                 <input name="name" placeholder="node-a" defaultValue={editingNode.name} required />
               </Field>
+              <Field label="节点地域" hint="拓扑图展示的地域，例如 广州 / 东京 / HomeLab。">
+                <input name="region" placeholder="广州" defaultValue={editingNode.region || ""} />
+              </Field>
               <Field label="入口地址" hint="多个地址用逗号分隔；受管连接会校验所选地址属于节点。" wide>
                 <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" defaultValue={nodeEndpointOptions(editingNode).join(", ")} required />
+              </Field>
+              <Field label="拓扑展示地址" hint="选择或输入拓扑节点卡片展示的本机地址；留空使用第一个入口地址。" wide>
+                <EndpointSelect
+                  name="topology_endpoint"
+                  options={endpointOptionsFrom(null, nodeEndpointOptions(editingNode), editingNode.topology_endpoint)}
+                  defaultValue={editingNode.topology_endpoint || ""}
+                  placeholder="选择或输入展示地址"
+                />
               </Field>
               <Field label="GitHub 代理 URL" hint="Agent 安装 GitHub release 插件时使用；留空则直连 GitHub。" wide>
                 <input name="github_proxy_url" placeholder="https://gh-proxy.example.com/" defaultValue={editingNode.github_proxy_url || ""} />
@@ -2984,7 +3059,17 @@ function App() {
               <h2><GitBranch size={18} /> 拓扑图</h2>
               <p className="muted">根据受管节点连接自动生成；拖动节点可保存自定义位置。</p>
             </div>
-            <span className="topologyMeta">{topology.nodes.length} 个节点 / {topology.edges.length} 条链路</span>
+            <div className="topologyToolbar">
+              <span className="topologyMeta">{topology.nodes.length} 个节点 / {topology.edges.length} 条链路</span>
+              <button
+                className="secondary"
+                type="button"
+                disabled={actionPending("topology:reset")}
+                onClick={() => void runAction(resetTopologyLayout, "topology:reset")}
+              >
+                <RefreshCw size={16} /> {actionPending("topology:reset") ? "还原中" : "还原拓扑"}
+              </button>
+            </div>
           </header>
           <div className="topologyCanvas">
             {topology.nodes.length === 0 ? (
@@ -2997,12 +3082,11 @@ function App() {
                 minZoom={0.35}
                 maxZoom={1.6}
                 onNodeClick={handleTopologyNodeClick}
+                onNodeDrag={handleTopologyNodeDrag}
                 onNodeDragStop={handleTopologyNodeDragStop}
                 onEdgeClick={handleTopologyEdgeClick}
               >
                 <Background color="#c9d7de" gap={18} />
-                <MiniMap pannable zoomable nodeColor={(node) => node.className?.includes("online") ? "#2b8a57" : "#b8c4cb"} />
-                <Controls showInteractive={false} />
               </ReactFlow>
             )}
           </div>
@@ -3013,7 +3097,7 @@ function App() {
             const expanded = node.id === selectedNodeId;
             const online = isNodeSelectable(node);
             return (
-              <section key={node.id} className={expanded ? "nodeCard expanded" : "nodeCard"}>
+              <section key={node.id} data-node-id={node.id} className={expanded ? "nodeCard expanded" : "nodeCard"}>
                 <div className="nodeBar">
                   <button
                     className="nodeHeader"
@@ -3118,6 +3202,7 @@ function App() {
                         configs.map((item) => (
                           <button
                             key={item.id}
+                            data-config-id={item.id}
                             className="configRow"
                             onClick={() => {
                               setSelectedConfigId(item.id);

@@ -439,7 +439,9 @@ def test_topology_returns_nodes_and_single_managed_edge() -> None:
             name="node-a",
             agent_token_hash="hash",
             status="online",
+            region="广州",
             endpoint_ips=["198.51.100.10"],
+            topology_endpoint="10.42.0.1",
             last_seen_at=datetime.utcnow(),
         )
         node_b = models.Node(
@@ -510,6 +512,8 @@ def test_topology_returns_nodes_and_single_managed_edge() -> None:
         topology = build_topology(session)
 
     assert [node.name for node in topology.nodes] == ["node-a", "node-b", "node-c"]
+    assert topology.nodes[0].region == "广州"
+    assert topology.nodes[0].topology_endpoint == "10.42.0.1"
     assert len(topology.edges) == 1
     assert topology.edges[0].local_interface_name == "wg-a"
     assert topology.edges[0].peer_interface_name == "wg-b"
@@ -535,6 +539,38 @@ def test_update_node_topology_position_persists_coordinates() -> None:
     assert updated.topology_x == 123.5
     assert updated.topology_y == 456.25
     assert updated.topology_locked is True
+
+
+def test_reset_topology_layout_clears_saved_coordinates() -> None:
+    """验证还原拓扑布局会清空所有节点自定义坐标。"""
+
+    from link42_api.main import reset_topology_layout
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="offline",
+            endpoint_ips=["10.0.0.1"],
+            topology_x=123.5,
+            topology_y=456.25,
+            topology_locked=True,
+        )
+        session.add(node)
+        session.commit()
+
+        topology = reset_topology_layout(session)
+        refreshed = session.get(models.Node, node.id)
+
+    assert refreshed is not None
+    assert refreshed.topology_x is None
+    assert refreshed.topology_y is None
+    assert refreshed.topology_locked is False
+    assert topology.nodes[0].topology_x is None
+    assert topology.nodes[0].topology_y is None
+    assert topology.nodes[0].topology_locked is False
 
 
 def test_sqlite_migration_adds_topology_columns() -> None:
@@ -564,7 +600,7 @@ def test_sqlite_migration_adds_topology_columns() -> None:
     finally:
         database.engine = original_engine
 
-    assert {"topology_x", "topology_y", "topology_locked"}.issubset(columns)
+    assert {"region", "topology_endpoint", "topology_x", "topology_y", "topology_locked"}.issubset(columns)
 
 
 def test_api_auth_exemptions_keep_health_login_and_agent_public() -> None:
