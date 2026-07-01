@@ -2543,7 +2543,7 @@ function App() {
               </button>
             </header>
             <form className="stack" onSubmit={(event) => void runAction(() => saveSettings(event), "settings:save")}>
-              <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.168.123.20:8000。">
+              <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.0.2.10:8000。">
                 <input name="controller_url" defaultValue={controllerUrl} placeholder={DEFAULT_CONTROLLER_URL} required />
               </Field>
               <Field label="用户名">
@@ -2575,7 +2575,7 @@ function App() {
                 <input name="name" placeholder="node-a" required />
               </Field>
               <Field label="主控地址" hint="Agent 安装时连接的 Link42 API 地址。">
-                <input name="controller_url" placeholder="http://192.168.123.20:8000" defaultValue={controllerUrl} required />
+                <input name="controller_url" placeholder="http://192.0.2.10:8000" defaultValue={controllerUrl} required />
               </Field>
               <Field label="入口地址" hint="多个地址用逗号分隔，后续受管连接会从这里选择 Endpoint。" wide>
                 <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" required />

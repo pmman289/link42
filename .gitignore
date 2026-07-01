@@ -22,3 +22,5 @@ dist/
 
 # 环境变量文件通常包含 token 或密码。
 .env
+.env.*
+scripts/release.env

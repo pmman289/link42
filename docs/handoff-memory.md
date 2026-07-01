@@ -17,9 +17,9 @@
 ## 当前本机测试环境
 
 - 工作目录：`/root/repo/link42`
-- 前端地址通常为：`http://192.168.123.20:5173/`
-- API 地址通常为：`http://192.168.123.20:8000`
-- API 健康检查：`http://192.168.123.20:8000/api/health`
+- 前端地址通常为：`http://192.0.2.10:5173/`
+- API 地址通常为：`http://192.0.2.10:8000`
+- API 健康检查：`http://192.0.2.10:8000/api/health`
 - 用户已授权测试/修复 Agent 在本机搭建真实开发测试环境：可以启动最新开发主控、使用临时测试数据库、安装/运行本机 Agent，并直接使用真实 `/etc/wireguard` 做测试；必须只操作测试专用接口名前缀如 `l42smoke*`，不能连接外部节点，结束后清理测试接口、配置和数据库。推荐执行 `scripts/smoke-real-local.sh` 做真实冒烟。
 - 已创建持久 Docker 双节点测试环境用于 udp2raw/跨节点 E2E：
   - 镜像：`link42-node-smoke:latest`
@@ -30,8 +30,8 @@
   - 容器支持 systemd、WireGuard、tcpdump，可真实启动 Agent 和 udp2raw systemd service；默认保留容器，不要随手删除。
 - 用户可能会要求清空数据库从头测，此时可以删除 `link42.db` 后重启 API。
 - 最近创建过两个本机测试节点，token 如下；如果数据库已清空则这些 token 已失效：
-  - `node1=l42agent_dWpxQBthT_4drtsuK_EDWEbtKXVl937RUchLawszIII`
-  - `node2=l42agent_hfx1eUJL5Gg8mLHTtOsujqRECLalGL5jrwpe_noWjzM`
+  - `node1=l42agent_xxx`
+  - `node2=l42agent_xxx`
 - 单机可同时跑两个 Agent 进程模拟两个节点，但必须为每个进程设置不同的 `LINK42_NODE_ID`、`LINK42_AGENT_TOKEN`，并谨慎处理真实 `/etc/wireguard` 接口名冲突。
 
 ## 最近完成的关键功能
@@ -87,7 +87,7 @@
 - 已添加 x64 Agent 单文件二进制构建脚本 `scripts/agent/build-x64.sh`。
 - 已添加 Agent 一键安装脚本 `deploy/sh/link42-agent.sh`，预期发布到 `https://get.pmman.tech/sh/link42-agent.sh`。
 - 前端节点安装命令已经改为使用上述安装脚本，并从 `https://get.pmman.tech/res/link42/` 下载二进制资源。
-- Git 仓库已初始化并推送过 first commit；远端为 `git@github.com:pmman289/link42.git`，提交身份为 `pmman <me@pmman.tech>`。
+- Git 仓库已初始化并推送过 first commit；远端和提交身份按实际环境配置。
 
 ## 当前未完成或刚提出的需求
 
@@ -128,7 +128,7 @@ npm run preview -- --host 0.0.0.0 --port 5173
 
 ```bash
 cd /root/repo/link42
-setsid env LINK42_SERVER_URL=http://192.168.123.20:8000 LINK42_NODE_ID=2 LINK42_AGENT_TOKEN=l42agent_YGhpdQRV5yBGkWhOo9Rxs9UzCmEqFW8x822OR7ETgsI LINK42_WIREGUARD_DIR=/etc/wireguard LINK42_AGENT_DRY_RUN=0 LINK42_POLL_INTERVAL=2 .venv/bin/python -m link42_agent.main > /tmp/link42-agent-node2.log 2>&1 < /dev/null &
+setsid env LINK42_SERVER_URL=http://192.0.2.10:8000 LINK42_NODE_ID=2 LINK42_AGENT_TOKEN=l42agent_xxx LINK42_WIREGUARD_DIR=/etc/wireguard LINK42_AGENT_DRY_RUN=0 LINK42_POLL_INTERVAL=2 .venv/bin/python -m link42_agent.main > /tmp/link42-agent-node2.log 2>&1 < /dev/null &
 ```
 
 构建 x64 Agent 二进制：
@@ -147,7 +147,7 @@ curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_SERVER_UR
 
 - 用户正在实机测试，不要主动清空数据库，除非用户明确要求。
 - Agent 是真实模式，不是 dry-run，会写 `/etc/wireguard` 并执行 `wg-quick`。
-- 家庭路由器 OpenWrt 测试环境可通过 `ssh mrouter` 访问，但这是用户真实家庭路由器，测试必须只做低风险检查，不要破坏现有网络环境。
+- 家庭路由器 OpenWrt 测试环境必须只做低风险检查，不要破坏现有网络环境。
 - 不要把 Agent 以前台命令启动，它会作为轮询进程阻塞当前交互。
 - 当前工作树出现过大量 `100644 -> 100755` 的文件模式变化，`git diff --stat` 为 0 行变更；不要把这些无关权限变化当业务修改提交。
 - FastAPI `TestClient` 在当前环境曾经挂起，测试更偏向 service/DB 层。

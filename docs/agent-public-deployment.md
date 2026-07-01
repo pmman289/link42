@@ -6,8 +6,8 @@
 静态站点服务器：
 
 ```text
-ssh aligz
-/opt/1panel/www/sites/get.pmman.tech/index
+ssh assets-host
+/srv/www/get.pmman.tech
 ```
 
 公开访问路径：
@@ -32,7 +32,7 @@ Agent 发布分两条线：
 服务器目录保持如下结构：
 
 ```text
-/opt/1panel/www/sites/get.pmman.tech/index/
+/srv/www/get.pmman.tech/
   sh/
     link42-agent.sh
   res/
@@ -120,16 +120,16 @@ PY
 创建远端目录：
 
 ```bash
-ssh aligz "mkdir -p /opt/1panel/www/sites/get.pmman.tech/index/sh /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION"
+ssh assets-host "mkdir -p /srv/www/get.pmman.tech/sh /srv/www/get.pmman.tech/res/link42/$AGENT_VERSION"
 ```
 
 上传安装脚本：
 
 ```bash
 scp deploy/sh/link42-agent.sh \
-  aligz:/opt/1panel/www/sites/get.pmman.tech/index/sh/link42-agent.sh
+  assets-host:/srv/www/get.pmman.tech/sh/link42-agent.sh
 
-ssh aligz "chmod 0755 /opt/1panel/www/sites/get.pmman.tech/index/sh/link42-agent.sh"
+ssh assets-host "chmod 0755 /srv/www/get.pmman.tech/sh/link42-agent.sh"
 ```
 
 上传 latest 产物：
@@ -140,7 +140,7 @@ scp dist/agent/link42-agent-linux-x64 \
   dist/agent/link42-agent-source.tar.gz \
   dist/agent/link42-agent-source.tar.gz.sha256 \
   dist/agent/manifest.json \
-  aligz:/opt/1panel/www/sites/get.pmman.tech/index/res/link42/
+  assets-host:/srv/www/get.pmman.tech/res/link42/
 ```
 
 上传固定版本产物：
@@ -150,13 +150,13 @@ scp dist/agent/link42-agent-linux-x64* \
   dist/agent/link42-agent-source.tar.gz \
   dist/agent/link42-agent-source.tar.gz.sha256 \
   dist/agent/manifest.json \
-  aligz:/opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/
+  assets-host:/srv/www/get.pmman.tech/res/link42/$AGENT_VERSION/
 ```
 
 修正权限：
 
 ```bash
-ssh aligz "chmod 0755 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/link42-agent-linux-x64 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/link42-agent-linux-x64* && chmod 0644 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/link42-agent-source.tar.gz /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/link42-agent-source.tar.gz /opt/1panel/www/sites/get.pmman.tech/index/res/link42/*.sha256 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/*.sha256 /opt/1panel/www/sites/get.pmman.tech/index/res/link42/manifest.json /opt/1panel/www/sites/get.pmman.tech/index/res/link42/$AGENT_VERSION/manifest.json"
+ssh assets-host "chmod 0755 /srv/www/get.pmman.tech/res/link42/link42-agent-linux-x64 /srv/www/get.pmman.tech/res/link42/$AGENT_VERSION/link42-agent-linux-x64* && chmod 0644 /srv/www/get.pmman.tech/res/link42/link42-agent-source.tar.gz /srv/www/get.pmman.tech/res/link42/$AGENT_VERSION/link42-agent-source.tar.gz /srv/www/get.pmman.tech/res/link42/*.sha256 /srv/www/get.pmman.tech/res/link42/$AGENT_VERSION/*.sha256 /srv/www/get.pmman.tech/res/link42/manifest.json /srv/www/get.pmman.tech/res/link42/$AGENT_VERSION/manifest.json"
 ```
 
 ## 发布后验证
