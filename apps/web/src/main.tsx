@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
+import { Background, Controls, MiniMap, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
@@ -14,6 +16,9 @@ type NodeItem = {
   public_ip: string | null;
   endpoint_ips: string[];
   github_proxy_url: string | null;
+  topology_x: number | null;
+  topology_y: number | null;
+  topology_locked: boolean;
   agent_token_value: string | null;
   agent_version: string | null;
   agent_protocol_version: number | null;
@@ -88,6 +93,39 @@ type LinkMonitorSamplesResponse = {
   monitor: LinkMonitor;
   summary: LinkMonitorSummary | null;
   samples: LinkMonitorSample[];
+};
+
+type TopologyNode = {
+  id: number;
+  name: string;
+  status: string;
+  hostname: string | null;
+  endpoint_ips: string[];
+  agent_version: string | null;
+  agent_platform: Record<string, unknown>;
+  topology_x: number | null;
+  topology_y: number | null;
+  topology_locked: boolean;
+};
+
+type TopologyEdge = {
+  id: string;
+  local_node_id: number;
+  peer_node_id: number;
+  local_interface_id: number;
+  peer_interface_id: number;
+  local_interface_name: string;
+  peer_interface_name: string;
+  local_status: string;
+  peer_status: string;
+  middleware_type: string | null;
+  local_monitor: LinkMonitorSummary | null;
+  peer_monitor: LinkMonitorSummary | null;
+};
+
+type TopologyResponse = {
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
 };
 
 type PeerItem = {
@@ -414,6 +452,38 @@ function formatLatency(value: number | null | undefined) {
 
 function formatLoss(value: number | null | undefined) {
   return typeof value === "number" ? `${(value * 100).toFixed(value > 0.01 ? 1 : 0)}%` : "--";
+}
+
+function middlewareLabel(value: string | null | undefined) {
+  if (value === "udp2raw") return "udp2raw";
+  if (value === "mimic") return "mimic";
+  return "直连";
+}
+
+function topologyNodeSystemLabel(node: TopologyNode): string {
+  const serviceManager = String(node.agent_platform?.service_manager || "");
+  const labels: Record<string, string> = {
+    "openwrt-uci": "OpenWrt / UCI",
+    systemd: "Linux / systemd",
+    openrc: "Linux / OpenRC",
+    "direct-wg-quick": "Linux / wg-quick",
+  };
+  return labels[serviceManager] || serviceManager || "未知系统";
+}
+
+function topologyEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "unknown" {
+  if (edge.local_status !== "running" || edge.peer_status !== "running") return "critical";
+  const statuses = [edge.local_monitor?.status, edge.peer_monitor?.status].filter(Boolean);
+  if (statuses.includes("critical")) return "critical";
+  if (statuses.includes("warning")) return "warning";
+  if (statuses.includes("healthy")) return "healthy";
+  return "unknown";
+}
+
+function topologyEdgeSummary(edge: TopologyEdge) {
+  const summary = edge.local_monitor || edge.peer_monitor;
+  if (!summary) return "未监测";
+  return `${formatLatency(summary.last_latency_ms)} / ${formatLoss(summary.packet_loss)}`;
 }
 
 function firstIpFromCidrs(values: string[]) {
@@ -1016,6 +1086,7 @@ function App() {
   const [settingsUsername, setSettingsUsername] = useState("pmman");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
+  const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
   const [configs, setConfigs] = useState<ConfigItem[]>([]);
   const [selectedConfigId, setSelectedConfigId] = useState<number | null>(null);
@@ -1138,6 +1209,73 @@ function App() {
   );
   const editLocalEndpointDefault = managedLink?.peer_peer.endpoint_host || selectedLocalEndpoints[0] || "";
   const editPeerEndpointDefault = managedLink?.local_peer.endpoint_host || selectedManagedLinkPeerEndpoints[0] || "";
+  const topologyFlowNodes = useMemo<FlowNode[]>(() => {
+    const count = Math.max(topology.nodes.length, 1);
+    const radius = Math.max(180, Math.min(340, count * 42));
+    return topology.nodes.map((node, index) => {
+      const angle = (Math.PI * 2 * index) / count - Math.PI / 2;
+      const x = node.topology_x ?? 420 + Math.cos(angle) * radius;
+      const y = node.topology_y ?? 260 + Math.sin(angle) * radius;
+      const online = node.status === "online";
+      return {
+        id: String(node.id),
+        position: { x, y },
+        data: {
+          label: (
+            <div className={online ? "topologyNode online" : "topologyNode"}>
+              <div className="topologyNodeHeader">
+                <strong>{node.name}</strong>
+                <span className={online ? "statusDot online" : "statusDot"} />
+              </div>
+              <small>{topologyNodeSystemLabel(node)}</small>
+              <span>{node.endpoint_ips[0] || node.hostname || "未配置入口"}</span>
+              {node.agent_version && <em>Agent {node.agent_version}</em>}
+            </div>
+          ),
+        },
+        draggable: true,
+        className: online ? "topologyFlowNode online" : "topologyFlowNode",
+      };
+    });
+  }, [topology.nodes]);
+  const topologyFlowEdges = useMemo<FlowEdge[]>(() =>
+    topology.edges.map((edge) => {
+      const tone = topologyEdgeTone(edge);
+      return {
+        id: edge.id,
+        source: String(edge.local_node_id),
+        target: String(edge.peer_node_id),
+        label: `${edge.local_interface_name} -> ${edge.peer_interface_name} / ${middlewareLabel(edge.middleware_type)} / ${topologyEdgeSummary(edge)}`,
+        animated: edge.local_status === "running" && edge.peer_status === "running",
+        className: `topologyEdge ${tone}`,
+        data: edge,
+      };
+    }),
+  [topology.edges]);
+
+  const handleTopologyNodeClick: NodeMouseHandler = (_event, node) => {
+    const nodeId = Number(node.id);
+    setSelectedNodeId(nodeId);
+    setSelectedConfigId(null);
+    setPlan(null);
+    setImportCandidatesExpanded(false);
+  };
+
+  const handleTopologyNodeDragStop: OnNodeDrag = (_event, node) => {
+    const nodeId = Number(node.id);
+    void runAction(
+      () => saveTopologyPosition(nodeId, node.position.x, node.position.y),
+      nodeActionKey(nodeId, "topology-position"),
+    );
+  };
+
+  const handleTopologyEdgeClick: EdgeMouseHandler = (_event, edge) => {
+    const data = edge.data as TopologyEdge | undefined;
+    if (!data) return;
+    setSelectedNodeId(data.local_node_id);
+    setSelectedConfigId(null);
+    setPlan(null);
+  };
 
   function notify(type: Toast["type"], text: string) {
     // 右上角 toast 避免把所有消息堆在主页主流程里。
@@ -1175,6 +1313,7 @@ function App() {
     setAuthToken("");
     setCurrentUser(null);
     setNodes([]);
+    setTopology({ nodes: [], edges: [] });
     setSelectedNodeId(null);
     setConfigs([]);
     setSelectedConfigId(null);
@@ -1275,7 +1414,7 @@ function App() {
     setAuthToken(result.token);
     setCurrentUser(result.username);
     await refreshSettings();
-    await refreshNodes();
+    await refreshHome();
   }
 
   async function logout() {
@@ -1317,6 +1456,37 @@ function App() {
     // 刷新节点列表；节点必须由用户主动点选，离线节点不能进入下级菜单。
     const data = await api<NodeItem[]>("/api/nodes");
     setNodes(data);
+  }
+
+  async function refreshTopology() {
+    const data = await api<TopologyResponse>("/api/topology");
+    setTopology(data);
+  }
+
+  async function refreshHome() {
+    await Promise.all([refreshNodes(), refreshTopology()]);
+  }
+
+  async function saveTopologyPosition(nodeId: number, x: number, y: number) {
+    await api<NodeItem>(`/api/nodes/${nodeId}/topology-position`, {
+      method: "PATCH",
+      body: JSON.stringify({ x, y, locked: true }),
+    });
+    setTopology((current) => ({
+      ...current,
+      nodes: current.nodes.map((node) =>
+        node.id === nodeId
+          ? { ...node, topology_x: x, topology_y: y, topology_locked: true }
+          : node,
+      ),
+    }));
+    setNodes((current) =>
+      current.map((node) =>
+        node.id === nodeId
+          ? { ...node, topology_x: x, topology_y: y, topology_locked: true }
+          : node,
+      ),
+    );
   }
 
   async function refreshConfigs(nodeId: number, preferredConfigId?: number | null) {
@@ -1408,7 +1578,7 @@ function App() {
         const me = await api<{ authenticated: boolean; username: string | null }>("/api/auth/me");
         setCurrentUser(me.username);
         await refreshSettings();
-        await refreshNodes();
+        await refreshHome();
       } catch {
         clearAuthenticatedState();
       } finally {
@@ -1421,7 +1591,7 @@ function App() {
   useEffect(() => {
     if (!authToken) return;
     const timer = window.setInterval(() => {
-      refreshNodes().catch((error) => {
+      refreshHome().catch((error) => {
         if (!(error instanceof Error && error.message.startsWith("401:"))) {
           notify("error", error instanceof Error ? error.message : String(error));
         }
@@ -2285,7 +2455,7 @@ function App() {
           <button className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
             <Settings size={18} />
           </button>
-          <button className="iconButton" onClick={() => void runAction(refreshNodes)} title="刷新">
+          <button className="iconButton" onClick={() => void runAction(refreshHome)} title="刷新">
             <RefreshCw size={18} />
           </button>
           <button className="iconButton" onClick={() => void runAction(logout)} title="退出">
@@ -2806,6 +2976,36 @@ function App() {
             <p className="muted">先创建节点并填写可被其它节点访问的入口地址。</p>
           </div>
           <button type="button" onClick={() => setNodeCreateOpen(true)}><Plus size={16} /> 添加节点</button>
+        </section>
+
+        <section className="topologyPanel">
+          <header className="topologyHeader">
+            <div>
+              <h2><GitBranch size={18} /> 拓扑图</h2>
+              <p className="muted">根据受管节点连接自动生成；拖动节点可保存自定义位置。</p>
+            </div>
+            <span className="topologyMeta">{topology.nodes.length} 个节点 / {topology.edges.length} 条链路</span>
+          </header>
+          <div className="topologyCanvas">
+            {topology.nodes.length === 0 ? (
+              <div className="empty">创建节点和受管连接后会显示拓扑。</div>
+            ) : (
+              <ReactFlow
+                nodes={topologyFlowNodes}
+                edges={topologyFlowEdges}
+                fitView
+                minZoom={0.35}
+                maxZoom={1.6}
+                onNodeClick={handleTopologyNodeClick}
+                onNodeDragStop={handleTopologyNodeDragStop}
+                onEdgeClick={handleTopologyEdgeClick}
+              >
+                <Background color="#c9d7de" gap={18} />
+                <MiniMap pannable zoomable nodeColor={(node) => node.className?.includes("online") ? "#2b8a57" : "#b8c4cb"} />
+                <Controls showInteractive={false} />
+              </ReactFlow>
+            )}
+          </div>
         </section>
 
         <div className="nodeList">

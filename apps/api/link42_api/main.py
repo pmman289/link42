@@ -1117,6 +1117,91 @@ def interface_read(db: Session, interface: models.WireGuardInterface) -> schemas
     return result
 
 
+def build_topology(db: Session) -> schemas.TopologyRead:
+    """汇总节点与受管双向链路，供首页拓扑图渲染。"""
+
+    nodes = list(db.scalars(select(models.Node).order_by(models.Node.id)))
+    changed = False
+    for node in nodes:
+        old_status = node.status
+        refresh_node_runtime_status(node)
+        changed = changed or node.status != old_status
+    if changed:
+        db.commit()
+
+    interfaces = list(
+        db.scalars(
+            select(models.WireGuardInterface)
+            .options(selectinload(models.WireGuardInterface.peers))
+            .where(models.WireGuardInterface.source == "managed-node")
+            .order_by(models.WireGuardInterface.id)
+        )
+    )
+    interface_by_id = {interface.id: interface for interface in interfaces}
+    edges: list[schemas.TopologyEdge] = []
+    seen_pairs: set[tuple[int, int]] = set()
+    for interface in interfaces:
+        local_peer = next(
+            (peer for peer in interface.peers if peer.peer_interface_id and peer.source == "managed-node"),
+            None,
+        )
+        if local_peer is None or local_peer.peer_interface_id not in interface_by_id:
+            continue
+        peer_interface = interface_by_id[local_peer.peer_interface_id]
+        peer_peer = next(
+            (
+                peer
+                for peer in peer_interface.peers
+                if peer.peer_interface_id == interface.id and peer.source == "managed-node"
+            ),
+            None,
+        )
+        if peer_peer is None:
+            continue
+        pair = tuple(sorted((interface.id, peer_interface.id)))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        middleware = managed_link_middleware(interface) or managed_link_middleware(peer_interface)
+        local_monitor = interface_monitor(db, interface.id)
+        peer_monitor = interface_monitor(db, peer_interface.id)
+        edges.append(
+            schemas.TopologyEdge(
+                id=f"wg-{pair[0]}-{pair[1]}",
+                local_node_id=interface.node_id,
+                peer_node_id=peer_interface.node_id,
+                local_interface_id=interface.id,
+                peer_interface_id=peer_interface.id,
+                local_interface_name=interface.name,
+                peer_interface_name=peer_interface.name,
+                local_status=interface.runtime_status,
+                peer_status=peer_interface.runtime_status,
+                middleware_type=middleware.get("type") if middleware else None,
+                local_monitor=summarize_monitor(db, local_monitor) if local_monitor else None,
+                peer_monitor=summarize_monitor(db, peer_monitor) if peer_monitor else None,
+            )
+        )
+
+    return schemas.TopologyRead(
+        nodes=[
+            schemas.TopologyNode(
+                id=node.id,
+                name=node.name,
+                status=node.status,
+                hostname=node.hostname,
+                endpoint_ips=node.endpoint_ips or [],
+                agent_version=node.agent_version,
+                agent_platform=node.agent_platform or {},
+                topology_x=node.topology_x,
+                topology_y=node.topology_y,
+                topology_locked=bool(node.topology_locked),
+            )
+            for node in nodes
+        ],
+        edges=edges,
+    )
+
+
 def monitor_read(db: Session, monitor: models.LinkMonitor, window: timedelta = MONITOR_SUMMARY_WINDOW) -> schemas.LinkMonitorRead:
     """把监测目标转成带摘要的响应。"""
 
@@ -1729,6 +1814,13 @@ def list_nodes(db: Session = Depends(get_db)) -> list[models.Node]:
     return nodes
 
 
+@app.get("/api/topology", response_model=schemas.TopologyRead)
+def get_topology(db: Session = Depends(get_db)) -> schemas.TopologyRead:
+    """返回首页拓扑图所需的节点和受管链路。"""
+
+    return build_topology(db)
+
+
 @app.get("/api/nodes/{node_id}", response_model=schemas.NodeRead)
 def get_node(node_id: int, db: Session = Depends(get_db)) -> models.Node:
     """读取单个节点详情。"""
@@ -1740,6 +1832,25 @@ def get_node(node_id: int, db: Session = Depends(get_db)) -> models.Node:
     if node.status != old_status:
         db.commit()
         db.refresh(node)
+    return node
+
+
+@app.patch("/api/nodes/{node_id}/topology-position", response_model=schemas.NodeRead)
+def update_node_topology_position(
+    node_id: int,
+    payload: schemas.TopologyPositionUpdate,
+    db: Session = Depends(get_db),
+) -> models.Node:
+    """保存用户在拓扑图中拖拽后的节点位置。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    node.topology_x = payload.x
+    node.topology_y = payload.y
+    node.topology_locked = True if payload.locked is None else payload.locked
+    db.commit()
+    db.refresh(node)
     return node
 
 

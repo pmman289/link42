@@ -75,6 +75,9 @@ class NodeRead(BaseModel):
     public_ip: str | None
     endpoint_ips: list[str]
     github_proxy_url: str | None = None
+    topology_x: float | None = None
+    topology_y: float | None = None
+    topology_locked: bool = False
     agent_token_value: str | None
     agent_version: str | None = None
     agent_protocol_version: int | None = None
@@ -243,6 +246,45 @@ class LinkMonitorSummary(BaseModel):
     status: str
     sample_count: int
     last_checked_at: datetime | None = None
+
+
+class TopologyPositionUpdate(BaseModel):
+    x: float
+    y: float
+    locked: bool | None = None
+
+
+class TopologyNode(BaseModel):
+    id: int
+    name: str
+    status: str
+    hostname: str | None = None
+    endpoint_ips: list[str] = Field(default_factory=list)
+    agent_version: str | None = None
+    agent_platform: dict[str, Any] = Field(default_factory=dict)
+    topology_x: float | None = None
+    topology_y: float | None = None
+    topology_locked: bool = False
+
+
+class TopologyEdge(BaseModel):
+    id: str
+    local_node_id: int
+    peer_node_id: int
+    local_interface_id: int
+    peer_interface_id: int
+    local_interface_name: str
+    peer_interface_name: str
+    local_status: str
+    peer_status: str
+    middleware_type: str | None = None
+    local_monitor: LinkMonitorSummary | None = None
+    peer_monitor: LinkMonitorSummary | None = None
+
+
+class TopologyRead(BaseModel):
+    nodes: list[TopologyNode]
+    edges: list[TopologyEdge]
 
 
 class LinkMonitorCreate(BaseModel):

@@ -213,6 +213,7 @@ textarea {
 }
 
 .nodeCreate,
+.topologyPanel,
 .nodeCard,
 .modalPanel {
   background: rgba(255, 255, 255, 0.94);
@@ -231,6 +232,7 @@ textarea {
 }
 
 .nodeCreate h2,
+.topologyPanel h2,
 .modalPanel h2 {
   display: flex;
   align-items: center;
@@ -238,6 +240,139 @@ textarea {
   margin: 0 0 12px;
   font-size: 18px;
   letter-spacing: 0;
+}
+
+.topologyPanel {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.topologyHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+}
+
+.topologyMeta {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  border-radius: 999px;
+  border: 1px solid #d5e0e6;
+  background: #f7fafb;
+  color: #53636d;
+  padding: 4px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.topologyCanvas {
+  height: clamp(360px, 48vh, 560px);
+  overflow: hidden;
+  border: 1px solid #dbe4e9;
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(247, 251, 252, 0.9), rgba(238, 245, 247, 0.9)),
+    #f4f8fa;
+}
+
+.topologyCanvas .empty {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  margin: 0;
+}
+
+.topologyFlowNode {
+  width: 178px;
+  border: 0;
+  background: transparent;
+}
+
+.topologyFlowNode .react-flow__handle {
+  opacity: 0;
+}
+
+.topologyNode {
+  display: grid;
+  gap: 4px;
+  width: 178px;
+  border: 1px solid #d5e0e6;
+  border-left: 4px solid #aebbc3;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 10px 26px rgba(30, 45, 55, 0.12);
+  padding: 10px 12px;
+  color: #18232b;
+}
+
+.topologyNode.online {
+  border-left-color: #2b8a57;
+}
+
+.topologyNodeHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.topologyNodeHeader strong,
+.topologyNode span,
+.topologyNode small,
+.topologyNode em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topologyNode small {
+  color: #5a6d78;
+}
+
+.topologyNode span,
+.topologyNode em {
+  color: #687982;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.statusDot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #aebbc3;
+}
+
+.statusDot.online {
+  background: #2b8a57;
+  box-shadow: 0 0 0 3px rgba(43, 138, 87, 0.14);
+}
+
+.topologyEdge .react-flow__edge-path {
+  stroke-width: 2.5;
+  stroke: #8ea3ad;
+}
+
+.topologyEdge.healthy .react-flow__edge-path {
+  stroke: #2b8a57;
+}
+
+.topologyEdge.warning .react-flow__edge-path {
+  stroke: #b68a1a;
+}
+
+.topologyEdge.critical .react-flow__edge-path {
+  stroke: #b64646;
+}
+
+.topologyEdge .react-flow__edge-text {
+  fill: #33424a;
+  font-size: 11px;
 }
 
 .nodeCreateForm {

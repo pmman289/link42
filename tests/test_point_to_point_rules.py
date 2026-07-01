@@ -30,6 +30,7 @@ from link42_api.main import (
     agent_register,
     agent_task_result,
     build_agent_upgrade_plan,
+    build_topology,
     enqueue_interface_task_once,
     ensure_unique_interface_name,
     get_controller_settings,
@@ -58,6 +59,7 @@ from link42_api.main import (
     update_managed_link,
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
+    update_node_topology_position,
 )
 from link42_api.schemas import (
     AgentTaskResultRequest,
@@ -77,6 +79,7 @@ from link42_api.schemas import (
     AgentUpgradeRequest,
     LinkMonitorCreate,
     Udp2RawMiddlewareConfig,
+    TopologyPositionUpdate,
 )
 from link42_common.security import hash_token, verify_token
 from link42_api.wireguard_service import build_diff, count_enabled_peers, render_interface_config
@@ -424,6 +427,144 @@ def test_openwrt_read_config_keeps_deployed_baseline_and_allows_start(monkeypatc
 
     assert len(tasks) == 1
     assert tasks[0].payload["interface_id"] == interface.id
+
+
+def test_topology_returns_nodes_and_single_managed_edge() -> None:
+    """验证拓扑只基于受管双向链路生成边，且同一链路不会重复。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+        )
+        node_c = models.Node(
+            name="node-c",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.30"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b, node_c])
+        session.flush()
+        wg_a = models.WireGuardInterface(
+            node_id=node_a.id,
+            name="wg-a",
+            source="managed-node",
+            runtime_status="running",
+            extras={"middleware": {"enabled": True, "type": "mimic"}},
+        )
+        wg_b = models.WireGuardInterface(
+            node_id=node_b.id,
+            name="wg-b",
+            source="managed-node",
+            runtime_status="running",
+            extras={"middleware": {"enabled": True, "type": "mimic"}},
+        )
+        unmanaged = models.WireGuardInterface(
+            node_id=node_c.id,
+            name="wg-imported",
+            source="imported",
+            runtime_status="running",
+        )
+        session.add_all([wg_a, wg_b, unmanaged])
+        session.flush()
+        session.add_all(
+            [
+                models.WireGuardPeer(
+                    interface_id=wg_a.id,
+                    peer_node_id=node_b.id,
+                    peer_interface_id=wg_b.id,
+                    public_key="b",
+                    source="managed-node",
+                ),
+                models.WireGuardPeer(
+                    interface_id=wg_b.id,
+                    peer_node_id=node_a.id,
+                    peer_interface_id=wg_a.id,
+                    public_key="a",
+                    source="managed-node",
+                ),
+                models.WireGuardPeer(
+                    interface_id=unmanaged.id,
+                    peer_node_id=node_a.id,
+                    peer_interface_id=wg_a.id,
+                    public_key="ignored",
+                    source="created",
+                ),
+            ]
+        )
+        session.commit()
+
+        topology = build_topology(session)
+
+    assert [node.name for node in topology.nodes] == ["node-a", "node-b", "node-c"]
+    assert len(topology.edges) == 1
+    assert topology.edges[0].local_interface_name == "wg-a"
+    assert topology.edges[0].peer_interface_name == "wg-b"
+    assert topology.edges[0].middleware_type == "mimic"
+
+
+def test_update_node_topology_position_persists_coordinates() -> None:
+    """验证拖拽拓扑节点后坐标会写回节点记录。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="offline", endpoint_ips=["10.0.0.1"])
+        session.add(node)
+        session.commit()
+
+        updated = update_node_topology_position(
+            node.id,
+            TopologyPositionUpdate(x=123.5, y=456.25),
+            session,
+        )
+
+    assert updated.topology_x == 123.5
+    assert updated.topology_y == 456.25
+    assert updated.topology_locked is True
+
+
+def test_sqlite_migration_adds_topology_columns() -> None:
+    """验证旧 SQLite nodes 表启动时会补齐拓扑坐标列。"""
+
+    import link42_api.database as database
+
+    engine = create_engine("sqlite:///:memory:")
+    original_engine = database.engine
+    try:
+        database.engine = engine
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE nodes (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        name VARCHAR(80) NOT NULL,
+                        agent_token_hash VARCHAR(128) NOT NULL
+                    )
+                    """
+                )
+            )
+        ensure_sqlite_point_to_point_constraints()
+        with engine.connect() as connection:
+            columns = {row[1] for row in connection.execute(text("PRAGMA table_info(nodes)")).fetchall()}
+    finally:
+        database.engine = original_engine
+
+    assert {"topology_x", "topology_y", "topology_locked"}.issubset(columns)
 
 
 def test_api_auth_exemptions_keep_health_login_and_agent_public() -> None:
