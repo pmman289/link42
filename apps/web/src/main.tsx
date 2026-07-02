@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
 import { Background, MarkerType, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -1142,6 +1142,8 @@ function App() {
   const [importCandidatesExpanded, setImportCandidatesExpanded] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deleteNodeConfig, setDeleteNodeConfig] = useState(false);
+  const [topologyFullscreenOpen, setTopologyFullscreenOpen] = useState(false);
+  const [topologyResetConfirmOpen, setTopologyResetConfirmOpen] = useState(false);
   const [monitorDialogConfigId, setMonitorDialogConfigId] = useState<number | null>(null);
   const [monitorWindow, setMonitorWindow] = useState("1h");
   const [monitorDetail, setMonitorDetail] = useState<LinkMonitorSamplesResponse | null>(null);
@@ -1638,6 +1640,7 @@ function App() {
         topology_locked: false,
       })),
     );
+    setTopologyResetConfirmOpen(false);
     notify("success", "拓扑位置已还原为自动布局。");
   }
 
@@ -2604,6 +2607,30 @@ function App() {
     }
   }
 
+  function renderTopologyCanvas(extraClassName = "") {
+    return (
+      <div className={extraClassName ? `topologyCanvas ${extraClassName}` : "topologyCanvas"}>
+        {topology.nodes.length === 0 ? (
+          <div className="empty">创建节点和受管连接后会显示拓扑。</div>
+        ) : (
+          <ReactFlow
+            nodes={topologyFlowNodes}
+            edges={topologyFlowEdges}
+            fitView
+            minZoom={0.2}
+            maxZoom={1.8}
+            onNodeClick={handleTopologyNodeClick}
+            onNodeDrag={handleTopologyNodeDrag}
+            onNodeDragStop={handleTopologyNodeDragStop}
+            onEdgeClick={handleTopologyEdgeClick}
+          >
+            <Background color="#c9d7de" gap={18} />
+          </ReactFlow>
+        )}
+      </div>
+    );
+  }
+
   if (!authChecked) {
     return <main className="app loginPage" />;
   }
@@ -2669,6 +2696,55 @@ function App() {
           </div>
         ))}
       </div>
+
+      {topologyFullscreenOpen && (
+        <div className="modalBackdrop topologyFullscreenBackdrop" role="presentation">
+          <section className="modalPanel topologyFullscreenModal" role="dialog" aria-modal="true" aria-labelledby="topology-fullscreen-title">
+            <header className="modalHeader topologyFullscreenHeader">
+              <div>
+                <h2 id="topology-fullscreen-title"><GitBranch size={18} /> 拓扑图</h2>
+                <p className="muted">{topology.nodes.length} 个节点 / {topology.edges.length} 条链路；拖动节点可保存位置。</p>
+              </div>
+              <div className="topologyToolbar">
+                <button
+                  className="secondary"
+                  type="button"
+                  disabled={actionPending("topology:reset")}
+                  onClick={() => setTopologyResetConfirmOpen(true)}
+                >
+                  <RefreshCw size={16} /> {actionPending("topology:reset") ? "还原中" : "还原拓扑"}
+                </button>
+                <button className="iconButton" onClick={() => setTopologyFullscreenOpen(false)} title="关闭">
+                  <X size={18} />
+                </button>
+              </div>
+            </header>
+            {renderTopologyCanvas("topologyCanvasFullscreen")}
+          </section>
+        </div>
+      )}
+
+      {topologyResetConfirmOpen && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel compactModal" role="dialog" aria-modal="true" aria-labelledby="topology-reset-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="topology-reset-title"><RefreshCw size={18} /> 还原拓扑</h2>
+                <p className="muted">这会清空所有节点的自定义拓扑位置，并重新使用自动布局。</p>
+              </div>
+              <button className="iconButton" onClick={() => setTopologyResetConfirmOpen(false)} disabled={actionPending("topology:reset")}>
+                <X size={18} />
+              </button>
+            </header>
+            <div className="actionRow">
+              <button className="secondary" onClick={() => setTopologyResetConfirmOpen(false)} disabled={actionPending("topology:reset")}>取消</button>
+              <button className="danger" disabled={actionPending("topology:reset")} onClick={() => void runAction(resetTopologyLayout, "topology:reset")}>
+                <RefreshCw size={16} /> {actionPending("topology:reset") ? "还原中" : "确认还原"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {settingsOpen && (
         <div className="modalBackdrop" role="presentation">
@@ -3213,32 +3289,21 @@ function App() {
               <button
                 className="secondary"
                 type="button"
+                onClick={() => setTopologyFullscreenOpen(true)}
+              >
+                <Maximize2 size={16} /> 全屏
+              </button>
+              <button
+                className="secondary"
+                type="button"
                 disabled={actionPending("topology:reset")}
-                onClick={() => void runAction(resetTopologyLayout, "topology:reset")}
+                onClick={() => setTopologyResetConfirmOpen(true)}
               >
                 <RefreshCw size={16} /> {actionPending("topology:reset") ? "还原中" : "还原拓扑"}
               </button>
             </div>
           </header>
-          <div className="topologyCanvas">
-            {topology.nodes.length === 0 ? (
-              <div className="empty">创建节点和受管连接后会显示拓扑。</div>
-            ) : (
-              <ReactFlow
-                nodes={topologyFlowNodes}
-                edges={topologyFlowEdges}
-                fitView
-                minZoom={0.35}
-                maxZoom={1.6}
-                onNodeClick={handleTopologyNodeClick}
-                onNodeDrag={handleTopologyNodeDrag}
-                onNodeDragStop={handleTopologyNodeDragStop}
-                onEdgeClick={handleTopologyEdgeClick}
-              >
-                <Background color="#c9d7de" gap={18} />
-              </ReactFlow>
-            )}
-          </div>
+          {renderTopologyCanvas()}
         </section>
 
         <div className="nodeList" aria-label="按地域分组的节点列表">

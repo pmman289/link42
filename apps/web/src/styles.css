@@ -343,6 +343,28 @@ textarea {
   display: none;
 }
 
+.topologyFullscreenBackdrop {
+  padding: 14px;
+}
+
+.topologyFullscreenModal {
+  width: min(100%, 1600px);
+  height: calc(100vh - 28px);
+  max-height: calc(100vh - 28px);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.topologyFullscreenHeader {
+  margin-bottom: 12px;
+}
+
+.topologyCanvasFullscreen {
+  height: 100%;
+  min-height: 0;
+}
+
 .topologyFlowNode {
   width: 178px;
   border: 0;
