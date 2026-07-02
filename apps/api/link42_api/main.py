@@ -231,6 +231,8 @@ def require_web_session(request: Request, db: Session) -> None:
 async def require_api_authentication(request: Request, call_next):
     """为所有非白名单 API 统一加 Web 鉴权，避免遗漏单个路由。"""
 
+    if request.method == "OPTIONS":
+        return await call_next(request)
     if request.url.path.startswith("/api/") and not is_api_auth_exempt(request.url.path):
         db = next(get_db())
         try:

@@ -298,6 +298,24 @@ def test_web_login_rotates_session_token() -> None:
     assert verify_token(result.token, session_hash)
 
 
+def test_web_login_replaces_previous_session_token() -> None:
+    """验证最后一次登录会挤掉上一次 Web 会话。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        set_setting(session, SETTING_ADMIN_PASSWORD_HASH, hash_token("secret-pass"))
+        session.commit()
+
+        first = login(LoginRequest(username=ADMIN_USERNAME, password="secret-pass"), session)
+        second = login(LoginRequest(username=ADMIN_USERNAME, password="secret-pass"), session)
+        session_hash = get_setting(session, SETTING_ADMIN_SESSION_HASH)
+
+    assert session_hash is not None
+    assert not verify_token(first.token, session_hash)
+    assert verify_token(second.token, session_hash)
+
+
 def test_web_login_rejects_wrong_password() -> None:
     """验证错误密码不会通过 Web 登录。"""
 

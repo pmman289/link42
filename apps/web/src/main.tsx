@@ -294,14 +294,14 @@ function optionalInt(value: FormDataEntryValue | null): number | null {
 async function api<T>(path: string, options?: RequestInit & { skipAuth?: boolean }): Promise<T> {
   // 统一封装 fetch，集中处理 JSON 和错误信息。
   const token = options?.skipAuth ? "" : window.localStorage.getItem(AUTH_TOKEN_KEY);
-  const { skipAuth: _skipAuth, ...fetchOptions } = options || {};
+  const { skipAuth: _skipAuth, headers, ...fetchOptions } = options || {};
   const response = await fetch(`${API_BASE}${path}`, {
+    ...fetchOptions,
     headers: {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(fetchOptions.headers || {}),
+      ...(headers || {}),
     },
-    ...fetchOptions,
   });
   if (!response.ok) {
     const text = await response.text();
