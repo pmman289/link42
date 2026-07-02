@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Pencil, Plus, RefreshCw, Server, Settings, Upload, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Pencil, Plus, RefreshCw, Server, Settings, Sun, Upload, X } from "lucide-react";
 import { Background, MarkerType, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -274,9 +274,16 @@ const DEFAULT_SITE_TITLE = "Link42";
 const DEFAULT_SITE_LOGO_URL = "/logo.png";
 const AUTH_TOKEN_KEY = "link42.authToken";
 const AUTH_EXPIRED_EVENT = "link42:auth-expired";
+const THEME_KEY = "link42.theme";
 const TASK_POLL_INTERVAL_MS = 2000;
 const AGENT_TASK_POLL_LIMIT = 90;
 const SHORT_TASK_POLL_LIMIT = 30;
+
+function initialTheme(): "light" | "dark" {
+  const saved = window.localStorage.getItem(THEME_KEY);
+  if (saved === "light" || saved === "dark") return saved;
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
 
 function splitList(value: string): string[] {
   // 将输入框中的逗号或换行分隔内容转换成 API 需要的数组；不要按冒号切分，IPv6 会用到 "::"。
@@ -1107,6 +1114,7 @@ function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [loginError, setLoginError] = useState("");
+  const [theme, setTheme] = useState<"light" | "dark">(() => initialTheme());
   const [controllerUrl, setControllerUrl] = useState(DEFAULT_CONTROLLER_URL);
   const [settingsUsername, setSettingsUsername] = useState("pmman");
   const [siteTitle, setSiteTitle] = useState(DEFAULT_SITE_TITLE);
@@ -1137,6 +1145,7 @@ function App() {
   const [udp2rawEnabled, setUdp2rawEnabled] = useState(false);
   const [mimicEnabled, setMimicEnabled] = useState(false);
   const [udp2rawServerSide, setUdp2rawServerSide] = useState<"local" | "peer">("peer");
+  const initializedManagedLinkDraftConfigIdRef = useRef<number | null>(null);
   const [managedCreateMtu, setManagedCreateMtu] = useState("1420");
   const [peerNodeConfigs, setPeerNodeConfigs] = useState<ConfigItem[]>([]);
   const [importCandidatesExpanded, setImportCandidatesExpanded] = useState(false);
@@ -1230,6 +1239,7 @@ function App() {
   const selectedManagedLinkPeerEndpoints = selectedManagedLinkPeerNode
     ? nodeEndpointOptions(selectedManagedLinkPeerNode)
     : [];
+  const topologyGridColor = theme === "dark" ? "#2c4654" : "#c9d7de";
   const replaceLocalConfig = replaceLocalConfigId
     ? configs.find((item) => item.id === replaceLocalConfigId) || null
     : null;
@@ -1767,6 +1777,11 @@ function App() {
   }, [siteTitle]);
 
   useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
     return () => {
       if (settingsLogoPreviewUrl.startsWith("blob:")) {
         URL.revokeObjectURL(settingsLogoPreviewUrl);
@@ -1828,7 +1843,22 @@ function App() {
   }, [selectedConfigId, selectedConfigIsManagedLink]);
 
   useEffect(() => {
-    if (!managedLink?.middleware) return;
+    if (!selectedConfigId || !selectedConfigIsManagedLink || !managedLink) {
+      initializedManagedLinkDraftConfigIdRef.current = null;
+      return;
+    }
+    const belongsToSelectedConfig =
+      managedLink.local_interface.id === selectedConfigId || managedLink.peer_interface.id === selectedConfigId;
+    if (!belongsToSelectedConfig || initializedManagedLinkDraftConfigIdRef.current === selectedConfigId) return;
+
+    initializedManagedLinkDraftConfigIdRef.current = selectedConfigId;
+    if (!managedLink.middleware) {
+      setMiddlewareType("none");
+      setUdp2rawEnabled(false);
+      setMimicEnabled(false);
+      setUdp2rawServerSide("peer");
+      return;
+    }
     if (managedLink.middleware.type === "udp2raw") {
       setMiddlewareType("udp2raw");
       setUdp2rawEnabled(Boolean(managedLink.middleware.enabled));
@@ -1838,8 +1868,9 @@ function App() {
       setMiddlewareType("mimic");
       setUdp2rawEnabled(false);
       setMimicEnabled(Boolean(managedLink.middleware.enabled));
+      setUdp2rawServerSide("peer");
     }
-  }, [managedLink?.middleware]);
+  }, [selectedConfigId, selectedConfigIsManagedLink, managedLink]);
 
   useEffect(() => {
     if (!monitorDialogConfigId) return;
@@ -2624,7 +2655,7 @@ function App() {
             onNodeDragStop={handleTopologyNodeDragStop}
             onEdgeClick={handleTopologyEdgeClick}
           >
-            <Background color="#c9d7de" gap={18} />
+            <Background color={topologyGridColor} gap={18} />
           </ReactFlow>
         )}
       </div>
@@ -2677,6 +2708,13 @@ function App() {
           </div>
         </div>
         <div className="topbarActions">
+          <button
+            className="iconButton"
+            onClick={() => setTheme((value) => (value === "dark" ? "light" : "dark"))}
+            title={theme === "dark" ? "切换到日间模式" : "切换到夜间模式"}
+          >
+            {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+          </button>
           <button className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
             <Settings size={18} />
           </button>
