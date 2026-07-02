@@ -354,6 +354,8 @@ function translateApiDetail(detail: string): string {
     "peer endpoint address is not registered on node": "对端入口地址不属于所选节点",
     "at least one endpoint address is required": "本端或对端至少需要填写一个入口地址",
     "udp2raw server endpoint address is required": "udp2raw server 侧需要可连接的入口地址，或填写 server connect host",
+    "mimic requires endpoint address on both sides": "启用 mimic 时双方入口地址都必须填写",
+    "mimic requires WireGuard listen port on both sides": "启用 mimic 时双方 WireGuard ListenPort 都必须填写",
     "mimic peer endpoint port is required": "mimic 对端 Endpoint 需要端口或对端 ListenPort",
     "mimic local endpoint port is required": "mimic 本端 Endpoint 需要端口或本端 ListenPort",
     "wireguard tool is not installed": "主控缺少 wg 工具，无法自动生成密钥",
@@ -1040,10 +1042,19 @@ function readMimicForm(form: FormData): Record<string, unknown> | null {
   };
 }
 
-function validateMimicForm(mimic: Record<string, unknown> | null, localListenPort: number | null, peerListenPort: number | null) {
+function validateMimicForm(
+  mimic: Record<string, unknown> | null,
+  localListenPort: number | null,
+  peerListenPort: number | null,
+  localEndpointHost: string,
+  peerEndpointHost: string,
+) {
   if (!mimic) return;
   if (!mimic.local_bind_interface || !mimic.peer_bind_interface) {
     throw new Error("mimic 需要选择双方出口网卡");
+  }
+  if (!localEndpointHost || !peerEndpointHost) {
+    throw new Error("mimic 需要双方入口地址都填写");
   }
   if (!localListenPort || !peerListenPort) {
     throw new Error("mimic 透明匹配需要双方 WireGuard ListenPort 都填写");
@@ -1108,6 +1119,7 @@ function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
   const [configs, setConfigs] = useState<ConfigItem[]>([]);
   const [selectedConfigId, setSelectedConfigId] = useState<number | null>(null);
+  const selectedConfigIdRef = useRef<number | null>(null);
   const [peer, setPeer] = useState<PeerItem | null>(null);
   const [managedLink, setManagedLink] = useState<ManagedLink | null>(null);
   const [importCandidates, setImportCandidates] = useState<ImportCandidate[]>([]);
@@ -1135,6 +1147,10 @@ function App() {
   const [monitorDetail, setMonitorDetail] = useState<LinkMonitorSamplesResponse | null>(null);
   const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
   const topologyEdgeSelectionRef = useRef<number | null>(null);
+  function selectConfigId(configId: number | null) {
+    selectedConfigIdRef.current = configId;
+    setSelectedConfigId(configId);
+  }
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) || null,
     [nodes, selectedNodeId],
@@ -1295,7 +1311,7 @@ function App() {
   const handleTopologyNodeClick: NodeMouseHandler = (_event, node) => {
     const nodeId = Number(node.id);
     setSelectedNodeId(nodeId);
-    setSelectedConfigId(null);
+    selectConfigId(null);
     setPlan(null);
     setImportCandidatesExpanded(false);
     window.setTimeout(() => {
@@ -1334,7 +1350,7 @@ function App() {
     if (!data) return;
     topologyEdgeSelectionRef.current = data.local_node_id === selectedNodeId ? null : data.local_interface_id;
     setSelectedNodeId(data.local_node_id);
-    setSelectedConfigId(data.local_interface_id);
+    selectConfigId(data.local_interface_id);
     setPlan(null);
     window.setTimeout(() => {
       document.querySelector(`[data-config-id="${data.local_interface_id}"]`)?.scrollIntoView({
@@ -1384,7 +1400,7 @@ function App() {
     setTopologyDraftPositions({});
     setSelectedNodeId(null);
     setConfigs([]);
-    setSelectedConfigId(null);
+    selectConfigId(null);
     setPeer(null);
     setManagedLink(null);
     setImportCandidates([]);
@@ -1625,15 +1641,21 @@ function App() {
     notify("success", "拓扑位置已还原为自动布局。");
   }
 
-  async function refreshConfigs(nodeId: number, preferredConfigId?: number | null) {
+  async function refreshConfigs(
+    nodeId: number,
+    preferredConfigId?: number | null,
+    options: { forceSelect?: boolean } = {},
+  ) {
     // 刷新某个节点下的 WireGuard 点对点配置列表。
     const data = await api<ConfigItem[]>(`/api/nodes/${nodeId}/wireguard/configs`);
     setConfigs(data);
-    const existing = selectedConfigId && data.some((item) => item.id === selectedConfigId);
-    if (preferredConfigId && data.some((item) => item.id === preferredConfigId)) {
-      setSelectedConfigId(preferredConfigId);
+    const currentConfigId = selectedConfigIdRef.current;
+    const existing = currentConfigId && data.some((item) => item.id === currentConfigId);
+    const preferredExists = preferredConfigId != null && data.some((item) => item.id === preferredConfigId);
+    if (preferredExists && (options.forceSelect || currentConfigId === preferredConfigId)) {
+      selectConfigId(preferredConfigId);
     } else if (!existing) {
-      setSelectedConfigId(null);
+      selectConfigId(null);
     }
   }
 
@@ -1764,7 +1786,7 @@ function App() {
       const preferredConfigId = topologyEdgeSelectionRef.current;
       topologyEdgeSelectionRef.current = null;
       if (!preferredConfigId) {
-        setSelectedConfigId(null);
+        selectConfigId(null);
       }
       setPlan(null);
       setManagedPeerNodeId(null);
@@ -1773,7 +1795,7 @@ function App() {
     } else {
       topologyEdgeSelectionRef.current = null;
       setConfigs([]);
-      setSelectedConfigId(null);
+      selectConfigId(null);
       setImportCandidates([]);
       setPlan(null);
     }
@@ -1954,7 +1976,7 @@ function App() {
     await api<{ status: string }>(`/api/nodes/${editingNode.id}`, { method: "DELETE" });
     if (selectedNodeId === editingNode.id) {
       setSelectedNodeId(null);
-      setSelectedConfigId(null);
+      selectConfigId(null);
       setConfigs([]);
       setImportCandidates([]);
       setPlan(null);
@@ -2158,7 +2180,7 @@ function App() {
       });
     }
     formElement.reset();
-    await refreshConfigs(selectedNodeId, item.id);
+    await refreshConfigs(selectedNodeId, item.id, { forceSelect: mode === "create" });
     setPlan(null);
     if (mode === "create") {
       setCreateDialog(null);
@@ -2211,7 +2233,7 @@ function App() {
       throw new Error("本端或对端至少需要填写一个入口地址");
     }
     validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
-    validateMimicForm(mimic, localListenPort, peerListenPort);
+    validateMimicForm(mimic, localListenPort, peerListenPort, localEndpointHost, peerEndpointHost);
     if (replaceLocalConfigId && !replacePeerConfigId) {
       throw new Error("请选择对端的导入配置覆盖项");
     }
@@ -2248,7 +2270,7 @@ function App() {
       },
     );
     formElement.reset();
-    await refreshConfigs(selectedNodeId, result.local_interface.id);
+    await refreshConfigs(selectedNodeId, result.local_interface.id, { forceSelect: true });
     setPlan(null);
     setManagedPeerNodeId(null);
     setReplaceLocalConfigId(null);
@@ -2262,7 +2284,9 @@ function App() {
     [1000, 2500, 4500].forEach((delay) => {
       window.setTimeout(() => {
         void refreshConfigs(selectedNodeId, result.local_interface.id);
-        void refreshManagedLink(result.local_interface.id);
+        if (selectedConfigIdRef.current === result.local_interface.id) {
+          void refreshManagedLink(result.local_interface.id);
+        }
       }, delay);
     });
     notify("success", `已创建 ${result.local_interface.name} / ${result.peer_interface.name}，两端部署和开机自启任务已下发。`);
@@ -2359,8 +2383,9 @@ function App() {
       throw new Error("PersistentKeepalive 必须是 0-65535 之间的整数");
     }
     validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
-    validateMimicForm(mimic, localListenPort, peerListenPort);
-    await api<ManagedLink>(`/api/wireguard/configs/${selectedConfigId}/managed-link`, {
+    validateMimicForm(mimic, localListenPort, peerListenPort, localEndpointHost, peerEndpointHost);
+    const configId = selectedConfigId;
+    await api<ManagedLink>(`/api/wireguard/configs/${configId}/managed-link`, {
       method: "PATCH",
       body: JSON.stringify({
         local_interface_name: form.get("local_interface_name"),
@@ -2386,11 +2411,13 @@ function App() {
         mimic,
       }),
     });
-    await refreshConfigs(selectedNodeId, selectedConfigId);
+    await refreshConfigs(selectedNodeId, configId);
     [1000, 2500, 4500].forEach((delay) => {
       window.setTimeout(() => {
-        void refreshConfigs(selectedNodeId, selectedConfigId);
-        void refreshManagedLink(selectedConfigId);
+        void refreshConfigs(selectedNodeId, configId);
+        if (selectedConfigIdRef.current === configId) {
+          void refreshManagedLink(configId);
+        }
       }, delay);
     });
     notify("success", "受管连接已保存，并已直接下发双方配置。");
@@ -2477,7 +2504,7 @@ function App() {
     }
     setDeleteDialogOpen(false);
     setDeleteNodeConfig(false);
-    setSelectedConfigId(null);
+    selectConfigId(null);
     setPlan(null);
     await refreshConfigs(selectedNodeId, null);
     await refreshImportCandidates(selectedNodeId);
@@ -2556,7 +2583,7 @@ function App() {
     notify("success", `已导入 ${item.name}，当前仍未接管管理。`);
     await refreshConfigs(selectedNodeId);
     await refreshImportCandidates(selectedNodeId);
-    setSelectedConfigId(item.id);
+    selectConfigId(item.id);
   }
 
   async function takeOverConfig() {
@@ -3005,7 +3032,7 @@ function App() {
                 <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
-              <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。udp2raw 会按 server 侧地址接管 Endpoint。">
+              <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。启用 mimic 时双方入口都必填。">
               <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址；本端不可被拨入时可留空。">
                 <EndpointSelect
                   key={`managed-local-endpoint-${replacePeerConfigId || "none"}-${managedLocalEndpointDefault}`}
@@ -3253,7 +3280,7 @@ function App() {
                           disabled={!online}
                           onClick={() => {
                             setSelectedNodeId(expanded ? null : node.id);
-                            setSelectedConfigId(null);
+                            selectConfigId(null);
                             setPlan(null);
                             setImportCandidatesExpanded(false);
                           }}
@@ -3354,7 +3381,7 @@ function App() {
                                   data-config-id={item.id}
                                   className="configRow"
                                   onClick={() => {
-                                    setSelectedConfigId(item.id);
+                                    selectConfigId(item.id);
                                     setPlan(null);
                                   }}
                                 >
@@ -3401,7 +3428,7 @@ function App() {
               <button
                 className="iconButton"
                 onClick={() => {
-                  setSelectedConfigId(null);
+                  selectConfigId(null);
                   setPlan(null);
                 }}
               >
@@ -3444,7 +3471,7 @@ function App() {
                       <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。udp2raw 会按 server 侧地址接管 Endpoint。">
+                  <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。启用 mimic 时双方入口都必填。">
                     <Field label="本端入口地址" hint="对端连接本节点时使用；本端不可被拨入时可留空。">
                       <EndpointSelect
                         key={`edit-local-endpoint-${editLocalEndpointDefault}`}
@@ -3661,7 +3688,7 @@ function App() {
                         className="secondary"
                         disabled={!selectedNodeOnline}
                         onClick={() => {
-                          setSelectedConfigId(null);
+                          selectConfigId(null);
                           setPlan(null);
                           openManagedCreateDialog({ replaceLocalConfigId: selectedConfig.id });
                         }}

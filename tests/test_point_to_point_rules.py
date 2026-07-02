@@ -1872,7 +1872,7 @@ def test_create_managed_link_with_mimic_enqueues_mimic_tasks(monkeypatch) -> Non
                 peer_interface_name="wg-b",
                 local_tunnel_ips=["10.42.0.1/32"],
                 peer_tunnel_ips=["10.42.0.2/32"],
-                local_endpoint_host=None,
+                local_endpoint_host="198.51.100.10",
                 peer_endpoint_host="198.51.100.20",
                 local_listen_port=51820,
                 peer_listen_port=51821,
@@ -1893,11 +1893,74 @@ def test_create_managed_link_with_mimic_enqueues_mimic_tasks(monkeypatch) -> Non
     assert local_peer is not None
     assert local_peer.endpoint_host == "198.51.100.20"
     assert local_peer.endpoint_port == 51821
-    assert [task.type for task in tasks].count("middleware.mimic.apply") == 1
+    assert [task.type for task in tasks].count("middleware.mimic.apply") == 2
     assert [task.type for task in tasks].count("wireguard.apply_config") == 2
     mimic_payloads = [task.payload for task in tasks if task.type == "middleware.mimic.apply"]
-    assert [payload["bind_interface"] for payload in mimic_payloads] == ["eth0"]
-    assert mimic_payloads[0]["peer_host"] == "198.51.100.20"
+    assert {payload["bind_interface"] for payload in mimic_payloads} == {"eth0", "eth1"}
+    assert {payload["peer_host"] for payload in mimic_payloads} == {"198.51.100.10", "198.51.100.20"}
+
+
+def test_create_managed_link_with_mimic_requires_both_endpoints(monkeypatch) -> None:
+    """验证 mimic 必须知道双方真实 Endpoint，避免被动回包无法被透明处理。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=[],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.2",
+            agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+            agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12", "is_openwrt": False},
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.2",
+            agent_capabilities=["wireguard", "middleware.mimic", "service:systemd"],
+            agent_platform={"os": "linux", "service_manager": "systemd", "kernel_version": "6.6.12", "is_openwrt": False},
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_managed_link(
+                node_a.id,
+                ManagedLinkCreate(
+                    peer_node_id=node_b.id,
+                    local_interface_name="wg-a",
+                    peer_interface_name="wg-b",
+                    local_tunnel_ips=["10.42.0.1/32"],
+                    peer_tunnel_ips=["10.42.0.2/32"],
+                    local_endpoint_host=None,
+                    peer_endpoint_host="198.51.100.20",
+                    local_listen_port=51820,
+                    peer_listen_port=51821,
+                    mimic=MimicMiddlewareConfig(
+                        enabled=True,
+                        local_bind_interface="eth0",
+                        peer_bind_interface="eth1",
+                    ),
+                ),
+                session,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "mimic requires endpoint address on both sides"
 
 
 def test_update_managed_link_disabling_mimic_enqueues_cleanup_tasks(monkeypatch) -> None:
@@ -1945,7 +2008,7 @@ def test_update_managed_link_disabling_mimic_enqueues_cleanup_tasks(monkeypatch)
                 peer_interface_name="wg-b",
                 local_tunnel_ips=["10.42.0.1/32"],
                 peer_tunnel_ips=["10.42.0.2/32"],
-                local_endpoint_host=None,
+                local_endpoint_host="198.51.100.10",
                 peer_endpoint_host="198.51.100.20",
                 local_listen_port=51820,
                 peer_listen_port=51821,

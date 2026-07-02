@@ -879,6 +879,10 @@ def mimic_endpoint_payloads(
 
     if not middleware or middleware.get("type") != "mimic":
         return []
+    if not local_endpoint or not peer_endpoint:
+        raise HTTPException(status_code=400, detail="mimic requires endpoint address on both sides")
+    if local_interface.listen_port is None or peer_interface.listen_port is None:
+        raise HTTPException(status_code=400, detail="mimic requires WireGuard listen port on both sides")
     instance = middleware_instance_name(local_interface, peer_interface)
     common = {
         "plugin": "mimic",
@@ -889,13 +893,12 @@ def mimic_endpoint_payloads(
         "keepalive_interval": middleware.get("keepalive_interval"),
         "padding": middleware.get("padding"),
     }
-    payloads: list[tuple[models.WireGuardInterface, str, dict]] = []
-    if peer_endpoint:
-        peer_endpoint = require_mimic_ip(peer_endpoint, "mimic peer endpoint")
-        local_peer_port = peer_endpoint_port or peer_interface.listen_port
-        if local_peer_port is None:
-            raise HTTPException(status_code=400, detail="mimic peer endpoint port is required")
-        payloads.append((
+    peer_endpoint = require_mimic_ip(peer_endpoint, "mimic peer endpoint")
+    local_endpoint = require_mimic_ip(local_endpoint, "mimic local endpoint")
+    local_peer_port = peer_endpoint_port or peer_interface.listen_port
+    peer_peer_port = local_endpoint_port or local_interface.listen_port
+    return [
+        (
             local_interface,
             "middleware.mimic.apply",
             {
@@ -907,13 +910,8 @@ def mimic_endpoint_payloads(
                 "peer_port": local_peer_port,
                 "filter_origin": "remote",
             },
-        ))
-    if local_endpoint:
-        local_endpoint = require_mimic_ip(local_endpoint, "mimic local endpoint")
-        peer_peer_port = local_endpoint_port or local_interface.listen_port
-        if peer_peer_port is None:
-            raise HTTPException(status_code=400, detail="mimic local endpoint port is required")
-        payloads.append((
+        ),
+        (
             peer_interface,
             "middleware.mimic.apply",
             {
@@ -925,8 +923,8 @@ def mimic_endpoint_payloads(
                 "peer_port": peer_peer_port,
                 "filter_origin": "remote",
             },
-        ))
-    return payloads
+        ),
+    ]
 
 
 def enqueue_mimic_tasks(
