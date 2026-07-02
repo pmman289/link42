@@ -1110,6 +1110,84 @@ def test_apply_config_enables_openrc_service_when_requested(tmp_path: Path, monk
     assert ["rc-service", "wg-quick@wg0", "restart"] in commands
 
 
+def test_apply_config_creates_openrc_wg_quick_symlink_when_missing(tmp_path: Path, monkeypatch) -> None:
+    """验证 Alpine 只有 wg-quick 模板服务时会生成接口软链接并启动。"""
+
+    commands: list[list[str]] = []
+    init_dir = tmp_path / "init.d"
+    init_dir.mkdir()
+    template = init_dir / "wg-quick"
+    template.write_text("#!/sbin/openrc-run\n", encoding="utf-8")
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        if command[:2] == ["rc-service", "--exists"]:
+            return command_result(command, returncode=1)
+        if command == ["rc-service", "wg-quick.wg0", "status"]:
+            return command_result(command, returncode=3, stdout="stopped\n")
+        if command == ["rc-update", "show", "default"]:
+            return command_result(command, stdout="")
+        if command == ["rc-update", "add", "wg-quick.wg0", "default"]:
+            return command_result(command)
+        if command == ["rc-service", "wg-quick.wg0", "restart"]:
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=False, openrc=True)
+    monkeypatch.setattr(service_manager, "OPENRC_INIT_DIR", init_dir)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+
+    result = system.apply_wireguard_config(
+        {"interface_name": "wg0", "config": "[Interface]\nPrivateKey = private\n", "enable_on_boot": True},
+        wireguard_dir=str(tmp_path),
+    )
+
+    script = init_dir / "wg-quick.wg0"
+    assert result["service"]["manager"] == "openrc"
+    assert script.is_symlink()
+    assert script.resolve() == template
+    assert ["rc-update", "add", "wg-quick.wg0", "default"] in commands
+    assert ["rc-service", "wg-quick.wg0", "restart"] in commands
+
+
+def test_apply_config_creates_link42_openrc_service_without_template(tmp_path: Path, monkeypatch) -> None:
+    """验证没有发行版 wg-quick 模板时仍能生成 Link42 自管服务。"""
+
+    commands: list[list[str]] = []
+    init_dir = tmp_path / "init.d"
+    init_dir.mkdir()
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        if command[:2] == ["rc-service", "--exists"]:
+            return command_result(command, returncode=1)
+        if command == ["rc-service", "link42-wg-quick.wg0", "status"]:
+            return command_result(command, returncode=3, stdout="stopped\n")
+        if command == ["rc-update", "show", "default"]:
+            return command_result(command, stdout="")
+        if command == ["rc-update", "add", "link42-wg-quick.wg0", "default"]:
+            return command_result(command)
+        if command == ["rc-service", "link42-wg-quick.wg0", "restart"]:
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=False, openrc=True)
+    monkeypatch.setattr(service_manager, "OPENRC_INIT_DIR", init_dir)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+
+    result = system.apply_wireguard_config(
+        {"interface_name": "wg0", "config": "[Interface]\nPrivateKey = private\n", "enable_on_boot": True},
+        wireguard_dir=str(tmp_path),
+    )
+
+    script = init_dir / "link42-wg-quick.wg0"
+    assert result["service"]["manager"] == "openrc"
+    assert script.exists()
+    assert "wg-quick up wg0" in script.read_text(encoding="utf-8")
+    assert ["rc-update", "add", "link42-wg-quick.wg0", "default"] in commands
+    assert ["rc-service", "link42-wg-quick.wg0", "restart"] in commands
+
+
 def test_stop_interface_uses_openrc_for_managed_service(monkeypatch) -> None:
     """验证 OpenRC 管理接口停止时使用 rc-service stop。"""
 

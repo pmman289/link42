@@ -12,6 +12,7 @@ CommandRunner = Callable[[list[str], bool], dict[str, Any]]
 
 SYSTEMD_ENABLED_STATES = {"enabled", "enabled-runtime", "linked", "linked-runtime", "alias"}
 OPENRC_RUNLEVEL = "default"
+OPENRC_INIT_DIR = Path("/etc/init.d")
 OPENWRT_WIREGUARD_PROTO = "/lib/netifd/proto/wireguard.sh"
 
 
@@ -87,14 +88,58 @@ class OpenRCServiceManager(ServiceManager):
         self.run_command = run_command
 
     def unit_candidates(self, interface_name: str) -> list[str]:
-        return [f"wg-quick@{interface_name}", f"wg-quick.{interface_name}", "wg-quick"]
+        return [f"wg-quick@{interface_name}", f"wg-quick.{interface_name}", f"link42-wg-quick.{interface_name}"]
 
     def unit(self, interface_name: str) -> str:
         for candidate in self.unit_candidates(interface_name):
             result = self.run_command(["rc-service", "--exists", candidate], True)
             if result["returncode"] == 0:
                 return candidate
-        return self.unit_candidates(interface_name)[0]
+        if (OPENRC_INIT_DIR / "wg-quick").exists():
+            return f"wg-quick.{interface_name}"
+        return f"link42-wg-quick.{interface_name}"
+
+    def ensure_link42_unit(self, interface_name: str) -> str:
+        unit = self.unit(interface_name)
+        if unit.startswith("wg-quick."):
+            path = OPENRC_INIT_DIR / unit
+            if not path.exists():
+                path.symlink_to(OPENRC_INIT_DIR / "wg-quick")
+            return unit
+        if not unit.startswith("link42-wg-quick."):
+            return unit
+        path = OPENRC_INIT_DIR / unit
+        if not path.exists():
+            path.write_text(
+                f"""#!/sbin/openrc-run
+name="Link42 WireGuard {interface_name}"
+description="Link42 managed WireGuard interface {interface_name}"
+
+depend() {{
+  need net
+  after firewall
+}}
+
+start() {{
+  ebegin "Starting WireGuard {interface_name}"
+  wg-quick up {interface_name}
+  eend $?
+}}
+
+stop() {{
+  ebegin "Stopping WireGuard {interface_name}"
+  wg-quick down {interface_name}
+  eend $?
+}}
+
+status() {{
+  wg show {interface_name} >/dev/null 2>&1
+}}
+""",
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+        return unit
 
     def state(self, interface_name: str) -> dict[str, Any]:
         unit = self.unit(interface_name)
@@ -114,13 +159,13 @@ class OpenRCServiceManager(ServiceManager):
         }
 
     def enable(self, interface_name: str) -> dict[str, Any]:
-        return self.run_command(["rc-update", "add", self.unit(interface_name), OPENRC_RUNLEVEL], False)
+        return self.run_command(["rc-update", "add", self.ensure_link42_unit(interface_name), OPENRC_RUNLEVEL], False)
 
     def restart(self, interface_name: str) -> dict[str, Any]:
-        return self.run_command(["rc-service", self.unit(interface_name), "restart"], False)
+        return self.run_command(["rc-service", self.ensure_link42_unit(interface_name), "restart"], False)
 
     def start(self, interface_name: str) -> dict[str, Any]:
-        return self.run_command(["rc-service", self.unit(interface_name), "start"], False)
+        return self.run_command(["rc-service", self.ensure_link42_unit(interface_name), "start"], False)
 
     def stop(self, interface_name: str) -> dict[str, Any]:
         return self.run_command(["rc-service", self.unit(interface_name), "stop"], False)
