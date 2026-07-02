@@ -352,6 +352,10 @@ function translateApiDetail(detail: string): string {
     "peer node has no endpoint address": "对端节点缺少可作为 Endpoint 的地址",
     "local endpoint address is not registered on node": "本端入口地址不属于当前节点",
     "peer endpoint address is not registered on node": "对端入口地址不属于所选节点",
+    "at least one endpoint address is required": "本端或对端至少需要填写一个入口地址",
+    "udp2raw server endpoint address is required": "udp2raw server 侧需要可连接的入口地址，或填写 server connect host",
+    "mimic peer endpoint port is required": "mimic 对端 Endpoint 需要端口或对端 ListenPort",
+    "mimic local endpoint port is required": "mimic 本端 Endpoint 需要端口或本端 ListenPort",
     "wireguard tool is not installed": "主控缺少 wg 工具，无法自动生成密钥",
     "managed node links are deployed directly": "受管连接由系统直接下发，不使用部署计划",
     "use managed link operation": "受管连接需要使用双端操作",
@@ -731,7 +735,7 @@ function EndpointSelect({
         value={selectedOption}
         options={options}
         isDisabled={disabled || locked}
-        isClearable={false}
+        isClearable={!locked}
         inputValue={inputValue}
         placeholder={placeholder}
         noOptionsMessage={() => "没有可选地址，可直接输入"}
@@ -2203,8 +2207,8 @@ function App() {
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
     }
-    if (!localEndpointHost || !peerEndpointHost) {
-      throw new Error("请填写双方用于互联的入口地址");
+    if (!localEndpointHost && !peerEndpointHost) {
+      throw new Error("本端或对端至少需要填写一个入口地址");
     }
     validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
     validateMimicForm(mimic, localListenPort, peerListenPort);
@@ -2223,9 +2227,9 @@ function App() {
           peer_tunnel_ips: peerTunnelIps,
           local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
           peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
-          local_endpoint_host: localEndpointHost,
+          local_endpoint_host: localEndpointHost || null,
           local_endpoint_port: localEndpointPort,
-          peer_endpoint_host: peerEndpointHost,
+          peer_endpoint_host: peerEndpointHost || null,
           peer_endpoint_port: peerEndpointPort,
           local_listen_port: localListenPort,
           peer_listen_port: peerListenPort,
@@ -2327,6 +2331,8 @@ function App() {
     const peerListenPort = optionalInt(form.get("peer_listen_port"));
     const localEndpointPort = optionalInt(form.get("local_endpoint_port"));
     const peerEndpointPort = optionalInt(form.get("peer_endpoint_port"));
+    const localEndpointHost = String(form.get("local_endpoint_host") || "").trim();
+    const peerEndpointHost = String(form.get("peer_endpoint_host") || "").trim();
     const keepalive = Number(form.get("persistent_keepalive")) || null;
     const mtu = optionalInt(form.get("mtu")) ?? 1420;
     const udp2raw = middlewareType === "udp2raw" ? readUdp2RawForm(form, localListenPort, peerListenPort) : null;
@@ -2346,6 +2352,9 @@ function App() {
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
     }
+    if (!localEndpointHost && !peerEndpointHost) {
+      throw new Error("本端或对端至少需要填写一个入口地址");
+    }
     if (keepalive !== null && (!Number.isInteger(keepalive) || keepalive < 0 || keepalive > 65535)) {
       throw new Error("PersistentKeepalive 必须是 0-65535 之间的整数");
     }
@@ -2360,9 +2369,9 @@ function App() {
         peer_tunnel_ips: peerTunnelIps,
         local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
         peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
-        local_endpoint_host: String(form.get("local_endpoint_host") || "").trim(),
+        local_endpoint_host: localEndpointHost || null,
         local_endpoint_port: localEndpointPort,
-        peer_endpoint_host: String(form.get("peer_endpoint_host") || "").trim(),
+        peer_endpoint_host: peerEndpointHost || null,
         peer_endpoint_port: peerEndpointPort,
         local_listen_port: localListenPort,
         peer_listen_port: peerListenPort,
@@ -2996,8 +3005,8 @@ function App() {
                 <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
-              <FormSection title="直连入口与路由" hint="直连和 mimic 使用这里的真实 Endpoint；只有 udp2raw 会把 Endpoint 接管到本地 client。">
-              <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址。">
+              <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。udp2raw 会按 server 侧地址接管 Endpoint。">
+              <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址；本端不可被拨入时可留空。">
                 <EndpointSelect
                   key={`managed-local-endpoint-${replacePeerConfigId || "none"}-${managedLocalEndpointDefault}`}
                   name="local_endpoint_host"
@@ -3017,7 +3026,7 @@ function App() {
                   disabled={!selectedNodeOnline || udp2rawActive}
                 />
               </Field>
-              <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址。">
+              <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址；对端不可被拨入时可留空。">
                 <EndpointSelect
                   key={`managed-peer-endpoint-${replaceLocalConfigId || "none"}-${managedPeerEndpointDefault}`}
                   name="peer_endpoint_host"
@@ -3435,8 +3444,8 @@ function App() {
                       <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="直连入口与路由" hint="直连和 mimic 使用这里的真实 Endpoint；只有 udp2raw 会把 Endpoint 接管到本地 client。">
-                    <Field label="本端入口地址" hint="对端连接本节点时使用。">
+                  <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。udp2raw 会按 server 侧地址接管 Endpoint。">
+                    <Field label="本端入口地址" hint="对端连接本节点时使用；本端不可被拨入时可留空。">
                       <EndpointSelect
                         key={`edit-local-endpoint-${editLocalEndpointDefault}`}
                         name="local_endpoint_host"
@@ -3455,7 +3464,7 @@ function App() {
                         disabled={!selectedNodeOnline || udp2rawActive}
                       />
                     </Field>
-                    <Field label="对端入口地址" hint="本端连接对端节点时使用。">
+                    <Field label="对端入口地址" hint="本端连接对端节点时使用；对端不可被拨入时可留空。">
                       <EndpointSelect
                         key={`edit-peer-endpoint-${editPeerEndpointDefault}`}
                         name="peer_endpoint_host"

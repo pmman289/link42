@@ -703,8 +703,8 @@ def apply_middleware_to_peers(
     peer_interface: models.WireGuardInterface,
     local_peer: models.WireGuardPeer,
     peer_peer: models.WireGuardPeer,
-    local_endpoint: str,
-    peer_endpoint: str,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
     local_endpoint_port: int | None = None,
     peer_endpoint_port: int | None = None,
 ) -> None:
@@ -724,9 +724,9 @@ def apply_middleware_to_peers(
         )
         return
     local_peer.endpoint_host = peer_endpoint
-    local_peer.endpoint_port = peer_endpoint_port or peer_interface.listen_port
+    local_peer.endpoint_port = (peer_endpoint_port or peer_interface.listen_port) if peer_endpoint else None
     peer_peer.endpoint_host = local_endpoint
-    peer_peer.endpoint_port = local_endpoint_port or local_interface.listen_port
+    peer_peer.endpoint_port = (local_endpoint_port or local_interface.listen_port) if local_endpoint else None
 
 
 def apply_udp2raw_to_peers(
@@ -735,8 +735,8 @@ def apply_udp2raw_to_peers(
     peer_interface: models.WireGuardInterface,
     local_peer: models.WireGuardPeer,
     peer_peer: models.WireGuardPeer,
-    local_endpoint: str,
-    peer_endpoint: str,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
     local_endpoint_port: int | None = None,
     peer_endpoint_port: int | None = None,
 ) -> None:
@@ -744,9 +744,9 @@ def apply_udp2raw_to_peers(
 
     if not middleware:
         local_peer.endpoint_host = peer_endpoint
-        local_peer.endpoint_port = peer_endpoint_port or peer_interface.listen_port
+        local_peer.endpoint_port = (peer_endpoint_port or peer_interface.listen_port) if peer_endpoint else None
         peer_peer.endpoint_host = local_endpoint
-        peer_peer.endpoint_port = local_endpoint_port or local_interface.listen_port
+        peer_peer.endpoint_port = (local_endpoint_port or local_interface.listen_port) if local_endpoint else None
         return
 
     server_side = middleware["server_side"]
@@ -774,8 +774,8 @@ def udp2raw_endpoint_payloads(
     middleware: dict | None,
     local_interface: models.WireGuardInterface,
     peer_interface: models.WireGuardInterface,
-    local_endpoint: str,
-    peer_endpoint: str,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
 ) -> list[tuple[models.WireGuardInterface, str, dict]]:
     """生成双方 udp2raw Agent payload；返回 interface、task_type、payload。"""
 
@@ -793,6 +793,8 @@ def udp2raw_endpoint_payloads(
         server_public_host = local_endpoint
     if server_interface.listen_port is None:
         raise HTTPException(status_code=400, detail="udp2raw server side requires WireGuard listen port")
+    if not server_public_host and not middleware.get("server_connect_host"):
+        raise HTTPException(status_code=400, detail="udp2raw server endpoint address is required")
     server_connect_host = require_udp2raw_ip(
         middleware.get("server_connect_host") or server_public_host,
         "udp2raw server connect host",
@@ -838,8 +840,8 @@ def enqueue_udp2raw_tasks(
     middleware: dict | None,
     local_interface: models.WireGuardInterface,
     peer_interface: models.WireGuardInterface,
-    local_endpoint: str,
-    peer_endpoint: str,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
 ) -> None:
     """为启用 udp2raw 的受管连接下发安装和配置任务。"""
 
@@ -868,8 +870,8 @@ def mimic_endpoint_payloads(
     middleware: dict | None,
     local_interface: models.WireGuardInterface,
     peer_interface: models.WireGuardInterface,
-    local_endpoint: str,
-    peer_endpoint: str,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
     local_endpoint_port: int | None = None,
     peer_endpoint_port: int | None = None,
 ) -> list[tuple[models.WireGuardInterface, str, dict]]:
@@ -877,12 +879,6 @@ def mimic_endpoint_payloads(
 
     if not middleware or middleware.get("type") != "mimic":
         return []
-    if local_interface.listen_port is None or peer_interface.listen_port is None:
-        raise HTTPException(status_code=400, detail="mimic requires WireGuard listen port on both sides")
-    local_endpoint = require_mimic_ip(local_endpoint, "mimic local endpoint")
-    peer_endpoint = require_mimic_ip(peer_endpoint, "mimic peer endpoint")
-    local_peer_port = peer_endpoint_port or peer_interface.listen_port
-    peer_peer_port = local_endpoint_port or local_interface.listen_port
     instance = middleware_instance_name(local_interface, peer_interface)
     common = {
         "plugin": "mimic",
@@ -893,8 +889,13 @@ def mimic_endpoint_payloads(
         "keepalive_interval": middleware.get("keepalive_interval"),
         "padding": middleware.get("padding"),
     }
-    return [
-        (
+    payloads: list[tuple[models.WireGuardInterface, str, dict]] = []
+    if peer_endpoint:
+        peer_endpoint = require_mimic_ip(peer_endpoint, "mimic peer endpoint")
+        local_peer_port = peer_endpoint_port or peer_interface.listen_port
+        if local_peer_port is None:
+            raise HTTPException(status_code=400, detail="mimic peer endpoint port is required")
+        payloads.append((
             local_interface,
             "middleware.mimic.apply",
             {
@@ -906,8 +907,13 @@ def mimic_endpoint_payloads(
                 "peer_port": local_peer_port,
                 "filter_origin": "remote",
             },
-        ),
-        (
+        ))
+    if local_endpoint:
+        local_endpoint = require_mimic_ip(local_endpoint, "mimic local endpoint")
+        peer_peer_port = local_endpoint_port or local_interface.listen_port
+        if peer_peer_port is None:
+            raise HTTPException(status_code=400, detail="mimic local endpoint port is required")
+        payloads.append((
             peer_interface,
             "middleware.mimic.apply",
             {
@@ -919,8 +925,8 @@ def mimic_endpoint_payloads(
                 "peer_port": peer_peer_port,
                 "filter_origin": "remote",
             },
-        ),
-    ]
+        ))
+    return payloads
 
 
 def enqueue_mimic_tasks(
@@ -928,8 +934,8 @@ def enqueue_mimic_tasks(
     middleware: dict | None,
     local_interface: models.WireGuardInterface,
     peer_interface: models.WireGuardInterface,
-    local_endpoint: str,
-    peer_endpoint: str,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
     local_endpoint_port: int | None = None,
     peer_endpoint_port: int | None = None,
 ) -> None:
@@ -958,8 +964,8 @@ def enqueue_middleware_tasks(
     middleware: dict | None,
     local_interface: models.WireGuardInterface,
     peer_interface: models.WireGuardInterface,
-    local_endpoint: str,
-    peer_endpoint: str,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
     local_endpoint_port: int | None = None,
     peer_endpoint_port: int | None = None,
 ) -> None:
@@ -1624,6 +1630,40 @@ def require_node_endpoint(node: models.Node, host: str, detail: str) -> str:
     return cleaned
 
 
+def optional_node_endpoint(node: models.Node, host: str | None, detail: str) -> str | None:
+    """校验并返回可选入口地址，留空表示该节点不提供可被对端拨入的 Endpoint。"""
+
+    if host is None:
+        return None
+    cleaned = host.strip()
+    if not cleaned:
+        return None
+    return require_node_endpoint(node, cleaned, detail)
+
+
+def require_managed_link_endpoints(
+    local_node: models.Node,
+    peer_node: models.Node,
+    local_endpoint_host: str | None,
+    peer_endpoint_host: str | None,
+) -> tuple[str | None, str | None]:
+    """校验受管连接入口地址；至少一端可拨入，另一端可因 NAT 或不对称出入口留空。"""
+
+    local_endpoint = optional_node_endpoint(
+        local_node,
+        local_endpoint_host,
+        "local endpoint address is not registered on node",
+    )
+    peer_endpoint = optional_node_endpoint(
+        peer_node,
+        peer_endpoint_host,
+        "peer endpoint address is not registered on node",
+    )
+    if not local_endpoint and not peer_endpoint:
+        raise HTTPException(status_code=400, detail="at least one endpoint address is required")
+    return local_endpoint, peer_endpoint
+
+
 def run_wg_text(args: list[str], input_text: str | None = None) -> str:
     """调用系统 wg 工具生成 WireGuard 密钥材料。"""
 
@@ -2136,17 +2176,13 @@ def create_managed_link(
         raise HTTPException(status_code=409, detail="local imported endpoint does not point to peer node")
     if replace_peer_peer and not endpoint_points_to_node(replace_peer_peer.endpoint_host, local_node) and not payload.force_endpoint_mismatch:
         raise HTTPException(status_code=409, detail="peer imported endpoint does not point to local node")
-    local_endpoint = require_node_endpoint(
-        local_node,
-        payload.local_endpoint_host,
-        "local endpoint address is not registered on node",
-    )
-    peer_endpoint = require_node_endpoint(
-        peer_node,
-        payload.peer_endpoint_host,
-        "peer endpoint address is not registered on node",
-    )
     middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
+    local_endpoint, peer_endpoint = require_managed_link_endpoints(
+        local_node,
+        peer_node,
+        payload.local_endpoint_host,
+        payload.peer_endpoint_host,
+    )
 
     peer_interface_name = payload.peer_interface_name or payload.local_interface_name
     ensure_unique_interface_name(
@@ -2431,17 +2467,13 @@ def update_managed_link(
     old_middleware = managed_link_middleware(local_interface)
     local_node = require_online_node(db, local_interface.node_id)
     peer_node = require_online_node(db, peer_interface.node_id)
-    local_endpoint = require_node_endpoint(
-        local_node,
-        payload.local_endpoint_host,
-        "local endpoint address is not registered on node",
-    )
-    peer_endpoint = require_node_endpoint(
-        peer_node,
-        payload.peer_endpoint_host,
-        "peer endpoint address is not registered on node",
-    )
     middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
+    local_endpoint, peer_endpoint = require_managed_link_endpoints(
+        local_node,
+        peer_node,
+        payload.local_endpoint_host,
+        payload.peer_endpoint_host,
+    )
     ensure_unique_interface_name(db, local_interface.node_id, payload.local_interface_name, local_interface.id)
     ensure_unique_interface_name(db, peer_interface.node_id, payload.peer_interface_name, peer_interface.id)
 

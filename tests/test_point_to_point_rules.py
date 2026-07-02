@@ -253,7 +253,7 @@ def test_require_node_endpoint_allows_original_or_manual_host() -> None:
 
 
 def test_managed_link_schema_allows_passive_listen_ports() -> None:
-    """验证受管连接监听端口可留空，以支持 WireGuard 被动模式。"""
+    """验证受管连接监听端口和单侧 Endpoint 可留空，以支持被动和不对称出入口。"""
 
     payload = ManagedLinkCreate(
         peer_node_id=2,
@@ -265,7 +265,7 @@ def test_managed_link_schema_allows_passive_listen_ports() -> None:
         peer_allowed_ips=["172.20.0.0/14", "fd00::/8"],
         local_endpoint_host="198.51.100.10",
         local_endpoint_port=11451,
-        peer_endpoint_host="198.51.100.20",
+        peer_endpoint_host=None,
         peer_endpoint_port=11452,
         local_listen_port=None,
         peer_listen_port=None,
@@ -277,6 +277,7 @@ def test_managed_link_schema_allows_passive_listen_ports() -> None:
     assert payload.local_allowed_ips == ["0.0.0.0/0", "::/0"]
     assert payload.peer_allowed_ips == ["172.20.0.0/14", "fd00::/8"]
     assert payload.local_endpoint_port == 11451
+    assert payload.peer_endpoint_host is None
     assert payload.peer_endpoint_port == 11452
 
 
@@ -1462,6 +1463,67 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
     assert any("PostUp = ip route add 10.2.0.0/16 dev wg-b" in task.payload["config"] for task in tasks)
 
 
+def test_create_managed_link_allows_one_side_without_endpoint(monkeypatch) -> None:
+    """验证 NAT 或出入口不对称时允许一侧 Peer 不写 Endpoint。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=[],
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        result = create_managed_link(
+            node_a.id,
+            ManagedLinkCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host=None,
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=None,
+                peer_listen_port=51821,
+            ),
+            session,
+        )
+        local_peer = session.scalar(
+            select(models.WireGuardPeer).where(models.WireGuardPeer.interface_id == result.local_interface.id)
+        )
+        remote_peer = session.scalar(
+            select(models.WireGuardPeer).where(models.WireGuardPeer.interface_id == result.peer_interface.id)
+        )
+
+    assert local_peer is not None
+    assert local_peer.endpoint_host == "198.51.100.20"
+    assert local_peer.endpoint_port == 51821
+    assert remote_peer is not None
+    assert remote_peer.endpoint_host is None
+    assert remote_peer.endpoint_port is None
+
+
 def test_delete_managed_link_preserves_node_configs_by_default() -> None:
     """验证删除受管双向链路默认只移除主控记录，不清理节点配置。"""
 
@@ -1810,7 +1872,7 @@ def test_create_managed_link_with_mimic_enqueues_mimic_tasks(monkeypatch) -> Non
                 peer_interface_name="wg-b",
                 local_tunnel_ips=["10.42.0.1/32"],
                 peer_tunnel_ips=["10.42.0.2/32"],
-                local_endpoint_host="198.51.100.10",
+                local_endpoint_host=None,
                 peer_endpoint_host="198.51.100.20",
                 local_listen_port=51820,
                 peer_listen_port=51821,
@@ -1831,10 +1893,11 @@ def test_create_managed_link_with_mimic_enqueues_mimic_tasks(monkeypatch) -> Non
     assert local_peer is not None
     assert local_peer.endpoint_host == "198.51.100.20"
     assert local_peer.endpoint_port == 51821
-    assert [task.type for task in tasks].count("middleware.mimic.apply") == 2
+    assert [task.type for task in tasks].count("middleware.mimic.apply") == 1
     assert [task.type for task in tasks].count("wireguard.apply_config") == 2
     mimic_payloads = [task.payload for task in tasks if task.type == "middleware.mimic.apply"]
-    assert {payload["bind_interface"] for payload in mimic_payloads} == {"eth0", "eth1"}
+    assert [payload["bind_interface"] for payload in mimic_payloads] == ["eth0"]
+    assert mimic_payloads[0]["peer_host"] == "198.51.100.20"
 
 
 def test_update_managed_link_disabling_mimic_enqueues_cleanup_tasks(monkeypatch) -> None:
@@ -1882,7 +1945,7 @@ def test_update_managed_link_disabling_mimic_enqueues_cleanup_tasks(monkeypatch)
                 peer_interface_name="wg-b",
                 local_tunnel_ips=["10.42.0.1/32"],
                 peer_tunnel_ips=["10.42.0.2/32"],
-                local_endpoint_host="198.51.100.10",
+                local_endpoint_host=None,
                 peer_endpoint_host="198.51.100.20",
                 local_listen_port=51820,
                 peer_listen_port=51821,

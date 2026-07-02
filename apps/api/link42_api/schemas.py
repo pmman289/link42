@@ -195,9 +195,9 @@ class ManagedLinkCreate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_allowed_ips: list[str] | None = None
     peer_allowed_ips: list[str] | None = None
-    local_endpoint_host: str = Field(max_length=255)
+    local_endpoint_host: str | None = Field(default=None, max_length=255)
     local_endpoint_port: int | None = None
-    peer_endpoint_host: str = Field(max_length=255)
+    peer_endpoint_host: str | None = Field(default=None, max_length=255)
     peer_endpoint_port: int | None = None
     local_listen_port: int | None = None
     peer_listen_port: int | None = None
@@ -617,9 +617,9 @@ class ManagedLinkUpdate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_allowed_ips: list[str] | None = None
     peer_allowed_ips: list[str] | None = None
-    local_endpoint_host: str = Field(max_length=255)
+    local_endpoint_host: str | None = Field(default=None, max_length=255)
     local_endpoint_port: int | None = None
-    peer_endpoint_host: str = Field(max_length=255)
+    peer_endpoint_host: str | None = Field(default=None, max_length=255)
     peer_endpoint_port: int | None = None
     local_listen_port: int | None = None
     peer_listen_port: int | None = None
