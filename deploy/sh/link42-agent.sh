@@ -39,6 +39,16 @@ shell_quote() {
   printf "%s" "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"
 }
 
+is_musl_system() {
+  if [ -f /etc/alpine-release ]; then
+    return 0
+  fi
+  if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+    return 0
+  fi
+  return 1
+}
+
 run_as_root_hint() {
   cat >&2 <<EOF
 Usage:
@@ -221,6 +231,9 @@ AGENT_INSTALL_MODE="binary"
 if command -v uci >/dev/null 2>&1 && [ -f /etc/rc.common ]; then
   AGENT_FILE="link42-agent-source.tar.gz"
   AGENT_INSTALL_MODE="source"
+elif is_musl_system; then
+  AGENT_FILE="link42-agent-source.tar.gz"
+  AGENT_INSTALL_MODE="source"
 else
   case "$ARCH" in
     x86_64|amd64)
@@ -250,7 +263,11 @@ install_packages() {
   elif command -v yum >/dev/null 2>&1; then
     yum install -y ca-certificates curl wireguard-tools
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache ca-certificates curl wireguard-tools
+    if [ "$AGENT_INSTALL_MODE" = "source" ]; then
+      apk add --no-cache ca-certificates curl python3 wireguard-tools
+    else
+      apk add --no-cache ca-certificates curl wireguard-tools
+    fi
   elif command -v opkg >/dev/null 2>&1; then
     missing_packages=""
     command -v python3 >/dev/null 2>&1 || missing_packages="$missing_packages python3"

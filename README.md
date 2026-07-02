@@ -79,6 +79,8 @@ curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall
 
 卸载 Agent 不会删除已有 WireGuard 配置。
 
+Alpine/musl 系统会自动使用源码包方式安装 Agent，避免 glibc 二进制在 Alpine 上出现文件存在但执行时报 `not found` 的问题。
+
 ## 常见使用流程
 
 ### 创建两台受管节点之间的连接

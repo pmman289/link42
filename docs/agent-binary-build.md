@@ -98,10 +98,12 @@ Link42 管理的 udp2raw 中间层服务、配置和资产。卸载不会删除 
 curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_KEEP_MIDDLEWARE=1 sh -s -- uninstall
 ```
 
-## OpenWrt ARM
+## Alpine/musl 和 OpenWrt ARM
 
-OpenWrt ARM/aarch64 第一阶段不使用 glibc PyInstaller 二进制。安装脚本会在检测到
-OpenWrt UCI/procd 后下载源码包：
+Alpine 使用 musl libc，不能直接运行当前 glibc PyInstaller 二进制；典型表现是文件明明存在，
+执行时却报 `not found`。OpenWrt ARM/aarch64 也不使用 glibc PyInstaller 二进制。
+
+安装脚本会在检测到 Alpine/musl 或 OpenWrt UCI/procd 后下载源码包：
 
 ```text
 https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
@@ -132,5 +134,5 @@ scripts/agent/build-source.sh
 ```
 
 OpenWrt Agent 使用 UCI 写入 WireGuard 配置，不依赖 `/etc/wireguard/*.conf` 或
-`wg-quick`。目前 OpenWrt 节点只上报基础 WireGuard/UCI 能力，不上报
+`wg-quick`。Alpine/OpenRC 节点仍使用普通 Linux `wg-quick` 后端。目前 OpenWrt 节点只上报基础 WireGuard/UCI 能力，不上报
 `agent.self_upgrade` 和 systemd 版 udp2raw 中间层能力。
