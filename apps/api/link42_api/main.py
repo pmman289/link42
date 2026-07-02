@@ -1763,7 +1763,7 @@ async def upload_site_logo(
             stale_path.unlink()
     target = logo_dir / f"logo.{suffix}"
     target.write_bytes(data)
-    set_setting(db, SETTING_SITE_LOGO_URL, f"/branding/logo?v={int(time.time())}")
+    set_setting(db, SETTING_SITE_LOGO_URL, f"/branding/logo?v={time.time_ns()}")
     db.commit()
     return schemas.ControllerSettingsRead(
         controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "",

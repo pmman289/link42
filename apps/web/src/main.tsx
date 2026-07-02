@@ -1096,6 +1096,7 @@ function App() {
   const [settingsUsername, setSettingsUsername] = useState("pmman");
   const [siteTitle, setSiteTitle] = useState(DEFAULT_SITE_TITLE);
   const [siteLogoUrl, setSiteLogoUrl] = useState(DEFAULT_SITE_LOGO_URL);
+  const [settingsLogoPreviewUrl, setSettingsLogoPreviewUrl] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
@@ -1503,6 +1504,9 @@ function App() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const newPassword = String(form.get("new_password") || "");
+    if (newPassword && newPassword.length < 6) {
+      throw new Error("新密码至少需要 6 个字符");
+    }
     const logoFile = form.get("site_logo_file");
     let uploadedLogoUrl: string | null = null;
     if (logoFile instanceof File && logoFile.size > 0) {
@@ -1513,19 +1517,28 @@ function App() {
       });
       uploadedLogoUrl = logoSettings.site_logo_url || DEFAULT_SITE_LOGO_URL;
     }
+    const payload: {
+      controller_url: string;
+      username: string;
+      site_title: string;
+      new_password?: string;
+    } = {
+      controller_url: String(form.get("controller_url") || "").trim(),
+      username: String(form.get("username") || "").trim(),
+      site_title: String(form.get("site_title") || "").trim() || DEFAULT_SITE_TITLE,
+    };
+    if (newPassword) {
+      payload.new_password = newPassword;
+    }
     const data = await api<ControllerSettings>("/api/settings", {
       method: "PATCH",
-      body: JSON.stringify({
-        controller_url: String(form.get("controller_url") || "").trim(),
-        username: String(form.get("username") || "").trim(),
-        site_title: String(form.get("site_title") || "").trim() || DEFAULT_SITE_TITLE,
-        new_password: newPassword || null,
-      }),
+      body: JSON.stringify(payload),
     });
     setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
     setSettingsUsername(data.username || "pmman");
     setSiteTitle(data.site_title || DEFAULT_SITE_TITLE);
     setSiteLogoUrl(uploadedLogoUrl || data.site_logo_url || DEFAULT_SITE_LOGO_URL);
+    setSettingsLogoPreviewUrl("");
     setSettingsOpen(false);
     if (newPassword) {
       clearAuthenticatedState();
@@ -1534,6 +1547,16 @@ function App() {
     }
     setCurrentUser(data.username || currentUser);
     notify("success", "设置已保存。");
+  }
+
+  function previewLogoFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    setSettingsLogoPreviewUrl((previous) => {
+      if (previous.startsWith("blob:")) {
+        URL.revokeObjectURL(previous);
+      }
+      return file ? URL.createObjectURL(file) : "";
+    });
   }
 
   async function refreshNodes() {
@@ -1713,6 +1736,14 @@ function App() {
   useEffect(() => {
     document.title = siteTitle || DEFAULT_SITE_TITLE;
   }, [siteTitle]);
+
+  useEffect(() => {
+    return () => {
+      if (settingsLogoPreviewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(settingsLogoPreviewUrl);
+      }
+    };
+  }, [settingsLogoPreviewUrl]);
 
   useEffect(() => {
     if (managedPeerNodeId) {
@@ -2627,12 +2658,12 @@ function App() {
               </Field>
               <Field label="Logo" hint="上传 PNG、JPEG 或 WebP；文件会保存到主控配置目录，Docker 映射后可持久化。">
                 <div className="logoUploadField">
-                  <img src={siteLogoUrl || DEFAULT_SITE_LOGO_URL} alt="" />
-                  <input name="site_logo_file" type="file" accept="image/png,image/jpeg,image/webp" />
+                  <img src={settingsLogoPreviewUrl || siteLogoUrl || DEFAULT_SITE_LOGO_URL} alt="" />
+                  <input name="site_logo_file" type="file" accept="image/png,image/jpeg,image/webp" onChange={previewLogoFile} />
                 </div>
               </Field>
               <Field label="新密码" hint="留空表示不修改密码。">
-                <input name="new_password" type="password" autoComplete="new-password" />
+                <input name="new_password" type="password" autoComplete="new-password" minLength={6} />
               </Field>
               <button type="submit" disabled={actionPending("settings:save")}><Check size={16} /> {actionPending("settings:save") ? "保存中" : "保存设置"}</button>
             </form>

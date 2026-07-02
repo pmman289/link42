@@ -362,6 +362,17 @@ def test_controller_settings_can_change_username_and_password() -> None:
     assert not verify_token("old-session", old_session_hash)
 
 
+def test_controller_settings_password_requires_six_characters() -> None:
+    """验证设置页新密码至少需要 6 个字符。"""
+
+    with pytest.raises(ValidationError):
+        ControllerSettingsUpdate(
+            controller_url="http://10.0.0.1:8000",
+            username="admin",
+            new_password="short",
+        )
+
+
 def test_openwrt_read_config_keeps_deployed_baseline_and_allows_start(monkeypatch) -> None:
     """验证 OpenWrt UCI 后端刷新配置时不会把文件式基线清空，且可继续下发启动任务。"""
 

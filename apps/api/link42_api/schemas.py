@@ -153,7 +153,7 @@ class ControllerSettingsUpdate(BaseModel):
     username: str = Field(min_length=1, max_length=80)
     site_title: str = Field(default="Link42", min_length=1, max_length=80)
     site_logo_url: str | None = Field(default=None, max_length=500)
-    new_password: str | None = Field(default=None, min_length=1, max_length=255)
+    new_password: str | None = Field(default=None, min_length=6, max_length=255)
 
     @field_validator("site_logo_url")
     @classmethod
