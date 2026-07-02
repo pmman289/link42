@@ -39,6 +39,24 @@ def _validate_optional_http_url(value: str | None) -> str | None:
     return value
 
 
+def _validate_optional_asset_url(value: str | None) -> str | None:
+    """校验可用于图片展示的 URL，支持站内绝对路径和 http(s) 地址。"""
+
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if any(char.isspace() or char in "'\"" for char in value):
+        raise ValueError("URL must not contain whitespace or quotes")
+    if value.startswith("/"):
+        return value
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL must be an absolute path or start with http:// or https://")
+    return value
+
+
 class NodeCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     hostname: str | None = None
@@ -118,15 +136,29 @@ class AuthStatus(BaseModel):
     username: str | None = None
 
 
+class BrandingRead(BaseModel):
+    site_title: str = "Link42"
+    site_logo_url: str = "/logo.png"
+
+
 class ControllerSettingsRead(BaseModel):
     controller_url: str
     username: str
+    site_title: str = "Link42"
+    site_logo_url: str = "/logo.png"
 
 
 class ControllerSettingsUpdate(BaseModel):
     controller_url: str = Field(min_length=1, max_length=255)
     username: str = Field(min_length=1, max_length=80)
+    site_title: str = Field(default="Link42", min_length=1, max_length=80)
+    site_logo_url: str | None = Field(default=None, max_length=500)
     new_password: str | None = Field(default=None, min_length=1, max_length=255)
+
+    @field_validator("site_logo_url")
+    @classmethod
+    def validate_site_logo_url(cls, value: str | None) -> str | None:
+        return _validate_optional_asset_url(value)
 
 
 class InterfaceCreate(BaseModel):

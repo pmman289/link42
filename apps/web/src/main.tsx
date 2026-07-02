@@ -246,6 +246,13 @@ type LoginResult = {
 type ControllerSettings = {
   controller_url: string;
   username: string;
+  site_title: string;
+  site_logo_url: string;
+};
+
+type BrandingSettings = {
+  site_title: string;
+  site_logo_url: string;
 };
 
 type Toast = {
@@ -263,6 +270,8 @@ const API_BASE =
 // 默认主控地址；节点 Agent 从本机访问时通常使用 127.0.0.1。
 const DEFAULT_CONTROLLER_URL =
   import.meta.env.VITE_LINK42_CONTROLLER_URL || API_BASE;
+const DEFAULT_SITE_TITLE = "Link42";
+const DEFAULT_SITE_LOGO_URL = "/logo.png";
 const AUTH_TOKEN_KEY = "link42.authToken";
 const AUTH_EXPIRED_EVENT = "link42:auth-expired";
 const TASK_POLL_INTERVAL_MS = 2000;
@@ -475,6 +484,10 @@ function topologyEdgeSummary(edge: TopologyEdge) {
 
 function topologyNodeEndpoint(node: TopologyNode) {
   return node.topology_endpoint || node.endpoint_ips[0] || node.hostname || "未配置地址";
+}
+
+function nodeRegionLabel(node: Pick<NodeItem, "region">) {
+  return node.region?.trim() || "未设置地域";
 }
 
 function firstIpFromCidrs(values: string[]) {
@@ -1081,6 +1094,8 @@ function App() {
   const [loginError, setLoginError] = useState("");
   const [controllerUrl, setControllerUrl] = useState(DEFAULT_CONTROLLER_URL);
   const [settingsUsername, setSettingsUsername] = useState("pmman");
+  const [siteTitle, setSiteTitle] = useState(DEFAULT_SITE_TITLE);
+  const [siteLogoUrl, setSiteLogoUrl] = useState(DEFAULT_SITE_LOGO_URL);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
@@ -1119,6 +1134,25 @@ function App() {
     () => nodes.find((node) => node.id === selectedNodeId) || null,
     [nodes, selectedNodeId],
   );
+  const nodeRegionGroups = useMemo(() => {
+    const groups = new Map<string, NodeItem[]>();
+    for (const node of nodes) {
+      const region = nodeRegionLabel(node);
+      groups.set(region, [...(groups.get(region) || []), node]);
+    }
+    return Array.from(groups.entries())
+      .map(([region, items], index) => ({
+        id: `node-region-${index}`,
+        region,
+        nodes: items,
+        onlineCount: items.filter(isNodeSelectable).length,
+      }))
+      .sort((left, right) => {
+        if (left.region === "未设置地域") return 1;
+        if (right.region === "未设置地域") return -1;
+        return left.region.localeCompare(right.region, "zh-Hans-CN");
+      });
+  }, [nodes]);
   const selectedConfig = useMemo(
     () => configs.find((item) => item.id === selectedConfigId) || null,
     [configs, selectedConfigId],
@@ -1455,22 +1489,43 @@ function App() {
     const data = await api<ControllerSettings>("/api/settings");
     setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
     setSettingsUsername(data.username || "pmman");
+    setSiteTitle(data.site_title || DEFAULT_SITE_TITLE);
+    setSiteLogoUrl(data.site_logo_url || DEFAULT_SITE_LOGO_URL);
+  }
+
+  async function refreshBranding() {
+    const data = await api<BrandingSettings>("/api/branding", { skipAuth: true });
+    setSiteTitle(data.site_title || DEFAULT_SITE_TITLE);
+    setSiteLogoUrl(data.site_logo_url || DEFAULT_SITE_LOGO_URL);
   }
 
   async function saveSettings(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const newPassword = String(form.get("new_password") || "");
+    const logoFile = form.get("site_logo_file");
+    let uploadedLogoUrl: string | null = null;
+    if (logoFile instanceof File && logoFile.size > 0) {
+      const logoSettings = await api<ControllerSettings>("/api/settings/logo", {
+        method: "POST",
+        headers: { "Content-Type": logoFile.type },
+        body: logoFile,
+      });
+      uploadedLogoUrl = logoSettings.site_logo_url || DEFAULT_SITE_LOGO_URL;
+    }
     const data = await api<ControllerSettings>("/api/settings", {
       method: "PATCH",
       body: JSON.stringify({
         controller_url: String(form.get("controller_url") || "").trim(),
         username: String(form.get("username") || "").trim(),
+        site_title: String(form.get("site_title") || "").trim() || DEFAULT_SITE_TITLE,
         new_password: newPassword || null,
       }),
     });
     setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
     setSettingsUsername(data.username || "pmman");
+    setSiteTitle(data.site_title || DEFAULT_SITE_TITLE);
+    setSiteLogoUrl(uploadedLogoUrl || data.site_logo_url || DEFAULT_SITE_LOGO_URL);
     setSettingsOpen(false);
     if (newPassword) {
       clearAuthenticatedState();
@@ -1625,6 +1680,7 @@ function App() {
   useEffect(() => {
     async function bootstrap() {
       if (!authToken) {
+        await refreshBranding().catch(() => undefined);
         setAuthChecked(true);
         return;
       }
@@ -1653,6 +1709,10 @@ function App() {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [selectedNodeId, selectedConfigId, monitorDialogConfigId, monitorWindow, authToken]);
+
+  useEffect(() => {
+    document.title = siteTitle || DEFAULT_SITE_TITLE;
+  }, [siteTitle]);
 
   useEffect(() => {
     if (managedPeerNodeId) {
@@ -2485,7 +2545,10 @@ function App() {
     return (
       <main className="app loginPage">
         <section className="loginPanel">
-          <h1>Link42</h1>
+          <div className="loginBrand">
+            <img src={siteLogoUrl || DEFAULT_SITE_LOGO_URL} alt="" />
+            <h1>{siteTitle || DEFAULT_SITE_TITLE}</h1>
+          </div>
           <p className="muted">主控访问登录</p>
           <form className="stack" onSubmit={(event) => void runAction(() => login(event), "auth:login")}>
             <Field label="用户名">
@@ -2512,9 +2575,12 @@ function App() {
   return (
     <main className="app">
       <header className="topbar">
-        <div>
-          <h1>Link42</h1>
-          <p>WireGuard 点对点链路管理面板 / {currentUser || "pmman"}</p>
+        <div className="brandBlock">
+          <img className="brandLogo" src={siteLogoUrl || DEFAULT_SITE_LOGO_URL} alt="" />
+          <div>
+            <h1>{siteTitle || DEFAULT_SITE_TITLE}</h1>
+            <p>WireGuard 点对点链路管理面板 / {currentUser || "pmman"}</p>
+          </div>
         </div>
         <div className="topbarActions">
           <button className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
@@ -2555,6 +2621,15 @@ function App() {
               </Field>
               <Field label="用户名">
                 <input name="username" defaultValue={settingsUsername} required />
+              </Field>
+              <Field label="站点标题" hint="展示在浏览器标题、登录页和顶部栏。">
+                <input name="site_title" defaultValue={siteTitle} required />
+              </Field>
+              <Field label="Logo" hint="上传 PNG、JPEG 或 WebP；文件会保存到主控配置目录，Docker 映射后可持久化。">
+                <div className="logoUploadField">
+                  <img src={siteLogoUrl || DEFAULT_SITE_LOGO_URL} alt="" />
+                  <input name="site_logo_file" type="file" accept="image/png,image/jpeg,image/webp" />
+                </div>
               </Field>
               <Field label="新密码" hint="留空表示不修改密码。">
                 <input name="new_password" type="password" autoComplete="new-password" />
@@ -3099,149 +3174,179 @@ function App() {
           </div>
         </section>
 
-        <div className="nodeList">
-          {nodes.map((node) => {
-            const expanded = node.id === selectedNodeId;
-            const online = isNodeSelectable(node);
-            return (
-              <section key={node.id} data-node-id={node.id} className={expanded ? "nodeCard expanded" : "nodeCard"}>
-                <div className="nodeBar">
-                  <button
-                    className="nodeHeader"
-                    disabled={!online}
-                    onClick={() => {
-                      setSelectedNodeId(expanded ? null : node.id);
-                      setSelectedConfigId(null);
-                      setPlan(null);
-                      setImportCandidatesExpanded(false);
-                    }}
-                  >
-                    <span>
-                      <strong>{node.name}</strong>
-                      <small>{nodeEndpointOptions(node).join(", ") || node.hostname || "未配置入口地址"}</small>
-                    </span>
-                    <span className={online ? "statusBadge online" : "statusBadge"}>{node.status}</span>
-                  </button>
-                  <button
-                    className="iconButton nodeEditButton"
-                    title="编辑节点"
-                    onClick={() => setEditingNodeId(node.id)}
-                  >
-                    <Pencil size={16} />
-                  </button>
+        <div className="nodeList" aria-label="按地域分组的节点列表">
+          <div className="regionIndex" aria-label="地域快捷导航">
+            {nodeRegionGroups.map((group) => (
+              <button
+                key={group.id}
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  document.querySelector(`[data-region-id="${group.id}"]`)?.scrollIntoView({
+                    behavior: "smooth",
+                    block: "start",
+                  });
+                }}
+              >
+                <span>{group.region}</span>
+                <small>{group.nodes.length}</small>
+              </button>
+            ))}
+          </div>
+          {nodeRegionGroups.map((group) => (
+            <section key={group.id} className="regionGroup" data-region-id={group.id}>
+              <header className="regionHeader">
+                <div>
+                  <h3>{group.region}</h3>
+                  <p className="muted">{group.onlineCount} online / {group.nodes.length} total</p>
                 </div>
-
-                {expanded && (
-                  <div className="nodeDetails">
-                    {!selectedNodeOnline && <div className="empty">Agent 已离线，当前节点暂不能修改或部署。</div>}
-                    <section className="connectionActions" aria-label="创建连接">
-                      <div>
-                        <h3>创建连接</h3>
-                        <p className="muted">手动连接用于接入非受管节点；受管连接会自动生成密钥、部署并启动双方接口。</p>
-                      </div>
-                      <div className="actionRow">
+              </header>
+              <div className="regionNodeList">
+                {group.nodes.map((node) => {
+                  const expanded = node.id === selectedNodeId;
+                  const online = isNodeSelectable(node);
+                  return (
+                    <section key={node.id} data-node-id={node.id} className={expanded ? "nodeCard expanded" : "nodeCard"}>
+                      <div className="nodeBar">
                         <button
-                          type="button"
-                          disabled={!selectedNodeOnline}
-                          onClick={() => setCreateDialog("external")}
-                        >
-                          <Plus size={16} /> 手动创建连接
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!selectedNodeOnline || nodes.filter((item) => item.id !== node.id && isNodeSelectable(item)).length === 0}
-                          onClick={() => openManagedCreateDialog()}
-                        >
-                          <GitBranch size={16} /> 创建受管连接
-                        </button>
-                      </div>
-                    </section>
-
-                    {selectedNodeSupportsWgQuickImport ? (
-                      <div className="sectionActions">
-                        <button
-                          className="secondary"
-                          disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNodeId, "import-scan"))}
-                          onClick={() => void runAction(requestImportScan, nodeActionKey(selectedNodeId, "import-scan"))}
-                        >
-                          <Upload size={16} /> {actionPending(nodeActionKey(selectedNodeId, "import-scan")) ? "扫描中" : "扫描现有 wg-quick"}
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="empty">{importScanUnavailableMessage(selectedNode, selectedNodeOnline)}</div>
-                    )}
-
-                    {selectedNodeSupportsWgQuickImport && importCandidates.length > 0 && (
-                      <div className="candidateList">
-                        <button
-                          type="button"
-                          className="candidateToggle"
-                          onClick={() => setImportCandidatesExpanded((value) => !value)}
+                          className="nodeHeader"
+                          disabled={!online}
+                          onClick={() => {
+                            setSelectedNodeId(expanded ? null : node.id);
+                            setSelectedConfigId(null);
+                            setPlan(null);
+                            setImportCandidatesExpanded(false);
+                          }}
                         >
                           <span>
-                            {importCandidatesExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                            <strong>扫描到的 wg-quick 配置</strong>
+                            <strong>{node.name}</strong>
+                            <small>{nodeEndpointOptions(node).join(", ") || node.hostname || "未配置入口地址"}</small>
                           </span>
-                          <small>{importCandidates.length} 个</small>
+                          <span className={online ? "statusBadge online" : "statusBadge"}>{node.status}</span>
                         </button>
-                        {importCandidatesExpanded && importCandidates.map((candidate) => (
-                          <div key={candidate.id} className="candidate">
-                            <div>
-                              <strong>{candidate.interface_name}</strong>
-                              <span>{candidate.path}</span>
-                              {candidate.warnings.length > 0 && <small>{candidate.warnings.join("; ")}</small>}
-                            </div>
-                            <button
-                              disabled={candidate.imported || !selectedNodeOnline || actionPending(candidateActionKey(candidate.id))}
-                              onClick={() => void runAction(() => importCandidate(candidate.id), candidateActionKey(candidate.id))}
-                            >
-                              {candidate.imported ? "已导入" : actionPending(candidateActionKey(candidate.id)) ? "导入中" : "导入"}
-                            </button>
-                          </div>
-                        ))}
+                        <button
+                          className="iconButton nodeEditButton"
+                          title="编辑节点"
+                          onClick={() => setEditingNodeId(node.id)}
+                        >
+                          <Pencil size={16} />
+                        </button>
                       </div>
-                    )}
 
-                    <div className="configList">
-                      {configs.length === 0 ? (
-                        <div className="empty">该节点还没有 WireGuard 配置。</div>
-                      ) : (
-                        configs.map((item) => (
-                          <button
-                            key={item.id}
-                            data-config-id={item.id}
-                            className="configRow"
-                            onClick={() => {
-                              setSelectedConfigId(item.id);
-                              setPlan(null);
-                            }}
-                          >
-                            <span>
-                              <strong>{item.name}</strong>
-                              <small>{item.source}{item.managed ? " / managed" : " / unmanaged"}</small>
-                            </span>
-                            <span className="configRowMetrics">
-                              <span className={`statusBadge ${item.runtime_status === "running" ? "online" : ""}`}>
-                                {statusLabel(item.runtime_status)}
-                              </span>
-                              <MonitorSummaryButton
-                                summary={item.monitor_summary}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  setMonitorDialogConfigId(item.id);
-                                  setMonitorWindow("1h");
-                                }}
-                              />
-                            </span>
-                          </button>
-                        ))
+                      {expanded && (
+                        <div className="nodeDetails">
+                          {!selectedNodeOnline && <div className="empty">Agent 已离线，当前节点暂不能修改或部署。</div>}
+                          <section className="connectionActions" aria-label="创建连接">
+                            <div>
+                              <h3>创建连接</h3>
+                              <p className="muted">手动连接用于接入非受管节点；受管连接会自动生成密钥、部署并启动双方接口。</p>
+                            </div>
+                            <div className="actionRow">
+                              <button
+                                type="button"
+                                disabled={!selectedNodeOnline}
+                                onClick={() => setCreateDialog("external")}
+                              >
+                                <Plus size={16} /> 手动创建连接
+                              </button>
+                              <button
+                                type="button"
+                                disabled={!selectedNodeOnline || nodes.filter((item) => item.id !== node.id && isNodeSelectable(item)).length === 0}
+                                onClick={() => openManagedCreateDialog()}
+                              >
+                                <GitBranch size={16} /> 创建受管连接
+                              </button>
+                            </div>
+                          </section>
+
+                          {selectedNodeSupportsWgQuickImport ? (
+                            <div className="sectionActions">
+                              <button
+                                className="secondary"
+                                disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNodeId, "import-scan"))}
+                                onClick={() => void runAction(requestImportScan, nodeActionKey(selectedNodeId, "import-scan"))}
+                              >
+                                <Upload size={16} /> {actionPending(nodeActionKey(selectedNodeId, "import-scan")) ? "扫描中" : "扫描现有 wg-quick"}
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="empty">{importScanUnavailableMessage(selectedNode, selectedNodeOnline)}</div>
+                          )}
+
+                          {selectedNodeSupportsWgQuickImport && importCandidates.length > 0 && (
+                            <div className="candidateList">
+                              <button
+                                type="button"
+                                className="candidateToggle"
+                                onClick={() => setImportCandidatesExpanded((value) => !value)}
+                              >
+                                <span>
+                                  {importCandidatesExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                                  <strong>扫描到的 wg-quick 配置</strong>
+                                </span>
+                                <small>{importCandidates.length} 个</small>
+                              </button>
+                              {importCandidatesExpanded && importCandidates.map((candidate) => (
+                                <div key={candidate.id} className="candidate">
+                                  <div>
+                                    <strong>{candidate.interface_name}</strong>
+                                    <span>{candidate.path}</span>
+                                    {candidate.warnings.length > 0 && <small>{candidate.warnings.join("; ")}</small>}
+                                  </div>
+                                  <button
+                                    disabled={candidate.imported || !selectedNodeOnline || actionPending(candidateActionKey(candidate.id))}
+                                    onClick={() => void runAction(() => importCandidate(candidate.id), candidateActionKey(candidate.id))}
+                                  >
+                                    {candidate.imported ? "已导入" : actionPending(candidateActionKey(candidate.id)) ? "导入中" : "导入"}
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          <div className="configList">
+                            {configs.length === 0 ? (
+                              <div className="empty">该节点还没有 WireGuard 配置。</div>
+                            ) : (
+                              configs.map((item) => (
+                                <button
+                                  key={item.id}
+                                  data-config-id={item.id}
+                                  className="configRow"
+                                  onClick={() => {
+                                    setSelectedConfigId(item.id);
+                                    setPlan(null);
+                                  }}
+                                >
+                                  <span>
+                                    <strong>{item.name}</strong>
+                                    <small>{item.source}{item.managed ? " / managed" : " / unmanaged"}</small>
+                                  </span>
+                                  <span className="configRowMetrics">
+                                    <span className={`statusBadge ${item.runtime_status === "running" ? "online" : ""}`}>
+                                      {statusLabel(item.runtime_status)}
+                                    </span>
+                                    <MonitorSummaryButton
+                                      summary={item.monitor_summary}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        setMonitorDialogConfigId(item.id);
+                                        setMonitorWindow("1h");
+                                      }}
+                                    />
+                                  </span>
+                                </button>
+                              ))
+                            )}
+                          </div>
+                        </div>
                       )}
-                    </div>
-                  </div>
-                )}
-              </section>
-            );
-          })}
+                    </section>
+                  );
+                })}
+              </div>
+            </section>
+          ))}
         </div>
       </section>
 

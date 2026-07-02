@@ -83,7 +83,7 @@ from link42_api.schemas import (
 )
 from link42_common.security import hash_token, verify_token
 from link42_api.wireguard_service import build_diff, count_enabled_peers, render_interface_config
-from link42_api.database import ensure_sqlite_point_to_point_constraints
+from link42_api.database import backup_sqlite_database_for_upgrade, ensure_sqlite_point_to_point_constraints
 
 
 def test_count_enabled_peers_ignores_disabled_peer() -> None:
@@ -2574,6 +2574,37 @@ def test_sqlite_point_to_point_repair_can_create_unique_index(monkeypatch) -> No
     assert "runtime_status" in columns
     assert "endpoint_ips" in node_columns
     assert "agent_token_value" in node_columns
+
+
+def test_sqlite_upgrade_backup_keeps_single_file(monkeypatch, tmp_path) -> None:
+    """验证升级备份固定覆盖同一个 SQLite 备份文件，避免备份堆积。"""
+
+    import sqlite3
+    import link42_api.database as database
+
+    db_path = tmp_path / "link42.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE demo (value TEXT)")
+        connection.execute("INSERT INTO demo (value) VALUES ('old')")
+        connection.commit()
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    monkeypatch.setattr(database, "engine", engine)
+
+    backup_path = backup_sqlite_database_for_upgrade()
+    assert backup_path == tmp_path / "link42.previous-version.db"
+    with sqlite3.connect(backup_path) as connection:
+        assert connection.execute("SELECT value FROM demo").fetchone()[0] == "old"
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE demo SET value = 'new'")
+        connection.commit()
+
+    backup_path_again = backup_sqlite_database_for_upgrade()
+    assert backup_path_again == backup_path
+    assert sorted(path.name for path in tmp_path.glob("*.previous-version.db")) == ["link42.previous-version.db"]
+    with sqlite3.connect(backup_path) as connection:
+        assert connection.execute("SELECT value FROM demo").fetchone()[0] == "new"
 
 
 def test_sqlite_repair_upgrades_legacy_schema_columns(monkeypatch) -> None:

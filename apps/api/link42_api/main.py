@@ -9,6 +9,7 @@ from pathlib import Path
 import secrets
 import shlex
 import subprocess
+import time
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -55,7 +56,39 @@ SETTING_ADMIN_USERNAME = "admin_username"
 SETTING_ADMIN_PASSWORD_HASH = "admin_password_hash"
 SETTING_ADMIN_SESSION_HASH = "admin_session_hash"
 SETTING_CONTROLLER_URL = "controller_url"
+SETTING_SITE_TITLE = "site_title"
+SETTING_SITE_LOGO_URL = "site_logo_url"
+SETTING_CONTROLLER_VERSION = "controller_version"
+DEFAULT_SITE_TITLE = "Link42"
+DEFAULT_SITE_LOGO_URL = "/logo.png"
+BRANDING_LOGO_MAX_BYTES = 3 * 1024 * 1024
 MONITOR_SUMMARY_WINDOW = timedelta(hours=1)
+
+
+def uploaded_logo_path() -> Path | None:
+    """返回当前上传 Logo 文件路径。"""
+
+    logo_dir = Path(settings.config_dir) / "branding"
+    for suffix in ["png", "jpg", "webp"]:
+        path = logo_dir / f"logo.{suffix}"
+        if path.exists():
+            return path
+    return None
+
+
+def detect_logo_extension(content_type: str, data: bytes) -> str:
+    """根据 content-type 和文件头判断 Logo 类型。"""
+
+    normalized = content_type.split(";", 1)[0].strip().lower()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp"
+    if normalized not in {"image/png", "image/jpeg", "image/jpg", "image/webp"}:
+        raise HTTPException(status_code=400, detail="logo must be PNG, JPEG, or WebP")
+    raise HTTPException(status_code=400, detail="logo must be PNG, JPEG, or WebP")
 
 def mount_web_panel() -> None:
     """按配置挂载前端静态文件，让主控镜像可以单端口运行。"""
@@ -69,6 +102,22 @@ def mount_web_panel() -> None:
         return
     if assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
+    @app.get("/branding/logo", include_in_schema=False)
+    def serve_uploaded_logo() -> FileResponse:
+        """返回用户上传并保存在配置目录中的 Logo。"""
+
+        path = uploaded_logo_path()
+        if not path:
+            raise HTTPException(status_code=404, detail="logo not uploaded")
+        return FileResponse(path)
+
+    logo_file = web_dist_dir / "logo.png"
+    if logo_file.exists():
+        @app.get("/logo.png", include_in_schema=False)
+        def serve_web_logo() -> FileResponse:
+            """返回默认站点 Logo。"""
+
+            return FileResponse(logo_file)
 
     @app.get("/", include_in_schema=False)
     def serve_web_index() -> FileResponse:
@@ -116,10 +165,35 @@ def ensure_admin_credentials() -> None:
         set_setting(db, SETTING_ADMIN_USERNAME, DEFAULT_ADMIN_USERNAME)
         set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_token(password))
         set_setting(db, SETTING_CONTROLLER_URL, get_setting(db, SETTING_CONTROLLER_URL) or "")
+        set_setting(db, SETTING_SITE_TITLE, get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE)
+        set_setting(db, SETTING_SITE_LOGO_URL, get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL)
         db.commit()
     finally:
         db.close()
     print(f"Link42 initial login: username={DEFAULT_ADMIN_USERNAME} password={password}", flush=True)
+
+
+def controller_version_in_database() -> str | None:
+    """读取数据库中记录的上次主控版本；旧库可能没有该设置。"""
+
+    db = next(get_db())
+    try:
+        return get_setting(db, SETTING_CONTROLLER_VERSION)
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+def record_controller_version() -> None:
+    """记录当前主控版本，用于下次启动判断是否发生升级。"""
+
+    db = next(get_db())
+    try:
+        set_setting(db, SETTING_CONTROLLER_VERSION, CONTROLLER_VERSION)
+        db.commit()
+    finally:
+        db.close()
 
 
 def admin_username(db: Session) -> str:
@@ -141,7 +215,7 @@ def bearer_token_from_request(request: Request) -> str | None:
 def is_api_auth_exempt(path: str) -> bool:
     """API 鉴权白名单：健康检查、登录和 Agent 自身 token 接口。"""
 
-    return path in {"/api/health", "/api/auth/login"} or path.startswith("/api/agent/")
+    return path in {"/api/health", "/api/auth/login", "/api/branding"} or path.startswith("/api/agent/")
 
 
 def require_web_session(request: Request, db: Session) -> None:
@@ -171,8 +245,19 @@ async def require_api_authentication(request: Request, call_next):
 @app.on_event("startup")
 def on_startup() -> None:
     """应用启动时初始化数据库。"""
+    previous_version = controller_version_in_database()
+    if previous_version != CONTROLLER_VERSION:
+        from .database import backup_sqlite_database_for_upgrade
+
+        backup_path = backup_sqlite_database_for_upgrade()
+        if backup_path:
+            print(
+                f"Link42 database backup before upgrade: {backup_path} ({previous_version} -> {CONTROLLER_VERSION})",
+                flush=True,
+            )
     init_db()
     ensure_admin_credentials()
+    record_controller_version()
 
 
 def require_agent(db: Session, node_id: int, token: str) -> models.Node:
@@ -1605,6 +1690,16 @@ def auth_me(db: Session = Depends(get_db)) -> schemas.AuthStatus:
     return schemas.AuthStatus(authenticated=True, username=admin_username(db))
 
 
+@app.get("/api/branding", response_model=schemas.BrandingRead)
+def get_branding(db: Session = Depends(get_db)) -> schemas.BrandingRead:
+    """公开读取站点品牌展示信息，供登录页使用。"""
+
+    return schemas.BrandingRead(
+        site_title=get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE,
+        site_logo_url=get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL,
+    )
+
+
 @app.get("/api/settings", response_model=schemas.ControllerSettingsRead)
 def get_controller_settings(db: Session = Depends(get_db)) -> schemas.ControllerSettingsRead:
     """读取主控 Web 设置。"""
@@ -1612,6 +1707,8 @@ def get_controller_settings(db: Session = Depends(get_db)) -> schemas.Controller
     return schemas.ControllerSettingsRead(
         controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "",
         username=admin_username(db),
+        site_title=get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE,
+        site_logo_url=get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL,
     )
 
 
@@ -1630,11 +1727,50 @@ def update_controller_settings(
         raise HTTPException(status_code=400, detail="username is required")
     set_setting(db, SETTING_CONTROLLER_URL, controller_url)
     set_setting(db, SETTING_ADMIN_USERNAME, username)
+    set_setting(db, SETTING_SITE_TITLE, payload.site_title.strip() or DEFAULT_SITE_TITLE)
+    if payload.site_logo_url is not None:
+        set_setting(db, SETTING_SITE_LOGO_URL, payload.site_logo_url.strip() or DEFAULT_SITE_LOGO_URL)
     if payload.new_password:
         set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_token(payload.new_password))
         set_setting(db, SETTING_ADMIN_SESSION_HASH, "")
     db.commit()
-    return schemas.ControllerSettingsRead(controller_url=controller_url, username=username)
+    return schemas.ControllerSettingsRead(
+        controller_url=controller_url,
+        username=username,
+        site_title=get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE,
+        site_logo_url=get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL,
+    )
+
+
+@app.post("/api/settings/logo", response_model=schemas.ControllerSettingsRead)
+async def upload_site_logo(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> schemas.ControllerSettingsRead:
+    """上传站点 Logo 到配置目录，便于 Docker bind mount 持久化。"""
+
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="logo file is required")
+    if len(data) > BRANDING_LOGO_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="logo file must be no larger than 3 MiB")
+    suffix = detect_logo_extension(request.headers.get("content-type", ""), data)
+    logo_dir = Path(settings.config_dir) / "branding"
+    logo_dir.mkdir(parents=True, exist_ok=True)
+    for stale_suffix in ["png", "jpg", "webp"]:
+        stale_path = logo_dir / f"logo.{stale_suffix}"
+        if stale_path.exists():
+            stale_path.unlink()
+    target = logo_dir / f"logo.{suffix}"
+    target.write_bytes(data)
+    set_setting(db, SETTING_SITE_LOGO_URL, f"/branding/logo?v={int(time.time())}")
+    db.commit()
+    return schemas.ControllerSettingsRead(
+        controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "",
+        username=admin_username(db),
+        site_title=get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE,
+        site_logo_url=get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL,
+    )
 
 
 @app.get("/api/agent/releases", response_model=schemas.AgentReleaseManifest)

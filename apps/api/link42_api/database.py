@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
+import shutil
+import sqlite3
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -18,6 +21,9 @@ if settings.database_url.startswith("sqlite"):
 engine = create_engine(settings.database_url, connect_args=connect_args)
 # 请求级 Session 工厂；关闭 autoflush 可以让写入时机更明确，便于审阅。
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+# 升级前数据库备份文件名；固定一个文件，避免长期运行后堆积备份。
+UPGRADE_BACKUP_SUFFIX = ".previous-version.db"
 
 
 class Base(DeclarativeBase):
@@ -42,6 +48,41 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     ensure_sqlite_point_to_point_constraints()
+
+
+def sqlite_database_path() -> Path | None:
+    """从 SQLAlchemy URL 中解析 SQLite 文件路径，内存库或非文件库返回空。"""
+
+    if engine.dialect.name != "sqlite":
+        return None
+    database = engine.url.database
+    if not database:
+        return None
+    if database == ":memory:":
+        return None
+    path = Path(database)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def backup_sqlite_database_for_upgrade() -> Path | None:
+    """在版本升级前备份 SQLite 数据库，并只保留一个升级备份。"""
+
+    source = sqlite_database_path()
+    if source is None or not source.exists():
+        return None
+    backup_path = source.with_name(f"{source.stem}{UPGRADE_BACKUP_SUFFIX}")
+    temporary_path = backup_path.with_suffix(f"{backup_path.suffix}.tmp")
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    if temporary_path.exists():
+        temporary_path.unlink()
+    with sqlite3.connect(source) as source_connection:
+        with sqlite3.connect(temporary_path) as backup_connection:
+            source_connection.backup(backup_connection)
+    shutil.copystat(source, temporary_path)
+    temporary_path.replace(backup_path)
+    return backup_path
 
 
 def ensure_sqlite_point_to_point_constraints() -> None:
