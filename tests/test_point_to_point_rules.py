@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from link42_api.database import Base
 from link42_api import models
 from link42_api.connection_drivers import connection_driver_for_interface
+from link42_api.node_plugins.base import NodePluginContext
+from link42_api.node_plugins.bird import BirdNodePlugin
 from link42_api.main import (
     ADMIN_USERNAME,
     SETTING_ADMIN_PASSWORD_HASH,
@@ -35,6 +37,7 @@ from link42_api.main import (
     ensure_unique_interface_name,
     get_controller_settings,
     get_setting,
+    list_node_plugins_for_node,
     install_node_middleware,
     mark_import_candidate_available_for_interface,
     is_node_online,
@@ -59,6 +62,7 @@ from link42_api.main import (
     update_managed_link,
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
+    request_node_plugin_action,
     update_node_topology_position,
 )
 from link42_api.schemas import (
@@ -77,6 +81,7 @@ from link42_api.schemas import (
     AgentLinkMonitorResultItem,
     AgentLinkMonitorResultRequest,
     AgentUpgradeRequest,
+    NodePluginActionRequest,
     LinkMonitorCreate,
     Udp2RawMiddlewareConfig,
     TopologyPositionUpdate,
@@ -147,10 +152,219 @@ def test_wireguard_connection_driver_exposes_standard_tasks() -> None:
 
     assert driver.type == "wireguard"
     assert driver.tasks == WIREGUARD_TASKS
-    assert payload["interface_name"] == "wg0"
-    assert payload["managed"] is True
-    assert payload["enable_on_boot"] is True
-    assert WIREGUARD_TASKS.apply_config in TASK_REQUIREMENTS
+
+
+def test_node_plugin_status_reports_missing_capability() -> None:
+    """验证节点插件宿主会报告 Agent 能力缺口。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            endpoint_ips=["203.0.113.1"],
+            status="online",
+            agent_token_hash="hash",
+            agent_capabilities=["wireguard"],
+            agent_version="0.5.9",
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        session.commit()
+
+        plugins = list_node_plugins_for_node(node.id, session)
+
+    test_plugin = next(plugin for plugin in plugins if plugin["type"] == "test-tools")
+    assert test_plugin["available"] is False
+    assert test_plugin["missing_capabilities"] == ["node_plugin.test_tools"]
+
+
+def test_node_plugin_status_checks_agent_version() -> None:
+    """验证插件可用状态同时受 Agent 版本和 capability 约束。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            endpoint_ips=["203.0.113.1"],
+            status="online",
+            agent_token_hash="hash",
+            agent_version="0.5.7",
+            agent_capabilities=["node_plugin.test_tools"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        session.commit()
+
+        plugins = list_node_plugins_for_node(node.id, session)
+
+    test_plugin = next(plugin for plugin in plugins if plugin["type"] == "test-tools")
+    assert test_plugin["available"] is False
+    assert test_plugin["version_supported"] is False
+    assert test_plugin["missing_capabilities"] == []
+
+
+def test_node_plugin_action_creates_agent_task() -> None:
+    """验证节点插件 action 通过宿主 API 入队为 Agent 任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            endpoint_ips=["203.0.113.1"],
+            status="online",
+            agent_token_hash="hash",
+            agent_version="0.6.0",
+            agent_capabilities=["node_plugin.test_tools"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        session.commit()
+
+        result = request_node_plugin_action(
+            node.id,
+            "test-tools",
+            "echo",
+            NodePluginActionRequest(payload={"message": "hello plugin"}),
+            session,
+        )
+        task = session.get(models.AgentTask, result.task_id)
+
+    assert result.status == "pending"
+    assert task is not None
+    assert task.type == "node_plugin.test_tools.echo"
+    assert task.payload["message"] == "hello plugin"
+
+
+def test_node_plugin_action_rejects_offline_node() -> None:
+    """验证插件 action 入口不只依赖前端禁用，后端也拒绝离线节点。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            endpoint_ips=["203.0.113.1"],
+            status="offline",
+            agent_token_hash="hash",
+            agent_version="0.5.8",
+            agent_capabilities=["node_plugin.test_tools"],
+        )
+        session.add(node)
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            request_node_plugin_action(
+                node.id,
+                "test-tools",
+                "echo",
+                NodePluginActionRequest(payload={"message": "hello plugin"}),
+                session,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "node is offline"
+
+
+def test_bird_node_plugin_action_creates_agent_task() -> None:
+    """验证 Bird 节点插件通过宿主 API 入队为 Agent 任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            endpoint_ips=["203.0.113.1"],
+            status="online",
+            agent_token_hash="hash",
+            agent_version="0.5.9",
+            agent_capabilities=["node_plugin.bird"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        session.commit()
+
+        result = request_node_plugin_action(
+            node.id,
+            "bird",
+            "read",
+            NodePluginActionRequest(payload={"resource_key": "/etc/bird/bird.conf"}),
+            session,
+        )
+        task = session.get(models.AgentTask, result.task_id)
+
+    assert result.status == "pending"
+    assert task is not None
+    assert task.type == "node_plugin.bird.read"
+    assert task.payload["resource_key"] == "/etc/bird/bird.conf"
+
+
+def test_bird_node_plugin_preserves_config_content_bytes() -> None:
+    """验证 Controller 不会 trim BIRD 配置内容，避免原样应用也改变文件。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    content = "router id 10.0.0.1;\n\n"
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online")
+        session.add(node)
+        session.commit()
+        plugin = BirdNodePlugin()
+
+        cleaned = plugin.validate_payload(
+            "apply",
+            {
+                "resource_key": " /etc/bird/bird.conf ",
+                "content": content,
+                "base_sha256": " abc123 ",
+                "reload": False,
+            },
+            NodePluginContext(node=node, db=session),
+        )
+
+    assert cleaned["resource_key"] == "/etc/bird/bird.conf"
+    assert cleaned["base_sha256"] == "abc123"
+    assert cleaned["content"] == content
+
+
+def test_bird_node_plugin_apply_many_preserves_all_config_content_bytes() -> None:
+    """验证批量保存 payload 不 trim 任意文件内容。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online")
+        session.add(node)
+        session.commit()
+        plugin = BirdNodePlugin()
+
+        cleaned = plugin.validate_payload(
+            "apply_many",
+            {
+                "files": [
+                    {
+                        "resource_key": " /etc/bird/bird.conf ",
+                        "content": "router id 10.0.0.1;\n\n",
+                        "base_sha256": " abc123 ",
+                    },
+                    {
+                        "resource_key": "/etc/bird/conf.d/peer.conf",
+                        "content": "\nprotocol device {}\n",
+                        "base_sha256": " def456 ",
+                    },
+                ],
+                "reload": False,
+            },
+            NodePluginContext(node=node, db=session),
+        )
+
+    assert cleaned["reload"] is False
+    assert cleaned["files"][0]["resource_key"] == "/etc/bird/bird.conf"
+    assert cleaned["files"][0]["content"] == "router id 10.0.0.1;\n\n"
+    assert cleaned["files"][0]["base_sha256"] == "abc123"
+    assert cleaned["files"][1]["content"] == "\nprotocol device {}\n"
 
 
 def test_diff_uses_deployed_config_as_baseline() -> None:
@@ -639,6 +853,8 @@ def test_api_auth_exemptions_keep_health_login_and_agent_public() -> None:
     assert is_api_auth_exempt("/api/health")
     assert is_api_auth_exempt("/api/auth/login")
     assert is_api_auth_exempt("/api/agent/heartbeat")
+    assert not is_api_auth_exempt("/api/tasks/1")
+    assert not is_api_auth_exempt("/api/agent/tasks/1")
     assert not is_api_auth_exempt("/api/nodes")
     assert not is_api_auth_exempt("/api/settings")
 

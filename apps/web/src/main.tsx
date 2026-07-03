@@ -1,9 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Pencil, Plus, RefreshCw, Server, Settings, Sun, Upload, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, FileText, Folder, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Pencil, Plug, Plus, RefreshCw, Server, Settings, Sun, Upload, X } from "lucide-react";
 import { Background, Handle, MarkerType, Position, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import CodeMirror from "@uiw/react-codemirror";
+import { indentWithTab } from "@codemirror/commands";
+import { StreamLanguage } from "@codemirror/language";
+import { nginx } from "@codemirror/legacy-modes/mode/nginx";
+import { EditorView, keymap } from "@codemirror/view";
+import { Tree, type NodeRendererProps } from "react-arborist";
 import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
 import "./styles.css";
@@ -217,6 +223,69 @@ type AgentTaskStatus = {
   result: Record<string, unknown> | null;
 };
 
+type NodePluginAction = {
+  name: string;
+  task_type: string;
+  risk: string;
+  requires_confirm: boolean;
+};
+
+type NodePluginStatus = {
+  type: string;
+  display_name: string;
+  description: string;
+  min_agent_version: string;
+  capabilities: string[];
+  actions: NodePluginAction[];
+  available: boolean;
+  missing_capabilities: string[];
+  agent_version: string | null;
+  version_supported: boolean;
+  node_status: string;
+};
+
+type NodePluginActionResult = {
+  task_id: number;
+  plugin_type: string;
+  action: string;
+  status: string;
+  message: string;
+};
+
+type BirdResource = {
+  resource_key: string;
+  path: string;
+  name: string;
+  size: number;
+  sha256: string;
+  mtime: string;
+  editable: boolean;
+  is_main: boolean;
+};
+
+type BirdFileTreeNode = {
+  name: string;
+  path: string;
+  directories: Map<string, BirdFileTreeNode>;
+  files: BirdResource[];
+};
+
+type BirdTreeItem = {
+  id: string;
+  name: string;
+  path: string;
+  type: "directory" | "file";
+  resource?: BirdResource;
+  children?: BirdTreeItem[];
+};
+
+type BirdFileDraft = {
+  resource: BirdResource;
+  content: string;
+  originalContent: string;
+  sha256: string;
+};
+
 type AgentUpgradePlan = {
   node_id: number;
   current_version: string | null;
@@ -384,6 +453,31 @@ function translateApiDetail(detail: string): string {
   return messages[detail] || detail;
 }
 
+function formatPluginTaskError(task: AgentTaskStatus, fallback = "插件任务执行失败"): string {
+  const result = task.result || {};
+  const error = typeof result.error === "string" ? result.error : "";
+  const check = result.check && typeof result.check === "object" ? result.check as Record<string, unknown> : null;
+  const reload = result.reload && typeof result.reload === "object" ? result.reload as Record<string, unknown> : null;
+  const stderr = check && typeof check.stderr === "string" ? check.stderr : "";
+  const stdout = check && typeof check.stdout === "string" ? check.stdout : "";
+  const reloadStderr = reload && typeof reload.stderr === "string" ? reload.stderr : "";
+  const reloadStdout = reload && typeof reload.stdout === "string" ? reload.stdout : "";
+  let friendly = "";
+  if (error.includes("BIRD resource changed on node")) {
+    friendly = "保存前节点上的配置文件已被其他人修改，请重新读取配置树后再合并修改。";
+  } else if (error.includes("BIRD resource does not exist")) {
+    friendly = "保存前节点上的配置文件已被删除或移动，请重新读取配置树。";
+  } else if (error.includes("duplicate BIRD resource")) {
+    friendly = "同一个配置文件被重复提交，请刷新后再试。";
+  }
+  if (!friendly && reload && Number(reload.returncode) !== 0) {
+    friendly = "birdc configure 执行失败，已恢复本次写入的配置文件。";
+  }
+  return [fallback, friendly, error, stderr, stdout, reloadStderr, reloadStdout]
+    .filter(Boolean)
+    .join("\n\n") || fallback;
+}
+
 function isNodeSelectable(node: NodeItem): boolean {
   // 只有 Agent 在线的节点才允许进入 WireGuard 下级菜单。
   return node.status === "online";
@@ -456,6 +550,54 @@ function importScanUnavailableMessage(node: NodeItem | null, online: boolean): s
     return "Agent 上报能力后显示可用的导入方式。";
   }
   return "当前节点未上报 wg-quick 文件导入能力。";
+}
+
+function birdDirectory(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index > 0 ? path.slice(0, index) : "/";
+}
+
+function buildBirdFileTree(files: BirdResource[]): BirdTreeItem[] {
+  const root: BirdFileTreeNode = { name: "/", path: "/", directories: new Map(), files: [] };
+  for (const file of files) {
+    const parts = file.path.split("/").filter(Boolean);
+    const fileName = parts.pop() || file.name;
+    let current = root;
+    let currentPath = "";
+    for (const part of parts) {
+      currentPath = `${currentPath}/${part}`;
+      let child = current.directories.get(part);
+      if (!child) {
+        child = { name: part, path: currentPath, directories: new Map(), files: [] };
+        current.directories.set(part, child);
+      }
+      current = child;
+    }
+    current.files.push({ ...file, name: fileName });
+  }
+  return birdTreeNodeChildren(root);
+}
+
+function birdTreeNodeChildren(node: BirdFileTreeNode): BirdTreeItem[] {
+  const directories = Array.from(node.directories.values())
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((directory) => ({
+      id: directory.path,
+      name: directory.name,
+      path: directory.path,
+      type: "directory" as const,
+      children: birdTreeNodeChildren(directory),
+    }));
+  const files = [...node.files]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((file) => ({
+      id: file.resource_key,
+      name: file.name,
+      path: file.path,
+      type: "file" as const,
+      resource: file,
+    }));
+  return [...directories, ...files];
 }
 
 function statusLabel(status: string): string {
@@ -1259,8 +1401,24 @@ function App() {
   const [monitorDialogConfigId, setMonitorDialogConfigId] = useState<number | null>(null);
   const [monitorWindow, setMonitorWindow] = useState("1h");
   const [monitorDetail, setMonitorDetail] = useState<LinkMonitorSamplesResponse | null>(null);
+  const [nodePlugins, setNodePlugins] = useState<NodePluginStatus[]>([]);
+  const [nodePluginDialogOpen, setNodePluginDialogOpen] = useState(false);
+  const [activeNodePluginType, setActiveNodePluginType] = useState("");
+  const [nodePluginError, setNodePluginError] = useState("");
+  const [nodePluginTasks, setNodePluginTasks] = useState<Record<string, AgentTaskStatus>>({});
+  const [nodePluginEchoMessage, setNodePluginEchoMessage] = useState("hello from Link42 plugin host");
+  const [birdResources, setBirdResources] = useState<BirdResource[]>([]);
+  const [birdDrafts, setBirdDrafts] = useState<Record<string, BirdFileDraft>>({});
+  const [birdSelectedResource, setBirdSelectedResource] = useState("");
+  const [birdOpeningResource, setBirdOpeningResource] = useState("");
+  const [birdEditorSyntax, setBirdEditorSyntax] = useState<"bird" | "plain">("bird");
+  const [birdEditorLineNumbers, setBirdEditorLineNumbers] = useState(true);
+  const [birdEditorLineWrapping, setBirdEditorLineWrapping] = useState(true);
+  const [birdEditorFoldGutter, setBirdEditorFoldGutter] = useState(true);
+  const [birdEditorAutocompletion, setBirdEditorAutocompletion] = useState(true);
   const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
   const topologyEdgeSelectionRef = useRef<number | null>(null);
+  const birdSelectedResourceRef = useRef("");
   function selectConfigId(configId: number | null) {
     selectedConfigIdRef.current = configId;
     setSelectedConfigId(configId);
@@ -1297,6 +1455,26 @@ function App() {
     [configs, monitorDialogConfigId],
   );
   const selectedNodeOnline = selectedNode ? isNodeSelectable(selectedNode) : false;
+  const availableNodePlugins = nodePlugins.filter((plugin) => plugin.available);
+  const activeNodePlugin = nodePlugins.find((plugin) => plugin.type === activeNodePluginType) || nodePlugins[0] || null;
+  const birdPlugin = nodePlugins.find((plugin) => plugin.type === "bird") || null;
+  const birdFileTree = useMemo(() => buildBirdFileTree(birdResources), [birdResources]);
+  const birdSelectedDirectory = birdSelectedResource ? birdDirectory(birdSelectedResource) : "";
+  const birdSelectedDraft = birdSelectedResource ? birdDrafts[birdSelectedResource] || null : null;
+  const birdContent = birdSelectedDraft?.content || "";
+  const birdDirtyDrafts = Object.values(birdDrafts).filter((draft) => draft.content !== draft.originalContent);
+  const birdHasUnsavedChanges = birdDirtyDrafts.length > 0;
+  const birdTreeLocked = Boolean(birdOpeningResource);
+  const birdEditorExtensions = useMemo(
+    () => [
+      ...(birdEditorLineWrapping ? [EditorView.lineWrapping] : []),
+      ...(birdEditorSyntax === "bird" ? [StreamLanguage.define(nginx)] : []),
+      keymap.of([
+        indentWithTab,
+      ]),
+    ],
+    [birdEditorSyntax, birdEditorLineWrapping],
+  );
   const editingNode = useMemo(
     () => nodes.find((node) => node.id === editingNodeId) || null,
     [nodes, editingNodeId],
@@ -1818,6 +1996,205 @@ function App() {
     setPeerNodeConfigs(data);
   }
 
+  async function refreshNodePlugins(nodeId: number) {
+    const data = await api<NodePluginStatus[]>(`/api/nodes/${nodeId}/plugins`);
+    setNodePlugins(data);
+  }
+
+  async function refreshAgentTask(taskId: number, key: string) {
+    const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
+    setNodePluginTasks((current) => ({ ...current, [key]: task }));
+    return task;
+  }
+
+  async function executeNodePluginAction(pluginType: string, action: string, payload: Record<string, unknown> = {}) {
+    if (!selectedNodeId) return;
+    const key = `${pluginType}:${action}`;
+    try {
+      const result = await api<NodePluginActionResult>(`/api/nodes/${selectedNodeId}/plugins/${pluginType}/${action}`, {
+        method: "POST",
+        body: JSON.stringify({ payload }),
+      });
+      for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
+        const task = await refreshAgentTask(result.task_id, key);
+        if (task.status === "succeeded") {
+          return task;
+        }
+        if (task.status === "failed") {
+          setNodePluginError(formatPluginTaskError(task));
+          return task;
+        }
+        await sleep(TASK_POLL_INTERVAL_MS);
+      }
+      notify("info", "插件任务仍在执行，请稍后刷新节点状态。");
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("401:")) {
+        throw error;
+      }
+      setNodePluginError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function runNodePluginAction(pluginType: string, action: string, payload: Record<string, unknown> = {}) {
+    const task = await executeNodePluginAction(pluginType, action, payload);
+    if (!task || task.status === "failed") return;
+    if (pluginType === "test-tools" && action === "echo") {
+      notify("success", `回显完成：${String(task.result?.message || "")}`);
+    } else if (pluginType === "test-tools" && action === "inspect") {
+      notify("success", "平台信息读取完成。");
+    } else {
+      notify("success", "插件任务执行完成。");
+    }
+  }
+
+  function resetBirdEditorState(clearResources = false) {
+    if (clearResources) {
+      setBirdResources([]);
+    }
+    setBirdDrafts({});
+    setBirdSelectedResource("");
+    setBirdOpeningResource("");
+  }
+
+  function confirmDiscardBirdChanges(): boolean {
+    if (!birdHasUnsavedChanges) return true;
+    return window.confirm("当前 BIRD 配置有未保存修改，是否放弃这些修改？");
+  }
+
+  function openNodePluginDialog() {
+    if (nodePlugins.length === 0) return;
+    resetBirdEditorState(true);
+    const preferredPlugin = nodePlugins.find((plugin) => plugin.type === "bird") || nodePlugins[0];
+    setActiveNodePluginType(preferredPlugin.type);
+    setNodePluginDialogOpen(true);
+  }
+
+  function closeNodePluginDialog() {
+    if (!confirmDiscardBirdChanges()) return;
+    setNodePluginDialogOpen(false);
+  }
+
+  function switchNodePluginTab(pluginType: string) {
+    if (pluginType === activeNodePluginType) return;
+    if (!confirmDiscardBirdChanges()) return;
+    resetBirdEditorState(pluginType === "bird");
+    setActiveNodePluginType(pluginType);
+  }
+
+  async function listBirdResources(options: { confirmDiscard?: boolean; clearDrafts?: boolean } = {}) {
+    if (options.confirmDiscard && !confirmDiscardBirdChanges()) return;
+    if (options.clearDrafts) {
+      resetBirdEditorState(false);
+    }
+    const task = await executeNodePluginAction("bird", "list");
+    if (!task || task.status === "failed") return;
+    const files = (task?.result?.files || []) as BirdResource[];
+    setBirdResources(files);
+    const selectedResource = birdSelectedResourceRef.current;
+    if (!files.some((file) => file.resource_key === selectedResource)) {
+      setBirdSelectedResource("");
+    }
+    notify(files.length > 0 ? "info" : "success", files.length > 0 ? "配置树已读取，请选择一个配置文件打开。" : "没有发现可编辑的 BIRD 配置文件。");
+  }
+
+  async function readBirdResource(resourceKey = birdSelectedResource) {
+    if (!resourceKey) return;
+    if (birdOpeningResource) return;
+    if (birdDrafts[resourceKey]) {
+      setBirdSelectedResource(resourceKey);
+      return;
+    }
+    setBirdOpeningResource(resourceKey);
+    try {
+      const task = await executeNodePluginAction("bird", "read", { resource_key: resourceKey });
+      if (!task || task.status === "failed") return;
+      const result = task?.result as (Record<string, unknown> | null | undefined);
+      if (result?.content != null) {
+        setBirdSelectedResource(resourceKey);
+        setBirdDrafts((current) => ({
+          ...current,
+          [resourceKey]: {
+            resource: result as unknown as BirdResource,
+            content: String(result.content),
+            originalContent: String(result.content),
+            sha256: String(result.sha256 || ""),
+          },
+        }));
+        notify("success", "配置文件已打开。");
+      }
+    } finally {
+      setBirdOpeningResource("");
+    }
+  }
+
+  async function validateBirdResource() {
+    if (!birdSelectedResource) return;
+    const task = await executeNodePluginAction("bird", "validate", {
+      resource_key: birdSelectedResource,
+      content: birdContent,
+    });
+    if (!task || task.status === "failed") return;
+    if (task.result?.valid) {
+      notify("success", "BIRD 配置校验通过。");
+    } else {
+      setNodePluginError(formatPluginTaskError(task, "BIRD 配置校验未通过"));
+    }
+  }
+
+  async function applyBirdResources(options: { confirm?: boolean } = {}) {
+    if (birdDirtyDrafts.length === 0) {
+      notify("info", "配置内容没有变化。");
+      return;
+    }
+    if (options.confirm !== false) {
+      const confirmed = window.confirm(`确认保存 ${birdDirtyDrafts.length} 个 BIRD 配置文件的变更，并执行 birdc configure 刷新配置？`);
+      if (!confirmed) return;
+    }
+    const task = await executeNodePluginAction("bird", "apply_many", {
+      files: birdDirtyDrafts.map((draft) => ({
+        resource_key: draft.resource.resource_key,
+        content: draft.content,
+        base_sha256: draft.sha256,
+      })),
+      reload: true,
+    });
+    if (!task || task.status === "failed") return;
+    if (task?.result?.applied) {
+      const savedFiles = Array.isArray(task.result.files) ? task.result.files as Array<Record<string, unknown>> : [];
+      setBirdDrafts((current) => {
+        const next = { ...current };
+        for (const saved of savedFiles) {
+          const resourceKey = String(saved.resource_key || "");
+          if (!resourceKey || !next[resourceKey]) continue;
+          next[resourceKey] = {
+            ...next[resourceKey],
+            originalContent: next[resourceKey].content,
+            sha256: String(saved.sha256 || next[resourceKey].sha256),
+          };
+        }
+        return next;
+      });
+      notify("success", `已保存 ${birdDirtyDrafts.length} 个 BIRD 配置文件，并已执行 birdc configure。`);
+      await listBirdResources();
+    } else {
+      setNodePluginError(formatPluginTaskError(task, "BIRD 配置未应用"));
+    }
+  }
+
+  function handleBirdEditorKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const key = event.key.toLowerCase();
+    if (key !== "s" || (!event.ctrlKey && !event.metaKey) || event.altKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!birdSelectedResource) return;
+    if (birdDirtyDrafts.length === 0) {
+      notify("info", "配置内容没有变化。");
+      return;
+    }
+    if (actionPending("plugin:bird:list") || actionPending("plugin:bird:apply")) return;
+    void runAction(() => applyBirdResources({ confirm: false }), "plugin:bird:apply");
+  }
+
   async function refreshPeer(configId: number) {
     // 刷新某个配置下的唯一对端；第一版一个配置只允许一个对端。
     const data = await api<PeerItem | null>(`/api/wireguard/configs/${configId}/peer`);
@@ -1941,6 +2318,11 @@ function App() {
 
   useEffect(() => {
     setImportCandidatesExpanded(false);
+    setBirdResources([]);
+    setBirdDrafts({});
+    setBirdSelectedResource("");
+    setNodePluginDialogOpen(false);
+    setActiveNodePluginType("");
     if (selectedNodeId) {
       const preferredConfigId = topologyEdgeSelectionRef.current;
       topologyEdgeSelectionRef.current = null;
@@ -1951,14 +2333,50 @@ function App() {
       setManagedPeerNodeId(null);
       refreshConfigs(selectedNodeId, preferredConfigId).catch((error) => notify("error", error.message));
       refreshImportCandidates(selectedNodeId).catch((error) => notify("error", error.message));
+      refreshNodePlugins(selectedNodeId).catch((error) => notify("error", error.message));
     } else {
       topologyEdgeSelectionRef.current = null;
       setConfigs([]);
       selectConfigId(null);
       setImportCandidates([]);
+      setNodePlugins([]);
+      setNodePluginTasks({});
+      setBirdResources([]);
+      setBirdDrafts({});
+      setBirdSelectedResource("");
+      setNodePluginDialogOpen(false);
+      setActiveNodePluginType("");
       setPlan(null);
     }
   }, [selectedNodeId]);
+
+  useEffect(() => {
+    birdSelectedResourceRef.current = birdSelectedResource;
+  }, [birdSelectedResource]);
+
+  useEffect(() => {
+    if (!nodePluginDialogOpen || nodePlugins.length === 0) return;
+    if (birdHasUnsavedChanges) return;
+    if (!activeNodePluginType || !nodePlugins.some((plugin) => plugin.type === activeNodePluginType)) {
+      setActiveNodePluginType(nodePlugins[0].type);
+    }
+  }, [nodePluginDialogOpen, nodePlugins, activeNodePluginType, birdHasUnsavedChanges]);
+
+  useEffect(() => {
+    if (!nodePluginDialogOpen || activeNodePluginType !== "bird" || birdResources.length > 0) return;
+    if (!birdPlugin?.available || !selectedNodeOnline || actionPending("plugin:bird:list")) return;
+    void runAction(() => listBirdResources(), "plugin:bird:list");
+  }, [nodePluginDialogOpen, activeNodePluginType, birdPlugin?.available, selectedNodeOnline, birdResources.length]);
+
+  useEffect(() => {
+    if (!birdHasUnsavedChanges) return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [birdHasUnsavedChanges]);
 
   useEffect(() => {
     if (!editingNodeId || !authToken) {
@@ -2227,7 +2645,7 @@ function App() {
   async function pollMiddlewareInstallTask(taskId: number, nodeId: number) {
     for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
       await sleep(TASK_POLL_INTERVAL_MS);
-      const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
+      const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
       await refreshNodes();
       if (task.status === "succeeded") {
         if (task.result?.reboot_required) {
@@ -2248,7 +2666,7 @@ function App() {
   async function pollAgentUpgradeTask(taskId: number, nodeId: number) {
     for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
       await sleep(TASK_POLL_INTERVAL_MS);
-      const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
+      const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
       await refreshNodes();
       await refreshAgentUpgradePlan(nodeId);
       if (task.status === "succeeded") {
@@ -2729,7 +3147,7 @@ function App() {
   async function pollImportScanTask(taskId: number, nodeId: number) {
     for (let attempt = 0; attempt < SHORT_TASK_POLL_LIMIT; attempt += 1) {
       await sleep(1000);
-      const task = await api<AgentTaskStatus>(`/api/agent/tasks/${taskId}`);
+      const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
       await refreshNodes();
       await refreshConfigs(nodeId, selectedConfigId);
       await refreshImportCandidates(nodeId);
@@ -2799,6 +3217,54 @@ function App() {
             <Background color={topologyGridColor} gap={18} />
           </ReactFlow>
         )}
+      </div>
+    );
+  }
+
+  function renderBirdTreeNode({ node, style }: NodeRendererProps<BirdTreeItem>) {
+    const item = node.data;
+    const isFile = item.type === "file";
+    const selected = isFile && item.resource?.resource_key === birdSelectedResource;
+    const opening = isFile && item.resource?.resource_key === birdOpeningResource;
+    const draft = isFile && item.resource ? birdDrafts[item.resource.resource_key] : null;
+    const cached = Boolean(draft);
+    const dirty = Boolean(draft && draft.content !== draft.originalContent);
+    return (
+      <div
+        className={[
+          "birdTreeNode",
+          isFile ? "file" : "directory",
+          selected ? "selected" : "",
+          opening ? "loading" : "",
+          dirty ? "dirty" : "",
+          birdTreeLocked ? "locked" : "",
+        ].filter(Boolean).join(" ")}
+        style={style}
+        onClick={() => {
+          if (birdTreeLocked) return;
+          if (isFile && item.resource) {
+            void runAction(() => readBirdResource(item.resource!.resource_key), `plugin:bird:read:${item.resource.resource_key}`);
+          } else {
+            node.toggle();
+          }
+        }}
+      >
+        {isFile ? (
+          <FileText size={15} />
+        ) : node.isOpen ? (
+          <ChevronDown size={15} />
+        ) : (
+          <ChevronRight size={15} />
+        )}
+        {!isFile && <Folder size={15} />}
+        <span>
+          <strong>{item.name}{dirty ? " *" : ""}</strong>
+          {isFile && item.resource && (
+            <small>
+              {opening ? "打开中..." : `${item.path}${item.resource.is_main ? " / main" : ""}${dirty ? " / 已修改" : cached ? " / 已缓存" : ""}`}
+            </small>
+          )}
+        </span>
       </div>
     );
   }
@@ -2920,6 +3386,244 @@ function App() {
               <button className="danger" disabled={actionPending("topology:reset")} onClick={() => void runAction(resetTopologyLayout, "topology:reset")}>
                 <RefreshCw size={16} /> {actionPending("topology:reset") ? "还原中" : "确认还原"}
               </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {nodePluginDialogOpen && selectedNode && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel nodePluginModal" role="dialog" aria-modal="true" aria-labelledby="node-plugin-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="node-plugin-title"><Plug size={18} /> 节点插件</h2>
+                <p className="muted">{selectedNode.name} / {selectedNodeOnline ? "在线" : "离线"}</p>
+              </div>
+              <button className="iconButton" onClick={closeNodePluginDialog} title="关闭">
+                <X size={18} />
+              </button>
+            </header>
+
+            <div className="nodePluginTabs" role="tablist" aria-label="节点插件">
+              {nodePlugins.map((plugin) => (
+                <button
+                  key={plugin.type}
+                  type="button"
+                  role="tab"
+                  className={plugin.type === activeNodePlugin?.type ? "nodePluginTab active" : "nodePluginTab"}
+                  aria-selected={plugin.type === activeNodePlugin?.type}
+                  onClick={() => switchNodePluginTab(plugin.type)}
+                >
+                  <span>{plugin.display_name}</span>
+                  <small>{plugin.available ? "可用" : "不可用"}</small>
+                </button>
+              ))}
+            </div>
+
+            {activeNodePlugin && !activeNodePlugin.available && (
+              <div className="empty">
+                {!activeNodePlugin.version_supported
+                  ? `Agent 版本过低：当前 ${activeNodePlugin.agent_version || "未知"}，需要 ${activeNodePlugin.min_agent_version} 或更高。`
+                  : `缺少能力：${activeNodePlugin.missing_capabilities.join(", ") || "未知"}；可能需要升级 Agent。`}
+              </div>
+            )}
+
+            {activeNodePlugin?.type === "bird" && (
+              <div className="nodePluginBird">
+                <div className="actionRow">
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={!birdPlugin?.available || !selectedNodeOnline || actionPending("plugin:bird:list")}
+                    onClick={() => void runAction(() => listBirdResources({ confirmDiscard: true, clearDrafts: true }), "plugin:bird:list")}
+                  >
+                    <RefreshCw size={16} /> {actionPending("plugin:bird:list") ? "读取中" : "刷新配置树"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={!birdPlugin?.available || !selectedNodeOnline || !birdSelectedResource || actionPending("plugin:bird:validate")}
+                    onClick={() => void runAction(validateBirdResource, "plugin:bird:validate")}
+                  >
+                    <Check size={16} /> {actionPending("plugin:bird:validate") ? "校验中" : "校验"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      !birdPlugin?.available ||
+                      !selectedNodeOnline ||
+                      birdDirtyDrafts.length === 0 ||
+                      actionPending("plugin:bird:list") ||
+                      actionPending("plugin:bird:apply")
+                    }
+                    onClick={() => void runAction(applyBirdResources, "plugin:bird:apply")}
+                  >
+                    <Upload size={16} /> {actionPending("plugin:bird:apply") ? "保存中" : `保存并刷新${birdDirtyDrafts.length ? ` (${birdDirtyDrafts.length})` : ""}`}
+                  </button>
+                </div>
+
+                <div className="birdEditor">
+                  <aside className="birdFileManager" aria-label="BIRD 配置文件">
+                    <div className="birdFileManagerHeader">
+                      <strong>配置文件</strong>
+                      <small>{birdResources.length} 个</small>
+                    </div>
+                    {actionPending("plugin:bird:list") ? (
+                      <div className="empty">正在读取配置树...</div>
+                    ) : birdResources.length === 0 ? (
+                      <div className="empty">未发现可编辑的 BIRD 配置文件。</div>
+                    ) : (
+                      <div className="birdFileTree">
+                        <Tree<BirdTreeItem>
+                          data={birdFileTree}
+                          idAccessor="id"
+                          childrenAccessor="children"
+                          rowHeight={42}
+                          height={470}
+                          width="100%"
+                          indent={18}
+                          openByDefault={false}
+                          selection={birdSelectedResource}
+                          disableDrag
+                          disableDrop
+                          disableEdit
+                        >
+                          {renderBirdTreeNode}
+                        </Tree>
+                      </div>
+                    )}
+                  </aside>
+
+                  <section className="birdEditorPane">
+                    {birdSelectedResource ? (
+                      <>
+                        <div className="birdEditorToolbar">
+                          <label>
+                            <span>语言模式</span>
+                            <select value={birdEditorSyntax} onChange={(event) => setBirdEditorSyntax(event.currentTarget.value as "bird" | "plain")}>
+                              <option value="bird">BIRD 配置</option>
+                              <option value="plain">纯文本</option>
+                            </select>
+                          </label>
+                          <label>
+                            <input type="checkbox" checked={birdEditorLineNumbers} onChange={(event) => setBirdEditorLineNumbers(event.currentTarget.checked)} />
+                            <span>行号</span>
+                          </label>
+                          <label>
+                            <input type="checkbox" checked={birdEditorLineWrapping} onChange={(event) => setBirdEditorLineWrapping(event.currentTarget.checked)} />
+                            <span>折行</span>
+                          </label>
+                          <label>
+                            <input type="checkbox" checked={birdEditorFoldGutter} onChange={(event) => setBirdEditorFoldGutter(event.currentTarget.checked)} />
+                            <span>折叠</span>
+                          </label>
+                          <label>
+                            <input type="checkbox" checked={birdEditorAutocompletion} onChange={(event) => setBirdEditorAutocompletion(event.currentTarget.checked)} />
+                            <span>补全</span>
+                          </label>
+                        </div>
+                        <Field label="配置内容" hint={birdSelectedDirectory} wide>
+                          <div onKeyDownCapture={handleBirdEditorKeyDown}>
+                            <CodeMirror
+                              className="birdConfigEditor"
+                              value={birdContent}
+                              height="520px"
+                              basicSetup={{
+                                lineNumbers: birdEditorLineNumbers,
+                                highlightActiveLine: true,
+                                highlightActiveLineGutter: true,
+                                foldGutter: birdEditorFoldGutter,
+                                autocompletion: birdEditorAutocompletion,
+                                bracketMatching: true,
+                                closeBrackets: true,
+                                searchKeymap: true,
+                              }}
+                              extensions={birdEditorExtensions}
+                              theme={theme}
+                              editable={Boolean(birdPlugin?.available && selectedNodeOnline && birdSelectedResource && !birdOpeningResource)}
+                              onChange={(value) => {
+                                if (!birdSelectedResource) return;
+                                setBirdDrafts((current) => {
+                                  const draft = current[birdSelectedResource];
+                                  if (!draft) return current;
+                                  return {
+                                    ...current,
+                                    [birdSelectedResource]: {
+                                      ...draft,
+                                      content: value,
+                                    },
+                                  };
+                                });
+                              }}
+                            />
+                          </div>
+                        </Field>
+                      </>
+                    ) : (
+                      <div className="empty birdSelectHint">配置树读取完成后，请从左侧选择一个配置文件打开。</div>
+                    )}
+                  </section>
+                </div>
+              </div>
+            )}
+
+            {activeNodePlugin?.type === "test-tools" && (
+              <div className="nodePluginTest">
+                <Field label="回显内容" hint="安全测试 action，会由 Agent 原样返回。">
+                  <input
+                    value={nodePluginEchoMessage}
+                    onChange={(event) => setNodePluginEchoMessage(event.currentTarget.value)}
+                    disabled={!activeNodePlugin.available || !selectedNodeOnline}
+                  />
+                </Field>
+                <div className="actionRow">
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={!activeNodePlugin.available || !selectedNodeOnline || actionPending(`plugin:${activeNodePlugin.type}:inspect`)}
+                    onClick={() => void runAction(
+                      () => runNodePluginAction(activeNodePlugin.type, "inspect"),
+                      `plugin:${activeNodePlugin.type}:inspect`,
+                    )}
+                  >
+                    <Settings size={16} /> {actionPending(`plugin:${activeNodePlugin.type}:inspect`) ? "执行中" : "读取平台"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={!activeNodePlugin.available || !selectedNodeOnline || actionPending(`plugin:${activeNodePlugin.type}:echo`)}
+                    onClick={() => void runAction(
+                      () => runNodePluginAction(activeNodePlugin.type, "echo", { message: nodePluginEchoMessage }),
+                      `plugin:${activeNodePlugin.type}:echo`,
+                    )}
+                  >
+                    <Check size={16} /> {actionPending(`plugin:${activeNodePlugin.type}:echo`) ? "执行中" : "测试回显"}
+                  </button>
+                </div>
+                {(nodePluginTasks[`${activeNodePlugin.type}:echo`] || nodePluginTasks[`${activeNodePlugin.type}:inspect`]) && (
+                  <p className="muted">最近一次测试任务已执行，结果已通过页面提示展示。</p>
+                )}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {nodePluginError && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel compactModal" role="dialog" aria-modal="true" aria-labelledby="node-plugin-error-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="node-plugin-error-title"><X size={18} /> 插件执行失败</h2>
+                <p className="muted">请根据错误信息调整配置后重试。</p>
+              </div>
+              <button className="iconButton" onClick={() => setNodePluginError("")} title="关闭">
+                <X size={18} />
+              </button>
+            </header>
+            <pre className="errorDetail">{nodePluginError}</pre>
+            <div className="actionRow">
+              <button type="button" onClick={() => setNodePluginError("")}>知道了</button>
             </div>
           </section>
         </div>
@@ -3614,6 +4318,26 @@ function App() {
                               ))}
                             </div>
                           )}
+
+                          <section className="nodePluginEntry" aria-label="节点插件">
+                            <div>
+                              <h3>节点插件</h3>
+                              <p className="muted">
+                                {availableNodePlugins.length > 0
+                                  ? `${availableNodePlugins.length} 个可用插件`
+                                  : selectedNodeOnline ? "当前节点暂无可用插件" : "节点在线后可使用插件"}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={!selectedNodeOnline || nodePlugins.length === 0}
+                              onClick={() => {
+                                openNodePluginDialog();
+                              }}
+                            >
+                              <Plug size={16} /> 打开插件
+                            </button>
+                          </section>
 
                           <div className="configList">
                             {configs.length === 0 ? (

@@ -13,6 +13,7 @@ from .config import AgentConfig
 from .config import load_config_from_env
 from .link_monitor import probe_latency
 from .middleware import mimic_official_release_codename_supported
+from .plugins import node_plugin_capabilities
 from .system import (
     get_agent_platform,
     get_hostname,
@@ -26,6 +27,7 @@ def build_capabilities() -> list[str]:
     """返回当前 Agent 支持的任务能力。"""
 
     service_manager = get_service_manager_name()
+    platform_info = get_agent_platform()
     capabilities = [
         "wireguard",
         "link.monitor",
@@ -44,13 +46,13 @@ def build_capabilities() -> list[str]:
             "agent.self_upgrade",
         ])
         capabilities.append("middleware.udp2raw.systemd")
-        platform_info = get_agent_platform()
         if mimic_installable(platform_info):
             capabilities.append("middleware.install.mimic")
         if mimic_runtime_supported(platform_info) and platform_info.get("has_mimic"):
             capabilities.append("middleware.mimic")
     if service_manager == "openwrt-uci":
         capabilities.append("middleware.udp2raw.openwrt-procd")
+    capabilities.extend(node_plugin_capabilities(platform=platform_info))
     return capabilities
 
 

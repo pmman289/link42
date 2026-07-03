@@ -18,6 +18,7 @@ from .middleware import (
     stop_mimic,
     stop_udp2raw,
 )
+from .plugins import execute_node_plugin_task
 from .system import (
     apply_wireguard_config,
     delete_wireguard_config,
@@ -83,6 +84,8 @@ TASK_HANDLERS: dict[str, TaskHandler] = {
 def execute_registered_task(task_type: str, payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
     """Execute an agent task through the registered backend handler."""
 
+    if task_type.startswith("node_plugin."):
+        return execute_node_plugin_task(task_type, payload, config)
     handler = TASK_HANDLERS.get(task_type)
     if handler is None:
         raise ValueError(f"unsupported task type: {task_type}")
