@@ -28,6 +28,7 @@ MIMIC_SYSTEM_CONFIG_DIR = Path("/etc/mimic")
 MIMIC_BIN = Path("/usr/bin/mimic")
 MIMIC_BLOCK_BEGIN = "# BEGIN Link42 managed mimic filters"
 MIMIC_BLOCK_END = "# END Link42 managed mimic filters"
+MIMIC_OFFICIAL_RELEASE_CODENAMES = {"bookworm", "noble", "trixie"}
 
 
 def install_middleware(payload: dict[str, Any], config: AgentConfig, dry_run: bool = False) -> dict[str, Any]:
@@ -270,14 +271,39 @@ def select_mimic_release_assets(release: dict[str, Any], codename: str | None, a
     if not codename:
         raise RuntimeError("missing distro codename for mimic release asset selection")
     assets = release.get("assets") or []
+    available_codenames = available_mimic_release_codenames(assets, arch)
     selected = []
     for package in ["mimic-dkms", "mimic"]:
         pattern = re.compile(rf"^{re.escape(codename)}_{re.escape(package)}_.+_{re.escape(arch)}\.deb$")
         matches = [asset for asset in assets if pattern.match(str(asset.get("name") or ""))]
         if not matches:
+            if codename not in available_codenames:
+                available = ", ".join(available_codenames) or "none"
+                raise RuntimeError(
+                    f"official mimic release {release.get('tag_name') or ''} does not provide {codename} {arch} packages; "
+                    f"available codenames for {arch}: {available}"
+                )
             raise RuntimeError(f"missing official mimic release asset for {codename} {package} {arch}")
         selected.append(matches[0])
     return selected
+
+
+def available_mimic_release_codenames(assets: list[dict[str, Any]], arch: str) -> list[str]:
+    """返回 release 中当前架构可安装的 mimic 发行版代号。"""
+
+    codenames: set[str] = set()
+    for asset in assets:
+        name = str(asset.get("name") or "")
+        match = re.match(rf"^([a-z0-9]+)_mimic(?:-dkms)?_.+_{re.escape(arch)}\.deb$", name)
+        if match:
+            codenames.add(match.group(1))
+    return sorted(codenames)
+
+
+def mimic_official_release_codename_supported(codename: str | None) -> bool:
+    """判断当前发行版代号是否有官方 mimic 预编译安装资产。"""
+
+    return bool(codename and codename.lower() in MIMIC_OFFICIAL_RELEASE_CODENAMES)
 
 
 def find_sha256_asset(release: dict[str, Any], package_name: str) -> dict[str, Any]:

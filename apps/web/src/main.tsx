@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Check, ChevronDown, ChevronRight, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Pencil, Plus, RefreshCw, Server, Settings, Sun, Upload, X } from "lucide-react";
-import { Background, MarkerType, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
+import { Background, Handle, MarkerType, Position, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import CreatableSelect from "react-select/creatable";
@@ -125,6 +125,11 @@ type TopologyEdge = {
   middleware_type: string | null;
   local_monitor: LinkMonitorSummary | null;
   peer_monitor: LinkMonitorSummary | null;
+};
+
+type TopologyDisplayEdge = TopologyEdge & {
+  link_count: number;
+  links: TopologyEdge[];
 };
 
 type TopologyResponse = {
@@ -480,7 +485,7 @@ function formatLoss(value: number | null | undefined) {
   return typeof value === "number" ? `${(value * 100).toFixed(value > 0.01 ? 1 : 0)}%` : "--";
 }
 
-function topologyEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "unknown" {
+function topologySingleEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "unknown" {
   if (edge.local_status !== "running" || edge.peer_status !== "running") return "critical";
   const statuses = [edge.local_monitor?.status, edge.peer_monitor?.status].filter(Boolean);
   if (statuses.includes("critical")) return "critical";
@@ -489,14 +494,86 @@ function topologyEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical
   return "unknown";
 }
 
-function topologyEdgeSummary(edge: TopologyEdge) {
-  const summary = edge.local_monitor || edge.peer_monitor;
-  if (!summary) return "-- / --";
-  return `${formatLatency(summary.last_latency_ms)} / ${formatLoss(summary.packet_loss)}`;
+function topologyEdgeTone(edge: TopologyDisplayEdge): "healthy" | "warning" | "critical" | "unknown" {
+  const tones = edge.links.map(topologySingleEdgeTone);
+  if (tones.includes("critical")) return "critical";
+  if (tones.includes("warning")) return "warning";
+  if (tones.includes("unknown")) return "unknown";
+  return "healthy";
+}
+
+function average(values: number[]) {
+  if (values.length === 0) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function topologyEdgeSummary(edge: TopologyDisplayEdge) {
+  const summaries = edge.links.flatMap((link) => [link.local_monitor, link.peer_monitor]).filter(Boolean) as LinkMonitorSummary[];
+  const prefix = edge.link_count > 1 ? `${edge.link_count}条 ` : "";
+  if (summaries.length === 0) return `${prefix}-- / --`;
+  const latencies = summaries
+    .map((summary) => summary.last_latency_ms)
+    .filter((value): value is number => typeof value === "number");
+  const losses = summaries.map((summary) => summary.packet_loss);
+  return `${prefix}${formatLatency(average(latencies))} / ${formatLoss(average(losses))}`;
 }
 
 function topologyNodeEndpoint(node: TopologyNode) {
   return node.topology_endpoint || node.endpoint_ips[0] || node.hostname || "未配置地址";
+}
+
+type TopologyHandleId = "top" | "right" | "bottom" | "left";
+
+type TopologyNodePosition = {
+  x: number;
+  y: number;
+};
+
+const TOPOLOGY_NODE_WIDTH = 178;
+const TOPOLOGY_NODE_HEIGHT = 78;
+
+const topologyHandlePositions: Record<TopologyHandleId, Position> = {
+  top: Position.Top,
+  right: Position.Right,
+  bottom: Position.Bottom,
+  left: Position.Left,
+};
+
+function topologyHandlePair(source: TopologyNodePosition | undefined, target: TopologyNodePosition | undefined) {
+  if (!source || !target) {
+    return { sourceHandle: "right" as TopologyHandleId, targetHandle: "left" as TopologyHandleId };
+  }
+  const sourceCenter = {
+    x: source.x + TOPOLOGY_NODE_WIDTH / 2,
+    y: source.y + TOPOLOGY_NODE_HEIGHT / 2,
+  };
+  const targetCenter = {
+    x: target.x + TOPOLOGY_NODE_WIDTH / 2,
+    y: target.y + TOPOLOGY_NODE_HEIGHT / 2,
+  };
+  const dx = targetCenter.x - sourceCenter.x;
+  const dy = targetCenter.y - sourceCenter.y;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0
+      ? { sourceHandle: "right" as TopologyHandleId, targetHandle: "left" as TopologyHandleId }
+      : { sourceHandle: "left" as TopologyHandleId, targetHandle: "right" as TopologyHandleId };
+  }
+  return dy >= 0
+    ? { sourceHandle: "bottom" as TopologyHandleId, targetHandle: "top" as TopologyHandleId }
+    : { sourceHandle: "top" as TopologyHandleId, targetHandle: "bottom" as TopologyHandleId };
+}
+
+function TopologyHandles() {
+  return (
+    <>
+      {(["top", "right", "bottom", "left"] as TopologyHandleId[]).map((id) => (
+        <React.Fragment key={id}>
+          <Handle id={id} type="source" position={topologyHandlePositions[id]} />
+          <Handle id={id} type="target" position={topologyHandlePositions[id]} />
+        </React.Fragment>
+      ))}
+    </>
+  );
 }
 
 function nodeRegionLabel(node: Pick<NodeItem, "region">) {
@@ -648,20 +725,46 @@ function Field({
   label,
   hint,
   wide = false,
+  requiredMark,
   children,
 }: {
   label: string;
   hint?: string;
   wide?: boolean;
+  requiredMark?: boolean;
   children: React.ReactNode;
 }) {
+  const required = requiredMark ?? hasRequiredControl(children);
   return (
     <label className={wide ? "field wideField" : "field"}>
-      <span>{label}</span>
+      <span className="fieldLabel">
+        {label}
+        {required && <span className="requiredMark" aria-label="必填">*</span>}
+      </span>
       {children}
       {hint && <small>{hint}</small>}
     </label>
   );
+}
+
+function hasRequiredControl(children: React.ReactNode): boolean {
+  let required = false;
+  React.Children.forEach(children, (child) => {
+    if (required || !React.isValidElement(child)) return;
+    const props = child.props as {
+      required?: boolean;
+      disabled?: boolean;
+      children?: React.ReactNode;
+    };
+    if (props.required && !props.disabled) {
+      required = true;
+      return;
+    }
+    if (props.children && hasRequiredControl(props.children)) {
+      required = true;
+    }
+  });
+  return required;
 }
 
 function FormSection({
@@ -1275,21 +1378,28 @@ function App() {
   );
   const editLocalEndpointDefault = managedLink?.peer_peer.endpoint_host || "";
   const editPeerEndpointDefault = managedLink?.local_peer.endpoint_host || "";
-  const topologyFlowNodes = useMemo<FlowNode[]>(() => {
+  const topologyNodePositions = useMemo<Record<number, TopologyNodePosition>>(() => {
     const count = Math.max(topology.nodes.length, 1);
     const radius = Math.max(180, Math.min(340, count * 42));
-    return topology.nodes.map((node, index) => {
+    return Object.fromEntries(topology.nodes.map((node, index) => {
       const angle = (Math.PI * 2 * index) / count - Math.PI / 2;
       const draft = topologyDraftPositions[node.id];
       const x = draft?.x ?? node.topology_x ?? 420 + Math.cos(angle) * radius;
       const y = draft?.y ?? node.topology_y ?? 260 + Math.sin(angle) * radius;
+      return [node.id, { x, y }];
+    }));
+  }, [topology.nodes, topologyDraftPositions]);
+  const topologyFlowNodes = useMemo<FlowNode[]>(() =>
+    topology.nodes.map((node) => {
+      const position = topologyNodePositions[node.id] || { x: 0, y: 0 };
       const online = node.status === "online";
       return {
         id: String(node.id),
-        position: { x, y },
+        position,
         data: {
           label: (
             <div className={online ? "topologyNode online" : "topologyNode"}>
+              <TopologyHandles />
               <div className="topologyNodeHeader">
                 <strong>{node.name}</strong>
                 <span className={online ? "statusDot online" : "statusDot"} />
@@ -1302,23 +1412,49 @@ function App() {
         draggable: true,
         className: online ? "topologyFlowNode online" : "topologyFlowNode",
       };
+    }),
+  [topology.nodes, topologyNodePositions]);
+  const topologyDisplayEdges = useMemo<TopologyDisplayEdge[]>(() => {
+    const groups = new Map<string, TopologyEdge[]>();
+    for (const edge of topology.edges) {
+      const [first, second] = [edge.local_node_id, edge.peer_node_id].sort((left, right) => left - right);
+      const key = `${first}:${second}`;
+      groups.set(key, [...(groups.get(key) || []), edge]);
+    }
+    return Array.from(groups.entries()).map(([key, links]) => {
+      const [localNodeId, peerNodeId] = key.split(":").map(Number);
+      const firstLink = links[0];
+      return {
+        ...firstLink,
+        id: `nodes-${localNodeId}-${peerNodeId}`,
+        local_node_id: localNodeId,
+        peer_node_id: peerNodeId,
+        link_count: links.length,
+        links,
+      };
     });
-  }, [topology.nodes, topologyDraftPositions]);
+  }, [topology.edges]);
   const topologyFlowEdges = useMemo<FlowEdge[]>(() =>
-    topology.edges.map((edge) => {
+    topologyDisplayEdges.map((edge) => {
       const tone = topologyEdgeTone(edge);
+      const handles = topologyHandlePair(
+        topologyNodePositions[edge.local_node_id],
+        topologyNodePositions[edge.peer_node_id],
+      );
       return {
         id: edge.id,
         source: String(edge.local_node_id),
         target: String(edge.peer_node_id),
+        sourceHandle: handles.sourceHandle,
+        targetHandle: handles.targetHandle,
         label: topologyEdgeSummary(edge),
-        animated: edge.local_status === "running" && edge.peer_status === "running",
+        animated: edge.links.some((link) => link.local_status === "running" && link.peer_status === "running"),
         className: `topologyEdge ${tone}`,
         markerEnd: { type: MarkerType.ArrowClosed },
         data: edge,
       };
     }),
-  [topology.edges]);
+  [topologyDisplayEdges, topologyNodePositions]);
 
   const handleTopologyNodeClick: NodeMouseHandler = (_event, node) => {
     const nodeId = Number(node.id);
@@ -1358,14 +1494,19 @@ function App() {
   };
 
   const handleTopologyEdgeClick: EdgeMouseHandler = (_event, edge) => {
-    const data = edge.data as TopologyEdge | undefined;
+    const data = edge.data as TopologyDisplayEdge | undefined;
     if (!data) return;
-    topologyEdgeSelectionRef.current = data.local_node_id === selectedNodeId ? null : data.local_interface_id;
-    setSelectedNodeId(data.local_node_id);
-    selectConfigId(data.local_interface_id);
+    const links = data.links.length > 0 ? data.links : [data];
+    const selectedSideLink = links.find((link) => link.local_node_id === selectedNodeId || link.peer_node_id === selectedNodeId);
+    const link = selectedSideLink || links[0];
+    const targetNodeId = link.peer_node_id === selectedNodeId ? link.peer_node_id : link.local_node_id;
+    const targetConfigId = link.peer_node_id === selectedNodeId ? link.peer_interface_id : link.local_interface_id;
+    topologyEdgeSelectionRef.current = targetNodeId === selectedNodeId ? null : targetConfigId;
+    setSelectedNodeId(targetNodeId);
+    selectConfigId(targetConfigId);
     setPlan(null);
     window.setTimeout(() => {
-      document.querySelector(`[data-config-id="${data.local_interface_id}"]`)?.scrollIntoView({
+      document.querySelector(`[data-config-id="${targetConfigId}"]`)?.scrollIntoView({
         behavior: "smooth",
         block: "center",
       });
@@ -3140,14 +3281,14 @@ function App() {
                 <input name="peer_tunnel_ips" placeholder="10.42.0.2/32, fd42::2/64" defaultValue={replacePeerConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
               </Field>
               <Field label="本端监听端口" hint="可选；留空表示本端 WireGuard 不写 ListenPort。udp2raw server 在本端时必须填写。">
-                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
               </Field>
               <Field label="对端监听端口" hint="可选；留空表示对端 WireGuard 不写 ListenPort。udp2raw server 在对端时必须填写。">
-                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
               <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。启用 mimic 时双方入口都必填。">
-              <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址；本端不可被拨入时可留空。">
+              <Field label="本端入口地址" hint="对端连接本节点时使用的 Endpoint 地址；本端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
                 <EndpointSelect
                   key={`managed-local-endpoint-${replacePeerConfigId || "none"}-${managedLocalEndpointDefault}`}
                   name="local_endpoint_host"
@@ -3167,7 +3308,7 @@ function App() {
                   disabled={!selectedNodeOnline || udp2rawActive}
                 />
               </Field>
-              <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址；对端不可被拨入时可留空。">
+              <Field label="对端入口地址" hint="本端连接对端节点时使用的 Endpoint 地址；对端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
                 <EndpointSelect
                   key={`managed-peer-endpoint-${replaceLocalConfigId || "none"}-${managedPeerEndpointDefault}`}
                   name="peer_endpoint_host"
@@ -3568,14 +3709,14 @@ function App() {
                       <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
                     </Field>
                     <Field label="本端监听端口" hint="可选；留空表示本端 WireGuard 不写 ListenPort。udp2raw server 在本端时必须填写。">
-                      <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+                      <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
                     </Field>
                     <Field label="对端监听端口" hint="可选；留空表示对端 WireGuard 不写 ListenPort。udp2raw server 在对端时必须填写。">
-                      <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
+                      <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
                   <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。启用 mimic 时双方入口都必填。">
-                    <Field label="本端入口地址" hint="对端连接本节点时使用；本端不可被拨入时可留空。">
+                    <Field label="本端入口地址" hint="对端连接本节点时使用；本端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
                       <EndpointSelect
                         key={`edit-local-endpoint-${editLocalEndpointDefault}`}
                         name="local_endpoint_host"
@@ -3594,7 +3735,7 @@ function App() {
                         disabled={!selectedNodeOnline || udp2rawActive}
                       />
                     </Field>
-                    <Field label="对端入口地址" hint="本端连接对端节点时使用；对端不可被拨入时可留空。">
+                    <Field label="对端入口地址" hint="本端连接对端节点时使用；对端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
                       <EndpointSelect
                         key={`edit-peer-endpoint-${editPeerEndpointDefault}`}
                         name="peer_endpoint_host"

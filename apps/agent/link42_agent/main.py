@@ -12,6 +12,7 @@ from .client import AgentClient, AgentHttpError
 from .config import AgentConfig
 from .config import load_config_from_env
 from .link_monitor import probe_latency
+from .middleware import mimic_official_release_codename_supported
 from .system import (
     get_agent_platform,
     get_hostname,
@@ -46,7 +47,7 @@ def build_capabilities() -> list[str]:
         platform_info = get_agent_platform()
         if mimic_installable(platform_info):
             capabilities.append("middleware.install.mimic")
-        if mimic_installable(platform_info) and platform_info.get("has_mimic"):
+        if mimic_runtime_supported(platform_info) and platform_info.get("has_mimic"):
             capabilities.append("middleware.mimic")
     if service_manager == "openwrt-uci":
         capabilities.append("middleware.udp2raw.openwrt-procd")
@@ -58,15 +59,27 @@ def mimic_installable(platform_info: dict[str, Any]) -> bool:
 
     arch = str(platform_info.get("arch") or "").lower()
     distro_id = str(platform_info.get("distro_id") or "").lower()
+    distro_codename = str(platform_info.get("distro_codename") or "").lower()
+    return (
+        mimic_runtime_supported(platform_info)
+        and distro_id in {"debian", "ubuntu"}
+        and mimic_official_release_codename_supported(distro_codename)
+        and arch in {"x86_64", "amd64", "aarch64", "arm64"}
+        and bool(shutil.which("dpkg"))
+        and bool(shutil.which("apt-get"))
+    )
+
+
+def mimic_runtime_supported(platform_info: dict[str, Any]) -> bool:
+    """判断当前节点环境是否允许运行已安装的 mimic。"""
+
+    arch = str(platform_info.get("arch") or "").lower()
     return (
         not platform_info.get("is_openwrt")
         and str(platform_info.get("os") or "linux").lower() == "linux"
         and str(platform_info.get("service_manager") or "") == "systemd"
         and kernel_newer_than(str(platform_info.get("kernel_version") or ""), 6, 1)
-        and distro_id in {"debian", "ubuntu"}
         and arch in {"x86_64", "amd64", "aarch64", "arm64"}
-        and bool(shutil.which("dpkg"))
-        and bool(shutil.which("apt-get"))
     )
 
 

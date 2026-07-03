@@ -402,26 +402,46 @@ textarea {
   display: none;
 }
 
-.topologyFullscreenBackdrop {
-  padding: 14px;
+.modalBackdrop.topologyFullscreenBackdrop {
+  padding: 0;
+  place-items: stretch;
+  background: var(--bg);
+  backdrop-filter: none;
 }
 
-.topologyFullscreenModal {
-  width: min(100%, 1600px);
-  height: calc(100vh - 28px);
-  max-height: calc(100vh - 28px);
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+.modalPanel.topologyFullscreenModal {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
   overflow: hidden;
 }
 
-.topologyFullscreenHeader {
-  margin-bottom: 12px;
+.modalHeader.topologyFullscreenHeader {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  right: 14px;
+  z-index: 5;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 0;
+  box-shadow: 0 14px 36px var(--shadow-strong);
 }
 
 .topologyCanvasFullscreen {
+  position: absolute;
+  inset: 0;
   height: 100%;
   min-height: 0;
+  border: 0;
+  border-radius: 0;
 }
 
 .topologyFlowNode {
@@ -435,6 +455,7 @@ textarea {
 }
 
 .topologyNode {
+  position: relative;
   display: grid;
   gap: 4px;
   width: 178px;
@@ -510,8 +531,13 @@ textarea {
 }
 
 .topologyEdge .react-flow__edge-text {
-  fill: var(--text-strong);
+  fill: #1e2a32;
   font-size: 11px;
+}
+
+.topologyEdge .react-flow__edge-textbg {
+  fill: #ffffff;
+  fill-opacity: 0.92;
 }
 
 .nodeCreateForm {
@@ -544,10 +570,16 @@ textarea {
   min-width: 0;
 }
 
-.field > span {
+.fieldLabel {
   color: var(--text-strong);
   font-size: 13px;
   font-weight: 700;
+}
+
+.requiredMark {
+  color: var(--danger);
+  margin-left: 4px;
+  font-weight: 800;
 }
 
 .field > small {
@@ -1250,6 +1282,15 @@ textarea {
 
 [data-theme="dark"] .topologyEdge.critical .react-flow__edge-path {
   stroke: var(--danger);
+}
+
+[data-theme="dark"] .topologyEdge .react-flow__edge-text {
+  fill: #e7f0f4;
+}
+
+[data-theme="dark"] .topologyEdge .react-flow__edge-textbg {
+  fill: #132127;
+  fill-opacity: 0.94;
 }
 
 @media (max-width: 760px) {

@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+import pytest
+
 from link42_common.connection_types import WIREGUARD_TASKS
 from link42_agent import link_monitor, main, middleware, service_manager, system, upgrade
 from link42_agent.client import AgentHttpError
@@ -155,6 +157,7 @@ def test_mimic_capability_requires_systemd_kernel_newer_than_61_and_binary(monke
             "os": "linux",
             "arch": "x86_64",
             "distro_id": "debian",
+            "distro_codename": "bookworm",
             "has_mimic": True,
         },
     )
@@ -176,6 +179,7 @@ def test_mimic_capability_requires_systemd_kernel_newer_than_61_and_binary(monke
             "os": "linux",
             "arch": "x86_64",
             "distro_id": "debian",
+            "distro_codename": "bookworm",
             "has_mimic": True,
         },
     )
@@ -191,10 +195,64 @@ def test_mimic_capability_requires_systemd_kernel_newer_than_61_and_binary(monke
             "os": "linux",
             "arch": "x86_64",
             "distro_id": "debian",
+            "distro_codename": "bookworm",
             "has_mimic": True,
         },
     )
     assert "middleware.mimic" not in main.build_capabilities()
+
+
+def test_mimic_install_capability_requires_official_release_codename(monkeypatch) -> None:
+    """验证 Ubuntu Jammy 这类没有官方 mimic 资产的系统不上报安装能力。"""
+
+    monkeypatch.setattr(main, "get_service_manager_name", lambda: "systemd")
+    monkeypatch.setattr(
+        main.shutil,
+        "which",
+        lambda binary: f"/usr/bin/{binary}" if binary in {"dpkg", "apt-get"} else None,
+    )
+    monkeypatch.setattr(
+        main,
+        "get_agent_platform",
+        lambda: {
+            "service_manager": "systemd",
+            "kernel_version": "6.8.0-1060-aws",
+            "is_openwrt": False,
+            "os": "linux",
+            "arch": "x86_64",
+            "distro_id": "ubuntu",
+            "distro_codename": "jammy",
+            "has_mimic": False,
+        },
+    )
+
+    assert "middleware.install.mimic" not in main.build_capabilities()
+
+
+def test_mimic_runtime_capability_allows_manually_installed_unsupported_codename(monkeypatch) -> None:
+    """验证没有官方安装资产的系统手工装好 mimic 后仍可上报运行能力。"""
+
+    monkeypatch.setattr(main, "get_service_manager_name", lambda: "systemd")
+    monkeypatch.setattr(main.shutil, "which", lambda binary: None)
+    monkeypatch.setattr(
+        main,
+        "get_agent_platform",
+        lambda: {
+            "service_manager": "systemd",
+            "kernel_version": "6.8.0-1060-aws",
+            "is_openwrt": False,
+            "os": "linux",
+            "arch": "x86_64",
+            "distro_id": "ubuntu",
+            "distro_codename": "jammy",
+            "has_mimic": True,
+        },
+    )
+
+    capabilities = main.build_capabilities()
+
+    assert "middleware.install.mimic" not in capabilities
+    assert "middleware.mimic" in capabilities
 
 
 def test_mimic_apply_renders_systemd_config(tmp_path: Path, monkeypatch) -> None:
@@ -463,6 +521,7 @@ def test_mimic_installer_selects_official_release_assets() -> None:
     """验证 mimic 安装器按发行版代号和架构选择官方 deb 资产。"""
 
     release = {
+        "tag_name": "v0.7.1",
         "assets": [
             {"name": "bookworm_mimic-dkms_0.1.0_amd64.deb"},
             {"name": "bookworm_mimic_0.1.0_amd64.deb"},
@@ -478,6 +537,29 @@ def test_mimic_installer_selects_official_release_assets() -> None:
         "bookworm_mimic-dkms_0.1.0_amd64.deb",
         "bookworm_mimic_0.1.0_amd64.deb",
     ]
+
+
+def test_mimic_installer_reports_unsupported_official_release_codename() -> None:
+    """验证官方 release 没有当前发行版资产时报告可用代号，而不是模糊缺包。"""
+
+    release = {
+        "tag_name": "v0.7.1",
+        "assets": [
+            {"name": "bookworm_mimic-dkms_0.7.1-1_amd64.deb"},
+            {"name": "bookworm_mimic_0.7.1-1_amd64.deb"},
+            {"name": "noble_mimic-dkms_0.7.1-1_amd64.deb"},
+            {"name": "noble_mimic_0.7.1-1_amd64.deb"},
+            {"name": "trixie_mimic-dkms_0.7.1-1_amd64.deb"},
+            {"name": "trixie_mimic_0.7.1-1_amd64.deb"},
+        ],
+    }
+
+    with pytest.raises(RuntimeError) as exc_info:
+        middleware.select_mimic_release_assets(release, "jammy", "amd64")
+
+    message = str(exc_info.value)
+    assert "does not provide jammy amd64 packages" in message
+    assert "available codenames for amd64: bookworm, noble, trixie" in message
 
 
 def test_mimic_github_proxy_wraps_download_url() -> None:
