@@ -49,6 +49,14 @@ TASK_REQUIREMENTS = {
     "middleware.mimic.stop": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
     "middleware.mimic.delete": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
     "middleware.mimic.status": {"min_agent_version": "0.5.2", "capabilities": ["middleware.mimic"]},
+    "node_plugin.bird.list": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.bird"]},
+    "node_plugin.bird.read": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.bird"]},
+    "node_plugin.bird.validate": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.bird"]},
+    "node_plugin.bird.apply": {"min_agent_version": "0.5.9", "capabilities": ["node_plugin.bird"]},
+    "node_plugin.bird.apply_many": {"min_agent_version": "0.5.9", "capabilities": ["node_plugin.bird"]},
+    "node_plugin.bird.status": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.bird"]},
+    "node_plugin.test_tools.echo": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.test_tools"]},
+    "node_plugin.test_tools.inspect": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.test_tools"]},
     "agent.self_upgrade": {"min_agent_version": "0.2.0", "capabilities": ["agent.self_upgrade"]},
 }
 

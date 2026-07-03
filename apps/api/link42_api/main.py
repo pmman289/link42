@@ -26,6 +26,8 @@ from . import models, schemas
 from .config import settings
 from .connection_drivers import connection_driver_for_interface
 from .database import get_db, init_db
+from .node_plugins import NODE_PLUGINS, get_node_plugin
+from .node_plugins.base import NodePluginContext
 from .wireguard_service import (
     build_apply_plan,
     build_apply_payload_from_config,
@@ -215,7 +217,22 @@ def bearer_token_from_request(request: Request) -> str | None:
 def is_api_auth_exempt(path: str) -> bool:
     """API 鉴权白名单：健康检查、登录和 Agent 自身 token 接口。"""
 
-    return path in {"/api/health", "/api/auth/login", "/api/branding"} or path.startswith("/api/agent/")
+    if path in {
+        "/api/health",
+        "/api/auth/login",
+        "/api/branding",
+        "/api/agent/register",
+        "/api/agent/heartbeat",
+        "/api/agent/tasks/poll",
+        "/api/agent/link-monitors/poll",
+        "/api/agent/link-monitors/result",
+    }:
+        return True
+    return (
+        re.fullmatch(r"/api/agent/tasks/\d+/result", path) is not None
+        or path.startswith("/api/agent/releases/")
+        or path.startswith("/api/agent/plugins/udp2raw/assets/")
+    )
 
 
 def require_web_session(request: Request, db: Session) -> None:
@@ -2017,6 +2034,85 @@ def get_node(node_id: int, db: Session = Depends(get_db)) -> models.Node:
     return node
 
 
+@app.get("/api/node-plugins", response_model=list[schemas.NodePluginRead])
+def list_node_plugins() -> list[dict[str, object]]:
+    """列出主控内置节点插件。"""
+
+    return [plugin.describe() for plugin in NODE_PLUGINS.values()]
+
+
+@app.get("/api/nodes/{node_id}/plugins", response_model=list[schemas.NodePluginStatusRead])
+def list_node_plugins_for_node(node_id: int, db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    """列出指定节点可用的插件和能力缺口。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    old_status = node.status
+    refresh_node_runtime_status(node)
+    if node.status != old_status:
+        db.commit()
+        db.refresh(node)
+    context = NodePluginContext(node=node, db=db)
+    return [plugin.status_for_node(context) for plugin in NODE_PLUGINS.values()]
+
+
+@app.post("/api/nodes/{node_id}/plugins/{plugin_type}/{action}", response_model=schemas.NodePluginActionResult)
+def request_node_plugin_action(
+    node_id: int,
+    plugin_type: str,
+    action: str,
+    payload: schemas.NodePluginActionRequest,
+    db: Session = Depends(get_db),
+) -> schemas.NodePluginActionResult:
+    """创建节点插件任务。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    plugin = get_node_plugin(plugin_type)
+    if plugin is None:
+        raise HTTPException(status_code=404, detail="plugin not found")
+    if action not in plugin.actions:
+        raise HTTPException(status_code=404, detail="plugin action not found")
+    refresh_node_runtime_status(node)
+    if not is_node_online(node):
+        raise HTTPException(status_code=409, detail="node is offline")
+    context = NodePluginContext(node=node, db=db)
+    status = plugin.status_for_node(context)
+    if not status["version_supported"]:
+        raise HTTPException(status_code=409, detail="agent does not support plugin version")
+    if status["missing_capabilities"]:
+        raise HTTPException(status_code=409, detail="plugin is not supported by this node")
+    try:
+        cleaned_payload = plugin.validate_payload(action, payload.payload, context)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    task_spec = plugin.build_task(action, cleaned_payload, context)
+    require_task_supported(node, task_spec.task_type)
+    task = models.AgentTask(node_id=node_id, type=task_spec.task_type, payload=task_spec.payload)
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return schemas.NodePluginActionResult(
+        task_id=task.id,
+        plugin_type=plugin_type,
+        action=action,
+        status=task.status,
+        message="插件任务已创建",
+    )
+
+
+@app.get("/api/tasks/{task_id}", response_model=schemas.AgentTaskStatusRead)
+def get_agent_task_status(task_id: int, db: Session = Depends(get_db)) -> models.AgentTask:
+    """读取 Agent 任务状态，供 Web 前端轮询。"""
+
+    task = db.get(models.AgentTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
 @app.patch("/api/nodes/{node_id}/topology-position", response_model=schemas.NodeRead)
 def update_node_topology_position(
     node_id: int,
@@ -2919,16 +3015,6 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
         status=task.status,
         message="scan task queued",
     )
-
-
-@app.get("/api/agent/tasks/{task_id}", response_model=schemas.AgentTaskStatusRead)
-def get_agent_task(task_id: int, db: Session = Depends(get_db)) -> models.AgentTask:
-    """读取 Agent 任务状态，供前端轮询直接任务。"""
-
-    task = db.get(models.AgentTask, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="task not found")
-    return task
 
 
 @app.get("/api/agent/plugins/udp2raw/assets/{asset_name}")

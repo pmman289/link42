@@ -608,6 +608,304 @@ textarea {
   min-height: auto;
 }
 
+.nodePluginEntry {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  background: var(--surface-muted);
+}
+
+.nodePluginEntry h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.nodePluginModal {
+  width: min(1180px, 100%);
+}
+
+.nodePluginTabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nodePluginTab {
+  display: grid;
+  gap: 2px;
+  min-width: 132px;
+  justify-items: start;
+  background: var(--surface-muted);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.nodePluginTab.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.nodePluginTab small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.nodePluginTest {
+  display: grid;
+  gap: 10px;
+}
+
+.nodePluginBird {
+  display: grid;
+  gap: 10px;
+}
+
+.birdEditor {
+  display: grid;
+  grid-template-columns: minmax(240px, 340px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  min-height: 520px;
+}
+
+.birdFileManager {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 520px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  overflow: auto;
+}
+
+.birdFileManagerHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.birdFileManagerHeader small {
+  color: var(--muted);
+}
+
+.birdFileTree {
+  padding: 6px;
+}
+
+.birdTreeNode {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: 6px;
+  padding: 0 8px;
+  cursor: pointer;
+  height: 38px;
+  color: var(--text);
+}
+
+.birdTreeNode.directory {
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.birdTreeNode.file {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.birdTreeNode.locked {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.birdTreeNode.loading {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.birdTreeNode:hover {
+  background: var(--surface-muted);
+}
+
+.birdTreeNode.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.birdTreeNode.dirty {
+  border-color: color-mix(in srgb, var(--warning) 70%, var(--border));
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface-elevated));
+}
+
+.birdTreeNode.dirty strong {
+  color: var(--warning);
+}
+
+.birdTreeNode span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.birdTreeNode strong,
+.birdTreeNode small {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.birdTreeNode small {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.birdEditorPane {
+  min-width: 0;
+}
+
+.birdEditorToolbar {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.birdEditorToolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.birdEditorToolbar input[type="checkbox"] {
+  width: auto;
+  min-height: auto;
+  padding: 0;
+}
+
+.birdEditorToolbar select {
+  min-height: 32px;
+  width: auto;
+}
+
+.birdConfigEditor {
+  min-height: 520px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.birdConfigEditor .cm-editor {
+  min-height: 520px;
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--surface-solid);
+  color: var(--text);
+  cursor: text;
+}
+
+.birdConfigEditor .cm-scroller {
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  cursor: text;
+}
+
+.birdConfigEditor .cm-content,
+.birdConfigEditor .cm-line {
+  cursor: text;
+}
+
+.birdConfigEditor .cm-gutters {
+  background: var(--surface-muted);
+  color: var(--muted);
+  border-right-color: var(--border);
+}
+
+.birdConfigEditor .cm-activeLine,
+.birdConfigEditor .cm-activeLineGutter {
+  background: var(--surface-subtle);
+}
+
+.birdConfigEditor .cm-focused {
+  outline: none;
+}
+
+.birdConfigEditor .cm-panel {
+  background: var(--surface-muted);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.birdConfigEditor .cm-panel.cm-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+}
+
+.birdConfigEditor .cm-panel.cm-search input {
+  width: auto;
+  min-width: 160px;
+  min-height: 26px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  font: inherit;
+}
+
+.birdConfigEditor .cm-panel.cm-search input[type="checkbox"] {
+  min-width: 0;
+  width: auto;
+  min-height: auto;
+  padding: 0;
+}
+
+.birdConfigEditor .cm-panel.cm-search button {
+  min-height: 26px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+.birdConfigEditor .cm-panel.cm-search label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.birdSelectHint {
+  min-height: 520px;
+  display: grid;
+  place-items: center;
+}
+
+.errorDetail {
+  max-height: 360px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+
 .dangerCheck {
   border: 1px solid var(--danger);
   border-radius: 6px;
@@ -1306,6 +1604,26 @@ textarea {
 
   .connectionActions {
     grid-template-columns: 1fr;
+  }
+
+  .nodePluginEntry {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .nodePluginEntry button {
+    width: 100%;
+  }
+
+  .birdEditor {
+    grid-template-columns: 1fr;
+    min-height: auto;
+  }
+
+  .birdFileManager,
+  .birdConfigEditor,
+  .birdSelectHint {
+    min-height: 300px;
   }
 
   .configRow {

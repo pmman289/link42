@@ -11,7 +11,8 @@ from link42_common.connection_types import WIREGUARD_TASKS
 from link42_agent import link_monitor, main, middleware, service_manager, system, upgrade
 from link42_agent.client import AgentHttpError
 from link42_agent.config import AgentConfig
-from link42_agent.task_handlers import TASK_HANDLERS
+from link42_agent.plugins import bird
+from link42_agent.task_handlers import TASK_HANDLERS, execute_registered_task
 
 
 def command_result(command: list[str], returncode: int = 0, stdout: str = "") -> dict[str, Any]:
@@ -59,6 +60,337 @@ def test_run_command_passes_timeout_to_subprocess(monkeypatch) -> None:
 
     assert result["stdout"] == "ok\n"
     assert seen == {"command": ["systemctl", "status", "link42-agent"], "timeout": 7.0}
+
+
+def test_node_plugin_test_tools_capability_and_echo(monkeypatch) -> None:
+    """验证 Agent 侧测试插件会上报能力并能执行固定 action。"""
+
+    use_service_binaries(monkeypatch, systemd=True)
+    monkeypatch.setattr(main, "mimic_installable", lambda platform: False)
+    monkeypatch.setattr(main, "mimic_runtime_supported", lambda platform: False)
+
+    capabilities = main.build_capabilities()
+    result = execute_registered_task(
+        "node_plugin.test_tools.echo",
+        {"message": "hello"},
+        AgentConfig(server_url="http://controller", node_id=1, token="token", dry_run=True),
+    )
+
+    assert "node_plugin.test_tools" in capabilities
+    assert "node_plugin.test_tools.echo" in capabilities
+    assert result["message"] == "hello"
+    assert result["dry_run"] is True
+
+
+def test_bird_plugin_lists_and_reads_recursive_config_tree(monkeypatch, tmp_path) -> None:
+    """验证 Bird 插件能递归发现 /etc/bird 下的多个配置文件。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    bird_root.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    include_dir = bird_root / "conf.d"
+    include_dir.mkdir()
+    peer_config = include_dir / "peer.conf"
+    envvars = bird_root / "envvars"
+    main_config.write_text("router id 10.0.0.1;\ninclude \"/etc/bird/conf.d/*.conf\";\n", encoding="utf-8")
+    peer_config.write_text("protocol device {}\n", encoding="utf-8")
+    envvars.write_text("BIRD_ARGS=\"\"\n", encoding="utf-8")
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(bird.shutil, "which", lambda binary: f"/usr/sbin/{binary}" if binary in {"bird", "birdc"} else None)
+
+    listed = bird.list_bird_resources()
+    read = bird.read_bird_resource(str(peer_config))
+
+    assert listed["main_config"] == str(main_config)
+    assert {item["path"] for item in listed["files"]} == {str(main_config), str(peer_config)}
+    assert read["content"] == "protocol device {}\n"
+
+
+def test_bird_plugin_rejects_path_outside_config_roots(monkeypatch, tmp_path) -> None:
+    """验证 Bird 插件不会读取声明根目录之外的任意文件。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    bird_root.mkdir(parents=True)
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", bird_root / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+
+    with pytest.raises(ValueError):
+        bird.resolve_bird_resource(str(tmp_path / "etc" / "shadow"))
+
+
+def test_bird_plugin_rejects_non_conf_files_under_bird_root(monkeypatch, tmp_path) -> None:
+    """验证 envvars 这类非 BIRD 配置语法文件不会被插件读写。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    bird_root.mkdir(parents=True)
+    envvars = bird_root / "envvars"
+    envvars.write_text("BIRD_ARGS=\"\"\n", encoding="utf-8")
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", bird_root / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+
+    listed = bird.list_bird_resources()
+
+    assert listed["files"] == []
+    with pytest.raises(ValueError, match="not a BIRD configuration file"):
+        bird.read_bird_resource(str(envvars))
+
+
+def test_bird_validate_restores_original_file_metadata(monkeypatch, tmp_path) -> None:
+    """验证 validate 后内容和 mtime 都恢复，避免一次校验就改变文件状态。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    bird_root.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    main_config.write_text("router id 10.0.0.1;\n", encoding="utf-8")
+    original_mtime_ns = 1_700_000_000_123_456_789
+    os.utime(main_config, ns=(original_mtime_ns, original_mtime_ns))
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(
+        bird,
+        "run_bird_config_check",
+        lambda main_config=None: command_result(["bird", "-p", "-c", str(main_config or bird.default_main_config())]),
+    )
+
+    result = bird.validate_bird_resource(str(main_config), "router id 10.0.0.2;\n")
+
+    assert result["valid"] is True
+    assert main_config.read_text(encoding="utf-8") == "router id 10.0.0.1;\n"
+    assert main_config.stat().st_mtime_ns == original_mtime_ns
+
+
+def test_bird_apply_restores_original_content_when_validation_fails(monkeypatch, tmp_path) -> None:
+    """验证 Bird 配置应用失败时会恢复原文件，避免节点配置被半写入。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    backup_root = tmp_path / "var" / "lib" / "link42" / "backups" / "bird"
+    bird_root.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    main_config.write_text("router id 10.0.0.1;\n", encoding="utf-8")
+    original_sha = bird.file_sha256(main_config)
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_BACKUP_DIR", backup_root)
+    monkeypatch.setattr(bird.shutil, "which", lambda binary: f"/usr/sbin/{binary}" if binary in {"bird", "birdc"} else None)
+    monkeypatch.setattr(
+        bird,
+        "run_bird_config_check",
+        lambda main_config=None: command_result(["bird", "-p", "-c", str(main_config or bird.default_main_config())], 1, ""),
+    )
+
+    result = bird.apply_bird_resource(
+        str(main_config),
+        "this is not bird config\n",
+        original_sha,
+        reload=True,
+        dry_run=False,
+    )
+
+    assert result["applied"] is False
+    assert result["restored"] is True
+    assert main_config.read_text(encoding="utf-8") == "router id 10.0.0.1;\n"
+    assert Path(str(result["backup_ref"])).exists()
+
+
+def test_bird_apply_same_content_keeps_file_hash(monkeypatch, tmp_path) -> None:
+    """验证带末尾换行的同内容应用不会因为处理链路改变文件字节。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    backup_root = tmp_path / "var" / "lib" / "link42" / "backups" / "bird"
+    bird_root.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    content = "router id 10.0.0.1;\n\n"
+    main_config.write_text(content, encoding="utf-8")
+    original_sha = bird.file_sha256(main_config)
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_BACKUP_DIR", backup_root)
+    monkeypatch.setattr(bird.shutil, "which", lambda binary: f"/usr/sbin/{binary}" if binary == "bird" else None)
+    monkeypatch.setattr(
+        bird,
+        "run_bird_config_check",
+        lambda main_config=None: command_result(["bird", "-p", "-c", str(main_config or bird.default_main_config())]),
+    )
+
+    result = bird.apply_bird_resource(
+        str(main_config),
+        content,
+        original_sha,
+        reload=False,
+        dry_run=False,
+    )
+
+    assert result["applied"] is True
+    assert result["sha256"] == original_sha
+    assert bird.file_sha256(main_config) == original_sha
+
+
+def test_bird_apply_many_writes_all_files_and_checks_hashes(monkeypatch, tmp_path) -> None:
+    """验证批量保存会一次提交多个配置文件，并返回每个文件的新 sha。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    backup_root = tmp_path / "var" / "lib" / "link42" / "backups" / "bird"
+    include_dir = bird_root / "conf.d"
+    include_dir.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    peer_config = include_dir / "peer.conf"
+    main_config.write_text("router id 10.0.0.1;\n", encoding="utf-8")
+    peer_config.write_text("protocol device {}\n", encoding="utf-8")
+    main_sha = bird.file_sha256(main_config)
+    peer_sha = bird.file_sha256(peer_config)
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_BACKUP_DIR", backup_root)
+    monkeypatch.setattr(bird.shutil, "which", lambda binary: f"/usr/sbin/{binary}" if binary == "bird" else None)
+    monkeypatch.setattr(
+        bird,
+        "run_bird_config_check",
+        lambda main_config=None: command_result(["bird", "-p", "-c", str(main_config or bird.default_main_config())]),
+    )
+
+    result = bird.apply_bird_resources(
+        [
+            {"resource_key": str(main_config), "content": "router id 10.0.0.2;\n", "base_sha256": main_sha},
+            {"resource_key": str(peer_config), "content": "protocol direct {}\n", "base_sha256": peer_sha},
+        ],
+        reload=False,
+        dry_run=False,
+    )
+
+    assert result["applied"] is True
+    assert main_config.read_text(encoding="utf-8") == "router id 10.0.0.2;\n"
+    assert peer_config.read_text(encoding="utf-8") == "protocol direct {}\n"
+    assert {item["resource_key"] for item in result["files"]} == {str(main_config), str(peer_config)}
+
+
+def test_bird_apply_many_reload_runs_birdc_configure(monkeypatch, tmp_path) -> None:
+    """验证批量保存 reload 时会执行 birdc configure 刷新 BIRD。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    backup_root = tmp_path / "var" / "lib" / "link42" / "backups" / "bird"
+    bird_root.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    main_config.write_text("router id 10.0.0.1;\n", encoding="utf-8")
+    main_sha = bird.file_sha256(main_config)
+    configure_calls: list[str] = []
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_BACKUP_DIR", backup_root)
+    monkeypatch.setattr(
+        bird,
+        "run_bird_config_check",
+        lambda main_config=None: command_result(["bird", "-p", "-c", str(main_config or bird.default_main_config())]),
+    )
+
+    def fake_configure() -> dict[str, Any]:
+        configure_calls.append("configure")
+        return command_result(["birdc", "configure"])
+
+    monkeypatch.setattr(bird, "run_bird_configure", fake_configure)
+
+    result = bird.apply_bird_resources(
+        [{"resource_key": str(main_config), "content": "router id 10.0.0.2;\n", "base_sha256": main_sha}],
+        reload=True,
+        dry_run=False,
+    )
+
+    assert result["applied"] is True
+    assert result["reload"]["command"] == ["birdc", "configure"]
+    assert configure_calls == ["configure"]
+    assert main_config.read_text(encoding="utf-8") == "router id 10.0.0.2;\n"
+
+
+def test_bird_apply_many_reload_failure_restores_files(monkeypatch, tmp_path) -> None:
+    """验证 birdc configure 失败时会恢复本次写入的所有文件。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    backup_root = tmp_path / "var" / "lib" / "link42" / "backups" / "bird"
+    include_dir = bird_root / "conf.d"
+    include_dir.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    peer_config = include_dir / "peer.conf"
+    main_original = "router id 10.0.0.1;\n"
+    peer_original = "protocol device {}\n"
+    main_config.write_text(main_original, encoding="utf-8")
+    peer_config.write_text(peer_original, encoding="utf-8")
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_BACKUP_DIR", backup_root)
+    monkeypatch.setattr(
+        bird,
+        "run_bird_config_check",
+        lambda main_config=None: command_result(["bird", "-p", "-c", str(main_config or bird.default_main_config())]),
+    )
+    monkeypatch.setattr(
+        bird,
+        "run_bird_configure",
+        lambda: {"command": ["birdc", "configure"], "returncode": 1, "stdout": "", "stderr": "reload failed"},
+    )
+
+    result = bird.apply_bird_resources(
+        [
+            {"resource_key": str(main_config), "content": "router id 10.0.0.2;\n", "base_sha256": bird.file_sha256(main_config)},
+            {"resource_key": str(peer_config), "content": "protocol direct {}\n", "base_sha256": bird.file_sha256(peer_config)},
+        ],
+        reload=True,
+        dry_run=False,
+    )
+
+    assert result["applied"] is False
+    assert result["valid"] is True
+    assert result["reload"]["stderr"] == "reload failed"
+    assert result["restored"] is True
+    assert main_config.read_text(encoding="utf-8") == main_original
+    assert peer_config.read_text(encoding="utf-8") == peer_original
+
+
+def test_bird_apply_many_rejects_changed_or_deleted_file_before_writing(monkeypatch, tmp_path) -> None:
+    """验证批量保存前会发现被别人修改或删除的文件，不会写入其它文件。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    include_dir = bird_root / "conf.d"
+    include_dir.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    peer_config = include_dir / "peer.conf"
+    main_config.write_text("router id 10.0.0.1;\n", encoding="utf-8")
+    peer_config.write_text("protocol device {}\n", encoding="utf-8")
+    main_sha = bird.file_sha256(main_config)
+    peer_sha = bird.file_sha256(peer_config)
+    peer_config.unlink()
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+
+    with pytest.raises(ValueError, match="does not exist"):
+        bird.apply_bird_resources(
+            [
+                {"resource_key": str(main_config), "content": "router id 10.0.0.2;\n", "base_sha256": main_sha},
+                {"resource_key": str(peer_config), "content": "protocol direct {}\n", "base_sha256": peer_sha},
+            ],
+            reload=False,
+            dry_run=False,
+        )
+
+    assert main_config.read_text(encoding="utf-8") == "router id 10.0.0.1;\n"
 
 
 def test_run_command_timeout_returns_result_or_raises(monkeypatch) -> None:

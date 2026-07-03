@@ -694,6 +694,42 @@ class TaskRequestResult(BaseModel):
     result: dict[str, Any] | None = None
 
 
+class NodePluginActionRead(BaseModel):
+    name: str
+    task_type: str
+    risk: str = "read"
+    requires_confirm: bool = False
+
+
+class NodePluginRead(BaseModel):
+    type: str
+    display_name: str
+    description: str
+    min_agent_version: str
+    capabilities: list[str]
+    actions: list[NodePluginActionRead]
+
+
+class NodePluginStatusRead(NodePluginRead):
+    available: bool
+    missing_capabilities: list[str] = Field(default_factory=list)
+    agent_version: str | None = None
+    version_supported: bool = False
+    node_status: str
+
+
+class NodePluginActionRequest(BaseModel):
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class NodePluginActionResult(BaseModel):
+    task_id: int
+    plugin_type: str
+    action: str
+    status: str
+    message: str
+
+
 class AgentReleaseAsset(BaseModel):
     path: str
     sha256: str
