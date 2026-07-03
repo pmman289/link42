@@ -1266,15 +1266,15 @@ function App() {
   const editLocalEndpointOptions = endpointOptionsFrom(
     null,
     selectedLocalEndpoints,
-    managedLink?.peer_peer.endpoint_host || selectedLocalEndpoints[0],
+    managedLink?.peer_peer.endpoint_host,
   );
   const editPeerEndpointOptions = endpointOptionsFrom(
     null,
     selectedManagedLinkPeerEndpoints,
-    managedLink?.local_peer.endpoint_host || selectedManagedLinkPeerEndpoints[0],
+    managedLink?.local_peer.endpoint_host,
   );
-  const editLocalEndpointDefault = managedLink?.peer_peer.endpoint_host || selectedLocalEndpoints[0] || "";
-  const editPeerEndpointDefault = managedLink?.local_peer.endpoint_host || selectedManagedLinkPeerEndpoints[0] || "";
+  const editLocalEndpointDefault = managedLink?.peer_peer.endpoint_host || "";
+  const editPeerEndpointDefault = managedLink?.local_peer.endpoint_host || "";
   const topologyFlowNodes = useMemo<FlowNode[]>(() => {
     const count = Math.max(topology.nodes.length, 1);
     const radius = Math.max(180, Math.min(340, count * 42));
