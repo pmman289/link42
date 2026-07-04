@@ -1415,6 +1415,44 @@ def test_apply_config_uses_direct_wg_quick_without_init_manager(tmp_path: Path, 
     assert ["wg-quick", "up", "wg0"] in commands
 
 
+def test_apply_config_cleans_previous_interface_name(tmp_path: Path, monkeypatch) -> None:
+    """验证接口改名部署时会先关闭并删除旧接口配置。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        if command == ["wg", "show", "wg-old"]:
+            return command_result(command)
+        if command[:2] == ["wg-quick", "down"]:
+            return command_result(command)
+        if command[:2] == ["wg-quick", "up"]:
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=False, openrc=False)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    old_config = tmp_path / "wg-old.conf"
+    old_config.write_text("old-config\n", encoding="utf-8")
+
+    result = system.apply_wireguard_config(
+        {
+            "interface_name": "wg-new",
+            "previous_interface_name": "wg-old",
+            "config": "[Interface]\nPrivateKey = private\n",
+        },
+        wireguard_dir=str(tmp_path),
+    )
+
+    assert ["wg", "show", "wg-old"] in commands
+    assert ["wg-quick", "down", "wg-old"] in commands
+    assert ["wg-quick", "down", "wg-new"] in commands
+    assert ["wg-quick", "up", "wg-new"] in commands
+    assert not old_config.exists()
+    assert (tmp_path / "wg-new.conf").exists()
+    assert result["rename_cleanup"]["delete_config"]["changed"] is True
+
+
 def test_apply_config_uses_systemd_enable_and_restart_when_requested(tmp_path: Path, monkeypatch) -> None:
     """验证新受管连接会通过 systemd 启动并启用开机自启。"""
 

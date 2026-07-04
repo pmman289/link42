@@ -82,7 +82,7 @@ def build_apply_plan(interface: models.WireGuardInterface) -> dict[str, Any]:
     """
 
     rendered = render_interface_config(interface)
-    return {
+    payload = {
         "interface_id": interface.id,
         "node_id": interface.node_id,
         "interface_name": interface.name,
@@ -90,6 +90,10 @@ def build_apply_plan(interface: models.WireGuardInterface) -> dict[str, Any]:
         "managed": interface.managed,
         "import_path": interface.import_path,
     }
+    previous_interface_name = (interface.extras or {}).get("previous_interface_name")
+    if previous_interface_name and previous_interface_name != interface.name:
+        payload["previous_interface_name"] = previous_interface_name
+    return payload
 
 
 def count_enabled_peers(interface: models.WireGuardInterface) -> int:
@@ -101,7 +105,7 @@ def count_enabled_peers(interface: models.WireGuardInterface) -> int:
 def build_apply_payload_from_config(interface: models.WireGuardInterface, config: str) -> dict[str, Any]:
     """使用指定配置文本生成部署 payload，避免预览阶段提前修改数据库状态。"""
 
-    return {
+    payload = {
         "interface_id": interface.id,
         "node_id": interface.node_id,
         "interface_name": interface.name,
@@ -109,6 +113,10 @@ def build_apply_payload_from_config(interface: models.WireGuardInterface, config
         "managed": True,
         "import_path": interface.import_path,
     }
+    previous_interface_name = (interface.extras or {}).get("previous_interface_name")
+    if previous_interface_name and previous_interface_name != interface.name:
+        payload["previous_interface_name"] = previous_interface_name
+    return payload
 
 
 def build_diff(old_config: str, new_config: str, fromfile: str = "current", tofile: str = "link42") -> str:

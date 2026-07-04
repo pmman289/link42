@@ -59,6 +59,7 @@ from link42_api.main import (
     start_interface,
     stop_managed_link,
     update_controller_settings,
+    update_interface,
     update_managed_link,
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
@@ -72,6 +73,7 @@ from link42_api.schemas import (
     AgentTaskResultRequest,
     ControllerSettingsUpdate,
     InterfaceCreate,
+    InterfaceUpdate,
     InterfaceRead,
     LoginRequest,
     ManagedLinkCreate,
@@ -92,7 +94,7 @@ from link42_api.schemas import (
     TopologyPositionUpdate,
 )
 from link42_common.security import hash_token, verify_token
-from link42_api.wireguard_service import build_diff, count_enabled_peers, render_interface_config
+from link42_api.wireguard_service import build_apply_plan, build_diff, count_enabled_peers, render_interface_config
 from link42_api.database import backup_sqlite_database_for_upgrade, ensure_sqlite_point_to_point_constraints
 
 
@@ -996,6 +998,48 @@ def test_interface_name_unique_check_can_exclude_current_interface() -> None:
             ensure_unique_interface_name(session, node.id, "wg1", exclude_interface_id=first.id)
 
     assert exc_info.value.status_code == 409
+
+
+def test_interface_rename_is_included_in_next_apply_payload() -> None:
+    """验证接口改名后下一次部署会要求 Agent 清理旧接口名。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        session.add(node)
+        session.flush()
+        interface = models.WireGuardInterface(
+            name="wg-old",
+            node_id=node.id,
+            tunnel_ips=["10.42.0.1/32"],
+            listen_port=23001,
+            private_key_value="private",
+            public_key="public",
+            deployed_config="[Interface]\nPrivateKey = private\n",
+        )
+        session.add(interface)
+        session.commit()
+
+        updated = update_interface(
+            interface.id,
+            InterfaceUpdate(
+                name="wg-new",
+                tunnel_ips=["10.42.0.1/32"],
+                listen_port=23001,
+                private_key="private",
+                public_key="public",
+                mtu=1420,
+                table_name="off",
+            ),
+            session,
+        )
+
+        payload = build_apply_plan(updated)
+
+    assert updated.extras["previous_interface_name"] == "wg-old"
+    assert payload["interface_name"] == "wg-new"
+    assert payload["previous_interface_name"] == "wg-old"
 
 
 def test_enqueue_interface_task_once_is_idempotent() -> None:

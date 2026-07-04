@@ -215,8 +215,19 @@ def apply_wireguard_config(
     config_text = payload["config"]
     enable_on_boot = bool(payload.get("enable_on_boot"))
     manager = detect_service_manager(run_command)
+    previous_interface_name = str(payload.get("previous_interface_name") or "").strip() or None
+    rename_cleanup = cleanup_previous_wireguard_interface(
+        previous_interface_name,
+        interface_name,
+        manager,
+        wireguard_dir,
+        dry_run,
+    )
     if isinstance(manager, OpenWrtUciManager):
-        return manager.apply_config(interface_name, config_text, enable_on_boot=enable_on_boot)
+        result = manager.apply_config(interface_name, config_text, enable_on_boot=enable_on_boot)
+        if rename_cleanup:
+            result["rename_cleanup"] = rename_cleanup
+        return result
     if isinstance(manager, UnsupportedServiceManager):
         raise RuntimeError(manager.state(interface_name)["message"])
 
@@ -238,6 +249,7 @@ def apply_wireguard_config(
             "dry_run": True,
             "config_path": str(target),
             "backup_path": backup_path,
+            "rename_cleanup": rename_cleanup,
             "message": "dry-run enabled, wg-quick was not executed",
         }
 
@@ -248,6 +260,7 @@ def apply_wireguard_config(
             "changed": True,
             "config_path": str(target),
             "backup_path": backup_path,
+            "rename_cleanup": rename_cleanup,
             "service": service_state,
             "restart": apply_result,
             "enable": enable_result,
@@ -260,6 +273,7 @@ def apply_wireguard_config(
             "changed": True,
             "config_path": str(target),
             "backup_path": backup_path,
+            "rename_cleanup": rename_cleanup,
             "service": service_state,
             "enable": enable_result,
             "restart": restart_result,
@@ -271,6 +285,7 @@ def apply_wireguard_config(
             "changed": True,
             "config_path": str(target),
             "backup_path": backup_path,
+            "rename_cleanup": rename_cleanup,
             "service": service_state,
             "down": restart_result["down"],
             "up": restart_result["up"],
@@ -279,8 +294,71 @@ def apply_wireguard_config(
         "changed": True,
         "config_path": str(target),
         "backup_path": backup_path,
+        "rename_cleanup": rename_cleanup,
         "service": service_state,
         "restart": restart_result,
+    }
+
+
+def cleanup_previous_wireguard_interface(
+    previous_interface_name: str | None,
+    interface_name: str,
+    manager: Any,
+    wireguard_dir: str,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    """清理改名后遗留的旧接口和旧配置文件。"""
+
+    if not previous_interface_name or previous_interface_name == interface_name:
+        return None
+    target = Path(wireguard_dir) / f"{previous_interface_name}.conf"
+    if dry_run:
+        return {
+            "changed": False,
+            "dry_run": True,
+            "previous_interface_name": previous_interface_name,
+            "config_path": str(target),
+            "message": "dry-run enabled, previous interface was not cleaned",
+        }
+    if isinstance(manager, OpenWrtUciManager):
+        state = manager.state(previous_interface_name)
+        return {
+            "previous_interface_name": previous_interface_name,
+            "service": state,
+            "stop": manager.stop(previous_interface_name) if state["active_state"] == "active" else None,
+            "delete_config": manager.delete_config(previous_interface_name),
+        }
+    if isinstance(manager, UnsupportedServiceManager):
+        return None
+
+    state = manager.state(previous_interface_name)
+    wg_state = run_command(["wg", "show", previous_interface_name], allow_failure=True)
+    stop_result = None
+    if state.get("active_state") == "active":
+        stop_result = manager.stop(previous_interface_name)
+    elif wg_state["returncode"] == 0:
+        stop_result = DirectWgQuickManager(run_command).stop(previous_interface_name)
+
+    disable_result = None
+    if manager.name == "systemd":
+        unit = state.get("unit") or f"wg-quick@{previous_interface_name}.service"
+        disable_result = run_command(["systemctl", "disable", str(unit)], allow_failure=True)
+    elif manager.name == "openrc":
+        unit = state.get("unit") or f"wg-quick.{previous_interface_name}"
+        disable_result = run_command(["rc-update", "del", str(unit)], allow_failure=True)
+
+    deleted = False
+    if target.exists():
+        target.unlink()
+        deleted = True
+    return {
+        "previous_interface_name": previous_interface_name,
+        "config_path": str(target),
+        "service": state,
+        "wg": wg_state,
+        "stop": stop_result,
+        "disable": disable_result,
+        "delete_config": {"changed": deleted},
     }
 
 

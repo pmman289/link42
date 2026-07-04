@@ -1110,6 +1110,19 @@ def set_extra_object(model: models.WireGuardInterface | models.WireGuardPeer, ke
     model.extras = extras
 
 
+def record_interface_rename(interface: models.WireGuardInterface, next_name: str) -> None:
+    """记录尚未在节点上清理的旧接口名，供下一次部署时迁移。"""
+
+    if interface.name == next_name:
+        return
+    previous_name = (interface.extras or {}).get("previous_interface_name")
+    if previous_name == next_name:
+        set_extra_value(interface, "previous_interface_name", None)
+        return
+    if not previous_name:
+        set_extra_value(interface, "previous_interface_name", interface.name)
+
+
 def get_wireguard_config_or_404(config_id: int, db: Session) -> models.WireGuardInterface:
     """按配置 ID 读取 WireGuard 配置，不存在时返回 404。"""
 
@@ -2701,6 +2714,8 @@ def update_managed_link(
     ensure_unique_interface_name(db, local_interface.node_id, payload.local_interface_name, local_interface.id)
     ensure_unique_interface_name(db, peer_interface.node_id, payload.peer_interface_name, peer_interface.id)
 
+    record_interface_rename(local_interface, payload.local_interface_name)
+    record_interface_rename(peer_interface, payload.peer_interface_name)
     local_interface.name = payload.local_interface_name
     local_interface.tunnel_ips = payload.local_tunnel_ips
     local_interface.listen_port = payload.local_listen_port
@@ -2864,6 +2879,7 @@ def update_interface(
     require_online_node(db, interface.node_id)
     ensure_unique_interface_name(db, interface.node_id, payload.name, exclude_interface_id=interface.id)
 
+    record_interface_rename(interface, payload.name)
     interface.name = payload.name
     interface.tunnel_ips = payload.tunnel_ips
     interface.listen_port = payload.listen_port
@@ -3473,6 +3489,7 @@ def agent_task_result(
                 # 部署成功后记录节点上的已部署配置，后续 Change Plan diff 才能对比真实基线。
                 interface.deployed_config = task.payload.get("config")
                 interface.runtime_status = "running"
+                set_extra_value(interface, "previous_interface_name", None)
             elif task.type == driver.tasks.read_config:
                 if not (
                     payload.result.get("config_backend") == "openwrt-uci"
