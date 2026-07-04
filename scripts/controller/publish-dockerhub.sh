@@ -30,6 +30,11 @@ cleanup_test_container() {
   docker volume rm "$TEST_VOLUME" >/dev/null 2>&1 || true
 }
 
+redacted_test_logs() {
+  docker logs --tail 80 "$TEST_CONTAINER" 2>&1 \
+    | sed -E 's/(password|PASSWORD|token|TOKEN|secret|SECRET)=[^ ]+/\1=<redacted>/g'
+}
+
 if [[ "$SKIP_VERIFY" != "1" ]]; then
   log "running Python tests"
   .venv/bin/python -m pytest -q
@@ -53,6 +58,7 @@ IMAGE_REPO="$IMAGE_REPO" IMAGE_TAG="$IMAGE_TAG" scripts/controller/build-image.s
 if [[ "$LOCAL_VERIFY" == "1" ]]; then
   log "verifying local container"
   cleanup_test_container
+  trap cleanup_test_container EXIT
   docker run -d \
     --name "$TEST_CONTAINER" \
     -p 127.0.0.1::8000 \
@@ -60,14 +66,46 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
     "$IMAGE_NAME" >/dev/null
 
   host_port="$(docker port "$TEST_CONTAINER" 8000/tcp | sed 's/.*://')"
-  sleep 2
-  auth_status="$(curl -sS -o /tmp/link42-auth-me.out -w '%{http_code}' "http://127.0.0.1:$host_port/api/auth/me")"
+  auth_status=""
+  for _ in {1..30}; do
+    auth_status="$(curl -sS -o /tmp/link42-auth-me.out -w '%{http_code}' "http://127.0.0.1:$host_port/api/auth/me" || true)"
+    [[ "$auth_status" == "401" ]] && break
+    sleep 1
+  done
   if [[ "$auth_status" != "401" ]]; then
     echo "expected /api/auth/me to return 401, got $auth_status" >&2
+    redacted_test_logs >&2 || true
     exit 1
   fi
-  curl -fsS "http://127.0.0.1:$host_port/api/agent/releases" >/dev/null
+
+  password="$(
+    docker logs "$TEST_CONTAINER" 2>&1 \
+      | sed -n 's/.*Link42 initial login: username=pmman password=//p' \
+      | tail -1
+  )"
+  if [[ -z "$password" ]]; then
+    echo "failed to read initial login password from test container logs" >&2
+    redacted_test_logs >&2 || true
+    exit 1
+  fi
+
+  login_payload="$(
+    LINK42_INITIAL_PASSWORD="$password" python3 -c 'import json, os; print(json.dumps({"username": "pmman", "password": os.environ["LINK42_INITIAL_PASSWORD"]}))'
+  )"
+  login_json="$(
+    printf '%s' "$login_payload" \
+      | curl -fsS -H 'Content-Type: application/json' -d @- "http://127.0.0.1:$host_port/api/auth/login"
+  )"
+  token="$(printf '%s' "$login_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')"
+  release_json="$(curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$host_port/api/agent/releases")"
+  release_latest="$(printf '%s' "$release_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["latest"])')"
+  [[ -n "$release_latest" ]] || {
+    echo "failed to detect latest agent release from /api/agent/releases" >&2
+    exit 1
+  }
+  printf 'local agent release latest: %s\n' "$release_latest"
   cleanup_test_container
+  trap - EXIT
 fi
 
 log "pushing $IMAGE_NAME"

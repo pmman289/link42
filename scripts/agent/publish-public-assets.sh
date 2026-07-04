@@ -107,8 +107,9 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 (
   cd "$tmpdir"
-  curl -fsSL "$PUBLIC_BASE_URL/sh/link42-agent.sh" | head -n 5
-  curl -fsSL "$PUBLIC_BASE_URL/sh/link42-agent.sh" | grep -E 'stop_service|reload_service|status_service'
+  curl -fsSL "$PUBLIC_BASE_URL/sh/link42-agent.sh" -o link42-agent.sh
+  sed -n '1,5p' link42-agent.sh
+  grep -E 'stop_service|reload_service|status_service' link42-agent.sh
   curl -fsSLO "$PUBLIC_BASE_URL/res/link42/link42-agent-linux-x64"
   curl -fsSLO "$PUBLIC_BASE_URL/res/link42/link42-agent-linux-x64.sha256"
   curl -fsSLO "$PUBLIC_BASE_URL/res/link42/link42-agent-source.tar.gz"
