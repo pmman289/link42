@@ -32,6 +32,7 @@ from .wireguard_service import (
     build_apply_plan,
     build_apply_payload_from_config,
     build_diff,
+    build_interface_rename_diff,
     count_enabled_peers,
     render_interface_config,
     split_endpoint,
@@ -2970,7 +2971,9 @@ def plan_apply(interface_id: int, db: Session = Depends(get_db)) -> models.Chang
     else:
         new_config = render_interface_config(interface)
     old_config = interface.deployed_config or ""
-    diff = build_diff(old_config, new_config, fromfile=f"{interface.name}.current", tofile=f"{interface.name}.link42")
+    config_diff = build_diff(old_config, new_config, fromfile=f"{interface.name}.current", tofile=f"{interface.name}.link42")
+    rename_diff = build_interface_rename_diff(interface)
+    diff = config_diff + ("\n" if config_diff and rename_diff else "") + rename_diff
     driver = connection_driver_for_interface(interface)
     plan = models.ChangePlan(
         title=f"Apply WireGuard interface {interface.name}",

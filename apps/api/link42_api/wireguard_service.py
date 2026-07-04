@@ -132,6 +132,22 @@ def build_diff(old_config: str, new_config: str, fromfile: str = "current", tofi
     )
 
 
+def build_interface_rename_diff(interface: models.WireGuardInterface) -> str:
+    """生成接口名变更 diff，让无配置文本变化的改名也能被确认部署。"""
+
+    previous_interface_name = str((interface.extras or {}).get("previous_interface_name") or "").strip()
+    if not previous_interface_name or previous_interface_name == interface.name:
+        return ""
+    old_metadata = f"InterfaceName = {previous_interface_name}\n"
+    new_metadata = f"InterfaceName = {interface.name}\n"
+    return build_diff(
+        old_metadata,
+        new_metadata,
+        fromfile=f"{previous_interface_name}.metadata",
+        tofile=f"{interface.name}.metadata",
+    )
+
+
 def split_endpoint(endpoint: str | None) -> tuple[str | None, int | None]:
     """拆分 Endpoint 字段，兼容只有 host 没有端口的导入配置。"""
 
