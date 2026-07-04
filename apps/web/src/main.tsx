@@ -1505,6 +1505,7 @@ function App() {
   const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
   const [topologyDraftPositions, setTopologyDraftPositions] = useState<Record<number, { x: number; y: number }>>({});
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
+  const selectedNodeIdRef = useRef<number | null>(null);
   const [configs, setConfigs] = useState<ConfigItem[]>([]);
   const [selectedConfigId, setSelectedConfigId] = useState<number | null>(null);
   const selectedConfigIdRef = useRef<number | null>(null);
@@ -1560,7 +1561,17 @@ function App() {
   const [portScanResults, setPortScanResults] = useState<PortScanResult[]>([]);
   const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
   const topologyEdgeSelectionRef = useRef<number | null>(null);
+  const topologyLocalPositionsRef = useRef<Record<number, { x: number; y: number }>>({});
   const birdSelectedResourceRef = useRef("");
+  function selectNodeId(nodeId: number | null) {
+    selectedNodeIdRef.current = nodeId;
+    setSelectedNodeId(nodeId);
+  }
+
+  function isCurrentSelectedNode(nodeId: number) {
+    return selectedNodeIdRef.current === nodeId;
+  }
+
   function selectConfigId(configId: number | null) {
     selectedConfigIdRef.current = configId;
     setSelectedConfigId(configId);
@@ -1794,7 +1805,7 @@ function App() {
 
   const handleTopologyNodeClick: NodeMouseHandler = (_event, node) => {
     const nodeId = Number(node.id);
-    setSelectedNodeId(nodeId);
+    selectNodeId(nodeId);
     selectConfigId(null);
     setPlan(null);
     setImportCandidatesExpanded(false);
@@ -1808,10 +1819,15 @@ function App() {
 
   const handleTopologyNodeDragStop: OnNodeDrag = (_event, node) => {
     const nodeId = Number(node.id);
+    const position = { x: node.position.x, y: node.position.y };
     void runAction(
       async () => {
-        await saveTopologyPosition(nodeId, node.position.x, node.position.y);
+        await saveTopologyPosition(nodeId, position.x, position.y);
         setTopologyDraftPositions((current) => {
+          const draft = current[nodeId];
+          if (draft && (draft.x !== position.x || draft.y !== position.y)) {
+            return current;
+          }
           const next = { ...current };
           delete next[nodeId];
           return next;
@@ -1838,7 +1854,7 @@ function App() {
     const targetNodeId = link.peer_node_id === selectedNodeId ? link.peer_node_id : link.local_node_id;
     const targetConfigId = link.peer_node_id === selectedNodeId ? link.peer_interface_id : link.local_interface_id;
     topologyEdgeSelectionRef.current = targetNodeId === selectedNodeId ? null : targetConfigId;
-    setSelectedNodeId(targetNodeId);
+    selectNodeId(targetNodeId);
     selectConfigId(targetConfigId);
     setPlan(null);
     window.setTimeout(() => {
@@ -1887,7 +1903,7 @@ function App() {
     setNodes([]);
     setTopology({ nodes: [], edges: [] });
     setTopologyDraftPositions({});
-    setSelectedNodeId(null);
+    selectNodeId(null);
     setConfigs([]);
     selectConfigId(null);
     setPeer(null);
@@ -2076,7 +2092,24 @@ function App() {
 
   async function refreshTopology() {
     const data = await api<TopologyResponse>("/api/topology");
-    setTopology(data);
+    const localPositions = topologyLocalPositionsRef.current;
+    const mergedNodes = data.nodes.map((node) => {
+      const local = localPositions[node.id];
+      if (!local) return node;
+      if (node.topology_x === local.x && node.topology_y === local.y) {
+        const next = { ...topologyLocalPositionsRef.current };
+        delete next[node.id];
+        topologyLocalPositionsRef.current = next;
+        return node;
+      }
+      return {
+        ...node,
+        topology_x: local.x,
+        topology_y: local.y,
+        topology_locked: true,
+      };
+    });
+    setTopology({ ...data, nodes: mergedNodes });
   }
 
   async function refreshHome() {
@@ -2094,10 +2127,18 @@ function App() {
   }
 
   async function saveTopologyPosition(nodeId: number, x: number, y: number) {
+    topologyLocalPositionsRef.current = {
+      ...topologyLocalPositionsRef.current,
+      [nodeId]: { x, y },
+    };
     await api<NodeItem>(`/api/nodes/${nodeId}/topology-position`, {
       method: "PATCH",
       body: JSON.stringify({ x, y, locked: true }),
     });
+    const currentLocal = topologyLocalPositionsRef.current[nodeId];
+    if (!currentLocal || currentLocal.x !== x || currentLocal.y !== y) {
+      return;
+    }
     setTopology((current) => ({
       ...current,
       nodes: current.nodes.map((node) =>
@@ -2117,6 +2158,7 @@ function App() {
 
   async function resetTopologyLayout() {
     const data = await api<TopologyResponse>("/api/topology/layout/reset", { method: "POST" });
+    topologyLocalPositionsRef.current = {};
     setTopologyDraftPositions({});
     setTopology(data);
     setNodes((current) =>
@@ -2138,6 +2180,7 @@ function App() {
   ) {
     // 刷新某个节点下的 WireGuard 点对点配置列表。
     const data = await api<ConfigItem[]>(`/api/nodes/${nodeId}/wireguard/configs`);
+    if (!isCurrentSelectedNode(nodeId)) return;
     setConfigs(data);
     const currentConfigId = selectedConfigIdRef.current;
     const existing = currentConfigId && data.some((item) => item.id === currentConfigId);
@@ -2156,6 +2199,7 @@ function App() {
 
   async function refreshNodePlugins(nodeId: number) {
     const data = await api<NodePluginStatus[]>(`/api/nodes/${nodeId}/plugins`);
+    if (!isCurrentSelectedNode(nodeId)) return;
     setNodePlugins(data);
   }
 
@@ -2196,6 +2240,7 @@ function App() {
   async function refreshPortInventory(nodeId = selectedNodeId) {
     if (!nodeId) return;
     const data = await api<PortInventory>(`/api/nodes/${nodeId}/port-inventory`);
+    if (!isCurrentSelectedNode(nodeId)) return;
     setPortInventory(data);
     setPortRangeStart(data.setting.range_start ? String(data.setting.range_start) : "");
     setPortRangeEnd(data.setting.range_end ? String(data.setting.range_end) : "");
@@ -2454,11 +2499,13 @@ function App() {
   async function refreshPeer(configId: number) {
     // 刷新某个配置下的唯一对端；第一版一个配置只允许一个对端。
     const data = await api<PeerItem | null>(`/api/wireguard/configs/${configId}/peer`);
+    if (selectedConfigIdRef.current !== configId) return;
     setPeer(data);
   }
 
   async function refreshManagedLink(configId: number) {
     const data = await api<ManagedLink>(`/api/wireguard/configs/${configId}/managed-link`);
+    if (selectedConfigIdRef.current !== configId) return;
     setManagedLink(data);
   }
 
@@ -2501,6 +2548,7 @@ function App() {
   async function refreshImportCandidates(nodeId: number) {
     // 刷新当前节点的 wg-quick 导入候选。
     const data = await api<ImportCandidate[]>(`/api/nodes/${nodeId}/wireguard/import-candidates`);
+    if (!isCurrentSelectedNode(nodeId)) return;
     setImportCandidates(data);
   }
 
@@ -2588,6 +2636,10 @@ function App() {
 
   useEffect(() => {
     setImportCandidatesExpanded(false);
+    setConfigs([]);
+    setImportCandidates([]);
+    setNodePlugins([]);
+    setNodePluginTasks({});
     setBirdResources([]);
     setBirdDrafts({});
     setBirdSelectedResource("");
@@ -2812,7 +2864,7 @@ function App() {
     setNodeCreateOpen(false);
     await refreshNodes();
     await refreshTopology();
-    setSelectedNodeId(null);
+    selectNodeId(null);
   }
 
   async function saveNode(event: React.FormEvent<HTMLFormElement>) {
@@ -2860,7 +2912,7 @@ function App() {
     if (!window.confirm(`确认删除节点 ${editingNode.name}？删除后该节点 Agent token 会失效。`)) return;
     await api<{ status: string }>(`/api/nodes/${editingNode.id}`, { method: "DELETE" });
     if (selectedNodeId === editingNode.id) {
-      setSelectedNodeId(null);
+      selectNodeId(null);
       selectConfigId(null);
       setConfigs([]);
       setImportCandidates([]);
@@ -4651,7 +4703,7 @@ function App() {
                           className="nodeHeader"
                           disabled={!online}
                           onClick={() => {
-                            setSelectedNodeId(expanded ? null : node.id);
+                            selectNodeId(expanded ? null : node.id);
                             selectConfigId(null);
                             setPlan(null);
                             setImportCandidatesExpanded(false);
