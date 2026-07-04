@@ -757,8 +757,8 @@ function TopologyHandles() {
     <>
       {(["top", "right", "bottom", "left"] as TopologyHandleId[]).map((id) => (
         <React.Fragment key={id}>
-          <Handle id={id} type="source" position={topologyHandlePositions[id]} />
-          <Handle id={id} type="target" position={topologyHandlePositions[id]} />
+          <Handle id={id} type="source" position={topologyHandlePositions[id]} isConnectable={false} />
+          <Handle id={id} type="target" position={topologyHandlePositions[id]} isConnectable={false} />
         </React.Fragment>
       ))}
     </>
@@ -3553,6 +3553,7 @@ function App() {
             fitView
             minZoom={0.2}
             maxZoom={1.8}
+            nodesConnectable={false}
             onNodeClick={handleTopologyNodeClick}
             onNodeDrag={handleTopologyNodeDrag}
             onNodeDragStop={handleTopologyNodeDragStop}
