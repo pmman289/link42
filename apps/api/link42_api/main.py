@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from link42_common.connection_types import TASK_REQUIREMENTS, WIREGUARD_TASKS
-from sqlalchemy import delete, or_, select
+from sqlalchemy import String, delete, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from link42_common.security import generate_token, hash_token, verify_token
@@ -2055,6 +2055,136 @@ def list_node_plugins_for_node(node_id: int, db: Session = Depends(get_db)) -> l
         db.refresh(node)
     context = NodePluginContext(node=node, db=db)
     return [plugin.status_for_node(context) for plugin in NODE_PLUGINS.values()]
+
+
+def port_inventory_setting_for_node(node_id: int, db: Session) -> models.PortInventorySetting:
+    setting = db.scalar(select(models.PortInventorySetting).where(models.PortInventorySetting.node_id == node_id))
+    if setting is None:
+        setting = models.PortInventorySetting(node_id=node_id)
+        db.add(setting)
+        db.flush()
+    return setting
+
+
+def validate_port_inventory_range(range_start: int | None, range_end: int | None) -> None:
+    if range_start is None or range_end is None:
+        return
+    if range_start > range_end:
+        raise HTTPException(status_code=400, detail="range_start must be less than or equal to range_end")
+
+
+def validate_port_inventory_entry(node_id: int, protocol: str, port: int, db: Session, exclude_id: int | None = None) -> None:
+    setting = db.scalar(select(models.PortInventorySetting).where(models.PortInventorySetting.node_id == node_id))
+    if setting and setting.range_start is not None and setting.range_end is not None:
+        if not setting.range_start <= port <= setting.range_end:
+            raise HTTPException(status_code=400, detail="port is outside configured range")
+    duplicate_query = select(models.PortInventoryEntry).where(
+        models.PortInventoryEntry.node_id == node_id,
+        models.PortInventoryEntry.protocol == protocol,
+        models.PortInventoryEntry.port == port,
+    )
+    if exclude_id is not None:
+        duplicate_query = duplicate_query.where(models.PortInventoryEntry.id != exclude_id)
+    duplicate = db.scalar(duplicate_query)
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="port entry already exists")
+
+
+@app.get("/api/nodes/{node_id}/port-inventory", response_model=schemas.PortInventoryRead)
+def get_port_inventory(node_id: int, q: str | None = None, db: Session = Depends(get_db)) -> schemas.PortInventoryRead:
+    """读取节点端口台账。"""
+
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    setting = port_inventory_setting_for_node(node_id, db)
+    query = select(models.PortInventoryEntry).where(models.PortInventoryEntry.node_id == node_id)
+    if q:
+        text = f"%{q.strip()}%"
+        query = query.where(
+            (models.PortInventoryEntry.purpose.like(text))
+            | (models.PortInventoryEntry.protocol.like(text))
+            | (models.PortInventoryEntry.detected_process.like(text))
+            | (models.PortInventoryEntry.detected_source.like(text))
+            | (models.PortInventoryEntry.port.cast(String).like(text))
+        )
+    entries = list(db.scalars(query.order_by(models.PortInventoryEntry.port, models.PortInventoryEntry.protocol)))
+    db.commit()
+    return schemas.PortInventoryRead(
+        setting=schemas.PortInventorySettingRead(range_start=setting.range_start, range_end=setting.range_end),
+        entries=entries,
+    )
+
+
+@app.put("/api/nodes/{node_id}/port-inventory/range", response_model=schemas.PortInventorySettingRead)
+def update_port_inventory_range(
+    node_id: int,
+    payload: schemas.PortInventorySettingUpdate,
+    db: Session = Depends(get_db),
+) -> schemas.PortInventorySettingRead:
+    """保存节点端口台账范围。"""
+
+    if db.get(models.Node, node_id) is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    validate_port_inventory_range(payload.range_start, payload.range_end)
+    setting = port_inventory_setting_for_node(node_id, db)
+    setting.range_start = payload.range_start
+    setting.range_end = payload.range_end
+    db.commit()
+    return schemas.PortInventorySettingRead(range_start=setting.range_start, range_end=setting.range_end)
+
+
+@app.post("/api/nodes/{node_id}/port-inventory/entries", response_model=schemas.PortInventoryEntryRead)
+def create_port_inventory_entry(
+    node_id: int,
+    payload: schemas.PortInventoryEntryCreate,
+    db: Session = Depends(get_db),
+) -> models.PortInventoryEntry:
+    """新增端口台账条目。"""
+
+    if db.get(models.Node, node_id) is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    validate_port_inventory_entry(node_id, payload.protocol, payload.port, db)
+    entry = models.PortInventoryEntry(node_id=node_id, **payload.model_dump())
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+@app.patch("/api/nodes/{node_id}/port-inventory/entries/{entry_id}", response_model=schemas.PortInventoryEntryRead)
+def update_port_inventory_entry(
+    node_id: int,
+    entry_id: int,
+    payload: schemas.PortInventoryEntryUpdate,
+    db: Session = Depends(get_db),
+) -> models.PortInventoryEntry:
+    """修改端口台账条目。"""
+
+    entry = db.get(models.PortInventoryEntry, entry_id)
+    if entry is None or entry.node_id != node_id:
+        raise HTTPException(status_code=404, detail="port entry not found")
+    data = payload.model_dump(exclude_unset=True)
+    protocol = data.get("protocol", entry.protocol)
+    port = data.get("port", entry.port)
+    validate_port_inventory_entry(node_id, protocol, port, db, exclude_id=entry.id)
+    for key, value in data.items():
+        setattr(entry, key, value)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+@app.delete("/api/nodes/{node_id}/port-inventory/entries/{entry_id}")
+def delete_port_inventory_entry(node_id: int, entry_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+    """删除端口台账条目。"""
+
+    entry = db.get(models.PortInventoryEntry, entry_id)
+    if entry is None or entry.node_id != node_id:
+        raise HTTPException(status_code=404, detail="port entry not found")
+    db.delete(entry)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @app.post("/api/nodes/{node_id}/plugins/{plugin_type}/{action}", response_model=schemas.NodePluginActionResult)

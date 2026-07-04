@@ -63,6 +63,9 @@ from link42_api.main import (
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
     request_node_plugin_action,
+    create_port_inventory_entry,
+    get_port_inventory,
+    update_port_inventory_range,
     update_node_topology_position,
 )
 from link42_api.schemas import (
@@ -82,6 +85,8 @@ from link42_api.schemas import (
     AgentLinkMonitorResultRequest,
     AgentUpgradeRequest,
     NodePluginActionRequest,
+    PortInventoryEntryCreate,
+    PortInventorySettingUpdate,
     LinkMonitorCreate,
     Udp2RawMiddlewareConfig,
     TopologyPositionUpdate,
@@ -174,9 +179,9 @@ def test_node_plugin_status_reports_missing_capability() -> None:
 
         plugins = list_node_plugins_for_node(node.id, session)
 
-    test_plugin = next(plugin for plugin in plugins if plugin["type"] == "test-tools")
-    assert test_plugin["available"] is False
-    assert test_plugin["missing_capabilities"] == ["node_plugin.test_tools"]
+    port_plugin = next(plugin for plugin in plugins if plugin["type"] == "port-inventory")
+    assert port_plugin["available"] is False
+    assert port_plugin["missing_capabilities"] == ["node_plugin.port_inventory"]
 
 
 def test_node_plugin_status_checks_agent_version() -> None:
@@ -191,7 +196,7 @@ def test_node_plugin_status_checks_agent_version() -> None:
             status="online",
             agent_token_hash="hash",
             agent_version="0.5.7",
-            agent_capabilities=["node_plugin.test_tools"],
+            agent_capabilities=["node_plugin.port_inventory"],
             last_seen_at=datetime.utcnow(),
         )
         session.add(node)
@@ -199,10 +204,10 @@ def test_node_plugin_status_checks_agent_version() -> None:
 
         plugins = list_node_plugins_for_node(node.id, session)
 
-    test_plugin = next(plugin for plugin in plugins if plugin["type"] == "test-tools")
-    assert test_plugin["available"] is False
-    assert test_plugin["version_supported"] is False
-    assert test_plugin["missing_capabilities"] == []
+    port_plugin = next(plugin for plugin in plugins if plugin["type"] == "port-inventory")
+    assert port_plugin["available"] is False
+    assert port_plugin["version_supported"] is False
+    assert port_plugin["missing_capabilities"] == []
 
 
 def test_node_plugin_action_creates_agent_task() -> None:
@@ -217,7 +222,7 @@ def test_node_plugin_action_creates_agent_task() -> None:
             status="online",
             agent_token_hash="hash",
             agent_version="0.6.0",
-            agent_capabilities=["node_plugin.test_tools"],
+            agent_capabilities=["node_plugin.port_inventory"],
             last_seen_at=datetime.utcnow(),
         )
         session.add(node)
@@ -225,17 +230,18 @@ def test_node_plugin_action_creates_agent_task() -> None:
 
         result = request_node_plugin_action(
             node.id,
-            "test-tools",
-            "echo",
-            NodePluginActionRequest(payload={"message": "hello plugin"}),
+            "port-inventory",
+            "scan",
+            NodePluginActionRequest(payload={"range_start": 23000, "range_end": 23099}),
             session,
         )
         task = session.get(models.AgentTask, result.task_id)
 
     assert result.status == "pending"
     assert task is not None
-    assert task.type == "node_plugin.test_tools.echo"
-    assert task.payload["message"] == "hello plugin"
+    assert task.type == "node_plugin.port_inventory.scan"
+    assert task.payload["range_start"] == 23000
+    assert task.payload["range_end"] == 23099
 
 
 def test_node_plugin_action_rejects_offline_node() -> None:
@@ -249,8 +255,8 @@ def test_node_plugin_action_rejects_offline_node() -> None:
             endpoint_ips=["203.0.113.1"],
             status="offline",
             agent_token_hash="hash",
-            agent_version="0.5.8",
-            agent_capabilities=["node_plugin.test_tools"],
+            agent_version="0.5.10",
+            agent_capabilities=["node_plugin.port_inventory"],
         )
         session.add(node)
         session.commit()
@@ -258,9 +264,9 @@ def test_node_plugin_action_rejects_offline_node() -> None:
         with pytest.raises(HTTPException) as exc_info:
             request_node_plugin_action(
                 node.id,
-                "test-tools",
-                "echo",
-                NodePluginActionRequest(payload={"message": "hello plugin"}),
+                "port-inventory",
+                "scan",
+                NodePluginActionRequest(payload={"range_start": 23000, "range_end": 23099}),
                 session,
             )
 
@@ -299,6 +305,54 @@ def test_bird_node_plugin_action_creates_agent_task() -> None:
     assert task is not None
     assert task.type == "node_plugin.bird.read"
     assert task.payload["resource_key"] == "/etc/bird/bird.conf"
+
+
+def test_port_inventory_range_entry_and_search() -> None:
+    """验证端口台账范围、条目唯一性和搜索。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            endpoint_ips=["203.0.113.1"],
+            status="online",
+            agent_token_hash="hash",
+        )
+        session.add(node)
+        session.commit()
+
+        setting = update_port_inventory_range(
+            node.id,
+            PortInventorySettingUpdate(range_start=23000, range_end=23099),
+            session,
+        )
+        entry = create_port_inventory_entry(
+            node.id,
+            PortInventoryEntryCreate(protocol="udp", port=23001, purpose="WireGuard"),
+            session,
+        )
+        inventory = get_port_inventory(node.id, "wire", session)
+
+        with pytest.raises(HTTPException) as duplicate_exc:
+            create_port_inventory_entry(
+                node.id,
+                PortInventoryEntryCreate(protocol="UDP", port=23001, purpose="duplicate"),
+                session,
+            )
+        with pytest.raises(HTTPException) as range_exc:
+            create_port_inventory_entry(
+                node.id,
+                PortInventoryEntryCreate(protocol="TCP", port=24000, purpose="outside"),
+                session,
+            )
+
+    assert setting.range_start == 23000
+    assert setting.range_end == 23099
+    assert entry.protocol == "UDP"
+    assert [item.port for item in inventory.entries] == [23001]
+    assert duplicate_exc.value.status_code == 409
+    assert range_exc.value.status_code == 400
 
 
 def test_bird_node_plugin_preserves_config_content_bytes() -> None:

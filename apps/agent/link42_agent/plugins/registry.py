@@ -6,12 +6,12 @@ from ..config import AgentConfig
 from ..system import get_agent_platform
 from .base import AgentNodePlugin, AgentPluginContext
 from .bird import BirdAgentPlugin
-from .test_tools import TestToolsAgentPlugin
+from .port_inventory import PortInventoryAgentPlugin
 
 
 AGENT_NODE_PLUGINS: dict[str, AgentNodePlugin] = {
     "bird": BirdAgentPlugin(),
-    "test_tools": TestToolsAgentPlugin(),
+    "port_inventory": PortInventoryAgentPlugin(),
 }
 
 

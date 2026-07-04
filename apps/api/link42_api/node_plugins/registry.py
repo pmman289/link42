@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from .base import NodePlugin
 from .bird import BirdNodePlugin
-from .test_tools import TestToolsNodePlugin
+from .port_inventory import PortInventoryNodePlugin
 
 
 NODE_PLUGINS: dict[str, NodePlugin] = {
     "bird": BirdNodePlugin(),
-    "test-tools": TestToolsNodePlugin(),
+    "port-inventory": PortInventoryNodePlugin(),
 }
 
 

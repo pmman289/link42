@@ -286,6 +286,40 @@ type BirdFileDraft = {
   sha256: string;
 };
 
+type PortInventorySetting = {
+  range_start: number | null;
+  range_end: number | null;
+};
+
+type PortInventoryEntry = {
+  id: number;
+  node_id: number;
+  protocol: "TCP" | "UDP";
+  port: number;
+  purpose: string;
+  source: string;
+  detected_process: string | null;
+  detected_pid: string | null;
+  detected_source: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type PortInventory = {
+  setting: PortInventorySetting;
+  entries: PortInventoryEntry[];
+};
+
+type PortScanResult = {
+  protocol: "TCP" | "UDP";
+  port: number;
+  purpose?: string;
+  source?: string;
+  detected_process?: string | null;
+  detected_pid?: string | null;
+  detected_source?: string | null;
+};
+
 type AgentUpgradePlan = {
   node_id: number;
   current_version: string | null;
@@ -352,6 +386,7 @@ const THEME_KEY = "link42.theme";
 const TASK_POLL_INTERVAL_MS = 2000;
 const AGENT_TASK_POLL_LIMIT = 90;
 const SHORT_TASK_POLL_LIMIT = 30;
+const PORT_INVENTORY_PAGE_SIZE = 10;
 
 function initialTheme(): "light" | "dark" {
   const saved = window.localStorage.getItem(THEME_KEY);
@@ -365,6 +400,18 @@ function splitList(value: string): string[] {
     .split(/[,\n]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function uniqueList(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
 }
 
 function optionalInt(value: FormDataEntryValue | null): number | null {
@@ -739,6 +786,10 @@ function isValidPort(value: number | null): boolean {
   return value === null || (Number.isInteger(value) && value >= 1 && value <= 65535);
 }
 
+function isRequiredPort(value: number): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
 function isValidMtu(value: number | null): boolean {
   return value === null || (Number.isInteger(value) && value >= 576 && value <= 9000);
 }
@@ -930,6 +981,90 @@ function FormSection({
         {children}
       </div>
     </section>
+  );
+}
+
+function EndpointListInput({
+  value,
+  onChange,
+  placeholder,
+  onDuplicate,
+}: {
+  value: string[];
+  onChange: (value: string[]) => void;
+  placeholder?: string;
+  onDuplicate?: (endpoint: string) => void;
+}) {
+  const [draft, setDraft] = useState("");
+
+  function addDraft() {
+    const additions = splitList(draft);
+    if (additions.length === 0) return;
+    const existing = new Set(value.map((item) => item.trim()).filter(Boolean));
+    const next = [...value];
+    let duplicate = "";
+    for (const endpoint of additions) {
+      if (existing.has(endpoint)) {
+        duplicate ||= endpoint;
+        continue;
+      }
+      existing.add(endpoint);
+      next.push(endpoint);
+    }
+    if (duplicate) {
+      onDuplicate?.(duplicate);
+    }
+    if (next.length !== value.length) {
+      onChange(next);
+      setDraft("");
+    }
+  }
+
+  function removeEndpoint(index: number) {
+    onChange(value.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function updateEndpoint(index: number, endpoint: string) {
+    onChange(value.map((item, itemIndex) => itemIndex === index ? endpoint : item));
+  }
+
+  return (
+    <div className="endpointListInput">
+      <div className="endpointListRow endpointListDraft">
+        <input
+          name="endpoint_ip_draft"
+          value={draft}
+          onChange={(event) => setDraft(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            addDraft();
+          }}
+          placeholder={placeholder}
+          aria-label="新增入口地址"
+        />
+        <button type="button" className="endpointListButton endpointListAddButton" onClick={addDraft} disabled={!draft.trim()} title="添加入口地址">
+          <Plus size={16} />
+        </button>
+      </div>
+      <div className="endpointListRows">
+        {value.length === 0 ? (
+          <div className="endpointListEmpty">尚未添加入口地址</div>
+        ) : value.map((endpoint, index) => (
+          <div className="endpointListRow" key={`${endpoint}-${index}`}>
+            <input
+              value={endpoint}
+              onChange={(event) => updateEndpoint(index, event.currentTarget.value)}
+              placeholder={placeholder}
+              aria-label={`入口地址 ${index + 1}`}
+            />
+            <button type="button" className="endpointListButton endpointListRemoveButton" onClick={() => removeEndpoint(index)} title="移除入口地址">
+              <X size={15} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1380,7 +1515,9 @@ function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [createDialog, setCreateDialog] = useState<"external" | "managed" | null>(null);
   const [nodeCreateOpen, setNodeCreateOpen] = useState(false);
+  const [nodeCreateEndpointIps, setNodeCreateEndpointIps] = useState<string[]>([]);
   const [editingNodeId, setEditingNodeId] = useState<number | null>(null);
+  const [editingNodeEndpointIps, setEditingNodeEndpointIps] = useState<string[]>([]);
   const [agentUpgradePlan, setAgentUpgradePlan] = useState<AgentUpgradePlan | null>(null);
   const [managedPeerNodeId, setManagedPeerNodeId] = useState<number | null>(null);
   const [replaceLocalConfigId, setReplaceLocalConfigId] = useState<number | null>(null);
@@ -1406,7 +1543,6 @@ function App() {
   const [activeNodePluginType, setActiveNodePluginType] = useState("");
   const [nodePluginError, setNodePluginError] = useState("");
   const [nodePluginTasks, setNodePluginTasks] = useState<Record<string, AgentTaskStatus>>({});
-  const [nodePluginEchoMessage, setNodePluginEchoMessage] = useState("hello from Link42 plugin host");
   const [birdResources, setBirdResources] = useState<BirdResource[]>([]);
   const [birdDrafts, setBirdDrafts] = useState<Record<string, BirdFileDraft>>({});
   const [birdSelectedResource, setBirdSelectedResource] = useState("");
@@ -1416,6 +1552,12 @@ function App() {
   const [birdEditorLineWrapping, setBirdEditorLineWrapping] = useState(true);
   const [birdEditorFoldGutter, setBirdEditorFoldGutter] = useState(true);
   const [birdEditorAutocompletion, setBirdEditorAutocompletion] = useState(true);
+  const [portInventory, setPortInventory] = useState<PortInventory | null>(null);
+  const [portRangeStart, setPortRangeStart] = useState("");
+  const [portRangeEnd, setPortRangeEnd] = useState("");
+  const [portSearch, setPortSearch] = useState("");
+  const [portInventoryPage, setPortInventoryPage] = useState(1);
+  const [portScanResults, setPortScanResults] = useState<PortScanResult[]>([]);
   const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
   const topologyEdgeSelectionRef = useRef<number | null>(null);
   const birdSelectedResourceRef = useRef("");
@@ -1458,6 +1600,7 @@ function App() {
   const availableNodePlugins = nodePlugins.filter((plugin) => plugin.available);
   const activeNodePlugin = nodePlugins.find((plugin) => plugin.type === activeNodePluginType) || nodePlugins[0] || null;
   const birdPlugin = nodePlugins.find((plugin) => plugin.type === "bird") || null;
+  const portInventoryPlugin = nodePlugins.find((plugin) => plugin.type === "port-inventory") || null;
   const birdFileTree = useMemo(() => buildBirdFileTree(birdResources), [birdResources]);
   const birdSelectedDirectory = birdSelectedResource ? birdDirectory(birdSelectedResource) : "";
   const birdSelectedDraft = birdSelectedResource ? birdDrafts[birdSelectedResource] || null : null;
@@ -1465,6 +1608,21 @@ function App() {
   const birdDirtyDrafts = Object.values(birdDrafts).filter((draft) => draft.content !== draft.originalContent);
   const birdHasUnsavedChanges = birdDirtyDrafts.length > 0;
   const birdTreeLocked = Boolean(birdOpeningResource);
+  const filteredPortEntries = useMemo(() => {
+    const query = portSearch.trim().toLowerCase();
+    const entries = portInventory?.entries || [];
+    if (!query) return entries;
+    return entries.filter((entry) =>
+      String(entry.port).includes(query)
+      || String(entry.protocol || "").toLowerCase().includes(query)
+      || String(entry.purpose || "").toLowerCase().includes(query)
+      || String(entry.detected_process || "").toLowerCase().includes(query)
+      || String(entry.detected_source || "").toLowerCase().includes(query),
+    );
+  }, [portInventory, portSearch]);
+  const portInventoryPageCount = Math.max(1, Math.ceil(filteredPortEntries.length / PORT_INVENTORY_PAGE_SIZE));
+  const portInventoryPageStart = (Math.min(portInventoryPage, portInventoryPageCount) - 1) * PORT_INVENTORY_PAGE_SIZE;
+  const pagedPortEntries = filteredPortEntries.slice(portInventoryPageStart, portInventoryPageStart + PORT_INVENTORY_PAGE_SIZE);
   const birdEditorExtensions = useMemo(
     () => [
       ...(birdEditorLineWrapping ? [EditorView.lineWrapping] : []),
@@ -2035,16 +2193,104 @@ function App() {
     }
   }
 
-  async function runNodePluginAction(pluginType: string, action: string, payload: Record<string, unknown> = {}) {
-    const task = await executeNodePluginAction(pluginType, action, payload);
-    if (!task || task.status === "failed") return;
-    if (pluginType === "test-tools" && action === "echo") {
-      notify("success", `回显完成：${String(task.result?.message || "")}`);
-    } else if (pluginType === "test-tools" && action === "inspect") {
-      notify("success", "平台信息读取完成。");
-    } else {
-      notify("success", "插件任务执行完成。");
+  async function refreshPortInventory(nodeId = selectedNodeId) {
+    if (!nodeId) return;
+    const data = await api<PortInventory>(`/api/nodes/${nodeId}/port-inventory`);
+    setPortInventory(data);
+    setPortRangeStart(data.setting.range_start ? String(data.setting.range_start) : "");
+    setPortRangeEnd(data.setting.range_end ? String(data.setting.range_end) : "");
+  }
+
+  async function savePortInventoryRange(options: { askScan?: boolean } = {}) {
+    if (!selectedNodeId) return;
+    const rangeStart = Number(portRangeStart);
+    const rangeEnd = Number(portRangeEnd);
+    if (!isRequiredPort(rangeStart) || !isRequiredPort(rangeEnd) || rangeStart > rangeEnd) {
+      throw new Error("端口范围必须填写 1-65535，且起始端口不能大于结束端口");
     }
+    const setting = await api<PortInventorySetting>(`/api/nodes/${selectedNodeId}/port-inventory/range`, {
+      method: "PUT",
+      body: JSON.stringify({ range_start: rangeStart, range_end: rangeEnd }),
+    });
+    setPortInventory((current) => ({
+      setting,
+      entries: current?.entries || [],
+    }));
+    notify("success", "端口范围已保存。");
+    if (options.askScan && selectedNodeOnline && window.confirm("端口范围已保存，是否立即扫描该范围内正在监听的端口？")) {
+      await scanPortInventory();
+    }
+  }
+
+  async function scanPortInventory() {
+    if (!portInventoryPlugin?.available || !selectedNodeOnline) return;
+    const rangeStart = Number(portRangeStart || portInventory?.setting.range_start);
+    const rangeEnd = Number(portRangeEnd || portInventory?.setting.range_end);
+    if (!isRequiredPort(rangeStart) || !isRequiredPort(rangeEnd) || rangeStart > rangeEnd) {
+      throw new Error("请先填写有效端口范围");
+    }
+    const task = await executeNodePluginAction("port-inventory", "scan", {
+      range_start: rangeStart,
+      range_end: rangeEnd,
+    });
+    if (!task || task.status === "failed") return;
+    const results = Array.isArray(task.result?.ports) ? task.result.ports as PortScanResult[] : [];
+    setPortScanResults(results);
+    notify("success", `扫描完成，发现 ${results.length} 个占用端口。`);
+  }
+
+  async function createPortInventoryEntry(entry: Omit<PortScanResult, "purpose"> & { purpose?: string }) {
+    if (!selectedNodeId) return;
+    await api<PortInventoryEntry>(`/api/nodes/${selectedNodeId}/port-inventory/entries`, {
+      method: "POST",
+      body: JSON.stringify({
+        protocol: entry.protocol,
+        port: entry.port,
+        purpose: entry.purpose || "",
+        source: entry.source || "manual",
+        detected_process: entry.detected_process || null,
+        detected_pid: entry.detected_pid || null,
+        detected_source: entry.detected_source || null,
+      }),
+    });
+    await refreshPortInventory();
+    notify("success", "端口条目已添加。");
+  }
+
+  async function createManualPortInventoryEntry(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const protocol = String(form.get("protocol") || "TCP") as "TCP" | "UDP";
+    const port = Number(form.get("port"));
+    const purpose = String(form.get("purpose") || "").trim();
+    if (!isRequiredPort(port)) {
+      throw new Error("端口号必须是 1-65535");
+    }
+    await createPortInventoryEntry({ protocol, port, purpose, source: "manual" });
+    formElement.reset();
+  }
+
+  async function updatePortInventoryEntryPurpose(entry: PortInventoryEntry, purpose: string) {
+    if (!selectedNodeId) return;
+    const updated = await api<PortInventoryEntry>(`/api/nodes/${selectedNodeId}/port-inventory/entries/${entry.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ purpose }),
+    });
+    setPortInventory((current) => current ? {
+      ...current,
+      entries: current.entries.map((item) => item.id === updated.id ? updated : item),
+    } : current);
+  }
+
+  async function deletePortInventoryEntry(entry: PortInventoryEntry) {
+    if (!selectedNodeId) return;
+    await api(`/api/nodes/${selectedNodeId}/port-inventory/entries/${entry.id}`, { method: "DELETE" });
+    setPortInventory((current) => current ? {
+      ...current,
+      entries: current.entries.filter((item) => item.id !== entry.id),
+    } : current);
+    notify("success", "端口条目已删除。");
   }
 
   function resetBirdEditorState(clearResources = false) {
@@ -2064,6 +2310,10 @@ function App() {
   function openNodePluginDialog() {
     if (nodePlugins.length === 0) return;
     resetBirdEditorState(true);
+    setPortInventory(null);
+    setPortScanResults([]);
+    setPortSearch("");
+    setPortInventoryPage(1);
     const preferredPlugin = nodePlugins.find((plugin) => plugin.type === "bird") || nodePlugins[0];
     setActiveNodePluginType(preferredPlugin.type);
     setNodePluginDialogOpen(true);
@@ -2078,6 +2328,12 @@ function App() {
     if (pluginType === activeNodePluginType) return;
     if (!confirmDiscardBirdChanges()) return;
     resetBirdEditorState(pluginType === "bird");
+    if (pluginType === "port-inventory") {
+      setPortInventory(null);
+      setPortScanResults([]);
+      setPortSearch("");
+      setPortInventoryPage(1);
+    }
     setActiveNodePluginType(pluginType);
   }
 
@@ -2300,6 +2556,20 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
+    if (nodeCreateOpen) {
+      setNodeCreateEndpointIps([]);
+    }
+  }, [nodeCreateOpen]);
+
+  useEffect(() => {
+    if (editingNode) {
+      setEditingNodeEndpointIps(nodeEndpointOptions(editingNode));
+    } else {
+      setEditingNodeEndpointIps([]);
+    }
+  }, [editingNodeId]);
+
+  useEffect(() => {
     return () => {
       if (settingsLogoPreviewUrl.startsWith("blob:")) {
         URL.revokeObjectURL(settingsLogoPreviewUrl);
@@ -2321,6 +2591,10 @@ function App() {
     setBirdResources([]);
     setBirdDrafts({});
     setBirdSelectedResource("");
+    setPortInventory(null);
+    setPortScanResults([]);
+    setPortSearch("");
+    setPortInventoryPage(1);
     setNodePluginDialogOpen(false);
     setActiveNodePluginType("");
     if (selectedNodeId) {
@@ -2344,6 +2618,10 @@ function App() {
       setBirdResources([]);
       setBirdDrafts({});
       setBirdSelectedResource("");
+      setPortInventory(null);
+      setPortScanResults([]);
+      setPortSearch("");
+      setPortInventoryPage(1);
       setNodePluginDialogOpen(false);
       setActiveNodePluginType("");
       setPlan(null);
@@ -2367,6 +2645,19 @@ function App() {
     if (!birdPlugin?.available || !selectedNodeOnline || actionPending("plugin:bird:list")) return;
     void runAction(() => listBirdResources(), "plugin:bird:list");
   }, [nodePluginDialogOpen, activeNodePluginType, birdPlugin?.available, selectedNodeOnline, birdResources.length]);
+
+  useEffect(() => {
+    if (!nodePluginDialogOpen || activeNodePluginType !== "port-inventory" || !selectedNodeId || portInventory) return;
+    void runAction(() => refreshPortInventory(selectedNodeId), "plugin:port-inventory:load");
+  }, [nodePluginDialogOpen, activeNodePluginType, selectedNodeId, portInventory]);
+
+  useEffect(() => {
+    setPortInventoryPage(1);
+  }, [portSearch]);
+
+  useEffect(() => {
+    setPortInventoryPage((page) => Math.min(page, portInventoryPageCount));
+  }, [portInventoryPageCount]);
 
   useEffect(() => {
     if (!birdHasUnsavedChanges) return;
@@ -2491,7 +2782,7 @@ function App() {
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const controllerUrl = String(form.get("controller_url") || DEFAULT_CONTROLLER_URL).trim();
-    const endpointIps = splitList(String(form.get("endpoint_ips") || ""));
+    const endpointIps = uniqueList([...nodeCreateEndpointIps, ...splitList(String(form.get("endpoint_ip_draft") || ""))]);
     if (endpointIps.length === 0) {
       throw new Error("请至少填写一个节点入口地址");
     }
@@ -2517,6 +2808,7 @@ function App() {
       ].join("\n"),
     );
     formElement.reset();
+    setNodeCreateEndpointIps([]);
     setNodeCreateOpen(false);
     await refreshNodes();
     await refreshTopology();
@@ -2529,7 +2821,7 @@ function App() {
     if (!editingNode) return;
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
-    const endpointIps = splitList(String(form.get("endpoint_ips") || ""));
+    const endpointIps = uniqueList([...editingNodeEndpointIps, ...splitList(String(form.get("endpoint_ip_draft") || ""))]);
     if (endpointIps.length === 0) {
       throw new Error("请至少填写一个节点入口地址");
     }
@@ -3567,42 +3859,164 @@ function App() {
               </div>
             )}
 
-            {activeNodePlugin?.type === "test-tools" && (
-              <div className="nodePluginTest">
-                <Field label="回显内容" hint="安全测试 action，会由 Agent 原样返回。">
-                  <input
-                    value={nodePluginEchoMessage}
-                    onChange={(event) => setNodePluginEchoMessage(event.currentTarget.value)}
-                    disabled={!activeNodePlugin.available || !selectedNodeOnline}
-                  />
-                </Field>
-                <div className="actionRow">
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={!activeNodePlugin.available || !selectedNodeOnline || actionPending(`plugin:${activeNodePlugin.type}:inspect`)}
-                    onClick={() => void runAction(
-                      () => runNodePluginAction(activeNodePlugin.type, "inspect"),
-                      `plugin:${activeNodePlugin.type}:inspect`,
-                    )}
-                  >
-                    <Settings size={16} /> {actionPending(`plugin:${activeNodePlugin.type}:inspect`) ? "执行中" : "读取平台"}
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={!activeNodePlugin.available || !selectedNodeOnline || actionPending(`plugin:${activeNodePlugin.type}:echo`)}
-                    onClick={() => void runAction(
-                      () => runNodePluginAction(activeNodePlugin.type, "echo", { message: nodePluginEchoMessage }),
-                      `plugin:${activeNodePlugin.type}:echo`,
-                    )}
-                  >
-                    <Check size={16} /> {actionPending(`plugin:${activeNodePlugin.type}:echo`) ? "执行中" : "测试回显"}
-                  </button>
-                </div>
-                {(nodePluginTasks[`${activeNodePlugin.type}:echo`] || nodePluginTasks[`${activeNodePlugin.type}:inspect`]) && (
-                  <p className="muted">最近一次测试任务已执行，结果已通过页面提示展示。</p>
+            {activeNodePlugin?.type === "port-inventory" && (
+              <div className="portInventoryPlugin">
+                {actionPending("plugin:port-inventory:load") && !portInventory && (
+                  <div className="empty">正在读取端口台账...</div>
                 )}
+                <section className="portInventoryPanel">
+                  <div className="portInventoryPanelHeader">
+                    <div>
+                      <h3>端口范围</h3>
+                      <p>为该节点维护一个可用入口端口段，并按需扫描占用情况。</p>
+                    </div>
+                    <span className={portInventoryPlugin?.available && selectedNodeOnline ? "portInventoryState ready" : "portInventoryState"}>
+                      {portInventoryPlugin?.available && selectedNodeOnline ? "可扫描" : "不可扫描"}
+                    </span>
+                  </div>
+                  <div className="portInventoryRange">
+                    <Field label="起始端口" requiredMark>
+                      <input value={portRangeStart} onChange={(event) => setPortRangeStart(event.currentTarget.value)} placeholder="23000" inputMode="numeric" />
+                    </Field>
+                    <Field label="结束端口" requiredMark>
+                      <input value={portRangeEnd} onChange={(event) => setPortRangeEnd(event.currentTarget.value)} placeholder="23099" inputMode="numeric" />
+                    </Field>
+                    <div className="portInventoryActions">
+                      <button type="button" disabled={actionPending("plugin:port-inventory:range")} onClick={() => void runAction(() => savePortInventoryRange({ askScan: true }), "plugin:port-inventory:range")}>
+                        <Check size={16} /> 保存范围
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={!portInventoryPlugin?.available || !selectedNodeOnline || actionPending("plugin:port-inventory:scan")}
+                        onClick={() => void runAction(scanPortInventory, "plugin:port-inventory:scan")}
+                      >
+                        <RefreshCw size={16} /> {actionPending("plugin:port-inventory:scan") ? "扫描中" : "扫描占用"}
+                      </button>
+                    </div>
+                  </div>
+                </section>
+
+                {portScanResults.length > 0 && (
+                  <section className="portInventoryPanel">
+                    <div className="portInventoryPanelHeader">
+                      <div>
+                        <h3>扫描结果</h3>
+                        <p>检测到的占用端口不会自动写入台账，确认后再登记。</p>
+                      </div>
+                      <span className="portInventoryCount">{portScanResults.length} 个</span>
+                    </div>
+                    <div className="portInventoryList">
+                      {portScanResults.map((result, index) => {
+                        const exists = (portInventory?.entries || []).some((entry) => entry.protocol === result.protocol && entry.port === result.port);
+                        return (
+                          <div className="portInventoryScanRow" key={`${result.protocol}-${result.port}-${result.detected_source || index}`}>
+                            <div className="portInventoryPort">
+                              <span>{result.protocol}</span>
+                              <strong>{result.port}</strong>
+                            </div>
+                            <div className="portInventoryMeta">
+                              <strong>{result.detected_process || "未知进程"}</strong>
+                              <small>{result.detected_source || "socket"}</small>
+                            </div>
+                            <button
+                              type="button"
+                              className="secondary"
+                              disabled={exists || actionPending(`plugin:port-inventory:add:${result.protocol}:${result.port}`)}
+                              onClick={() => void runAction(() => createPortInventoryEntry(result), `plugin:port-inventory:add:${result.protocol}:${result.port}`)}
+                            >
+                              <Plus size={15} /> {exists ? "已登记" : "登记"}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
+
+                <section className="portInventoryPanel">
+                  <div className="portInventoryPanelHeader">
+                    <div>
+                      <h3>端口记录</h3>
+                      <p>记录真实用途，后续通过端口号或用途快速查找。</p>
+                    </div>
+                    <input className="portInventorySearch" value={portSearch} onChange={(event) => setPortSearch(event.currentTarget.value)} placeholder="搜索端口、用途、来源" />
+                  </div>
+                  <form className="portInventoryEntryForm" onSubmit={(event) => void runAction(() => createManualPortInventoryEntry(event), "plugin:port-inventory:create")}>
+                    <select name="protocol" defaultValue="TCP">
+                      <option value="TCP">TCP</option>
+                      <option value="UDP">UDP</option>
+                    </select>
+                    <input name="port" placeholder="端口" inputMode="numeric" required />
+                    <input name="purpose" placeholder="用途" />
+                    <button type="submit" disabled={actionPending("plugin:port-inventory:create")}><Plus size={16} /> 添加条目</button>
+                  </form>
+                  <div className="portInventoryList">
+                    {filteredPortEntries.length > 0 && (
+                      <div className="portInventoryListHead">
+                        <span>端口</span>
+                        <span>用途</span>
+                        <span>来源</span>
+                        <span />
+                      </div>
+                    )}
+                    {filteredPortEntries.length === 0 ? (
+                      <div className="empty">暂无端口记录。</div>
+                    ) : pagedPortEntries.map((entry) => (
+                      <div className="portInventoryRow" key={entry.id}>
+                        <div className="portInventoryPort">
+                          <span>{entry.protocol}</span>
+                          <strong>{entry.port}</strong>
+                        </div>
+                        <input
+                          value={entry.purpose || ""}
+                          onChange={(event) => {
+                            const purpose = event.currentTarget.value;
+                            setPortInventory((current) => current ? {
+                              ...current,
+                              entries: current.entries.map((item) => item.id === entry.id ? { ...item, purpose } : item),
+                            } : current);
+                          }}
+                          onBlur={(event) => void runAction(() => updatePortInventoryEntryPurpose(entry, event.currentTarget.value), `plugin:port-inventory:update:${entry.id}`)}
+                          placeholder="填写用途"
+                        />
+                        <div className="portInventoryMeta">
+                          <strong>{entry.detected_process || entry.source}</strong>
+                          <small>{entry.detected_source || "手动登记"}</small>
+                        </div>
+                        <button type="button" className="danger" onClick={() => void runAction(() => deletePortInventoryEntry(entry), `plugin:port-inventory:delete:${entry.id}`)}>
+                          <X size={15} /> 删除
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  {filteredPortEntries.length > PORT_INVENTORY_PAGE_SIZE && (
+                    <div className="portInventoryPagination">
+                      <span>
+                        第 {Math.min(portInventoryPage, portInventoryPageCount)} / {portInventoryPageCount} 页，
+                        共 {filteredPortEntries.length} 条
+                      </span>
+                      <div>
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={portInventoryPage <= 1}
+                          onClick={() => setPortInventoryPage((page) => Math.max(1, page - 1))}
+                        >
+                          上一页
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={portInventoryPage >= portInventoryPageCount}
+                          onClick={() => setPortInventoryPage((page) => Math.min(portInventoryPageCount, page + 1))}
+                        >
+                          下一页
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </section>
               </div>
             )}
           </section>
@@ -3685,8 +4099,13 @@ function App() {
               <Field label="主控地址" hint="Agent 安装时连接的 Link42 API 地址。">
                 <input name="controller_url" placeholder="http://192.168.123.20:8000" defaultValue={controllerUrl} required />
               </Field>
-              <Field label="入口地址" hint="多个地址用逗号分隔，后续受管连接会从这里选择 Endpoint。" wide>
-                <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" required />
+              <Field label="入口地址" hint="可添加公网 IP、内网 IP 或域名；后续受管连接会从这里选择 Endpoint。" wide requiredMark>
+                <EndpointListInput
+                  value={nodeCreateEndpointIps}
+                  onChange={setNodeCreateEndpointIps}
+                  placeholder="203.0.113.10"
+                  onDuplicate={(endpoint) => notify("info", `已有该入口地址：${endpoint}`)}
+                />
               </Field>
               <Field label="节点地域" hint="拓扑图展示的地域，例如 广州 / 东京 / HomeLab。">
                 <input name="region" placeholder="广州" />
@@ -3719,13 +4138,18 @@ function App() {
               <Field label="节点地域" hint="拓扑图展示的地域，例如 广州 / 东京 / HomeLab。">
                 <input name="region" placeholder="广州" defaultValue={editingNode.region || ""} />
               </Field>
-              <Field label="入口地址" hint="多个地址用逗号分隔；受管连接会校验所选地址属于节点。" wide>
-                <textarea name="endpoint_ips" placeholder="203.0.113.10, 10.0.0.10" defaultValue={nodeEndpointOptions(editingNode).join(", ")} required />
+              <Field label="入口地址" hint="可添加公网 IP、内网 IP 或域名；受管连接会校验所选地址属于节点。" wide requiredMark>
+                <EndpointListInput
+                  value={editingNodeEndpointIps}
+                  onChange={setEditingNodeEndpointIps}
+                  placeholder="203.0.113.10"
+                  onDuplicate={(endpoint) => notify("info", `已有该入口地址：${endpoint}`)}
+                />
               </Field>
               <Field label="拓扑展示地址" hint="选择或输入拓扑节点卡片展示的本机地址；留空使用第一个入口地址。" wide>
                 <EndpointSelect
                   name="topology_endpoint"
-                  options={endpointOptionsFrom(null, nodeEndpointOptions(editingNode), editingNode.topology_endpoint)}
+                  options={endpointOptionsFrom(null, editingNodeEndpointIps, editingNode.topology_endpoint)}
                   defaultValue={editingNode.topology_endpoint || ""}
                   placeholder="选择或输入展示地址"
                 />

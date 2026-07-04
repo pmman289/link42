@@ -55,8 +55,7 @@ TASK_REQUIREMENTS = {
     "node_plugin.bird.apply": {"min_agent_version": "0.5.9", "capabilities": ["node_plugin.bird"]},
     "node_plugin.bird.apply_many": {"min_agent_version": "0.5.9", "capabilities": ["node_plugin.bird"]},
     "node_plugin.bird.status": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.bird"]},
-    "node_plugin.test_tools.echo": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.test_tools"]},
-    "node_plugin.test_tools.inspect": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.test_tools"]},
+    "node_plugin.port_inventory.scan": {"min_agent_version": "0.5.10", "capabilities": ["node_plugin.port_inventory"]},
     "agent.self_upgrade": {"min_agent_version": "0.2.0", "capabilities": ["agent.self_upgrade"]},
 }
 

@@ -187,6 +187,35 @@ class ImportCandidate(TimestampMixin, Base):
     imported: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class PortInventorySetting(TimestampMixin, Base):
+    """节点端口台账的可用入口端口范围。"""
+
+    __tablename__ = "port_inventory_settings"
+    __table_args__ = (UniqueConstraint("node_id", name="uq_port_inventory_setting_node_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
+    range_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    range_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class PortInventoryEntry(TimestampMixin, Base):
+    """用户维护的节点入口端口占用记录。"""
+
+    __tablename__ = "port_inventory_entries"
+    __table_args__ = (UniqueConstraint("node_id", "protocol", "port", name="uq_port_inventory_node_protocol_port"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
+    protocol: Mapped[str] = mapped_column(String(8))
+    port: Mapped[int] = mapped_column(Integer)
+    purpose: Mapped[str] = mapped_column(String(255), default="")
+    source: Mapped[str] = mapped_column(String(32), default="manual")
+    detected_process: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    detected_pid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detected_source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
 class ChangePlan(TimestampMixin, Base):
     """用户可审阅的部署计划。
 

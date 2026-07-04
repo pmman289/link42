@@ -121,6 +121,79 @@ class NodeCreateResult(BaseModel):
     agent_token: str
 
 
+class PortInventorySettingRead(BaseModel):
+    range_start: int | None = None
+    range_end: int | None = None
+
+
+class PortInventorySettingUpdate(BaseModel):
+    range_start: int
+    range_end: int
+
+    @field_validator("range_start", "range_end")
+    @classmethod
+    def validate_range_port(cls, value: int) -> int:
+        return int(_validate_port(value) or value)
+
+
+class PortInventoryEntryBase(BaseModel):
+    protocol: str = Field(pattern="^(?i:tcp|udp)$")
+    port: int
+    purpose: str = Field(default="", max_length=255)
+    source: str = Field(default="manual", max_length=32)
+    detected_process: str | None = Field(default=None, max_length=255)
+    detected_pid: str | None = Field(default=None, max_length=64)
+    detected_source: str | None = Field(default=None, max_length=255)
+
+    @field_validator("protocol")
+    @classmethod
+    def normalize_protocol(cls, value: str) -> str:
+        return value.upper()
+
+    @field_validator("port")
+    @classmethod
+    def validate_inventory_port(cls, value: int) -> int:
+        return int(_validate_port(value) or value)
+
+
+class PortInventoryEntryCreate(PortInventoryEntryBase):
+    pass
+
+
+class PortInventoryEntryUpdate(BaseModel):
+    protocol: str | None = Field(default=None, pattern="^(?i:tcp|udp)$")
+    port: int | None = None
+    purpose: str | None = Field(default=None, max_length=255)
+    source: str | None = Field(default=None, max_length=32)
+    detected_process: str | None = Field(default=None, max_length=255)
+    detected_pid: str | None = Field(default=None, max_length=64)
+    detected_source: str | None = Field(default=None, max_length=255)
+
+    @field_validator("protocol")
+    @classmethod
+    def normalize_optional_protocol(cls, value: str | None) -> str | None:
+        return value.upper() if value else value
+
+    @field_validator("port")
+    @classmethod
+    def validate_optional_inventory_port(cls, value: int | None) -> int | None:
+        return _validate_port(value)
+
+
+class PortInventoryEntryRead(PortInventoryEntryBase):
+    id: int
+    node_id: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class PortInventoryRead(BaseModel):
+    setting: PortInventorySettingRead
+    entries: list[PortInventoryEntryRead]
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=255)

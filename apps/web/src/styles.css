@@ -608,6 +608,77 @@ textarea {
   min-height: auto;
 }
 
+.endpointListInput {
+  display: grid;
+  gap: 8px;
+}
+
+.endpointListRows {
+  display: grid;
+  gap: 6px;
+}
+
+.endpointListRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 8px;
+  align-items: center;
+}
+
+.gridForm .endpointListRow button {
+  grid-column: auto;
+}
+
+.endpointListRow input {
+  min-width: 0;
+}
+
+.endpointListButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  min-width: 38px;
+  height: 38px;
+  min-height: 38px;
+  padding: 0;
+  border-radius: 6px;
+  color: #fff;
+}
+
+.endpointListAddButton {
+  background: var(--success);
+  border-color: var(--success);
+}
+
+.endpointListAddButton:not(:disabled):hover {
+  background: color-mix(in srgb, var(--success) 84%, #000);
+  border-color: color-mix(in srgb, var(--success) 84%, #000);
+}
+
+.endpointListRemoveButton {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.endpointListRemoveButton:not(:disabled):hover {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
+}
+
+.endpointListDraft {
+  margin-bottom: 2px;
+}
+
+.endpointListEmpty {
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  padding: 10px;
+  font-size: 13px;
+}
+
 .nodePluginEntry {
   display: flex;
   justify-content: space-between;
@@ -654,9 +725,179 @@ textarea {
   font-size: 11px;
 }
 
-.nodePluginTest {
+.portInventoryPlugin {
   display: grid;
+  gap: 12px;
+}
+
+.portInventoryPanel {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-solid);
+  padding: 12px;
+}
+
+.portInventoryPanelHeader {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.portInventoryPanelHeader h3 {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-strong);
+}
+
+.portInventoryPanelHeader p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.portInventoryRange {
+  display: grid;
+  grid-template-columns: minmax(120px, 160px) minmax(120px, 160px) auto;
   gap: 10px;
+  align-items: end;
+}
+
+.portInventoryActions,
+.portInventoryEntryForm {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+  min-width: 0;
+}
+
+.portInventoryActions button {
+  white-space: nowrap;
+}
+
+.portInventoryEntryForm {
+  display: grid;
+  grid-template-columns: 96px minmax(110px, 140px) minmax(220px, 1fr) auto;
+}
+
+.portInventorySearch {
+  width: min(320px, 100%);
+}
+
+.portInventoryState,
+.portInventoryCount {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted-strong);
+  padding: 4px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.portInventoryState.ready {
+  border-color: var(--success);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.portInventoryList {
+  display: grid;
+  gap: 6px;
+}
+
+.portInventoryListHead,
+.portInventoryRow,
+.portInventoryScanRow {
+  display: grid;
+  grid-template-columns: 108px minmax(180px, 1fr) minmax(180px, 280px) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.portInventoryListHead {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 8px;
+}
+
+.portInventoryRow,
+.portInventoryScanRow {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  padding: 8px;
+}
+
+.portInventoryPort {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.portInventoryPort span {
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-solid);
+  color: var(--muted-strong);
+  padding: 2px 7px;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.portInventoryPort strong {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong);
+}
+
+.portInventoryMeta {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.portInventoryMeta strong,
+.portInventoryMeta small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.portInventoryMeta strong {
+  font-size: 13px;
+  color: var(--text-strong);
+}
+
+.portInventoryMeta small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.portInventoryPagination {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.portInventoryPagination > div {
+  display: flex;
+  gap: 8px;
+}
+
+.portInventoryPagination button {
+  min-height: 32px;
+  padding: 6px 10px;
 }
 
 .nodePluginBird {
@@ -1624,6 +1865,42 @@ textarea {
   .birdConfigEditor,
   .birdSelectHint {
     min-height: 300px;
+  }
+
+  .portInventoryPanelHeader,
+  .portInventoryRange,
+  .portInventoryEntryForm,
+  .portInventoryListHead,
+  .portInventoryRow,
+  .portInventoryScanRow {
+    grid-template-columns: 1fr;
+  }
+
+  .portInventoryActions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .portInventoryActions button,
+  .portInventoryEntryForm button,
+  .portInventoryRow button,
+  .portInventoryScanRow button,
+  .portInventorySearch {
+    width: 100%;
+  }
+
+  .portInventoryListHead {
+    display: none;
+  }
+
+  .portInventoryPagination {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .portInventoryPagination > div {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
   }
 
   .configRow {

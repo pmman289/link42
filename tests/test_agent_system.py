@@ -12,6 +12,7 @@ from link42_agent import link_monitor, main, middleware, service_manager, system
 from link42_agent.client import AgentHttpError
 from link42_agent.config import AgentConfig
 from link42_agent.plugins import bird
+from link42_agent.plugins import port_inventory
 from link42_agent.task_handlers import TASK_HANDLERS, execute_registered_task
 
 
@@ -62,24 +63,36 @@ def test_run_command_passes_timeout_to_subprocess(monkeypatch) -> None:
     assert seen == {"command": ["systemctl", "status", "link42-agent"], "timeout": 7.0}
 
 
-def test_node_plugin_test_tools_capability_and_echo(monkeypatch) -> None:
-    """验证 Agent 侧测试插件会上报能力并能执行固定 action。"""
+def test_node_plugin_port_inventory_capability_and_scan(monkeypatch, tmp_path) -> None:
+    """验证 Agent 侧端口台账插件会上报能力并能扫描 WireGuard ListenPort。"""
 
     use_service_binaries(monkeypatch, systemd=True)
     monkeypatch.setattr(main, "mimic_installable", lambda platform: False)
     monkeypatch.setattr(main, "mimic_runtime_supported", lambda platform: False)
+    monkeypatch.setattr(port_inventory.shutil, "which", lambda binary: f"/usr/bin/{binary}" if binary in {"ss"} else None)
+    monkeypatch.setattr(port_inventory, "scan_socket_listeners", lambda range_start, range_end: [])
+    wg_dir = tmp_path / "wireguard"
+    wg_dir.mkdir()
+    (wg_dir / "wg0.conf").write_text("[Interface]\nListenPort = 23001\n", encoding="utf-8")
 
     capabilities = main.build_capabilities()
     result = execute_registered_task(
-        "node_plugin.test_tools.echo",
-        {"message": "hello"},
-        AgentConfig(server_url="http://controller", node_id=1, token="token", dry_run=True),
+        "node_plugin.port_inventory.scan",
+        {"range_start": 23000, "range_end": 23099},
+        AgentConfig(server_url="http://controller", node_id=1, token="token", wireguard_dir=str(wg_dir), dry_run=True),
     )
 
-    assert "node_plugin.test_tools" in capabilities
-    assert "node_plugin.test_tools.echo" in capabilities
-    assert result["message"] == "hello"
-    assert result["dry_run"] is True
+    assert "node_plugin.port_inventory" in capabilities
+    assert "node_plugin.port_inventory.scan" in capabilities
+    assert {
+        "protocol": "UDP",
+        "port": 23001,
+        "purpose": "",
+        "source": "scan",
+        "detected_process": "wireguard",
+        "detected_pid": None,
+        "detected_source": str(wg_dir / "wg0.conf"),
+    } in result["ports"]
 
 
 def test_bird_plugin_lists_and_reads_recursive_config_tree(monkeypatch, tmp_path) -> None:

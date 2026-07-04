@@ -188,6 +188,47 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("import_candidates", candidate_columns, "warnings", "JSON DEFAULT '[]'")
             add_column("import_candidates", candidate_columns, "imported", "BOOLEAN DEFAULT 0")
 
+        if not table_exists("port_inventory_settings"):
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE port_inventory_settings (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        node_id INTEGER NOT NULL,
+                        range_start INTEGER,
+                        range_end INTEGER,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT uq_port_inventory_setting_node_id UNIQUE (node_id)
+                    )
+                    """
+                )
+            )
+            connection.execute(text("CREATE INDEX ix_port_inventory_settings_node_id ON port_inventory_settings(node_id)"))
+
+        if not table_exists("port_inventory_entries"):
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE port_inventory_entries (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        node_id INTEGER NOT NULL,
+                        protocol VARCHAR(8) NOT NULL,
+                        port INTEGER NOT NULL,
+                        purpose VARCHAR(255) DEFAULT '',
+                        source VARCHAR(32) DEFAULT 'manual',
+                        detected_process VARCHAR(255),
+                        detected_pid VARCHAR(64),
+                        detected_source VARCHAR(255),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT uq_port_inventory_node_protocol_port UNIQUE (node_id, protocol, port)
+                    )
+                    """
+                )
+            )
+            connection.execute(text("CREATE INDEX ix_port_inventory_entries_node_id ON port_inventory_entries(node_id)"))
+
         plan_columns = table_columns("change_plans")
         if plan_columns:
             add_column("change_plans", plan_columns, "status", "VARCHAR(32) DEFAULT 'draft'")
