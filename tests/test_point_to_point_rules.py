@@ -2865,6 +2865,92 @@ def test_update_udp2raw_direction_refreshes_pending_apply_tasks(monkeypatch) -> 
     assert peer_task.payload["listen_port"] == 23003
 
 
+def test_update_managed_link_rename_queues_previous_interface_cleanup(monkeypatch) -> None:
+    """验证受管连接改名会先下发旧接口清理任务，再应用新接口配置。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+    monkeypatch.setattr(api_main, "generate_token", lambda prefix: f"{prefix}_secret")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+        node_a_id = node_a.id
+        node_b_id = node_b.id
+
+        result = create_managed_link(
+            node_a_id,
+            ManagedLinkCreate(
+                peer_node_id=node_b_id,
+                local_interface_name="wg-old-a",
+                peer_interface_name="wg-old-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=51821,
+            ),
+            session,
+        )
+        session.query(models.AgentTask).delete()
+        session.commit()
+
+        update_managed_link(
+            result.local_interface.id,
+            ManagedLinkUpdate(
+                local_interface_name="wg-new-a",
+                peer_interface_name="wg-new-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=51821,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+
+    local_tasks = [task for task in tasks if task.node_id == node_a_id]
+    peer_tasks = [task for task in tasks if task.node_id == node_b_id]
+    assert [task.type for task in local_tasks] == [
+        "wireguard.stop_interface",
+        "wireguard.delete_config",
+        "wireguard.apply_config",
+    ]
+    assert [task.payload["interface_name"] for task in local_tasks] == ["wg-old-a", "wg-old-a", "wg-new-a"]
+    assert local_tasks[-1].payload["previous_interface_name"] == "wg-old-a"
+    assert [task.type for task in peer_tasks] == [
+        "wireguard.stop_interface",
+        "wireguard.delete_config",
+        "wireguard.apply_config",
+    ]
+    assert [task.payload["interface_name"] for task in peer_tasks] == ["wg-old-b", "wg-old-b", "wg-new-b"]
+    assert peer_tasks[-1].payload["previous_interface_name"] == "wg-old-b"
+
+
 def test_update_managed_link_disabling_udp2raw_enqueues_cleanup_tasks(monkeypatch) -> None:
     """验证编辑受管连接禁用 udp2raw 时会清理节点上的旧 udp2raw 服务和配置。"""
 

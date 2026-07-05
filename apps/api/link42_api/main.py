@@ -1613,6 +1613,23 @@ def enqueue_apply_config(
     """幂等下发某个受管接口配置。"""
 
     driver = connection_driver_for_interface(interface)
+    previous_interface_name = str((interface.extras or {}).get("previous_interface_name") or "").strip()
+    if previous_interface_name and previous_interface_name != interface.name:
+        previous_payload = {"interface_name": previous_interface_name}
+        enqueue_interface_task_once(
+            db,
+            interface,
+            driver.tasks.stop,
+            payload_extra=previous_payload,
+            update_pending_payload=True,
+        )
+        enqueue_interface_task_once(
+            db,
+            interface,
+            driver.tasks.delete_config,
+            payload_extra=previous_payload,
+            update_pending_payload=True,
+        )
     return enqueue_interface_task_once(
         db,
         interface,
