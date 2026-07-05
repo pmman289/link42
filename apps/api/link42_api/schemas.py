@@ -17,12 +17,19 @@ def _validate_port(value: int | None) -> int | None:
 
 
 def _validate_cidrs(values: list[str]) -> list[str]:
-    """轻量校验 CIDR 字段形态，避免明显错误进入部署计划。"""
+    """校验 CIDR 字段，避免无效地址进入部署计划。"""
 
+    normalized = []
     for value in values:
-        if "/" not in value:
+        cidr = value.strip()
+        if "/" not in cidr:
             raise ValueError("CIDR value must contain prefix length")
-    return values
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"invalid CIDR value: {cidr}") from exc
+        normalized.append(cidr)
+    return normalized
 
 
 def _validate_optional_http_url(value: str | None) -> str | None:

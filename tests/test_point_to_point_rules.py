@@ -1544,10 +1544,25 @@ def test_schema_rejects_invalid_ports_and_cidrs() -> None:
         InterfaceCreate(name="wg0", tunnel_ips=["10.42.0.1"], listen_port=51820)
 
     with pytest.raises(ValueError):
+        InterfaceCreate(name="wg0", tunnel_ips=["::./0"], listen_port=51820)
+
+    with pytest.raises(ValueError):
         InterfaceCreate(name="wg0", tunnel_ips=["10.42.0.1/24"], listen_port=70000)
 
     with pytest.raises(ValueError):
         PeerCreate(public_key="peer", allowed_ips=["10.42.0.2/32"], endpoint_port=70000)
+
+    with pytest.raises(ValueError):
+        PeerCreate(public_key="peer", allowed_ips=["0.0.0.0/0", "::./0"])
+
+    with pytest.raises(ValueError):
+        ManagedLinkCreate(
+            peer_node_id=2,
+            local_interface_name="wg-a",
+            local_tunnel_ips=["10.42.0.1/32"],
+            peer_tunnel_ips=["10.42.0.2/32"],
+            local_allowed_ips=["0.0.0.0/0", "::./0"],
+        )
 
 
 def test_confirm_change_plan_rejects_empty_diff() -> None:
@@ -2735,10 +2750,119 @@ def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> 
         "wireguard.apply_config",
     ]
     assert tasks[2].payload["mode"] == "server"
+    assert tasks[2].node_id == result.peer_interface.node_id
     assert tasks[2].payload["remote_host"] == "127.0.0.1"
     assert tasks[2].payload["remote_port"] == 11451
     assert tasks[3].payload["mode"] == "client"
+    assert tasks[3].node_id == result.local_interface.node_id
     assert tasks[3].payload["remote_host"] == "198.51.100.20"
+
+
+def test_update_udp2raw_direction_refreshes_pending_apply_tasks(monkeypatch) -> None:
+    """验证未执行的 udp2raw apply 会随方向变更更新，避免本端缺少 client 进程。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+    monkeypatch.setattr(api_main, "generate_token", lambda prefix: f"{prefix}_secret")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    capabilities = [
+        "wireguard",
+        "wg_quick_import",
+        "service:systemd",
+        "middleware",
+        "middleware.install",
+        "middleware.udp2raw",
+    ]
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            agent_version="0.2.0",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            agent_version="0.2.0",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        result = create_managed_link(
+            node_a.id,
+            ManagedLinkCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=None,
+                udp2raw=Udp2RawMiddlewareConfig(
+                    enabled=True,
+                    server_side="local",
+                    server_connect_host="198.51.100.10",
+                    server_listen_port=23002,
+                    client_listen_port=12312,
+                ),
+            ),
+            session,
+        )
+
+        update_managed_link(
+            result.local_interface.id,
+            ManagedLinkUpdate(
+                local_interface_name="wg-a",
+                peer_interface_name="wg-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=None,
+                peer_listen_port=51821,
+                udp2raw=Udp2RawMiddlewareConfig(
+                    enabled=True,
+                    server_side="peer",
+                    server_connect_host="198.51.100.20",
+                    server_listen_port=23003,
+                    client_listen_port=12313,
+                ),
+            ),
+            session,
+        )
+        udp2raw_apply_tasks = list(
+            session.scalars(
+                select(models.AgentTask)
+                .where(models.AgentTask.type == "middleware.udp2raw.apply")
+                .order_by(models.AgentTask.node_id)
+            )
+        )
+        local_task = next(task for task in udp2raw_apply_tasks if task.node_id == result.local_interface.node_id)
+        peer_task = next(task for task in udp2raw_apply_tasks if task.node_id == result.peer_interface.node_id)
+
+    assert len(udp2raw_apply_tasks) == 2
+    assert local_task.payload["mode"] == "client"
+    assert local_task.payload["listen_port"] == 12313
+    assert local_task.payload["remote_host"] == "198.51.100.20"
+    assert local_task.payload["remote_port"] == 23003
+    assert peer_task.payload["mode"] == "server"
+    assert peer_task.payload["listen_port"] == 23003
 
 
 def test_update_managed_link_disabling_udp2raw_enqueues_cleanup_tasks(monkeypatch) -> None:

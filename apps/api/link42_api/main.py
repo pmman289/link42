@@ -877,7 +877,14 @@ def enqueue_udp2raw_tasks(
         local_endpoint,
         peer_endpoint,
     ):
-        enqueue_interface_task_once(db, interface, task_type, payload)
+        enqueue_interface_task_once(
+            db,
+            interface,
+            task_type,
+            payload,
+            update_pending_payload=True,
+            queue_after_running=True,
+        )
 
 
 def middleware_instance_name(local_interface: models.WireGuardInterface, peer_interface: models.WireGuardInterface) -> str:
@@ -1468,17 +1475,27 @@ def create_interface_task(
     )
 
 
-def has_active_interface_task(db: Session, interface_id: int, task_type: str) -> bool:
-    """判断某接口是否已有同类型待执行任务，保证用户重复点击时幂等。"""
+def get_interface_task(
+    db: Session,
+    interface_id: int,
+    task_type: str,
+    statuses: list[str],
+) -> models.AgentTask | None:
+    """读取某接口指定状态的同类型任务。"""
 
-    existing = db.scalar(
+    return db.scalar(
         select(models.AgentTask).where(
             models.AgentTask.type == task_type,
-            models.AgentTask.status.in_(["pending", "running"]),
+            models.AgentTask.status.in_(statuses),
             models.AgentTask.payload["interface_id"].as_integer() == interface_id,
         )
     )
-    return existing is not None
+
+
+def has_active_interface_task(db: Session, interface_id: int, task_type: str) -> bool:
+    """判断某接口是否已有同类型待执行任务，保证用户重复点击时幂等。"""
+
+    return get_interface_task(db, interface_id, task_type, ["pending", "running"]) is not None
 
 
 def enqueue_interface_task_once(
@@ -1486,10 +1503,18 @@ def enqueue_interface_task_once(
     interface: models.WireGuardInterface,
     task_type: str,
     payload_extra: dict | None = None,
+    update_pending_payload: bool = False,
+    queue_after_running: bool = False,
 ) -> bool:
     """幂等创建接口任务；已存在待执行任务时不重复入队。"""
 
-    if has_active_interface_task(db, interface.id, task_type):
+    pending_task = get_interface_task(db, interface.id, task_type, ["pending"])
+    if pending_task is not None:
+        if update_pending_payload:
+            pending_task.payload = create_interface_task(interface, task_type, payload_extra=payload_extra).payload
+            return True
+        return False
+    if not queue_after_running and get_interface_task(db, interface.id, task_type, ["running"]) is not None:
         return False
     node = db.get(models.Node, interface.node_id)
     if node is not None:
@@ -1593,6 +1618,8 @@ def enqueue_apply_config(
         interface,
         driver.tasks.apply_config,
         payload_extra=driver.build_apply_payload(interface, enable_on_boot=enable_on_boot),
+        update_pending_payload=True,
+        queue_after_running=True,
     )
 
 

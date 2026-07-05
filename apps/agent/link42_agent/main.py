@@ -109,13 +109,18 @@ def run_once(client: AgentClient, config: Union[AgentConfig, str]) -> None:
     except TypeError:
         tasks = client.poll_tasks(capabilities)
     for task in tasks:
+        task_id = task["id"]
+        task_type = task["type"]
+        print(f"task {task_id} {task_type} started", flush=True)
         try:
             result = execute_task(task, config)
-            client.report_task(task["id"], "succeeded", result)
+            print(f"task {task_id} {task_type} succeeded", flush=True)
+            client.report_task(task_id, "succeeded", result)
         except Exception as exc:  # noqa: BLE001
             # Agent 不能因为单个任务失败而退出；失败信息上报后继续处理后续任务。
+            print(f"task {task_id} {task_type} failed: {exc}", flush=True)
             client.report_task(
-                task["id"],
+                task_id,
                 "failed",
                 {"error": str(exc), "traceback": traceback.format_exc()},
             )

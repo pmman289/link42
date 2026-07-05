@@ -803,8 +803,14 @@ function isProbablyIpAddress(value: string): boolean {
 }
 
 function isValidCidrs(values: string[]): boolean {
-  // 用浏览器内置 URL/IP 能力不足，这里做轻量 CIDR 形态校验，后续可替换为严格解析器。
-  return values.every((value) => /^([0-9a-fA-F:.]+)\/\d{1,3}$/.test(value));
+  return values.every((value) => {
+    const [address, prefixText, ...rest] = value.trim().split("/");
+    if (!address || !prefixText || rest.length) return false;
+    if (!/^\d+$/.test(prefixText)) return false;
+    const prefix = Number(prefixText);
+    if (!isProbablyIpAddress(address)) return false;
+    return address.includes(":") ? prefix >= 0 && prefix <= 128 : prefix >= 0 && prefix <= 32;
+  });
 }
 
 function MonitorSummaryButton({
