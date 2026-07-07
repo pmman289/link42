@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck disable=SC1091
+. "$ROOT_DIR/scripts/lib/release.sh"
 OUT_DIR="$ROOT_DIR/dist/agent"
 NAME="link42-agent-source.tar.gz"
 
@@ -15,5 +17,5 @@ tar \
   packages/link42_common \
   packages/link42_wireguard
 
-sha256sum "$OUT_DIR/$NAME" > "$OUT_DIR/$NAME.sha256"
+link42_write_sha256 "$OUT_DIR/$NAME"
 echo "$OUT_DIR/$NAME"

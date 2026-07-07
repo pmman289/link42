@@ -6,7 +6,7 @@ from .base import AgentTaskSpec, NodePlugin, NodePluginAction, NodePluginContext
 
 
 class BirdNodePlugin(NodePlugin):
-    """Controller-side BIRD configuration editor plugin."""
+    """主控侧 BIRD 配置编辑插件。"""
 
     type = "bird"
     display_name = "BIRD 配置"
@@ -23,6 +23,8 @@ class BirdNodePlugin(NodePlugin):
     }
 
     def validate_payload(self, action: str, payload: dict[str, Any], context: NodePluginContext) -> dict[str, Any]:
+        """按 BIRD action 校验资源路径、配置内容和批量文件列表。"""
+
         super().validate_payload(action, payload, context)
         if action in {"list", "status"}:
             return {}
@@ -48,6 +50,8 @@ class BirdNodePlugin(NodePlugin):
         raise ValueError("plugin action not found")
 
     def build_task(self, action: str, payload: dict[str, Any], context: NodePluginContext) -> AgentTaskSpec:
+        """为 BIRD action 附加插件类型、动作和节点 ID 后生成任务。"""
+
         task = super().build_task(action, payload, context)
         return AgentTaskSpec(
             task_type=task.task_type,
@@ -61,6 +65,8 @@ class BirdNodePlugin(NodePlugin):
 
 
 def required_string(payload: dict[str, Any], key: str) -> str:
+    """读取必填字符串字段并去除首尾空白。"""
+
     value = str(payload.get(key) or "").strip()
     if not value:
         raise ValueError(f"{key} is required")
@@ -68,6 +74,8 @@ def required_string(payload: dict[str, Any], key: str) -> str:
 
 
 def required_raw_string(payload: dict[str, Any], key: str) -> str:
+    """读取必须保持原样的字符串字段，不做 trim。"""
+
     value = payload.get(key)
     if not isinstance(value, str):
         raise ValueError(f"{key} must be a string")
@@ -75,11 +83,15 @@ def required_raw_string(payload: dict[str, Any], key: str) -> str:
 
 
 def optional_string(payload: dict[str, Any], key: str) -> str | None:
+    """读取可选字符串字段，空值归一为空。"""
+
     value = str(payload.get(key) or "").strip()
     return value or None
 
 
 def required_resource_changes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """校验批量 BIRD 配置变更列表。"""
+
     files = payload.get("files")
     if not isinstance(files, list) or not files:
         raise ValueError("files are required")

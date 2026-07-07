@@ -56,6 +56,10 @@ class Node(TimestampMixin, Base):
         back_populates="node",
         cascade="all, delete-orphan",
     )
+    connection_endpoints: Mapped[list[ConnectionEndpoint]] = relationship(
+        back_populates="node",
+        cascade="all, delete-orphan",
+    )
     tasks: Mapped[list[AgentTask]] = relationship(back_populates="node")
 
 
@@ -106,6 +110,8 @@ class WireGuardInterface(TimestampMixin, Base):
 
     @property
     def interface_custom_config(self) -> str | None:
+        """返回导入或编辑时保留的 Interface 自定义配置片段。"""
+
         return (self.extras or {}).get("custom_config")
 
     @property
@@ -170,7 +176,61 @@ class WireGuardPeer(TimestampMixin, Base):
 
     @property
     def peer_custom_config(self) -> str | None:
+        """返回导入或编辑时保留的 Peer 自定义配置片段。"""
+
         return (self.extras or {}).get("custom_config")
+
+
+class Connection(TimestampMixin, Base):
+    """跨协议的点对点连接记录。
+
+    WireGuard 暂时保留旧表，本表第一阶段用于 GRE 等新协议。
+    """
+
+    __tablename__ = "connections"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    protocol_type: Mapped[str] = mapped_column(String(32), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    source: Mapped[str] = mapped_column(String(32), default="managed-node")
+    managed: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(32), default="stopped")
+    extras: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    endpoints: Mapped[list[ConnectionEndpoint]] = relationship(
+        back_populates="connection",
+        cascade="all, delete-orphan",
+        order_by="ConnectionEndpoint.id",
+    )
+
+
+class ConnectionEndpoint(TimestampMixin, Base):
+    """跨协议连接在单个节点上的本地端点。"""
+
+    __tablename__ = "connection_endpoints"
+    __table_args__ = (
+        UniqueConstraint("node_id", "interface_name", name="uq_connection_endpoint_node_interface"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    connection_id: Mapped[int] = mapped_column(ForeignKey("connections.id"), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
+    role: Mapped[str] = mapped_column(String(32))
+    interface_name: Mapped[str] = mapped_column(String(32))
+    tunnel_ips: Mapped[list[str]] = mapped_column(JSON, default=list)
+    mtu: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    routes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    runtime_status: Mapped[str] = mapped_column(String(32), default="stopped")
+    deployed_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    protocol_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    extras: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    connection: Mapped[Connection] = relationship(back_populates="endpoints")
+    node: Mapped[Node] = relationship(back_populates="connection_endpoints")
+    link_monitors: Mapped[list[LinkMonitor]] = relationship(
+        back_populates="connection_endpoint",
+        cascade="all, delete-orphan",
+    )
 
 
 class ImportCandidate(TimestampMixin, Base):
@@ -285,6 +345,11 @@ class LinkMonitor(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
     interface_id: Mapped[int | None] = mapped_column(ForeignKey("wg_interfaces.id"), index=True, nullable=True)
+    connection_endpoint_id: Mapped[int | None] = mapped_column(
+        ForeignKey("connection_endpoints.id"),
+        index=True,
+        nullable=True,
+    )
     name: Mapped[str] = mapped_column(String(80))
     target_host: Mapped[str] = mapped_column(String(255))
     interval_seconds: Mapped[int] = mapped_column(Integer, default=10)
@@ -294,6 +359,7 @@ class LinkMonitor(TimestampMixin, Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     interface: Mapped[WireGuardInterface | None] = relationship(back_populates="link_monitors")
+    connection_endpoint: Mapped[ConnectionEndpoint | None] = relationship(back_populates="link_monitors")
     samples: Mapped[list[LinkMonitorSample]] = relationship(
         back_populates="monitor",
         cascade="all, delete-orphan",

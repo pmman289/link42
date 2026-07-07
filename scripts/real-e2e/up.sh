@@ -24,15 +24,18 @@ POLL_INTERVAL="${LINK42_REAL_POLL_INTERVAL:-2}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 UVICORN_BIN="${UVICORN_BIN:-$ROOT_DIR/.venv/bin/uvicorn}"
 
+# 输出错误并终止真实端到端测试。
 fail() {
   echo "[link42-real-e2e] ERROR: $*" >&2
   exit 1
 }
 
+# 检查真实端到端测试依赖命令。
 require() {
   command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"
 }
 
+# 从 JSON 标准输入中读取指定字段。
 json_get() {
   "$PYTHON_BIN" -c 'import json,sys
 data=json.load(sys.stdin)
@@ -41,6 +44,7 @@ for key in sys.argv[1].split("."):
 print(data)' "$1"
 }
 
+# 等待测试主控健康检查通过。
 wait_for_api() {
   for _ in $(seq 1 120); do
     if curl -fsS "$BASE_URL/api/health" >/dev/null 2>&1; then
@@ -52,6 +56,7 @@ wait_for_api() {
   fail "controller did not become healthy"
 }
 
+# 等待真实端到端测试节点上线。
 wait_for_nodes_online() {
   for _ in $(seq 1 80); do
     local count
@@ -66,6 +71,7 @@ wait_for_nodes_online() {
   fail "timed out waiting for both agents to become online"
 }
 
+# 以已登录 token 调用测试主控 API。
 api() {
   local method="$1"
   local path="$2"
@@ -81,6 +87,7 @@ api() {
   fi
 }
 
+# 写入真实端到端测试运行状态。
 write_state() {
   cat > "$RUN_DIR/state.env" <<EOF
 LINK42_REAL_RUN_DIR=$(printf '%q' "$RUN_DIR")
@@ -96,6 +103,7 @@ LINK42_REAL_REMOTE_SSH=$(printf '%q' "$REMOTE_SSH")
 EOF
 }
 
+# 执行脚本主流程。
 main() {
   require curl
   require ssh
@@ -147,8 +155,27 @@ main() {
   ssh "$REMOTE_SSH" "rm -rf '$RUN_DIR/remote-agent' && mkdir -p '$RUN_DIR/remote-agent'"
   scp -q "$RUN_DIR/agent-src.tar.gz" "$REMOTE_SSH:$RUN_DIR/remote-agent/"
   ssh "$REMOTE_SSH" "cd '$RUN_DIR/remote-agent' && tar -xzf agent-src.tar.gz"
-  ssh "$REMOTE_SSH" "cd '$RUN_DIR/remote-agent' && nohup env PYTHONPATH=apps/agent:packages LINK42_SERVER_URL='$REMOTE_AGENT_URL' LINK42_NODE_ID='$REMOTE_NODE_ID' LINK42_AGENT_TOKEN='$remote_token' LINK42_POLL_INTERVAL='$POLL_INTERVAL' python3 -m link42_agent.main > '$RUN_DIR/remote-agent.log' 2>&1 < /dev/null & echo \$! > '$RUN_DIR/remote-agent.pid'"
-  REMOTE_AGENT_PID="$(ssh "$REMOTE_SSH" "cat '$RUN_DIR/remote-agent.pid'")"
+  ssh "$REMOTE_SSH" "cat > '$RUN_DIR/remote-agent/start-agent.sh' <<SH
+#!/bin/sh
+cd '$RUN_DIR/remote-agent'
+export PYTHONPATH='apps/agent:packages'
+export LINK42_SERVER_URL='$REMOTE_AGENT_URL'
+export LINK42_NODE_ID='$REMOTE_NODE_ID'
+export LINK42_AGENT_TOKEN='$remote_token'
+export LINK42_POLL_INTERVAL='$POLL_INTERVAL'
+exec python3 -m link42_agent.main
+SH
+chmod 700 '$RUN_DIR/remote-agent/start-agent.sh'"
+  ssh -f -n "$REMOTE_SSH" "cd '$RUN_DIR/remote-agent' && nohup ./start-agent.sh > '$RUN_DIR/remote-agent.log' 2>&1 < /dev/null & echo \$! > '$RUN_DIR/remote-agent.pid'"
+  REMOTE_AGENT_PID=""
+  for _ in $(seq 1 50); do
+    REMOTE_AGENT_PID="$(ssh "$REMOTE_SSH" "cat '$RUN_DIR/remote-agent.pid' 2>/dev/null" || true)"
+    if [[ -n "$REMOTE_AGENT_PID" ]]; then
+      break
+    fi
+    sleep 0.2
+  done
+  [[ -n "$REMOTE_AGENT_PID" ]] || fail "remote agent pid file was not written"
 
   write_state
   wait_for_nodes_online

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
-from link42_common.connection_types import TASK_REQUIREMENTS, WIREGUARD_TASKS
+from link42_common.connection_types import GRE_TASKS, TASK_REQUIREMENTS, WIREGUARD_TASKS
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
@@ -21,6 +21,7 @@ from link42_api.main import (
     SETTING_ADMIN_USERNAME,
     SETTING_CONTROLLER_URL,
     create_managed_link,
+    create_managed_connection,
     create_node,
     confirm_change_plan,
     delete_interface,
@@ -35,7 +36,9 @@ from link42_api.main import (
     build_topology,
     enqueue_interface_task_once,
     ensure_unique_interface_name,
+    expire_stale_running_agent_tasks,
     get_controller_settings,
+    list_node_connections,
     get_setting,
     list_node_plugins_for_node,
     install_node_middleware,
@@ -87,6 +90,7 @@ from link42_api.schemas import (
     AgentLinkMonitorResultItem,
     AgentLinkMonitorResultRequest,
     AgentUpgradeRequest,
+    GreManagedConnectionCreate,
     NodePluginActionRequest,
     PortInventoryEntryCreate,
     PortInventorySettingUpdate,
@@ -1100,14 +1104,26 @@ def test_interface_rename_plan_can_be_confirmed_without_config_diff() -> None:
 
         plan = plan_apply(interface.id, session)
         confirmed = confirm_change_plan(plan.id, session)
-        task = session.scalar(select(models.AgentTask).where(models.AgentTask.change_plan_id == confirmed.id))
+        tasks = list(
+            session.scalars(
+                select(models.AgentTask)
+                .where(models.AgentTask.change_plan_id == confirmed.id)
+                .order_by(models.AgentTask.id)
+            )
+        )
 
     assert plan.diff.strip()
     assert "-InterfaceName = wg-old" in plan.diff
     assert "+InterfaceName = wg-new" in plan.diff
-    assert task is not None
-    assert task.payload["interface_name"] == "wg-new"
-    assert task.payload["previous_interface_name"] == "wg-old"
+    assert [task.type for task in tasks] == [
+        "wireguard.stop_interface",
+        "wireguard.delete_config",
+        "wireguard.apply_config",
+    ]
+    assert [task.payload["interface_name"] for task in tasks] == ["wg-old", "wg-old", "wg-new"]
+    assert tasks[1].payload["depends_on_task_id"] == tasks[0].id
+    assert tasks[2].payload["depends_on_task_id"] == tasks[1].id
+    assert tasks[2].payload["previous_interface_name"] == "wg-old"
 
 
 def test_enqueue_interface_task_once_is_idempotent() -> None:
@@ -1860,6 +1876,268 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
     assert any("PostUp = ip route add 10.2.0.0/16 dev wg-b" in task.payload["config"] for task in tasks)
 
 
+def test_create_gre_managed_connection_creates_endpoints_and_tasks() -> None:
+    """验证受管 GRE 连接会创建双方端点并下发 apply/start 任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["203.0.113.10"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        result = create_managed_connection(
+            node_a.id,
+            GreManagedConnectionCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="gre-a-b",
+                peer_interface_name="gre-b-a",
+                local_outer_ip="203.0.113.10",
+                peer_outer_ip="198.51.100.20",
+                local_tunnel_ips=["10.42.8.1/30"],
+                peer_tunnel_ips=["10.42.8.2/30"],
+                local_routes=["10.77.0.0/24"],
+                peer_routes=["10.88.0.0/24"],
+                mtu=1476,
+                gre_key="42",
+                ttl=255,
+                pmtudisc=True,
+                risk_accepted=True,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+        topology = build_topology(session)
+        node_connections = list_node_connections(node_a.id, session)
+
+    assert result.protocol_type == "gre"
+    assert result.status == "changing"
+    assert len(result.endpoints) == 2
+    assert {endpoint.interface_name for endpoint in result.endpoints} == {"gre-a-b", "gre-b-a"}
+    assert [task.type for task in tasks] == [
+        GRE_TASKS.apply_config,
+        GRE_TASKS.start,
+        GRE_TASKS.apply_config,
+        GRE_TASKS.start,
+    ]
+    assert tasks[0].payload["interface_name"] == "gre-a-b"
+    assert tasks[0].payload["outer_local_ip"] == "203.0.113.10"
+    assert tasks[0].payload["outer_remote_ip"] == "198.51.100.20"
+    assert tasks[0].payload["routes"] == ["10.77.0.0/24"]
+    assert tasks[1].payload["depends_on_task_id"] == tasks[0].id
+    assert tasks[2].payload["interface_name"] == "gre-b-a"
+    assert tasks[3].payload["depends_on_task_id"] == tasks[2].id
+    assert any(edge.protocol_type == "gre" and edge.protocol_label == "GRE" for edge in topology.edges)
+    assert any(connection.protocol_type == "gre" for connection in node_connections)
+
+
+def test_create_gre_managed_connection_rejects_missing_capability() -> None:
+    """验证没有 GRE 能力的在线节点也不能创建 GRE 连接。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["203.0.113.10"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard"],
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_managed_connection(
+                node_a.id,
+                GreManagedConnectionCreate(
+                    peer_node_id=node_b.id,
+                    local_interface_name="gre-a-b",
+                    peer_interface_name="gre-b-a",
+                    local_outer_ip="203.0.113.10",
+                    peer_outer_ip="198.51.100.20",
+                    local_tunnel_ips=["10.42.8.1/30"],
+                    peer_tunnel_ips=["10.42.8.2/30"],
+                    risk_accepted=True,
+                ),
+                session,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == f"agent does not support task: {GRE_TASKS.apply_config}"
+
+
+def test_create_gre_managed_connection_rejects_ttl_without_pmtu_discovery() -> None:
+    """验证主控拒绝 iproute2 不支持的 GRE TTL 和关闭 PMTU 组合。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["203.0.113.10"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_managed_connection(
+                node_a.id,
+                GreManagedConnectionCreate(
+                    peer_node_id=node_b.id,
+                    local_interface_name="gre-a-b",
+                    peer_interface_name="gre-b-a",
+                    local_outer_ip="203.0.113.10",
+                    peer_outer_ip="198.51.100.20",
+                    local_tunnel_ips=["10.42.8.1/30"],
+                    peer_tunnel_ips=["10.42.8.2/30"],
+                    ttl=63,
+                    pmtudisc=False,
+                    risk_accepted=True,
+                ),
+                session,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "gre ttl requires pmtu discovery"
+
+
+def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
+    """验证 GRE 改名只在启动任务确认旧配置清理后才清除旧接口名。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["gre"],
+        )
+        connection = models.Connection(
+            protocol_type="gre",
+            name="gre-new",
+            source="managed-node",
+            managed=True,
+            status="starting",
+        )
+        endpoint = models.ConnectionEndpoint(
+            connection=connection,
+            node=node,
+            role="local",
+            interface_name="gre-new",
+            tunnel_ips=["10.42.8.1/30"],
+            mtu=1476,
+            routes=[],
+            runtime_status="starting",
+            protocol_config={
+                "outer_local_ip": "203.0.113.10",
+                "outer_remote_ip": "198.51.100.20",
+                "key": None,
+                "ttl": None,
+                "pmtudisc": True,
+            },
+            extras={"previous_interface_name": "gre-old"},
+        )
+        session.add_all([node, connection, endpoint])
+        session.flush()
+        apply_task = models.AgentTask(
+            node_id=node.id,
+            type=GRE_TASKS.apply_config,
+            payload={
+                "node_id": node.id,
+                "connection_endpoint_id": endpoint.id,
+                "interface_name": "gre-new",
+                "previous_interface_name": "gre-old",
+            },
+        )
+        session.add(apply_task)
+        session.commit()
+
+        agent_task_result(
+            apply_task.id,
+            AgentTaskResultRequest(node_id=node.id, token="token", status="succeeded", result={"changed": True}),
+            session,
+        )
+        session.refresh(endpoint)
+        assert endpoint.extras["previous_interface_name"] == "gre-old"
+
+        start_task = models.AgentTask(
+            node_id=node.id,
+            type=GRE_TASKS.start,
+            payload={
+                "node_id": node.id,
+                "connection_endpoint_id": endpoint.id,
+                "interface_name": "gre-new",
+                "previous_interface_name": "gre-old",
+            },
+        )
+        session.add(start_task)
+        session.commit()
+
+        agent_task_result(
+            start_task.id,
+            AgentTaskResultRequest(
+                node_id=node.id,
+                token="token",
+                status="succeeded",
+                result={"previous_config_cleanup": {"interface_name": "gre-old", "deleted": True}},
+            ),
+            session,
+        )
+        session.refresh(endpoint)
+
+    assert "previous_interface_name" not in (endpoint.extras or {})
+
+
 def test_create_managed_link_allows_one_side_without_endpoint(monkeypatch) -> None:
     """验证 NAT 或出入口不对称时允许一侧 Peer 不写 Endpoint。"""
 
@@ -2050,6 +2328,167 @@ def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeyp
     assert [task.type for task in response.tasks] == ["wireguard.import_scan"]
 
 
+def test_agent_poll_honors_task_dependencies(monkeypatch) -> None:
+    """验证依赖任务失败后，后续 delete/apply 不会继续下发给 Agent。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.5.11",
+            agent_capabilities=["wireguard"],
+        )
+        session.add(node)
+        session.flush()
+        interface = models.WireGuardInterface(name="wg-new", node_id=node.id)
+        session.add(interface)
+        session.flush()
+        stop_task = models.AgentTask(
+            node_id=node.id,
+            type="wireguard.stop_interface",
+            payload={"node_id": node.id, "interface_id": interface.id, "interface_name": "wg-old"},
+        )
+        session.add(stop_task)
+        session.flush()
+        delete_task = models.AgentTask(
+            node_id=node.id,
+            type="wireguard.delete_config",
+            payload={
+                "node_id": node.id,
+                "interface_id": interface.id,
+                "interface_name": "wg-old",
+                "depends_on_task_id": stop_task.id,
+            },
+        )
+        session.add(delete_task)
+        session.flush()
+        apply_task = models.AgentTask(
+            node_id=node.id,
+            type="wireguard.apply_config",
+            payload={
+                "node_id": node.id,
+                "interface_id": interface.id,
+                "interface_name": "wg-new",
+                "config": "[Interface]\nPrivateKey = private\n",
+                "depends_on_task_id": delete_task.id,
+            },
+        )
+        session.add(apply_task)
+        session.commit()
+
+        first_poll = agent_poll(
+            AgentPollRequest(
+                node_id=node.id,
+                token="token",
+                agent_version="0.5.11",
+                protocol_version=1,
+                capabilities=["wireguard"],
+            ),
+            session,
+        )
+        agent_task_result(
+            stop_task.id,
+            AgentTaskResultRequest(node_id=node.id, token="token", status="failed", result={"error": "stop failed"}),
+            session,
+        )
+        second_poll = agent_poll(
+            AgentPollRequest(
+                node_id=node.id,
+                token="token",
+                agent_version="0.5.11",
+                protocol_version=1,
+                capabilities=["wireguard"],
+            ),
+            session,
+        )
+        session.refresh(delete_task)
+        session.refresh(apply_task)
+
+    assert [task.type for task in first_poll.tasks] == ["wireguard.stop_interface"]
+    assert second_poll.tasks == []
+    assert delete_task.status == "failed"
+    assert apply_task.status == "failed"
+
+
+def test_stale_running_agent_tasks_are_expired() -> None:
+    """验证长时间未上报结果的 running 任务会被回收，避免后续部署永久阻塞。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        session.add(node)
+        session.flush()
+        task = models.AgentTask(
+            node_id=node.id,
+            type="wireguard.import_scan",
+            status="running",
+            payload={"node_id": node.id},
+            started_at=datetime.utcnow() - timedelta(hours=2, minutes=1),
+        )
+        session.add(task)
+        session.commit()
+
+        expired = expire_stale_running_agent_tasks(session, node_id=node.id)
+        session.refresh(task)
+
+    assert expired == 1
+    assert task.status == "failed"
+    assert "timed out" in task.result["error"]
+
+
+def test_apply_result_keeps_previous_name_without_cleanup_evidence(monkeypatch) -> None:
+    """验证 apply 成功但没有清理证据时不会过早清除旧接口名标记。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        session.add(node)
+        session.flush()
+        interface = models.WireGuardInterface(
+            name="wg-new",
+            node_id=node.id,
+            extras={"previous_interface_name": "wg-old"},
+        )
+        session.add(interface)
+        session.flush()
+        task = models.AgentTask(
+            node_id=node.id,
+            type="wireguard.apply_config",
+            payload={
+                "node_id": node.id,
+                "interface_id": interface.id,
+                "interface_name": "wg-new",
+                "previous_interface_name": "wg-old",
+                "config": "[Interface]\nPrivateKey = private\n",
+            },
+        )
+        session.add(task)
+        session.commit()
+
+        agent_task_result(
+            task.id,
+            AgentTaskResultRequest(node_id=node.id, token="token", status="succeeded", result={"changed": True}),
+            session,
+        )
+        session.refresh(interface)
+
+    assert interface.extras["previous_interface_name"] == "wg-old"
+
+
 def test_link_monitor_agent_poll_and_result_updates_summary(monkeypatch) -> None:
     """验证链路监测目标会被 Agent 拉取、上报并生成摘要。"""
 
@@ -2100,6 +2539,56 @@ def test_link_monitor_agent_poll_and_result_updates_summary(monkeypatch) -> None
     assert summary.packet_loss == 0.5
     assert listed[0].monitor_summary is not None
     assert listed[0].monitor_summary.monitor_id == monitor.id
+
+
+def test_connection_endpoint_link_monitor_is_listed() -> None:
+    """验证 GRE 等通用连接端点可以创建链路监测并在连接响应中展示摘要。"""
+
+    import link42_api.main as api_main
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(name="node-a", agent_token_hash=hash_token("token"), status="online", last_seen_at=datetime.utcnow())
+        node_b = models.Node(name="node-b", agent_token_hash="hash-b", status="online", last_seen_at=datetime.utcnow())
+        session.add_all([node_a, node_b])
+        session.flush()
+        connection = models.Connection(protocol_type="gre", name="gre-a-b", source="managed-node", managed=True)
+        endpoint_a = models.ConnectionEndpoint(
+            connection=connection,
+            node_id=node_a.id,
+            role="local",
+            interface_name="gre-a",
+            tunnel_ips=["10.43.0.1/30"],
+            routes=["172.21.0.0/24"],
+            runtime_status="running",
+        )
+        endpoint_b = models.ConnectionEndpoint(
+            connection=connection,
+            node_id=node_b.id,
+            role="peer",
+            interface_name="gre-b",
+            tunnel_ips=["10.43.0.2/30"],
+            routes=["172.22.0.0/24"],
+            runtime_status="running",
+        )
+        session.add_all([connection, endpoint_a, endpoint_b])
+        session.commit()
+
+        monitor = api_main.upsert_connection_endpoint_link_monitor(
+            endpoint_a.id,
+            LinkMonitorCreate(target_host="10.43.0.2", interval_seconds=10, retention_days=7, enabled=True),
+            session,
+        )
+        poll = agent_link_monitor_poll(AgentPollRequest(node_id=node_a.id, token="token"), session)
+
+        listed = api_main.list_node_connections(node_a.id, session)
+
+    assert monitor.connection_endpoint_id == endpoint_a.id
+    assert [item.id for item in poll.monitors] == [monitor.id]
+    assert [item.target_host for item in poll.monitors] == ["10.43.0.2"]
+    assert listed[0].endpoints[0].monitor_summary is not None
+    assert listed[0].endpoints[0].monitor_summary.monitor_id == monitor.id
 
 
 def test_link_monitor_samples_rejects_invalid_window(monkeypatch) -> None:
@@ -2941,6 +3430,8 @@ def test_update_managed_link_rename_queues_previous_interface_cleanup(monkeypatc
         "wireguard.apply_config",
     ]
     assert [task.payload["interface_name"] for task in local_tasks] == ["wg-old-a", "wg-old-a", "wg-new-a"]
+    assert local_tasks[1].payload["depends_on_task_id"] == local_tasks[0].id
+    assert local_tasks[2].payload["depends_on_task_id"] == local_tasks[1].id
     assert local_tasks[-1].payload["previous_interface_name"] == "wg-old-a"
     assert [task.type for task in peer_tasks] == [
         "wireguard.stop_interface",
@@ -2948,7 +3439,89 @@ def test_update_managed_link_rename_queues_previous_interface_cleanup(monkeypatc
         "wireguard.apply_config",
     ]
     assert [task.payload["interface_name"] for task in peer_tasks] == ["wg-old-b", "wg-old-b", "wg-new-b"]
+    assert peer_tasks[1].payload["depends_on_task_id"] == peer_tasks[0].id
+    assert peer_tasks[2].payload["depends_on_task_id"] == peer_tasks[1].id
     assert peer_tasks[-1].payload["previous_interface_name"] == "wg-old-b"
+
+
+def test_update_managed_link_rename_cancels_stale_pending_apply(monkeypatch) -> None:
+    """验证改名前已有 pending apply 时会取消旧任务，并把新 apply 排到清理任务之后。"""
+
+    private_keys = iter(["local-private", "peer-private"])
+    public_keys = iter(["local-public", "peer-public"])
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: (next(private_keys), next(public_keys)))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+    monkeypatch.setattr(api_main, "generate_token", lambda prefix: f"{prefix}_secret")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+        result = create_managed_link(
+            node_a.id,
+            ManagedLinkCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="wg-old-a",
+                peer_interface_name="wg-old-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=51821,
+            ),
+            session,
+        )
+
+        update_managed_link(
+            result.local_interface.id,
+            ManagedLinkUpdate(
+                local_interface_name="wg-new-a",
+                peer_interface_name="wg-new-b",
+                local_tunnel_ips=["10.42.0.1/32"],
+                peer_tunnel_ips=["10.42.0.2/32"],
+                local_endpoint_host="198.51.100.10",
+                peer_endpoint_host="198.51.100.20",
+                local_listen_port=51820,
+                peer_listen_port=51821,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+        local_id = result.local_interface.node_id
+        peer_id = result.peer_interface.node_id
+
+    for node_id, old_name, new_name in [(local_id, "wg-old-a", "wg-new-a"), (peer_id, "wg-old-b", "wg-new-b")]:
+        node_tasks = [task for task in tasks if task.node_id == node_id]
+        assert [task.type for task in node_tasks] == [
+            "wireguard.apply_config",
+            "wireguard.stop_interface",
+            "wireguard.delete_config",
+            "wireguard.apply_config",
+        ]
+        assert node_tasks[0].status == "cancelled"
+        assert node_tasks[0].result["reason"] == "interface rename cleanup must run before apply_config"
+        assert [task.payload["interface_name"] for task in node_tasks[1:]] == [old_name, old_name, new_name]
+        assert node_tasks[2].payload["depends_on_task_id"] == node_tasks[1].id
+        assert node_tasks[3].payload["depends_on_task_id"] == node_tasks[2].id
 
 
 def test_update_managed_link_disabling_udp2raw_enqueues_cleanup_tasks(monkeypatch) -> None:

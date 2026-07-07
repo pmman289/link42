@@ -2,13 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
-if [[ -f "$ROOT_DIR/scripts/release.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$ROOT_DIR/scripts/release.env"
-  set +a
-fi
+# shellcheck disable=SC1091
+. "$ROOT_DIR/scripts/lib/release.sh"
+link42_load_release_env
 
 IMAGE_REPO="${IMAGE_REPO:-pmman/link42}"
 IMAGE_TAG="${1:-${IMAGE_TAG:-$(date +%Y%m%d-%H%M%S)}}"
@@ -21,44 +17,47 @@ TEST_VOLUME="${TEST_VOLUME:-link42-publish-test-runtime}"
 
 cd "$ROOT_DIR"
 
-log() {
-  printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
-}
-
+# 清理本地镜像验证容器和数据卷。
 cleanup_test_container() {
   docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
   docker volume rm "$TEST_VOLUME" >/dev/null 2>&1 || true
 }
 
+# 读取验证容器日志并遮盖敏感字段。
 redacted_test_logs() {
   docker logs --tail 80 "$TEST_CONTAINER" 2>&1 \
-    | sed -E 's/(password|PASSWORD|token|TOKEN|secret|SECRET)=[^ ]+/\1=<redacted>/g'
+    | link42_redact_secrets
 }
 
 if [[ "$SKIP_VERIFY" != "1" ]]; then
-  log "running Python tests"
+  link42_log "running Python tests"
   .venv/bin/python -m pytest -q
 
-  log "running Python compile check"
+  link42_log "running Python compile check"
   .venv/bin/python -m compileall apps/api apps/agent packages tests
 
-  log "building web"
+  link42_log "building web"
   npm run build --prefix apps/web
 
-  log "checking whitespace"
+  link42_log "checking whitespace"
   git diff --check
 fi
 
-log "preparing controller embedded agent releases"
+link42_log "preparing controller embedded agent releases"
 scripts/agent/prepare-release-assets.sh
 
-log "building controller image $IMAGE_NAME"
-IMAGE_REPO="$IMAGE_REPO" IMAGE_TAG="$IMAGE_TAG" scripts/controller/build-image.sh
+link42_log "building controller image $IMAGE_NAME"
+IMAGE_REPO="$IMAGE_REPO" IMAGE_TAG="$IMAGE_TAG" SKIP_PREPARE_AGENT_RELEASES=1 scripts/controller/build-image.sh
 
 if [[ "$LOCAL_VERIFY" == "1" ]]; then
-  log "verifying local container"
+  link42_log "verifying local container"
   cleanup_test_container
-  trap cleanup_test_container EXIT
+  verify_tmp="$(mktemp -d)"
+  cleanup_verify() {
+    cleanup_test_container
+    rm -rf "$verify_tmp"
+  }
+  trap cleanup_verify EXIT
   docker run -d \
     --name "$TEST_CONTAINER" \
     -p 127.0.0.1::8000 \
@@ -68,7 +67,7 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
   host_port="$(docker port "$TEST_CONTAINER" 8000/tcp | sed 's/.*://')"
   auth_status=""
   for _ in {1..30}; do
-    auth_status="$(curl -sS -o /tmp/link42-auth-me.out -w '%{http_code}' "http://127.0.0.1:$host_port/api/auth/me" || true)"
+    auth_status="$(curl -s -o "$verify_tmp/auth-me.out" -w '%{http_code}' "http://127.0.0.1:$host_port/api/auth/me" || true)"
     [[ "$auth_status" == "401" ]] && break
     sleep 1
   done
@@ -80,7 +79,7 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
 
   password="$(
     docker logs "$TEST_CONTAINER" 2>&1 \
-      | sed -n 's/.*Link42 initial login: username=pmman password=//p' \
+      | sed -n -E 's/.*(Link42 initial login:|Link42 初始登录信息) username=pmman password=//p' \
       | tail -1
   )"
   if [[ -z "$password" ]]; then
@@ -104,19 +103,19 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
     exit 1
   }
   printf 'local agent release latest: %s\n' "$release_latest"
-  cleanup_test_container
+  cleanup_verify
   trap - EXIT
 fi
 
-log "pushing $IMAGE_NAME"
+link42_log "pushing $IMAGE_NAME"
 docker push "$IMAGE_NAME"
 
 if [[ "$PUSH_LATEST" == "1" ]]; then
-  log "pushing $IMAGE_REPO:latest"
+  link42_log "pushing $IMAGE_REPO:latest"
   docker tag "$IMAGE_NAME" "$IMAGE_REPO:latest"
   docker push "$IMAGE_REPO:latest"
 
-  log "verifying remote digests"
+  link42_log "verifying remote digests"
   tag_digest="$(docker buildx imagetools inspect "$IMAGE_NAME" | awk '/Digest:/ {print $2; exit}')"
   latest_digest="$(docker buildx imagetools inspect "$IMAGE_REPO:latest" | awk '/Digest:/ {print $2; exit}')"
   if [[ "$tag_digest" != "$latest_digest" ]]; then
@@ -128,4 +127,4 @@ else
   docker buildx imagetools inspect "$IMAGE_NAME" | awk '/Digest:/ {print "'"$IMAGE_REPO"'@" $2; exit}'
 fi
 
-log "published controller image $IMAGE_NAME"
+link42_log "published controller image $IMAGE_NAME"

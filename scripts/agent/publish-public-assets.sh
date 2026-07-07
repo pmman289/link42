@@ -2,13 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
-if [[ -f "$ROOT_DIR/scripts/release.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$ROOT_DIR/scripts/release.env"
-  set +a
-fi
+# shellcheck disable=SC1091
+. "$ROOT_DIR/scripts/lib/release.sh"
+link42_load_release_env
 
 REMOTE_HOST="${LINK42_PUBLIC_HOST:-aligz}"
 REMOTE_ROOT="${LINK42_PUBLIC_ROOT:-/opt/1panel/www/sites/get.pmman.tech/index}"
@@ -17,15 +13,11 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 
 cd "$ROOT_DIR"
 
-log() {
-  printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
-}
-
 if [[ "$SKIP_BUILD" != "1" ]]; then
-  log "building x64 agent"
+  link42_log "building x64 agent"
   scripts/agent/build-x64.sh
 
-  log "building OpenWrt source package"
+  link42_log "building OpenWrt source package"
   scripts/agent/build-source.sh
 fi
 
@@ -35,9 +27,9 @@ AGENT_VERSION="$(dist/agent/link42-agent-linux-x64 --version | awk '{print $NF}'
   exit 1
 }
 
-log "agent version: $AGENT_VERSION"
-sha256sum -c dist/agent/link42-agent-linux-x64.sha256
-sha256sum -c dist/agent/link42-agent-source.tar.gz.sha256
+link42_log "agent version: $AGENT_VERSION"
+link42_verify_sha256 dist/agent/link42-agent-linux-x64 dist/agent/link42-agent-linux-x64.sha256
+link42_verify_sha256 dist/agent/link42-agent-source.tar.gz dist/agent/link42-agent-source.tar.gz.sha256
 
 required_files=(
   "deploy/sh/link42-agent.sh"
@@ -52,20 +44,15 @@ required_files=(
   "dist/agent/manifest.json"
 )
 
-for file in "${required_files[@]}"; do
-  [[ -f "$file" ]] || {
-    echo "missing required file: $file" >&2
-    exit 1
-  }
-done
+link42_require_files "${required_files[@]}"
 
-log "creating remote directories"
+link42_log "creating remote directories"
 ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_ROOT/sh' '$REMOTE_ROOT/res/link42/$AGENT_VERSION'"
 
-log "uploading installer script"
+link42_log "uploading installer script"
 scp deploy/sh/link42-agent.sh "$REMOTE_HOST:$REMOTE_ROOT/sh/link42-agent.sh"
 
-log "uploading latest assets"
+link42_log "uploading latest assets"
 scp \
   dist/agent/link42-agent-linux-x64 \
   dist/agent/link42-agent-linux-x64.sha256 \
@@ -74,7 +61,7 @@ scp \
   dist/agent/manifest.json \
   "$REMOTE_HOST:$REMOTE_ROOT/res/link42/"
 
-log "uploading versioned assets"
+link42_log "uploading versioned assets"
 scp \
   "dist/agent/link42-agent-linux-x64" \
   "dist/agent/link42-agent-linux-x64.sha256" \
@@ -87,7 +74,7 @@ scp \
   "dist/agent/manifest.json" \
   "$REMOTE_HOST:$REMOTE_ROOT/res/link42/$AGENT_VERSION/"
 
-log "fixing remote permissions"
+link42_log "fixing remote permissions"
 ssh "$REMOTE_HOST" "
 set -eu
 chmod 0755 '$REMOTE_ROOT/sh/link42-agent.sh'
@@ -102,7 +89,7 @@ chmod 0644 '$REMOTE_ROOT/res/link42/$AGENT_VERSION/manifest.json'
 find '$REMOTE_ROOT/res/link42/$AGENT_VERSION' -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
 "
 
-log "verifying public URLs"
+link42_log "verifying public URLs"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 (
@@ -114,8 +101,8 @@ trap 'rm -rf "$tmpdir"' EXIT
   curl -fsSLO "$PUBLIC_BASE_URL/res/link42/link42-agent-linux-x64.sha256"
   curl -fsSLO "$PUBLIC_BASE_URL/res/link42/link42-agent-source.tar.gz"
   curl -fsSLO "$PUBLIC_BASE_URL/res/link42/link42-agent-source.tar.gz.sha256"
-  sha256sum -c link42-agent-linux-x64.sha256
-  sha256sum -c link42-agent-source.tar.gz.sha256
+  link42_verify_sha256 link42-agent-linux-x64 link42-agent-linux-x64.sha256
+  link42_verify_sha256 link42-agent-source.tar.gz link42-agent-source.tar.gz.sha256
   chmod +x link42-agent-linux-x64
   ./link42-agent-linux-x64 --version
   curl -fsSI "$PUBLIC_BASE_URL/res/link42/$AGENT_VERSION/link42-agent-linux-x64" >/dev/null
@@ -123,4 +110,4 @@ trap 'rm -rf "$tmpdir"' EXIT
   curl -fsS "$PUBLIC_BASE_URL/res/link42/$AGENT_VERSION/manifest.json" >/dev/null
 )
 
-log "published agent $AGENT_VERSION to $PUBLIC_BASE_URL/res/link42"
+link42_log "published agent $AGENT_VERSION to $PUBLIC_BASE_URL/res/link42"

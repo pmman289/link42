@@ -10,7 +10,7 @@ from .base import AgentNodePlugin, AgentPluginContext
 
 
 class PortInventoryAgentPlugin(AgentNodePlugin):
-    """Scan node-local TCP/UDP/WireGuard port usage for a configured range."""
+    """扫描节点本机指定范围内的 TCP/UDP/WireGuard 端口占用。"""
 
     type = "port-inventory"
     capabilities = [
@@ -21,6 +21,8 @@ class PortInventoryAgentPlugin(AgentNodePlugin):
     actions = {"scan"}
 
     def detect(self, context: AgentPluginContext) -> dict[str, Any]:
+        """检测是否存在可用于扫描端口占用的系统工具或配置目录。"""
+
         wireguard_config_dir = Path(context.config.wireguard_dir)
         return {
             "plugin_type": self.type,
@@ -34,6 +36,8 @@ class PortInventoryAgentPlugin(AgentNodePlugin):
         }
 
     def execute(self, action: str, payload: dict[str, Any], context: AgentPluginContext) -> dict[str, Any]:
+        """执行端口范围扫描并返回端口占用列表。"""
+
         if action != "scan":
             raise ValueError(f"unsupported port inventory action: {action}")
         range_start = int(payload.get("range_start") or 0)
@@ -51,6 +55,8 @@ class PortInventoryAgentPlugin(AgentNodePlugin):
 
 
 def scan_ports(range_start: int, range_end: int, wireguard_dir: str) -> list[dict[str, Any]]:
+    """合并系统监听端口和 WireGuard 配置端口扫描结果。"""
+
     entries: dict[tuple[str, int, str], dict[str, Any]] = {}
 
     for entry in scan_socket_listeners(range_start, range_end):
@@ -65,6 +71,8 @@ def scan_ports(range_start: int, range_end: int, wireguard_dir: str) -> list[dic
 
 
 def scan_socket_listeners(range_start: int, range_end: int) -> list[dict[str, Any]]:
+    """使用 ss 或 netstat 扫描系统当前监听的 TCP/UDP 端口。"""
+
     if shutil.which("ss"):
         result = run_command(["ss", "-H", "-lntup"], allow_failure=True)
         if result["returncode"] == 0:
@@ -77,6 +85,8 @@ def scan_socket_listeners(range_start: int, range_end: int) -> list[dict[str, An
 
 
 def parse_ss_output(output: str, range_start: int, range_end: int) -> list[dict[str, Any]]:
+    """解析 ss -lntup 输出中的端口、协议和进程信息。"""
+
     entries: list[dict[str, Any]] = []
     for line in output.splitlines():
         parts = line.split()
@@ -102,6 +112,8 @@ def parse_ss_output(output: str, range_start: int, range_end: int) -> list[dict[
 
 
 def parse_netstat_output(output: str, range_start: int, range_end: int) -> list[dict[str, Any]]:
+    """解析 netstat -lntup 输出中的端口、协议和进程信息。"""
+
     entries: list[dict[str, Any]] = []
     for line in output.splitlines():
         parts = line.split()
@@ -130,6 +142,8 @@ def parse_netstat_output(output: str, range_start: int, range_end: int) -> list[
 
 
 def scan_wireguard_ports(range_start: int, range_end: int, wireguard_dir: str) -> list[dict[str, Any]]:
+    """从运行态、wg-quick 文件和 OpenWrt UCI 中扫描 WireGuard 监听端口。"""
+
     entries: list[dict[str, Any]] = []
     entries.extend(scan_wg_show_ports(range_start, range_end))
     entries.extend(scan_wg_quick_config_ports(range_start, range_end, wireguard_dir))
@@ -138,6 +152,8 @@ def scan_wireguard_ports(range_start: int, range_end: int, wireguard_dir: str) -
 
 
 def scan_wg_show_ports(range_start: int, range_end: int) -> list[dict[str, Any]]:
+    """通过 wg show all listen-port 扫描运行中的 WireGuard 监听端口。"""
+
     if not shutil.which("wg"):
         return []
     result = run_command(["wg", "show", "all", "listen-port"], allow_failure=True)
@@ -166,6 +182,8 @@ def scan_wg_show_ports(range_start: int, range_end: int) -> list[dict[str, Any]]
 
 
 def scan_wg_quick_config_ports(range_start: int, range_end: int, wireguard_dir: str) -> list[dict[str, Any]]:
+    """从 wg-quick 配置文件 ListenPort 字段中扫描 WireGuard 端口。"""
+
     entries: list[dict[str, Any]] = []
     root = Path(wireguard_dir)
     if not root.exists():
@@ -193,6 +211,8 @@ def scan_wg_quick_config_ports(range_start: int, range_end: int, wireguard_dir: 
 
 
 def scan_openwrt_uci_wireguard_ports(range_start: int, range_end: int) -> list[dict[str, Any]]:
+    """从 OpenWrt UCI network 配置中扫描 WireGuard listen_port。"""
+
     if not shutil.which("uci"):
         return []
     result = run_command(["uci", "show", "network"], allow_failure=True)
@@ -229,6 +249,8 @@ def scan_openwrt_uci_wireguard_ports(range_start: int, range_end: int) -> list[d
 
 
 def protocol_from_token(token: str) -> str | None:
+    """把 ss/netstat 协议列转换为 TCP 或 UDP。"""
+
     token = token.lower()
     if token.startswith("tcp"):
         return "TCP"
@@ -238,6 +260,8 @@ def protocol_from_token(token: str) -> str | None:
 
 
 def first_port_in_range(parts: list[str], range_start: int, range_end: int) -> int | None:
+    """从命令输出分片中找出第一个落在指定范围内的端口。"""
+
     for part in parts:
         port = port_from_address(part)
         if port is not None and range_start <= port <= range_end:
@@ -246,6 +270,8 @@ def first_port_in_range(parts: list[str], range_start: int, range_end: int) -> i
 
 
 def port_from_address(value: str) -> int | None:
+    """从 address:port 或 [IPv6]:port 字符串末尾解析端口。"""
+
     value = value.strip().strip(",")
     if ":" not in value:
         return None
@@ -256,6 +282,8 @@ def port_from_address(value: str) -> int | None:
 
 
 def parse_process_info(line: str) -> tuple[str | None, str | None]:
+    """从 ss 输出行中提取监听进程名和 pid。"""
+
     process_match = re.search(r'users:\(\("([^"]+)"', line)
     pid_match = re.search(r"pid=(\d+)", line)
     return (

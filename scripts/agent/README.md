@@ -58,6 +58,13 @@ cp scripts/release.env.example scripts/release.env
 
 脚本会自动读取 `scripts/release.env`，命令行环境变量仍可临时覆盖。
 
+校验说明：
+
+```text
+*.sha256 文件只记录文件名，不记录构建机绝对路径。
+发布脚本会重新计算公网下载到的文件 hash，避免误校验本地 dist 目录。
+```
+
 发布后应能访问：
 
 ```text
@@ -81,3 +88,12 @@ scripts/agent/prepare-release-assets.sh
 ```text
 dist/controller-agent-releases
 ```
+
+`prepare-release-assets.sh` 会根据当前源码、`dist/agent/manifest.json` 和产物时间自动判断是否需要重建：
+
+```bash
+scripts/agent/prepare-release-assets.sh
+REBUILD_AGENT_RELEASES=1 scripts/agent/prepare-release-assets.sh
+```
+
+当只发布主控镜像时，这个检查可以避免镜像内置旧 Agent。

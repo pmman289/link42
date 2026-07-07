@@ -25,6 +25,7 @@ PING_A="${ADDR_A%%/*}"
 PING_B="${ADDR_B%%/*}"
 PIDS=()
 
+# 检查冒烟测试依赖命令。
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "missing required command: $1" >&2
@@ -32,6 +33,7 @@ require_command() {
   fi
 }
 
+# 清理冒烟测试使用的 WireGuard 接口。
 cleanup_interface() {
   local iface="$1"
   wg-quick down "$iface" >/dev/null 2>&1 || true
@@ -41,6 +43,7 @@ cleanup_interface() {
   rm -f "$WG_DIR/$iface.conf".link42-backup-*
 }
 
+# 清理冒烟测试启动的进程和临时资源。
 cleanup() {
   set +e
   for pid in "${PIDS[@]}"; do
@@ -56,6 +59,7 @@ cleanup() {
   rm -f "$DB_PATH"
 }
 
+# 从 JSON 标准输入中读取指定字段。
 json_get() {
   "$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); path=sys.argv[1].split("."); value=data
 for key in path:
@@ -63,6 +67,7 @@ for key in path:
 print(value)' "$1"
 }
 
+# 以已登录 token 调用测试主控 API。
 api() {
   local method="$1"
   local path="$2"
@@ -78,6 +83,7 @@ api() {
   fi
 }
 
+# 等待测试主控健康检查通过。
 wait_for_api() {
   for _ in $(seq 1 80); do
     if curl -fsS "$BASE_URL/api/health" >/dev/null 2>&1; then
@@ -90,6 +96,7 @@ wait_for_api() {
   return 1
 }
 
+# 等待指定类型任务成功达到目标数量。
 wait_for_task_type() {
   local task_type="$1"
   local expected_count="$2"
@@ -124,6 +131,7 @@ PY
   return 1
 }
 
+# 等待指定数量的测试节点上线。
 wait_for_node_count_online() {
   for _ in $(seq 1 80); do
     local online
@@ -138,6 +146,7 @@ wait_for_node_count_online() {
   return 1
 }
 
+# 创建冒烟测试使用的一对 WireGuard 配置。
 create_config_pair() {
   local private_a public_a private_b public_b psk
   private_a="$(wg genkey)"
@@ -197,6 +206,7 @@ create_config_pair() {
   IFACE_B_ID="$iface_b_id"
 }
 
+# 生成并确认指定接口的部署计划。
 confirm_plan() {
   local iface_id="$1"
   local plan plan_id
@@ -205,14 +215,17 @@ confirm_plan() {
   api POST /api/change-plans/"$plan_id"/confirm >/dev/null
 }
 
+# 请求停止指定测试接口。
 stop_iface() {
   api POST /api/wireguard/configs/"$1"/stop >/dev/null || true
 }
 
+# 删除指定测试接口记录。
 delete_iface() {
   api DELETE /api/wireguard/configs/"$1" >/dev/null || true
 }
 
+# 执行脚本主流程。
 main() {
   if [[ "$(id -u)" != "0" ]]; then
     echo "real local smoke test must run as root because wg-quick changes host networking" >&2

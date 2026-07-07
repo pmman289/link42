@@ -1,4 +1,4 @@
-# Link42 Playwright E2E
+# Link42 Playwright 端到端测试
 
 This directory keeps lightweight helpers for browser-based manual/E2E testing.
 The heavy dependencies are installed outside the repository so repeated test

@@ -11,7 +11,7 @@ from .. import models
 
 @dataclass(frozen=True)
 class NodePluginAction:
-    """A node plugin action exposed by the controller and executed by the agent."""
+    """主控暴露给前端、最终由 Agent 执行的节点插件动作。"""
 
     name: str
     task_type: str
@@ -21,7 +21,7 @@ class NodePluginAction:
 
 @dataclass(frozen=True)
 class AgentTaskSpec:
-    """Task descriptor produced by a node plugin action."""
+    """节点插件动作生成的 Agent 任务描述。"""
 
     task_type: str
     payload: dict[str, Any]
@@ -29,7 +29,7 @@ class AgentTaskSpec:
 
 @dataclass
 class NodePluginContext:
-    """Controller-side context passed to node plugins."""
+    """传给主控侧节点插件的上下文。"""
 
     node: models.Node
     db: Session
@@ -37,7 +37,7 @@ class NodePluginContext:
 
 
 class NodePlugin:
-    """Base class for controller-side node plugins."""
+    """主控侧节点插件基类。"""
 
     type: str
     display_name: str
@@ -47,6 +47,8 @@ class NodePlugin:
     actions: dict[str, NodePluginAction]
 
     def describe(self) -> dict[str, Any]:
+        """返回插件元数据和可执行 action 列表。"""
+
         return {
             "type": self.type,
             "display_name": self.display_name,
@@ -65,6 +67,8 @@ class NodePlugin:
         }
 
     def status_for_node(self, context: NodePluginContext) -> dict[str, Any]:
+        """根据节点能力和版本判断插件在该节点上是否可用。"""
+
         capabilities = set(context.node.agent_capabilities or [])
         missing = [capability for capability in self.capabilities if capability not in capabilities]
         task_requirements = [
@@ -85,16 +89,22 @@ class NodePlugin:
         }
 
     def validate_payload(self, action: str, payload: dict[str, Any], context: NodePluginContext) -> dict[str, Any]:
+        """校验并清洗插件 action 的前端 payload。"""
+
         if action not in self.actions:
             raise ValueError("plugin action not found")
         return dict(payload)
 
     def build_task(self, action: str, payload: dict[str, Any], context: NodePluginContext) -> AgentTaskSpec:
+        """把已校验 payload 转换为 Agent 可执行任务。"""
+
         action_spec = self.actions[action]
         return AgentTaskSpec(task_type=action_spec.task_type, payload=payload)
 
 
 def parse_semver(value: str | None) -> tuple[int, int, int]:
+    """解析三段式版本号，缺失或非法段按 0 处理。"""
+
     if not value:
         return (0, 0, 0)
     parts = value.split("-", 1)[0].split(".")

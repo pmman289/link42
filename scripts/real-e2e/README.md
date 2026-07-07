@@ -1,4 +1,4 @@
-# Link42 Real E2E Harness
+# Link42 真实端到端测试工具
 
 These helpers create a disposable real-machine controller plus two real agents.
 They are intended for middleware, WireGuard, and uninstall regression testing

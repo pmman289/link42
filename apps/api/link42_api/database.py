@@ -97,6 +97,8 @@ def ensure_sqlite_point_to_point_constraints() -> None:
 
     with engine.begin() as connection:
         def table_exists(name: str) -> bool:
+            """判断指定表是否已经存在。"""
+
             return bool(
                 connection.scalar(
                     text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = :name"),
@@ -105,6 +107,8 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             )
 
         def table_columns(name: str) -> set[str]:
+            """读取指定表已有列名，表不存在时返回空集合。"""
+
             if not table_exists(name):
                 return set()
             return {
@@ -113,6 +117,8 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             }
 
         def add_column(table: str, columns: set[str], name: str, definition: str) -> None:
+            """在旧表缺少字段时追加列，并同步本地列集合。"""
+
             if name not in columns:
                 connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
                 columns.add(name)
@@ -305,6 +311,49 @@ def ensure_sqlite_point_to_point_constraints() -> None:
         connection.execute(
             text(
                 """
+                CREATE TABLE IF NOT EXISTS connections (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    protocol_type VARCHAR(32) NOT NULL,
+                    name VARCHAR(120) NOT NULL,
+                    source VARCHAR(32) DEFAULT 'managed-node',
+                    managed BOOLEAN DEFAULT 1,
+                    status VARCHAR(32) DEFAULT 'stopped',
+                    extras JSON DEFAULT '{}',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_connections_protocol_type ON connections(protocol_type)"))
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS connection_endpoints (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    connection_id INTEGER NOT NULL,
+                    node_id INTEGER NOT NULL,
+                    role VARCHAR(32) NOT NULL,
+                    interface_name VARCHAR(32) NOT NULL,
+                    tunnel_ips JSON DEFAULT '[]',
+                    mtu INTEGER,
+                    routes JSON DEFAULT '[]',
+                    runtime_status VARCHAR(32) DEFAULT 'stopped',
+                    deployed_config TEXT,
+                    protocol_config JSON DEFAULT '{}',
+                    extras JSON DEFAULT '{}',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT uq_connection_endpoint_node_interface UNIQUE (node_id, interface_name)
+                )
+                """
+            )
+        )
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_connection_endpoints_connection_id ON connection_endpoints(connection_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_connection_endpoints_node_id ON connection_endpoints(node_id)"))
+        connection.execute(
+            text(
+                """
                 CREATE TABLE IF NOT EXISTS system_settings (
                     "key" VARCHAR(80) NOT NULL PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -321,6 +370,7 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                     id INTEGER NOT NULL PRIMARY KEY,
                     node_id INTEGER NOT NULL,
                     interface_id INTEGER,
+                    connection_endpoint_id INTEGER,
                     name VARCHAR(80) NOT NULL,
                     target_host VARCHAR(255) NOT NULL,
                     interval_seconds INTEGER DEFAULT 10,
@@ -336,6 +386,9 @@ def ensure_sqlite_point_to_point_constraints() -> None:
         )
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_node_id ON link_monitors(node_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_interface_id ON link_monitors(interface_id)"))
+        link_monitor_columns = table_columns("link_monitors")
+        add_column("link_monitors", link_monitor_columns, "connection_endpoint_id", "INTEGER")
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_connection_endpoint_id ON link_monitors(connection_endpoint_id)"))
         connection.execute(
             text(
                 """

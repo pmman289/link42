@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from link42_common.connection_types import WIREGUARD_TASKS
+from link42_common.connection_types import GRE_TASKS, WIREGUARD_TASKS
 
 from .config import AgentConfig
+from .gre import (
+    apply_gre_config,
+    delete_gre_config,
+    gre_status,
+    read_gre_config,
+    start_gre_interface,
+    stop_gre_interface,
+)
 from .middleware import (
     apply_udp2raw,
     apply_mimic,
@@ -35,23 +43,69 @@ TaskHandler = Callable[[dict[str, Any], AgentConfig], dict[str, Any]]
 
 
 def _dry_run(config: AgentConfig) -> bool:
+    """读取 Agent 是否处于只演练不落地的 dry-run 模式。"""
+
     return config.dry_run
 
 
 def wireguard_import_scan(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """扫描本机可导入的 wg-quick 配置候选项。"""
+
     return {"candidates": scan_wg_quick_configs(config.wireguard_dir)}
 
 
 def wireguard_apply_config(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """写入并应用 WireGuard 配置任务。"""
+
     return apply_wireguard_config(payload, config.wireguard_dir, dry_run=_dry_run(config))
 
 
 def wireguard_read_config(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """读取本机指定 WireGuard 配置文件。"""
+
     return read_wireguard_config(payload, config.wireguard_dir)
 
 
 def middleware_install(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """安装任务中指定的连接中间层组件。"""
+
     return install_middleware(payload, config, dry_run=_dry_run(config))
+
+
+def gre_apply_config(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """写入 GRE 配置任务。"""
+
+    return apply_gre_config(payload, config.gre_dir, dry_run=_dry_run(config))
+
+
+def gre_read_config(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """读取 GRE 配置任务。"""
+
+    return read_gre_config(payload, config.gre_dir)
+
+
+def gre_start(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """启动 GRE 接口任务。"""
+
+    return start_gre_interface(payload, config.gre_dir, dry_run=_dry_run(config))
+
+
+def gre_stop(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """停止 GRE 接口任务。"""
+
+    return stop_gre_interface(payload, dry_run=_dry_run(config))
+
+
+def gre_delete(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """删除 GRE 配置任务。"""
+
+    return delete_gre_config(payload, config.gre_dir, dry_run=_dry_run(config))
+
+
+def gre_status_task(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """查询 GRE 接口状态任务。"""
+
+    return gre_status(payload)
 
 
 TASK_HANDLERS: dict[str, TaskHandler] = {
@@ -66,6 +120,12 @@ TASK_HANDLERS: dict[str, TaskHandler] = {
         config.wireguard_dir,
         dry_run=_dry_run(config),
     ),
+    GRE_TASKS.apply_config: gre_apply_config,
+    GRE_TASKS.read_config: gre_read_config,
+    GRE_TASKS.status: gre_status_task,
+    GRE_TASKS.start: gre_start,
+    GRE_TASKS.stop: gre_stop,
+    GRE_TASKS.delete_config: gre_delete,
     "middleware.install": middleware_install,
     "middleware.udp2raw.apply": lambda payload, config: apply_udp2raw(payload, dry_run=_dry_run(config)),
     "middleware.udp2raw.start": lambda payload, config: start_udp2raw(payload, dry_run=_dry_run(config)),
@@ -82,7 +142,7 @@ TASK_HANDLERS: dict[str, TaskHandler] = {
 
 
 def execute_registered_task(task_type: str, payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
-    """Execute an agent task through the registered backend handler."""
+    """按任务类型分派到已注册的 Agent 后端处理器。"""
 
     if task_type.startswith("node_plugin."):
         return execute_node_plugin_task(task_type, payload, config)

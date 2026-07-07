@@ -21,6 +21,7 @@ LOCAL_MIMIC_IFACES="${LINK42_REAL_LOCAL_MIMIC_IFACES:-}"
 REMOTE_MIMIC_IFACES="${LINK42_REAL_REMOTE_MIMIC_IFACES:-}"
 PURGE_MIMIC="${LINK42_REAL_PURGE_MIMIC:-0}"
 
+# 停止并强制清理指定进程。
 stop_pid() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0
@@ -29,6 +30,7 @@ stop_pid() {
   kill -9 "$pid" >/dev/null 2>&1 || true
 }
 
+# 清理本机 WireGuard 测试接口和配置。
 cleanup_local_iface() {
   local iface="$1"
   [[ -n "$iface" ]] || return 0
@@ -39,6 +41,7 @@ cleanup_local_iface() {
   rm -f /etc/wireguard/"$iface".conf.link42-backup-*
 }
 
+# 清理本机 mimic 测试配置和服务。
 cleanup_local_mimic() {
   local iface="$1"
   [[ -n "$iface" ]] || return 0
@@ -48,6 +51,7 @@ cleanup_local_mimic() {
   rm -rf "/etc/link42/middleware/mimic/$iface"
 }
 
+# 清理本机 udp2raw 中间层测试资产。
 cleanup_local_middleware() {
   systemctl disable --now 'link42-udp2raw-server@*.service' >/dev/null 2>&1 || true
   systemctl disable --now 'link42-udp2raw-client@*.service' >/dev/null 2>&1 || true
@@ -59,6 +63,7 @@ cleanup_local_middleware() {
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
+# 生成远端测试环境清理脚本。
 remote_cleanup_script() {
   cat <<'SH'
 set -eu
@@ -106,6 +111,7 @@ rm -rf "$RUN_DIR/remote-agent"
 SH
 }
 
+# 执行脚本主流程。
 main() {
   if [[ -f "$RUN_DIR/local-agent.pid" ]]; then
     stop_pid "$(cat "$RUN_DIR/local-agent.pid")"

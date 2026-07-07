@@ -83,6 +83,8 @@ def download_file(config: AgentConfig, url: str, target: Path) -> None:
 
 
 def sha256_file(path: Path) -> str:
+    """计算文件的 sha256 摘要。"""
+
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -91,6 +93,8 @@ def sha256_file(path: Path) -> str:
 
 
 def verify_binary_version(path: Path, target_version: str, args: list[Any]) -> None:
+    """执行下载后的 Agent 二进制，确认其版本符合目标版本。"""
+
     command = [str(path), *[str(arg) for arg in args]]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     output = (result.stdout or result.stderr).strip()
@@ -99,11 +103,15 @@ def verify_binary_version(path: Path, target_version: str, args: list[Any]) -> N
 
 
 def write_state(data: dict[str, Any]) -> None:
+    """写入自升级状态文件，供主控或用户排查升级进度。"""
+
     UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def write_upgrade_script(service_name: str, install_path: Path) -> None:
+    """生成负责停服务、替换二进制和失败回滚的升级脚本。"""
+
     backup_path = UPGRADE_DIR / "link42-agent.bak"
     script = f"""#!/bin/sh
 set -eu
@@ -158,4 +166,6 @@ def schedule_upgrade_script() -> None:
 
 
 def shell_quote(value: str) -> str:
+    """为生成 shell 脚本时的单引号参数做安全转义。"""
+
     return "'" + value.replace("'", "'\\''") + "'"

@@ -1,2 +1,1 @@
-"""Shared helpers for Link42."""
-
+"""Link42 多端共用的辅助模块。"""

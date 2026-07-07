@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     agent_res_base_url: str = "https://get.pmman.tech/res/link42"
     # Agent 心跳超过该秒数后视为离线，前端和部署确认都会据此拦截。
     agent_offline_after_seconds: int = 15
+    # 主控日志等级；排查问题时可设为 DEBUG。
+    log_level: str = "INFO"
 
 
 # 全局配置实例，应用启动后各模块通过它读取运行参数。

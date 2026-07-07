@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import platform
 import re
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +20,33 @@ from .service_manager import DirectWgQuickManager, OpenWrtUciManager, Unsupporte
 # wg-quick 默认配置目录；可通过环境变量覆盖，便于测试和非标准系统布局。
 DEFAULT_WIREGUARD_DIR = "/etc/wireguard"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+logger = logging.getLogger("link42.agent.system")
+
+
+def sanitize_command_for_log(command: list[str]) -> list[str]:
+    """遮罩命令参数中的密钥和口令，避免日志或任务结果泄露敏感信息。"""
+
+    sanitized: list[str] = []
+    hide_next = False
+    sensitive_flags = {"-k", "--key", "--password", "--token"}
+    sensitive_fragments = ("private_key=", "preshared_key=", "password=", "token=")
+    for item in command:
+        text = str(item)
+        lower_text = text.lower()
+        if hide_next:
+            sanitized.append("***")
+            hide_next = False
+            continue
+        if lower_text in sensitive_flags:
+            sanitized.append(text)
+            hide_next = True
+            continue
+        if any(fragment in lower_text for fragment in sensitive_fragments):
+            prefix, separator, _ = text.partition("=")
+            sanitized.append(f"{prefix}{separator}***" if separator else "***")
+            continue
+        sanitized.append(text)
+    return sanitized
 
 
 def command_timeout_seconds() -> float:
@@ -89,6 +118,8 @@ def mimic_runtime_ready() -> bool:
 
 
 def mimic_runtime_health() -> dict[str, Any]:
+    """检查 mimic 二进制、包状态、systemd unit、用户和内核模块是否齐备。"""
+
     checks: dict[str, Any] = {
         "binary": bool(shutil.which("mimic")),
         "packages": {},
@@ -322,10 +353,13 @@ def cleanup_previous_wireguard_interface(
         }
     if isinstance(manager, OpenWrtUciManager):
         state = manager.state(previous_interface_name)
+        stop_result = manager.stop(previous_interface_name) if state["active_state"] == "active" else None
+        runtime_after = assert_wireguard_stopped(previous_interface_name, {"stop": stop_result}) if stop_result else None
         return {
             "previous_interface_name": previous_interface_name,
             "service": state,
-            "stop": manager.stop(previous_interface_name) if state["active_state"] == "active" else None,
+            "stop": stop_result,
+            "runtime": runtime_after,
             "delete_config": manager.delete_config(previous_interface_name),
         }
     if isinstance(manager, UnsupportedServiceManager):
@@ -338,6 +372,7 @@ def cleanup_previous_wireguard_interface(
         stop_result = manager.stop(previous_interface_name)
     elif wg_state["returncode"] == 0:
         stop_result = DirectWgQuickManager(run_command).stop(previous_interface_name)
+    runtime_after = assert_wireguard_stopped(previous_interface_name, {"stop": stop_result}) if stop_result else None
 
     disable_result = None
     if manager.name == "systemd":
@@ -357,6 +392,7 @@ def cleanup_previous_wireguard_interface(
         "service": state,
         "wg": wg_state,
         "stop": stop_result,
+        "runtime": runtime_after,
         "disable": disable_result,
         "delete_config": {"changed": deleted},
     }
@@ -405,6 +441,37 @@ def get_wireguard_status(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def assert_wireguard_stopped(interface_name: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
+    """确认接口已经不在内核 WireGuard 状态中。"""
+
+    current = get_wireguard_status({"interface_name": interface_name})
+    if current["runtime_status"] == "running":
+        detail = ""
+        if result:
+            failed_result = result.get("down") or result.get("stop") or result
+            if isinstance(failed_result, dict):
+                detail = str(failed_result.get("stderr") or failed_result.get("stdout") or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"wireguard interface {interface_name} is still running after stop{suffix}")
+    return current
+
+
+def disable_wireguard_service(interface_name: str, manager: Any, service_state: dict[str, Any]) -> dict[str, Any] | None:
+    """删除配置文件前关闭 wg-quick 开机自启，避免重启后启动缺失配置。"""
+
+    if isinstance(manager, OpenWrtUciManager) or isinstance(manager, UnsupportedServiceManager):
+        return None
+    if not service_state.get("managed"):
+        return None
+    if manager.name == "systemd":
+        unit = str(service_state.get("unit") or f"wg-quick@{interface_name}.service")
+        return run_command(["systemctl", "disable", "--now", unit], allow_failure=True)
+    if manager.name == "openrc":
+        unit = str(service_state.get("unit") or f"wg-quick.{interface_name}")
+        return run_command(["rc-update", "del", unit, "default"], allow_failure=True)
+    return None
+
+
 def start_wireguard_interface(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     """启动指定 WireGuard 接口。"""
 
@@ -437,12 +504,16 @@ def stop_wireguard_interface(payload: dict[str, Any], dry_run: bool = False) -> 
     service_state = current["service"]
     manager = detect_service_manager(run_command)
     if service_state["managed"] or isinstance(manager, OpenWrtUciManager):
-        return {
+        result = {
             "changed": True,
             "service": service_state,
             "stop": manager.stop(interface_name),
         }
-    return {"changed": True, "down": run_command(["wg-quick", "down", interface_name], allow_failure=True)}
+        result["runtime"] = assert_wireguard_stopped(interface_name, result)
+        return result
+    result = {"changed": True, "down": run_command(["wg-quick", "down", interface_name], allow_failure=True)}
+    result["runtime"] = assert_wireguard_stopped(interface_name, result)
+    return result
 
 
 def delete_wireguard_config(
@@ -462,14 +533,23 @@ def delete_wireguard_config(
             "config_path": str(target),
             "message": "dry-run enabled, config file was not deleted",
         }
+    current = get_wireguard_status({"interface_name": interface_name})
+    if current["runtime_status"] == "running":
+        raise RuntimeError(f"wireguard interface {interface_name} must be stopped before deleting config")
     if isinstance(manager, OpenWrtUciManager):
         return manager.delete_config(interface_name)
     if isinstance(manager, UnsupportedServiceManager):
         raise RuntimeError(manager.state(interface_name)["message"])
+    service_disable = disable_wireguard_service(interface_name, manager, current["service"])
     if target.exists():
         target.unlink()
-        return {"changed": True, "config_path": str(target)}
-    return {"changed": False, "config_path": str(target), "message": "config file did not exist"}
+        return {"changed": True, "config_path": str(target), "service_disable": service_disable}
+    return {
+        "changed": bool(service_disable and service_disable.get("returncode") == 0),
+        "config_path": str(target),
+        "service_disable": service_disable,
+        "message": "config file did not exist",
+    }
 
 
 def get_wg_quick_service_state(interface_name: str) -> dict[str, Any]:
@@ -491,6 +571,9 @@ def run_command(
     effective_env = subprocess_env()
     if env:
         effective_env.update(env)
+    safe_command = sanitize_command_for_log(command)
+    started_at = time.monotonic()
+    logger.debug("执行系统命令 command=%s timeout=%s allow_failure=%s", safe_command, effective_timeout, allow_failure)
     try:
         completed = subprocess.run(
             command,
@@ -501,24 +584,37 @@ def run_command(
             env=effective_env,
         )
     except subprocess.TimeoutExpired as exc:
+        duration = time.monotonic() - started_at
+        logger.warning("系统命令超时 command=%s timeout=%s duration=%.2fs", safe_command, effective_timeout, duration)
         result = {
-            "command": command,
+            "command": safe_command,
             "returncode": 124,
             "stdout": exc.stdout or "",
             "stderr": f"command timed out after {effective_timeout:g}s",
             "timeout": effective_timeout,
         }
         if not allow_failure:
-            raise RuntimeError(f"command timed out after {effective_timeout:g}s: {' '.join(command)}") from exc
+            raise RuntimeError(f"command timed out after {effective_timeout:g}s: {' '.join(safe_command)}") from exc
         return result
+    duration = time.monotonic() - started_at
     result = {
-        "command": command,
+        "command": safe_command,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
     }
+    if completed.returncode == 0:
+        logger.debug("系统命令完成 command=%s returncode=%s duration=%.2fs", safe_command, completed.returncode, duration)
+    else:
+        logger.warning(
+            "系统命令失败 command=%s returncode=%s duration=%.2fs stderr=%s",
+            safe_command,
+            completed.returncode,
+            duration,
+            (completed.stderr or "")[:500],
+        )
     if completed.returncode != 0 and not allow_failure:
-        raise RuntimeError(f"command failed: {' '.join(command)}\n{completed.stderr}")
+        raise RuntimeError(f"command failed: {' '.join(safe_command)}\n{completed.stderr}")
     return result
 
 

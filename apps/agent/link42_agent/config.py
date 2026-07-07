@@ -13,7 +13,9 @@ class AgentConfig:
     token: str
     poll_interval: int = 5
     wireguard_dir: str = "/etc/wireguard"
+    gre_dir: str = "/etc/link42/gre"
     dry_run: bool = False
+    log_level: str = "INFO"
 
 
 def load_config_from_env() -> AgentConfig:
@@ -25,5 +27,7 @@ def load_config_from_env() -> AgentConfig:
         token=os.environ["LINK42_AGENT_TOKEN"],
         poll_interval=int(os.environ.get("LINK42_POLL_INTERVAL", "5")),
         wireguard_dir=os.environ.get("LINK42_WIREGUARD_DIR", "/etc/wireguard"),
+        gre_dir=os.environ.get("LINK42_GRE_DIR", "/etc/link42/gre"),
         dry_run=os.environ.get("LINK42_AGENT_DRY_RUN", "0") == "1",
+        log_level=os.environ.get("LINK42_LOG_LEVEL", "INFO"),
     )

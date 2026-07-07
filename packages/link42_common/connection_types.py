@@ -4,13 +4,14 @@ from dataclasses import dataclass
 
 
 CONNECTION_TYPE_WIREGUARD = "wireguard"
+CONNECTION_TYPE_GRE = "gre"
 
 
 @dataclass(frozen=True)
 class ConnectionTaskSet:
-    """A connection backend's standard agent task names."""
+    """连接后端对应的一组标准 Agent 任务名。"""
 
-    import_scan: str
+    import_scan: str | None
     apply_config: str
     read_config: str
     status: str
@@ -29,6 +30,16 @@ WIREGUARD_TASKS = ConnectionTaskSet(
     delete_config="wireguard.delete_config",
 )
 
+GRE_TASKS = ConnectionTaskSet(
+    import_scan=None,
+    apply_config="gre.apply_config",
+    read_config="gre.read_config",
+    status="gre.status",
+    start="gre.start_interface",
+    stop="gre.stop_interface",
+    delete_config="gre.delete_config",
+)
+
 
 TASK_REQUIREMENTS = {
     WIREGUARD_TASKS.import_scan: {"min_agent_version": "0.1.0", "capabilities": ["wg_quick_import"]},
@@ -38,6 +49,12 @@ TASK_REQUIREMENTS = {
     WIREGUARD_TASKS.start: {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
     WIREGUARD_TASKS.stop: {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
     WIREGUARD_TASKS.delete_config: {"min_agent_version": "0.1.0", "capabilities": ["wireguard"]},
+    GRE_TASKS.apply_config: {"min_agent_version": "0.6.0", "capabilities": ["gre"]},
+    GRE_TASKS.read_config: {"min_agent_version": "0.6.0", "capabilities": ["gre"]},
+    GRE_TASKS.status: {"min_agent_version": "0.6.0", "capabilities": ["gre"]},
+    GRE_TASKS.start: {"min_agent_version": "0.6.0", "capabilities": ["gre"]},
+    GRE_TASKS.stop: {"min_agent_version": "0.6.0", "capabilities": ["gre"]},
+    GRE_TASKS.delete_config: {"min_agent_version": "0.6.0", "capabilities": ["gre"]},
     "middleware.install": {"min_agent_version": "0.2.0", "capabilities": ["middleware.install"]},
     "middleware.udp2raw.apply": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
     "middleware.udp2raw.start": {"min_agent_version": "0.2.0", "capabilities": ["middleware.udp2raw"]},
@@ -61,9 +78,11 @@ TASK_REQUIREMENTS = {
 
 
 def connection_type_for_task(task_type: str) -> str | None:
-    """Return the connection backend prefix for a task name, when one exists."""
+    """从任务名中解析连接后端类型，无法识别时返回空。"""
 
     prefix = task_type.split(".", 1)[0]
     if prefix == CONNECTION_TYPE_WIREGUARD:
         return CONNECTION_TYPE_WIREGUARD
+    if prefix == CONNECTION_TYPE_GRE:
+        return CONNECTION_TYPE_GRE
     return None

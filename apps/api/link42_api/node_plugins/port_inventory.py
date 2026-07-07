@@ -6,7 +6,7 @@ from .base import AgentTaskSpec, NodePlugin, NodePluginAction, NodePluginContext
 
 
 class PortInventoryNodePlugin(NodePlugin):
-    """Controller-side port inventory helper plugin."""
+    """主控侧端口台账扫描辅助插件。"""
 
     type = "port-inventory"
     display_name = "端口台账"
@@ -18,6 +18,8 @@ class PortInventoryNodePlugin(NodePlugin):
     }
 
     def validate_payload(self, action: str, payload: dict[str, Any], context: NodePluginContext) -> dict[str, Any]:
+        """校验端口台账扫描范围。"""
+
         super().validate_payload(action, payload, context)
         if action != "scan":
             raise ValueError("plugin action not found")
@@ -30,6 +32,8 @@ class PortInventoryNodePlugin(NodePlugin):
         return {"range_start": range_start, "range_end": range_end}
 
     def build_task(self, action: str, payload: dict[str, Any], context: NodePluginContext) -> AgentTaskSpec:
+        """为端口台账扫描任务附加插件类型、动作和节点 ID。"""
+
         task = super().build_task(action, payload, context)
         return AgentTaskSpec(
             task_type=task.task_type,

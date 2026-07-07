@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 from typing import Any
 
 import pytest
 
-from link42_common.connection_types import WIREGUARD_TASKS
-from link42_agent import link_monitor, main, middleware, service_manager, system, upgrade
+from link42_common.connection_types import GRE_TASKS, WIREGUARD_TASKS
+from link42_agent import gre, link_monitor, main, middleware, service_manager, system, upgrade
 from link42_agent.client import AgentHttpError
 from link42_agent.config import AgentConfig
 from link42_agent.plugins import bird
@@ -17,6 +19,7 @@ from link42_agent.task_handlers import TASK_HANDLERS, execute_registered_task
 
 
 def command_result(command: list[str], returncode: int = 0, stdout: str = "") -> dict[str, Any]:
+    """构造测试用的命令执行结果。"""
     return {"command": command, "returncode": returncode, "stdout": stdout, "stderr": ""}
 
 
@@ -31,6 +34,7 @@ def use_service_binaries(
     """让 service manager 探测在测试里可控，不依赖宿主机 init 系统。"""
 
     def fake_which(binary: str) -> str | None:
+        """模拟 shutil.which 的返回结果。"""
         if binary == "systemctl" and systemd:
             return "/bin/systemctl"
         if binary in {"rc-service", "rc-update"} and openrc:
@@ -50,6 +54,7 @@ def test_run_command_passes_timeout_to_subprocess(monkeypatch) -> None:
     seen: dict[str, Any] = {}
 
     def fake_run(command: list[str], **kwargs: Any):
+        """模拟 subprocess.run 的返回或异常。"""
         seen["command"] = command
         seen["timeout"] = kwargs.get("timeout")
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
@@ -61,6 +66,24 @@ def test_run_command_passes_timeout_to_subprocess(monkeypatch) -> None:
 
     assert result["stdout"] == "ok\n"
     assert seen == {"command": ["systemctl", "status", "link42-agent"], "timeout": 7.0}
+
+
+def test_run_command_masks_sensitive_arguments(monkeypatch) -> None:
+    """验证命令结果和异常中的私钥参数会被遮罩，避免日志泄露。"""
+
+    def fake_run(command: list[str], **kwargs: Any):
+        """模拟 subprocess.run 返回失败命令。"""
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="bad key")
+
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    result = system.run_command(["uci", "set", "network.wg0.private_key=secret-key"], allow_failure=True)
+
+    assert result["command"] == ["uci", "set", "network.wg0.private_key=***"]
+    with pytest.raises(RuntimeError) as exc_info:
+        system.run_command(["uci", "set", "network.wg0.private_key=secret-key"], allow_failure=False)
+    assert "secret-key" not in str(exc_info.value)
+    assert "network.wg0.private_key=***" in str(exc_info.value)
 
 
 def test_node_plugin_port_inventory_capability_and_scan(monkeypatch, tmp_path) -> None:
@@ -312,6 +335,7 @@ def test_bird_apply_many_reload_runs_birdc_configure(monkeypatch, tmp_path) -> N
     )
 
     def fake_configure() -> dict[str, Any]:
+        """模拟 birdc configure 调用。"""
         configure_calls.append("configure")
         return command_result(["birdc", "configure"])
 
@@ -410,6 +434,7 @@ def test_run_command_timeout_returns_result_or_raises(monkeypatch) -> None:
     """验证命令超时不会卡死任务，允许失败时返回结果，不允许失败时抛错。"""
 
     def fake_run(command: list[str], **kwargs: Any):
+        """模拟 subprocess.run 的返回或异常。"""
         raise subprocess.TimeoutExpired(command, kwargs["timeout"], output="partial")
 
     monkeypatch.setenv("LINK42_COMMAND_TIMEOUT", "3")
@@ -434,6 +459,7 @@ def test_run_command_strips_pyinstaller_library_path(monkeypatch) -> None:
     seen: dict[str, Any] = {}
 
     def fake_run(command: list[str], **kwargs: Any):
+        """模拟 subprocess.run 的返回或异常。"""
         seen["env"] = kwargs.get("env")
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
 
@@ -452,6 +478,7 @@ def test_run_command_restores_original_library_path(monkeypatch) -> None:
     seen: dict[str, Any] = {}
 
     def fake_run(command: list[str], **kwargs: Any):
+        """模拟 subprocess.run 的返回或异常。"""
         seen["env"] = kwargs.get("env")
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
 
@@ -479,6 +506,16 @@ def test_agent_task_registry_keeps_wireguard_handlers() -> None:
         assert task_type in TASK_HANDLERS
 
     for task_type in [
+        GRE_TASKS.apply_config,
+        GRE_TASKS.read_config,
+        GRE_TASKS.status,
+        GRE_TASKS.start,
+        GRE_TASKS.stop,
+        GRE_TASKS.delete_config,
+    ]:
+        assert task_type in TASK_HANDLERS
+
+    for task_type in [
         "middleware.mimic.apply",
         "middleware.mimic.start",
         "middleware.mimic.stop",
@@ -486,6 +523,210 @@ def test_agent_task_registry_keeps_wireguard_handlers() -> None:
         "middleware.mimic.status",
     ]:
         assert task_type in TASK_HANDLERS
+
+
+def test_gre_capability_depends_on_iproute2(monkeypatch) -> None:
+    """验证 Agent 只有检测到 iproute2 GRE 能力时才上报 GRE。"""
+
+    platform_info = {
+        "service_manager": "systemd",
+        "kernel_version": "6.6.12",
+        "is_openwrt": False,
+        "os": "linux",
+        "arch": "x86_64",
+        "distro_id": "debian",
+        "distro_codename": "bookworm",
+        "has_mimic": False,
+    }
+    monkeypatch.setattr(main, "gre_runtime_supported", lambda: True)
+    monkeypatch.setattr(main, "mimic_installable", lambda platform: False)
+    monkeypatch.setattr(main, "mimic_runtime_supported", lambda platform: False)
+
+    assert "gre" in main.build_capabilities(platform_info)
+    assert "gre.iproute2" in main.build_capabilities(platform_info)
+
+    monkeypatch.setattr(main, "gre_runtime_supported", lambda: False)
+    assert "gre" not in main.build_capabilities(platform_info)
+
+
+def test_run_gre_service_command_outputs_json(monkeypatch, capsys) -> None:
+    """验证 systemd 调用的 gre-start 子命令会输出 JSON 结果。"""
+
+    def fake_start_gre_from_config(interface_name: str, config_dir: str | None) -> dict[str, str | None]:
+        """模拟从配置文件启动 GRE 接口。"""
+
+        return {"interface_name": interface_name, "config_dir": config_dir}
+
+    monkeypatch.setenv("LINK42_GRE_DIR", "/tmp/link42-gre")
+    monkeypatch.setattr(main, "start_gre_from_config", fake_start_gre_from_config)
+
+    handled = main.run_gre_service_command(["link42-agent", "gre-start", "gre0"])
+    output = json.loads(capsys.readouterr().out)
+
+    assert handled is True
+    assert output == {"config_dir": "/tmp/link42-gre", "interface_name": "gre0"}
+
+
+def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) -> None:
+    """验证 GRE 改名启动会先建新接口，成功后再清理旧接口和旧配置。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """记录 GRE 启动时调用的系统命令。"""
+
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    result = gre.start_gre_interface(
+        {
+            "interface_name": "gre-new",
+            "previous_interface_name": "gre-old",
+            "outer_local_ip": "203.0.113.10",
+            "outer_remote_ip": "198.51.100.20",
+            "tunnel_ips": ["10.42.8.1/30"],
+            "routes": ["10.77.0.0/24"],
+            "mtu": 1476,
+            "key": "42",
+            "ttl": 255,
+            "pmtudisc": True,
+        },
+        str(tmp_path),
+    )
+    saved = (tmp_path / "gre-new.json").read_text(encoding="utf-8")
+
+    assert result["runtime_status"] == "running"
+    assert result["previous_config_cleanup"]["config_path"] == str(tmp_path / "gre-old.json")
+    assert '"interface_name": "gre-new"' in saved
+    assert commands == [
+        ["/sbin/ip", "link", "del", "gre-new"],
+        [
+            "/sbin/ip",
+            "tunnel",
+            "add",
+            "gre-new",
+            "mode",
+            "gre",
+            "local",
+            "203.0.113.10",
+            "remote",
+            "198.51.100.20",
+            "key",
+            "42",
+            "ttl",
+            "255",
+            "pmtudisc",
+        ],
+        ["/sbin/ip", "addr", "add", "10.42.8.1/30", "dev", "gre-new"],
+        ["/sbin/ip", "link", "set", "dev", "gre-new", "mtu", "1476", "up"],
+        ["/sbin/ip", "route", "replace", "10.77.0.0/24", "dev", "gre-new"],
+        ["/sbin/ip", "link", "del", "gre-old"],
+    ]
+
+
+def test_gre_rejects_ttl_without_pmtu_discovery(tmp_path: Path) -> None:
+    """验证 Agent 拒绝 iproute2 不支持的 GRE TTL 和 nopmtudisc 组合。"""
+
+    with pytest.raises(ValueError, match="GRE ttl requires PMTU discovery"):
+        gre.start_gre_interface(
+            {
+                "interface_name": "gre-bad",
+                "outer_local_ip": "203.0.113.10",
+                "outer_remote_ip": "198.51.100.20",
+                "tunnel_ips": ["10.42.8.1/30"],
+                "routes": [],
+                "ttl": 63,
+                "pmtudisc": False,
+            },
+            str(tmp_path),
+        )
+
+
+def test_gre_delete_config_removes_previous_rename_files(monkeypatch, tmp_path: Path) -> None:
+    """验证 GRE 删除任务会同时清理改名前后的配置文件。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """记录删除 GRE 配置时调用的系统命令。"""
+
+        commands.append(command)
+        return command_result(command)
+
+    (tmp_path / "gre-new.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "gre-old.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    result = gre.delete_gre_config(
+        {"interface_name": "gre-new", "previous_interface_name": "gre-old"},
+        str(tmp_path),
+    )
+
+    assert result["deleted"] is True
+    assert result["previous_config"]["deleted"] is True
+    assert not (tmp_path / "gre-new.json").exists()
+    assert not (tmp_path / "gre-old.json").exists()
+    assert commands == [
+        ["/sbin/ip", "link", "del", "gre-new"],
+        ["/sbin/ip", "link", "del", "gre-old"],
+    ]
+
+
+def test_gre_status_accepts_unknown_state_with_up_flag(monkeypatch) -> None:
+    """验证 GRE 接口 state UNKNOWN 但 flags 带 UP 时仍识别为运行中。"""
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 ip link show 返回 GRE 常见的 UNKNOWN 状态。"""
+
+        return command_result(
+            command,
+            stdout=(
+                "72: l42grren@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> "
+                "mtu 1476 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\n"
+            ),
+        )
+
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    result = gre.gre_status({"interface_name": "l42grren"})
+
+    assert result["runtime_status"] == "running"
+
+
+def test_gre_systemd_start_uses_agent_service_entry(monkeypatch, tmp_path: Path) -> None:
+    """验证 systemd 节点会通过 link42-gre@.service 持久化 GRE 接口。"""
+
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: True)
+    monkeypatch.setattr(gre, "systemctl_command", lambda: "/bin/systemctl")
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "agent_binary_path", lambda: "/usr/local/bin/link42-agent")
+
+    result = gre.start_gre_interface(
+        {
+            "interface_name": "gre-a-b",
+            "outer_local_ip": "203.0.113.10",
+            "outer_remote_ip": "198.51.100.20",
+            "tunnel_ips": ["10.42.8.1/30"],
+            "routes": [],
+        },
+        str(tmp_path),
+        dry_run=True,
+    )
+
+    assert result["service_backend"] == "systemd"
+    assert "ExecStart=/usr/local/bin/link42-agent gre-start %i" in result["unit"]["content"]
+    assert result["commands"] == [
+        ["/bin/systemctl", "daemon-reload"],
+        ["/bin/systemctl", "enable", "link42-gre@gre-a-b.service"],
+        ["/bin/systemctl", "restart", "link42-gre@gre-a-b.service"],
+    ]
 
 
 def test_mimic_capability_requires_systemd_kernel_newer_than_61_and_binary(monkeypatch) -> None:
@@ -610,6 +851,7 @@ def test_mimic_apply_renders_systemd_config(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr(middleware.shutil, "which", lambda binary: "/usr/bin/mimic" if binary == "mimic" else None)
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         return command_result(command)
 
@@ -673,6 +915,7 @@ def test_mimic_runtime_ready_rejects_half_installed_package(monkeypatch) -> None
     """验证 mimic 半安装状态不会上报 runtime capability。"""
 
     def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
             package = command[-1]
             return command_result(command, stdout="iF " if package == "mimic-dkms" else "ii ")
@@ -699,6 +942,7 @@ def test_mimic_runtime_ready_accepts_complete_install(monkeypatch) -> None:
     """验证 mimic 包、unit、用户、模块和版本都正常时才上报 runtime capability。"""
 
     def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
             return command_result(command, stdout="ii ")
         if command in [
@@ -750,11 +994,13 @@ def test_agent_platform_has_mimic_uses_runtime_health(monkeypatch) -> None:
     monkeypatch.setattr(system, "network_interfaces", lambda: ["enp3s0"])
 
     def fake_which(binary: str) -> str | None:
+        """模拟 shutil.which 的返回结果。"""
         if binary in {"mimic", "systemctl", "ldd", "apt-get"}:
             return f"/usr/bin/{binary}"
         return None
 
     def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         if command == ["ldd", "--version"]:
             return command_result(command, stdout="ldd (Ubuntu GLIBC 2.39)\n")
         if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
@@ -810,6 +1056,7 @@ def test_mimic_apt_dependency_install_repairs_dpkg_and_retries(monkeypatch) -> N
         allow_failure: bool,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         nonlocal install_attempts
         commands.append(command)
         if command[:3] == ["apt-get", "install", "-y"] and "dkms" in command:
@@ -923,16 +1170,21 @@ def test_mimic_fetch_release_falls_back_to_proxy(monkeypatch) -> None:
     requested_urls: list[str] = []
 
     class FakeResponse:
+        """模拟 HTTP 响应上下文对象。"""
         def __enter__(self) -> "FakeResponse":
+            """进入模拟响应上下文。"""
             return self
 
         def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            """退出模拟响应上下文。"""
             return None
 
         def read(self) -> bytes:
+            """返回模拟响应体。"""
             return b'{"tag_name":"v1.0.0","prerelease":false,"assets":[]}'
 
     def fake_urlopen(request_obj: Any, timeout: int) -> FakeResponse:
+        """模拟 urlopen 网络请求。"""
         url = request_obj.full_url
         requested_urls.append(url)
         if url.startswith("https://api.github.com/"):
@@ -954,15 +1206,19 @@ def test_agent_main_reports_401_without_traceback(monkeypatch, capsys) -> None:
     """验证 Agent 凭据错误时输出明确提示，而不是持续刷 traceback。"""
 
     class FakeClient:
+        """模拟 AgentClient 与主控交互。"""
         def __init__(self, config: AgentConfig) -> None:
+            """初始化测试替身对象。"""
             self.config = config
 
         def register(self, hostname: str, capabilities: list[str], platform: dict[str, Any]) -> None:
+            """模拟 Agent 注册请求。"""
             raise AgentHttpError(401, "/api/agent/register", '{"detail":"invalid agent credentials"}')
 
     sleep_calls = 0
 
     def fake_sleep(seconds: int) -> None:
+        """模拟 sleep 并控制测试轮询退出。"""
         nonlocal sleep_calls
         sleep_calls += 1
         if sleep_calls >= 1:
@@ -971,7 +1227,7 @@ def test_agent_main_reports_401_without_traceback(monkeypatch, capsys) -> None:
     monkeypatch.setattr(main, "load_config_from_env", lambda: AgentConfig("https://controller", 1, "bad-token"))
     monkeypatch.setattr(main, "AgentClient", FakeClient)
     monkeypatch.setattr(main, "get_hostname", lambda: "node-a")
-    monkeypatch.setattr(main, "build_capabilities", lambda: ["wireguard"])
+    monkeypatch.setattr(main, "build_capabilities", lambda platform_info=None: ["wireguard"])
     monkeypatch.setattr(main, "get_agent_platform", lambda: {})
     monkeypatch.setattr(main.time, "sleep", fake_sleep)
 
@@ -1060,6 +1316,7 @@ def test_udp2raw_delete_uses_payload_mode_only(tmp_path: Path, monkeypatch) -> N
     (tmp_path / "client").write_text("link42-1 -c -l127.0.0.1:12312\n", encoding="utf-8")
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         return command_result(command)
 
@@ -1079,6 +1336,7 @@ def test_udp2raw_stop_uses_payload_mode_only(monkeypatch) -> None:
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         return command_result(command)
 
@@ -1103,6 +1361,7 @@ def test_udp2raw_apply_uses_openwrt_procd(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         return command_result(command)
 
@@ -1172,9 +1431,11 @@ def test_udp2raw_install_uses_openwrt_backend_without_systemd_units(tmp_path: Pa
     monkeypatch.setattr(middleware, "detect_udp2raw_asset", lambda: "udp2raw_arm")
 
     def fake_download(config: Any, asset: str, target: Path) -> None:
+        """模拟二进制资产下载。"""
         target.write_text("#!/bin/sh\n", encoding="utf-8")
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         return command_result(command)
 
@@ -1213,6 +1474,7 @@ def test_udp2raw_delete_uses_openwrt_role_init(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         return command_result(command)
 
@@ -1240,6 +1502,7 @@ def test_udp2raw_openwrt_does_not_insert_direct_iptables_drop(tmp_path: Path, mo
     monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         return command_result(command)
 
@@ -1267,6 +1530,7 @@ def test_apply_config_restarts_existing_systemd_service(tmp_path: Path, monkeypa
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command == ["systemctl", "is-active", "wg-quick@wg0.service"]:
             return command_result(command, stdout="active\n")
@@ -1296,6 +1560,7 @@ def test_apply_config_keeps_only_one_wireguard_backup(tmp_path: Path, monkeypatc
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command == ["systemctl", "is-active", "wg-quick@wg0.service"]:
             return command_result(command, stdout="active\n")
@@ -1334,6 +1599,7 @@ def test_apply_config_enables_existing_systemd_service_when_requested(tmp_path: 
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command == ["systemctl", "is-active", "wg-quick@wg0.service"]:
             return command_result(command, stdout="active\n")
@@ -1364,6 +1630,7 @@ def test_apply_config_falls_back_to_wg_quick_when_no_systemd_unit(tmp_path: Path
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command[:2] == ["systemctl", "is-active"]:
             return command_result(command, returncode=3, stdout="inactive\n")
@@ -1394,6 +1661,7 @@ def test_apply_config_uses_direct_wg_quick_without_init_manager(tmp_path: Path, 
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command[:2] == ["wg-quick", "down"]:
             return command_result(command, returncode=1)
@@ -1419,12 +1687,17 @@ def test_apply_config_cleans_previous_interface_name(tmp_path: Path, monkeypatch
     """验证接口改名部署时会先关闭并删除旧接口配置。"""
 
     commands: list[list[str]] = []
+    wg_old_running = True
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
+        nonlocal wg_old_running
         commands.append(command)
         if command == ["wg", "show", "wg-old"]:
-            return command_result(command)
+            return command_result(command) if wg_old_running else command_result(command, returncode=1)
         if command[:2] == ["wg-quick", "down"]:
+            if command[2] == "wg-old":
+                wg_old_running = False
             return command_result(command)
         if command[:2] == ["wg-quick", "up"]:
             return command_result(command)
@@ -1459,6 +1732,7 @@ def test_apply_config_uses_systemd_enable_and_restart_when_requested(tmp_path: P
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command[:2] == ["systemctl", "is-active"]:
             return command_result(command, returncode=3, stdout="inactive\n")
@@ -1488,16 +1762,20 @@ def test_stop_interface_uses_systemd_for_managed_service(monkeypatch) -> None:
     """验证停止已由 systemd 管理的接口时使用 systemctl stop。"""
 
     commands: list[list[str]] = []
+    running = True
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
+        nonlocal running
         commands.append(command)
         if command == ["wg", "show", "wg0"]:
-            return command_result(command)
+            return command_result(command) if running else command_result(command, returncode=1)
         if command == ["systemctl", "is-active", "wg-quick@wg0.service"]:
             return command_result(command, stdout="active\n")
         if command == ["systemctl", "is-enabled", "wg-quick@wg0.service"]:
             return command_result(command, stdout="enabled\n")
         if command == ["systemctl", "stop", "wg-quick@wg0.service"]:
+            running = False
             return command_result(command)
         raise AssertionError(f"unexpected command: {command}")
 
@@ -1511,12 +1789,45 @@ def test_stop_interface_uses_systemd_for_managed_service(monkeypatch) -> None:
     assert ["wg-quick", "down", "wg0"] not in commands
 
 
+def test_delete_wireguard_config_disables_systemd_service(tmp_path: Path, monkeypatch) -> None:
+    """验证删除 WireGuard 配置时会同步禁用残留的 systemd wg-quick 服务。"""
+
+    commands: list[list[str]] = []
+    target = tmp_path / "wg0.conf"
+    target.write_text("[Interface]\nPrivateKey = private\n", encoding="utf-8")
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟已停止但仍 enable 的 wg-quick systemd 服务。"""
+
+        commands.append(command)
+        if command == ["wg", "show", "wg0"]:
+            return command_result(command, returncode=1)
+        if command == ["systemctl", "is-active", "wg-quick@wg0.service"]:
+            return command_result(command, returncode=3, stdout="inactive\n")
+        if command == ["systemctl", "is-enabled", "wg-quick@wg0.service"]:
+            return command_result(command, stdout="enabled\n")
+        if command == ["systemctl", "disable", "--now", "wg-quick@wg0.service"]:
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=True)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+
+    result = system.delete_wireguard_config({"interface_name": "wg0"}, wireguard_dir=str(tmp_path))
+
+    assert result["changed"] is True
+    assert result["service_disable"]["returncode"] == 0
+    assert not target.exists()
+    assert ["systemctl", "disable", "--now", "wg-quick@wg0.service"] in commands
+
+
 def test_apply_config_uses_openrc_when_service_is_managed(tmp_path: Path, monkeypatch) -> None:
     """验证 OpenRC 已管理接口下发时通过 rc-service restart。"""
 
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command == ["rc-service", "--exists", "wg-quick@wg0"]:
             return command_result(command)
@@ -1548,6 +1859,7 @@ def test_apply_config_enables_openrc_service_when_requested(tmp_path: Path, monk
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command == ["rc-service", "--exists", "wg-quick@wg0"]:
             return command_result(command)
@@ -1585,6 +1897,7 @@ def test_apply_config_creates_openrc_wg_quick_symlink_when_missing(tmp_path: Pat
     template.write_text("#!/sbin/openrc-run\n", encoding="utf-8")
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command[:2] == ["rc-service", "--exists"]:
             return command_result(command, returncode=1)
@@ -1623,6 +1936,7 @@ def test_apply_config_creates_link42_openrc_service_without_template(tmp_path: P
     init_dir.mkdir()
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command[:2] == ["rc-service", "--exists"]:
             return command_result(command, returncode=1)
@@ -1657,18 +1971,22 @@ def test_stop_interface_uses_openrc_for_managed_service(monkeypatch) -> None:
     """验证 OpenRC 管理接口停止时使用 rc-service stop。"""
 
     commands: list[list[str]] = []
+    running = True
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
+        nonlocal running
         commands.append(command)
         if command == ["rc-service", "--exists", "wg-quick@wg0"]:
             return command_result(command)
         if command == ["wg", "show", "wg0"]:
-            return command_result(command)
+            return command_result(command) if running else command_result(command, returncode=1)
         if command == ["rc-service", "wg-quick@wg0", "status"]:
             return command_result(command)
         if command == ["rc-update", "show", "default"]:
             return command_result(command, stdout="wg-quick@wg0 | default\n")
         if command == ["rc-service", "wg-quick@wg0", "stop"]:
+            running = False
             return command_result(command)
         raise AssertionError(f"unexpected command: {command}")
 
@@ -1688,6 +2006,7 @@ def test_apply_config_uses_openwrt_uci_backend(tmp_path: Path, monkeypatch) -> N
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         commands.append(command)
         if command == ["uci", "-q", "show", "network"]:
             return command_result(command, stdout="network.@wireguard_wg0[0]=wireguard_wg0\n")
@@ -1745,10 +2064,13 @@ def test_openwrt_backend_is_reported_as_agent_capability(monkeypatch, tmp_path: 
     seen_capabilities: list[str] = []
 
     class FakeClient:
+        """模拟 AgentClient 与主控交互。"""
         def heartbeat(self) -> None:
+            """模拟 Agent 心跳请求。"""
             return None
 
         def poll_tasks(self, capabilities: list[str] | None = None) -> list[dict[str, Any]]:
+            """模拟 Agent 轮询任务。"""
             seen_capabilities.extend(capabilities or [])
             return []
 
@@ -1773,10 +2095,13 @@ def test_run_once_reports_service_manager_capability(monkeypatch, tmp_path: Path
     seen_capabilities: list[str] = []
 
     class FakeClient:
+        """模拟 AgentClient 与主控交互。"""
         def heartbeat(self) -> None:
+            """模拟 Agent 心跳请求。"""
             return None
 
         def poll_tasks(self, capabilities: list[str] | None = None) -> list[dict[str, Any]]:
+            """模拟 Agent 轮询任务。"""
             seen_capabilities.extend(capabilities or [])
             return []
 
@@ -1798,16 +2123,21 @@ def test_run_once_polls_and_reports_link_monitors(monkeypatch, tmp_path: Path) -
     reported: list[dict[str, Any]] = []
 
     class FakeClient:
+        """模拟 AgentClient 与主控交互。"""
         def heartbeat(self, capabilities: list[str], platform: dict[str, Any]) -> None:
+            """模拟 Agent 心跳请求。"""
             assert "link.monitor" in capabilities
 
         def poll_tasks(self, capabilities: list[str], platform: dict[str, Any]) -> list[dict[str, Any]]:
+            """模拟 Agent 轮询任务。"""
             return []
 
         def poll_link_monitors(self, capabilities: list[str], platform: dict[str, Any]) -> list[dict[str, Any]]:
+            """模拟 Agent 轮询链路监测目标。"""
             return [{"id": 7, "target_host": "10.42.0.2", "timeout_seconds": 1}]
 
         def report_link_monitor_results(self, results: list[dict[str, Any]]) -> None:
+            """模拟 Agent 上报链路监测结果。"""
             reported.extend(results)
 
     use_service_binaries(monkeypatch, systemd=True)
@@ -1817,6 +2147,65 @@ def test_run_once_polls_and_reports_link_monitors(monkeypatch, tmp_path: Path) -
     main.run_once(FakeClient(), str(tmp_path))
 
     assert reported == [{"monitor_id": 7, "success": True, "latency_ms": 12.3, "error": None, "checked_at": "2026-06-30T00:00:00"}]
+
+
+def test_probe_link_monitors_runs_in_parallel(monkeypatch) -> None:
+    """验证多个链路监测目标会并发探测，避免串行等待 ping 超时。"""
+
+    entered = 0
+    lock = threading.Lock()
+    both_entered = threading.Event()
+
+    def fake_probe_latency(target: str, timeout: float) -> dict[str, Any]:
+        """模拟阻塞探测，并确认第二个探测能同时进入。"""
+        nonlocal entered
+        with lock:
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+        if not both_entered.wait(1):
+            raise AssertionError("link monitor probes did not run concurrently")
+        return {"success": True, "latency_ms": float(target[-1]), "error": None, "checked_at": target}
+
+    monkeypatch.setenv("LINK42_LINK_MONITOR_WORKERS", "2")
+    monkeypatch.setattr(main, "probe_latency", fake_probe_latency)
+
+    results = main.probe_link_monitors([
+        {"id": 1, "target_host": "10.0.0.1", "timeout_seconds": 1},
+        {"id": 2, "target_host": "10.0.0.2", "timeout_seconds": 1},
+    ])
+
+    assert [item["monitor_id"] for item in results] == [1, 2]
+    assert [item["success"] for item in results] == [True, True]
+
+
+def test_background_heartbeat_can_keep_running_and_stop() -> None:
+    """验证长任务后台心跳会持续发送，并能被主线程正常停止。"""
+
+    heartbeats = 0
+    first_heartbeat = threading.Event()
+
+    class FakeClient:
+        """模拟 AgentClient 心跳。"""
+
+        def heartbeat(self, capabilities: list[str], platform: dict[str, Any]) -> None:
+            """记录后台心跳调用。"""
+            nonlocal heartbeats
+            assert capabilities == ["wireguard"]
+            assert platform == {"service_manager": "systemd"}
+            heartbeats += 1
+            first_heartbeat.set()
+
+    snapshot = main.AgentSnapshot(capabilities=["wireguard"], platform={"service_manager": "systemd"})
+    stop_event, thread = main.start_background_heartbeat(FakeClient(), snapshot, 0.01)
+    try:
+        assert first_heartbeat.wait(1)
+    finally:
+        stop_event.set()
+        thread.join(timeout=1)
+
+    assert heartbeats >= 1
+    assert not thread.is_alive()
 
 
 def test_probe_latency_parses_ping_time(monkeypatch) -> None:
@@ -1844,6 +2233,7 @@ def test_agent_platform_reports_musl_libc(monkeypatch) -> None:
     monkeypatch.setattr(system.platform, "machine", lambda: "aarch64")
     monkeypatch.setattr(system.platform, "libc_ver", lambda: ("glibc", "2.0"))
     def fake_which(binary: str) -> str | None:
+        """模拟 shutil.which 的返回结果。"""
         if binary == "ldd":
             return "/usr/bin/ldd"
         if binary in {"uci", "ifup", "ifdown"}:
@@ -1853,6 +2243,7 @@ def test_agent_platform_reports_musl_libc(monkeypatch) -> None:
     monkeypatch.setattr(system.shutil, "which", fake_which)
 
     def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 Agent 系统命令执行器。"""
         if command == ["ldd", "--version"]:
             return command_result(command, stdout="musl libc (aarch64)\nVersion 1.2.3\n")
         return command_result(command)

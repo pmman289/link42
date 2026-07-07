@@ -1,2 +1,1 @@
-"""FastAPI backend for Link42."""
-
+"""Link42 主控 FastAPI 后端。"""

@@ -31,6 +31,8 @@ PEER_FIELDS = {
 
 @dataclass
 class ParsedPeer:
+    """解析后的单个 WireGuard Peer 配置。"""
+
     public_key: Optional[str] = None
     preshared_key: Optional[str] = None
     allowed_ips: list[str] = field(default_factory=list)
@@ -42,6 +44,8 @@ class ParsedPeer:
 
 @dataclass
 class ParsedInterface:
+    """解析后的 wg-quick Interface 配置及其 Peer 列表。"""
+
     name: str
     private_key: Optional[str] = None
     addresses: list[str] = field(default_factory=list)

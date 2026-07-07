@@ -9,13 +9,21 @@ from pathlib import Path
 import secrets
 import shlex
 import subprocess
+import sys
 import time
+from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from link42_common.connection_types import TASK_REQUIREMENTS, WIREGUARD_TASKS
+from link42_common.connection_types import (
+    CONNECTION_TYPE_GRE,
+    CONNECTION_TYPE_WIREGUARD,
+    GRE_TASKS,
+    TASK_REQUIREMENTS,
+    WIREGUARD_TASKS,
+)
 from sqlalchemy import String, delete, or_, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -39,6 +47,84 @@ from .wireguard_service import (
 )
 
 
+LOGGER_NAME = "link42.api"
+logger = logging.getLogger(LOGGER_NAME)
+
+
+def configure_logging(level_name: str) -> None:
+    """配置主控业务日志输出，方便容器、systemd 和前台开发服务直接采集。"""
+
+    level = getattr(logging, str(level_name or "INFO").upper(), logging.INFO)
+    root_logger = logging.getLogger("link42")
+    existing_handler = next(
+        (handler for handler in root_logger.handlers if getattr(handler, "_link42_handler", False)),
+        None,
+    )
+    if isinstance(existing_handler, logging.StreamHandler):
+        existing_handler.setStream(sys.stdout)
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+        handler._link42_handler = True  # type: ignore[attr-defined]
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        root_logger.addHandler(handler)
+    root_logger.setLevel(level)
+    root_logger.propagate = False
+
+
+def scrub_text_for_log(value: object, limit: int = 500) -> str:
+    """清洗日志文本，避免常见密钥字段直接出现在日志中。"""
+
+    text = str(value)
+    for key in ["private_key", "preshared_key", "password", "token", "agent_token"]:
+        text = re.sub(rf"({key}[\"']?\s*[=:]\s*[\"']?)[^,\s\"']+", r"\1***", text, flags=re.IGNORECASE)
+    return text[:limit]
+
+
+def summarize_task_payload(payload: dict | None) -> dict[str, object]:
+    """生成可安全写入日志的任务 payload 摘要。"""
+
+    payload = payload or {}
+    safe_keys = [
+        "node_id",
+        "interface_id",
+        "interface_name",
+        "plugin",
+        "mode",
+        "instance",
+        "depends_on_task_id",
+        "range_start",
+        "range_end",
+    ]
+    return {key: payload[key] for key in safe_keys if key in payload}
+
+
+def summarize_agent_task(task: models.AgentTask) -> dict[str, object]:
+    """生成 AgentTask 的日志摘要。"""
+
+    return {
+        "id": task.id,
+        "node_id": task.node_id,
+        "type": task.type,
+        "status": task.status,
+        "payload": summarize_task_payload(task.payload),
+    }
+
+
+def summarize_task_result(result: dict | None) -> dict[str, object]:
+    """生成 Agent 任务结果摘要，避免输出配置正文。"""
+
+    result = result or {}
+    summary: dict[str, object] = {"keys": sorted(result.keys())}
+    for key in ["error", "message", "runtime_status"]:
+        if key in result:
+            summary[key] = scrub_text_for_log(result[key])
+    for key in ["changed", "applied", "valid", "restored", "reboot_required"]:
+        if key in result:
+            summary[key] = result[key]
+    return summary
+
+
+configure_logging(settings.log_level)
 logging.getLogger("uvicorn.access").disabled = True
 
 
@@ -66,6 +152,9 @@ DEFAULT_SITE_TITLE = "Link42"
 DEFAULT_SITE_LOGO_URL = "/logo.png"
 BRANDING_LOGO_MAX_BYTES = 3 * 1024 * 1024
 MONITOR_SUMMARY_WINDOW = timedelta(hours=1)
+AGENT_TASK_RUNNING_TIMEOUT = timedelta(hours=2)
+AGENT_TASK_POLL_BATCH_SIZE = 5
+AGENT_TASK_POLL_SCAN_LIMIT = 50
 
 
 def uploaded_logo_path() -> Path | None:
@@ -173,7 +262,7 @@ def ensure_admin_credentials() -> None:
         db.commit()
     finally:
         db.close()
-    print(f"Link42 initial login: username={DEFAULT_ADMIN_USERNAME} password={password}", flush=True)
+    logger.warning("Link42 初始登录信息 username=%s password=%s", DEFAULT_ADMIN_USERNAME, password)
 
 
 def controller_version_in_database() -> str | None:
@@ -249,6 +338,7 @@ def require_web_session(request: Request, db: Session) -> None:
 async def require_api_authentication(request: Request, call_next):
     """为所有非白名单 API 统一加 Web 鉴权，避免遗漏单个路由。"""
 
+    started_at = time.monotonic()
     if request.method == "OPTIONS":
         return await call_next(request)
     if request.url.path.startswith("/api/") and not is_api_auth_exempt(request.url.path):
@@ -256,34 +346,71 @@ async def require_api_authentication(request: Request, call_next):
         try:
             require_web_session(request, db)
         except HTTPException as exc:
+            logger.warning(
+                "Web API 鉴权失败 method=%s path=%s client=%s status=%s",
+                request.method,
+                request.url.path,
+                request.client.host if request.client else None,
+                exc.status_code,
+            )
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         finally:
             db.close()
-    return await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "HTTP 请求处理异常 method=%s path=%s client=%s duration=%.2fs",
+            request.method,
+            request.url.path,
+            request.client.host if request.client else None,
+            time.monotonic() - started_at,
+        )
+        raise
+    duration = time.monotonic() - started_at
+    if response.status_code >= 500:
+        logger.error("HTTP 请求失败 method=%s path=%s status=%s duration=%.2fs", request.method, request.url.path, response.status_code, duration)
+    elif response.status_code >= 400:
+        logger.warning("HTTP 请求被拒绝 method=%s path=%s status=%s duration=%.2fs", request.method, request.url.path, response.status_code, duration)
+    else:
+        logger.debug("HTTP 请求完成 method=%s path=%s status=%s duration=%.2fs", request.method, request.url.path, response.status_code, duration)
+    return response
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     """应用启动时初始化数据库。"""
+    logger.info(
+        "Link42 主控启动 version=%s database_url=%s config_dir=%s web_dist_dir=%s log_level=%s",
+        CONTROLLER_VERSION,
+        settings.database_url,
+        settings.config_dir,
+        settings.web_dist_dir,
+        settings.log_level,
+    )
     previous_version = controller_version_in_database()
     if previous_version != CONTROLLER_VERSION:
         from .database import backup_sqlite_database_for_upgrade
 
         backup_path = backup_sqlite_database_for_upgrade()
         if backup_path:
-            print(
-                f"Link42 database backup before upgrade: {backup_path} ({previous_version} -> {CONTROLLER_VERSION})",
-                flush=True,
+            logger.info(
+                "升级前数据库备份完成 path=%s previous_version=%s current_version=%s",
+                backup_path,
+                previous_version,
+                CONTROLLER_VERSION,
             )
     init_db()
     ensure_admin_credentials()
     record_controller_version()
+    logger.info("Link42 主控启动完成 version=%s", CONTROLLER_VERSION)
 
 
 def require_agent(db: Session, node_id: int, token: str) -> models.Node:
     """校验 Agent 身份，并返回对应节点。"""
     node = db.get(models.Node, node_id)
     if node is None or not verify_token(token, node.agent_token_hash):
+        logger.warning("Agent 鉴权失败 node_id=%s", node_id)
         raise HTTPException(status_code=401, detail="invalid agent credentials")
     return node
 
@@ -352,6 +479,8 @@ def update_agent_metadata(
         if not previous_version or previous_version != agent_version or node.agent_update_status in {None, "healthy"}:
             node.agent_update_status = "ok"
             node.agent_last_error = None
+    if agent_version and previous_version and previous_version != agent_version:
+        logger.info("Agent 版本变化 node_id=%s previous=%s current=%s", node.id, previous_version, agent_version)
 
 
 def agent_satisfies_task(node: models.Node, task_type: str) -> bool:
@@ -380,7 +509,173 @@ def require_task_supported(node: models.Node, task_type: str) -> None:
     """创建任务前校验 Agent 版本和能力。"""
 
     if not agent_satisfies_task(node, task_type):
+        logger.warning(
+            "Agent 不支持任务 node_id=%s task_type=%s agent_version=%s capabilities=%s",
+            node.id,
+            task_type,
+            node.agent_version,
+            node.agent_capabilities,
+        )
         raise HTTPException(status_code=409, detail=f"agent does not support task: {task_type}")
+
+
+def expire_stale_running_agent_tasks(
+    db: Session,
+    node_id: int | None = None,
+    now: datetime | None = None,
+) -> int:
+    """回收 Agent 拉取后长时间未上报结果的 running 任务。"""
+
+    now = now or datetime.utcnow()
+    cutoff = now - AGENT_TASK_RUNNING_TIMEOUT
+    query = select(models.AgentTask).where(
+        models.AgentTask.status == "running",
+        models.AgentTask.started_at.is_not(None),
+        models.AgentTask.started_at < cutoff,
+    )
+    if node_id is not None:
+        query = query.where(models.AgentTask.node_id == node_id)
+    tasks = list(db.scalars(query.order_by(models.AgentTask.id)))
+    for task in tasks:
+        task.status = "failed"
+        task.finished_at = now
+        task.result = {
+            "error": f"agent task timed out after {int(AGENT_TASK_RUNNING_TIMEOUT.total_seconds())} seconds",
+            "timeout_seconds": int(AGENT_TASK_RUNNING_TIMEOUT.total_seconds()),
+        }
+    if tasks:
+        db.flush()
+        logger.warning(
+            "回收超时 Agent 任务 node_id=%s count=%d task_ids=%s",
+            node_id,
+            len(tasks),
+            [task.id for task in tasks],
+        )
+    return len(tasks)
+
+
+def task_dependency_id(task: models.AgentTask) -> int | None:
+    """读取任务 payload 中的依赖任务 ID。"""
+
+    raw_value = (task.payload or {}).get("depends_on_task_id")
+    if raw_value in (None, ""):
+        return None
+    try:
+        dependency_id = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return dependency_id if dependency_id > 0 else None
+
+
+def is_task_ready_for_poll(db: Session, task: models.AgentTask, now: datetime) -> bool:
+    """判断 pending 任务的依赖是否已满足；依赖失败时同步标记失败。"""
+
+    dependency_id = task_dependency_id(task)
+    if dependency_id is None:
+        return True
+    dependency = db.get(models.AgentTask, dependency_id)
+    if dependency is None:
+        task.status = "failed"
+        task.finished_at = now
+        task.result = {
+            "error": f"dependency task {dependency_id} was not found",
+            "dependency_task_id": dependency_id,
+        }
+        logger.warning("Agent 任务依赖不存在 task_id=%s dependency_task_id=%s", task.id, dependency_id)
+        return False
+    if dependency.status == "succeeded":
+        return True
+    if dependency.status in {"failed", "cancelled"}:
+        task.status = "failed"
+        task.finished_at = now
+        task.result = {
+            "error": f"dependency task {dependency_id} ended with status {dependency.status}",
+            "dependency_task_id": dependency_id,
+            "dependency_status": dependency.status,
+            "dependency_result": dependency.result,
+        }
+        logger.warning(
+            "Agent 任务依赖失败 task_id=%s dependency_task_id=%s dependency_status=%s",
+            task.id,
+            dependency_id,
+            dependency.status,
+        )
+    return False
+
+
+def command_result_failed(result: object) -> bool:
+    """判断 Agent 返回的命令结果是否明确失败。"""
+
+    if not isinstance(result, dict) or "returncode" not in result:
+        return False
+    try:
+        return int(result["returncode"]) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def stop_task_result_failed(result: dict) -> bool:
+    """兼容旧 Agent：stop 任务里 wg-quick/ifdown 失败时不应被视为成功。"""
+
+    return command_result_failed(result.get("down")) or command_result_failed(result.get("stop"))
+
+
+def normalize_agent_task_report(
+    db: Session,
+    task: models.AgentTask,
+    status: str,
+    result: dict,
+) -> tuple[str, dict]:
+    """把旧 Agent 的部分宽松结果规整成真实业务状态。"""
+
+    if status != "succeeded":
+        return status, result
+    interface_id = (task.payload or {}).get("interface_id")
+    interface = db.get(models.WireGuardInterface, interface_id) if interface_id else None
+    if interface is None:
+        return status, result
+    driver = connection_driver_for_interface(interface)
+    if task.type == driver.tasks.stop and stop_task_result_failed(result):
+        return (
+            "failed",
+            {
+                **result,
+                "error": "wireguard stop command failed",
+            },
+        )
+    return status, result
+
+
+def should_clear_previous_interface_name(db: Session, task: models.AgentTask, result: dict) -> bool:
+    """确认旧接口清理链路成功后才清除 previous_interface_name 标记。"""
+
+    previous_interface_name = str((task.payload or {}).get("previous_interface_name") or "").strip()
+    if not previous_interface_name:
+        return True
+    dependency_id = task_dependency_id(task)
+    if dependency_id is not None:
+        dependency = db.get(models.AgentTask, dependency_id)
+        return dependency is not None and dependency.status == "succeeded"
+    rename_cleanup = result.get("rename_cleanup")
+    return isinstance(rename_cleanup, dict) and not rename_cleanup.get("dry_run")
+
+
+def update_change_plan_task_status(db: Session, plan: models.ChangePlan) -> None:
+    """根据计划下所有 Agent 任务聚合 Change Plan 状态。"""
+
+    tasks = list(
+        db.scalars(
+            select(models.AgentTask)
+            .where(models.AgentTask.change_plan_id == plan.id)
+            .order_by(models.AgentTask.id)
+        )
+    )
+    if any(task.status in {"failed", "cancelled"} for task in tasks):
+        plan.status = "failed"
+    elif tasks and all(task.status == "succeeded" for task in tasks):
+        plan.status = "succeeded"
+    elif plan.status != "failed":
+        plan.status = "confirmed"
 
 
 def agent_release_dir() -> Path:
@@ -678,6 +973,8 @@ def normalize_middleware_config(
 
 
 def parse_kernel_major_minor(value: object) -> tuple[int, int]:
+    """从平台上报的内核版本字符串中解析 major/minor。"""
+
     match = re.match(r"(\d+)\.(\d+)", str(value or ""))
     if not match:
         return (0, 0)
@@ -685,6 +982,8 @@ def parse_kernel_major_minor(value: object) -> tuple[int, int]:
 
 
 def node_supports_mimic_platform(node: models.Node) -> tuple[bool, str | None]:
+    """判断节点平台是否满足 mimic 的系统、init 和内核要求。"""
+
     platform = node.agent_platform or {}
     if platform.get("is_openwrt") or node_uses_openwrt_uci(node):
         return False, "mimic is not supported on OpenWrt nodes"
@@ -699,6 +998,8 @@ def node_supports_mimic_platform(node: models.Node) -> tuple[bool, str | None]:
 
 
 def require_mimic_supported(node: models.Node) -> None:
+    """要求节点当前版本和平台都支持部署 mimic。"""
+
     supported, reason = node_supports_mimic_platform(node)
     if not supported:
         raise HTTPException(status_code=409, detail=reason or "node does not support mimic middleware")
@@ -706,6 +1007,8 @@ def require_mimic_supported(node: models.Node) -> None:
 
 
 def require_mimic_install_supported(node: models.Node) -> None:
+    """要求节点支持通过 Agent 自动安装 mimic。"""
+
     supported, reason = node_supports_mimic_platform(node)
     if not supported:
         raise HTTPException(status_code=409, detail=reason or "node does not support installing mimic")
@@ -785,6 +1088,8 @@ def apply_udp2raw_to_peers(
 
 
 def udp2raw_instance_name(local_interface: models.WireGuardInterface, peer_interface: models.WireGuardInterface) -> str:
+    """根据双端接口 ID 生成稳定的 udp2raw 实例名。"""
+
     return f"link42-{min(local_interface.id, peer_interface.id)}-{max(local_interface.id, peer_interface.id)}"
 
 
@@ -888,6 +1193,8 @@ def enqueue_udp2raw_tasks(
 
 
 def middleware_instance_name(local_interface: models.WireGuardInterface, peer_interface: models.WireGuardInterface) -> str:
+    """生成中间层实例名，当前复用 udp2raw 的双端稳定命名规则。"""
+
     return udp2raw_instance_name(local_interface, peer_interface)
 
 
@@ -992,6 +1299,8 @@ def enqueue_middleware_tasks(
     local_endpoint_port: int | None = None,
     peer_endpoint_port: int | None = None,
 ) -> None:
+    """按中间层类型下发受管连接两端所需的安装或配置任务。"""
+
     if not middleware:
         return
     if middleware.get("type") == "udp2raw":
@@ -1039,6 +1348,8 @@ def middleware_task_payloads(
     peer_interface: models.WireGuardInterface,
     action: str,
 ) -> list[tuple[models.WireGuardInterface, str, dict]]:
+    """按旧中间层配置生成 stop/delete 等清理任务 payload。"""
+
     if not middleware:
         return []
     instance = middleware_instance_name(local_interface, peer_interface)
@@ -1246,6 +1557,273 @@ def interface_read(db: Session, interface: models.WireGuardInterface) -> schemas
     return result
 
 
+def connection_endpoint_ref(endpoint: models.ConnectionEndpoint) -> str:
+    """返回通用连接端点引用。"""
+
+    return f"{endpoint.connection.protocol_type}:{endpoint.id}"
+
+
+def connection_ref(protocol_type: str, item_id: int) -> str:
+    """返回通用连接引用。"""
+
+    return f"{protocol_type}:{item_id}"
+
+
+def parse_connection_ref(value: str) -> tuple[str, int]:
+    """解析通用连接引用，格式为 protocol:id。"""
+
+    protocol_type, separator, raw_id = value.partition(":")
+    if separator != ":" or protocol_type not in {CONNECTION_TYPE_WIREGUARD, CONNECTION_TYPE_GRE}:
+        raise HTTPException(status_code=404, detail="connection not found")
+    try:
+        item_id = int(raw_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="connection not found") from exc
+    return protocol_type, item_id
+
+
+def connection_endpoint_monitor(db: Session, endpoint_id: int) -> models.LinkMonitor | None:
+    """读取通用连接端点绑定的第一个链路监测目标。"""
+
+    return db.scalar(
+        select(models.LinkMonitor)
+        .where(models.LinkMonitor.connection_endpoint_id == endpoint_id)
+        .order_by(models.LinkMonitor.id)
+        .limit(1)
+    )
+
+
+def connection_endpoint_read(db: Session, endpoint: models.ConnectionEndpoint) -> schemas.ConnectionEndpointRead:
+    """把数据库连接端点转成通用 API 响应。"""
+
+    monitor = connection_endpoint_monitor(db, endpoint.id)
+    return schemas.ConnectionEndpointRead(
+        id=endpoint.id,
+        endpoint_ref=connection_endpoint_ref(endpoint),
+        node_id=endpoint.node_id,
+        node_name=endpoint.node.name if endpoint.node else None,
+        role=endpoint.role,
+        interface_name=endpoint.interface_name,
+        tunnel_ips=endpoint.tunnel_ips or [],
+        mtu=endpoint.mtu,
+        routes=endpoint.routes or [],
+        runtime_status=endpoint.runtime_status,
+        protocol_config=endpoint.protocol_config or {},
+        monitor_summary=summarize_monitor(db, monitor) if monitor else None,
+    )
+
+
+def gre_connection_status(connection: models.Connection) -> str:
+    """根据两端状态聚合 GRE 连接展示状态。"""
+
+    statuses = [endpoint.runtime_status for endpoint in connection.endpoints]
+    if statuses and all(status == "running" for status in statuses):
+        return "running"
+    if any(status in {"starting", "stopping"} for status in statuses):
+        return "changing"
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    return "stopped"
+
+
+def gre_connection_read(db: Session, connection: models.Connection) -> schemas.ConnectionRead:
+    """把 GRE 连接转成通用 API 响应。"""
+
+    endpoints = sorted(connection.endpoints, key=lambda endpoint: 0 if endpoint.role == "local" else 1)
+    return schemas.ConnectionRead(
+        id=connection.id,
+        connection_ref=connection_ref(CONNECTION_TYPE_GRE, connection.id),
+        protocol_type=CONNECTION_TYPE_GRE,
+        protocol_label="GRE",
+        name=connection.name,
+        source=connection.source,
+        managed=connection.managed,
+        status=gre_connection_status(connection),
+        endpoints=[connection_endpoint_read(db, endpoint) for endpoint in endpoints],
+        warnings=[
+            "GRE 不加密，请勿直接承载敏感流量",
+            "GRE 需要中间网络放行 IP protocol 47，普通 NAT 环境通常不可用",
+        ],
+    )
+
+
+def wireguard_connection_read(db: Session, interface: models.WireGuardInterface) -> schemas.ConnectionRead:
+    """把旧 WireGuard 配置映射成通用连接响应。"""
+
+    peer_interface = None
+    local_peer = next(
+        (peer for peer in interface.peers if peer.peer_interface_id and peer.source == "managed-node"),
+        None,
+    )
+    if local_peer is not None:
+        peer_interface = db.get(models.WireGuardInterface, local_peer.peer_interface_id)
+    local_monitor = interface_monitor(db, interface.id)
+    endpoints = [
+        schemas.ConnectionEndpointRead(
+            id=interface.id,
+            endpoint_ref=connection_ref(CONNECTION_TYPE_WIREGUARD, interface.id),
+            node_id=interface.node_id,
+            node_name=interface.node.name if interface.node else None,
+            role="local",
+            interface_name=interface.name,
+            tunnel_ips=interface.tunnel_ips or [],
+            mtu=interface.mtu,
+            routes=interface.primary_peer_allowed_ips,
+            runtime_status=interface.runtime_status,
+            protocol_config={"listen_port": interface.listen_port},
+            monitor_summary=summarize_monitor(db, local_monitor) if local_monitor else None,
+        )
+    ]
+    if peer_interface is not None:
+        peer_monitor = interface_monitor(db, peer_interface.id)
+        endpoints.append(
+            schemas.ConnectionEndpointRead(
+                id=peer_interface.id,
+                endpoint_ref=connection_ref(CONNECTION_TYPE_WIREGUARD, peer_interface.id),
+                node_id=peer_interface.node_id,
+                node_name=peer_interface.node.name if peer_interface.node else None,
+                role="peer",
+                interface_name=peer_interface.name,
+                tunnel_ips=peer_interface.tunnel_ips or [],
+                mtu=peer_interface.mtu,
+                routes=peer_interface.primary_peer_allowed_ips,
+                runtime_status=peer_interface.runtime_status,
+                protocol_config={"listen_port": peer_interface.listen_port},
+                monitor_summary=summarize_monitor(db, peer_monitor) if peer_monitor else None,
+            )
+        )
+    return schemas.ConnectionRead(
+        id=interface.id,
+        connection_ref=connection_ref(CONNECTION_TYPE_WIREGUARD, interface.id),
+        protocol_type=CONNECTION_TYPE_WIREGUARD,
+        protocol_label="WireGuard",
+        name=interface.name,
+        source=interface.source,
+        managed=interface.managed,
+        status=interface.runtime_status,
+        endpoints=endpoints,
+    )
+
+
+def require_gre_supported(node: models.Node) -> None:
+    """要求节点 Agent 支持 GRE 连接任务。"""
+
+    require_task_supported(node, GRE_TASKS.apply_config)
+
+
+def validate_gre_payload(payload: schemas.GreManagedConnectionCreate | schemas.GreManagedConnectionUpdate) -> None:
+    """执行跨字段 GRE 业务校验。"""
+
+    if not payload.risk_accepted:
+        raise HTTPException(status_code=400, detail="gre risk must be accepted")
+    if payload.local_outer_ip == payload.peer_outer_ip:
+        raise HTTPException(status_code=400, detail="gre outer addresses must be different")
+    if payload.ttl is not None and not payload.pmtudisc:
+        raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
+
+
+def gre_protocol_config(local_outer_ip: str, remote_outer_ip: str, payload: schemas.GreManagedConnectionCreate | schemas.GreManagedConnectionUpdate) -> dict:
+    """生成单端 GRE 协议配置 JSON。"""
+
+    return {
+        "outer_local_ip": local_outer_ip,
+        "outer_remote_ip": remote_outer_ip,
+        "key": payload.gre_key,
+        "ttl": payload.ttl,
+        "pmtudisc": payload.pmtudisc,
+    }
+
+
+def gre_task_payload(endpoint: models.ConnectionEndpoint) -> dict[str, Any]:
+    """把 GRE 端点转换为 Agent 任务 payload。"""
+
+    previous_interface_name = str((endpoint.extras or {}).get("previous_interface_name") or "").strip()
+    payload = {
+        "node_id": endpoint.node_id,
+        "connection_id": endpoint.connection_id,
+        "connection_endpoint_id": endpoint.id,
+        "interface_name": endpoint.interface_name,
+        "tunnel_ips": endpoint.tunnel_ips or [],
+        "routes": endpoint.routes or [],
+        "mtu": endpoint.mtu,
+        **(endpoint.protocol_config or {}),
+    }
+    if previous_interface_name and previous_interface_name != endpoint.interface_name:
+        payload["previous_interface_name"] = previous_interface_name
+    return payload
+
+
+def create_connection_endpoint_task(
+    db: Session,
+    endpoint: models.ConnectionEndpoint,
+    task_type: str,
+    payload_extra: dict | None = None,
+) -> models.AgentTask:
+    """创建通用连接端点 Agent 任务。"""
+
+    node = db.get(models.Node, endpoint.node_id)
+    if node is not None:
+        require_task_supported(node, task_type)
+    payload = gre_task_payload(endpoint)
+    if payload_extra:
+        payload.update(payload_extra)
+    task = models.AgentTask(node_id=endpoint.node_id, type=task_type, payload=payload)
+    db.add(task)
+    db.flush()
+    logger.info("创建连接端点任务 task=%s", summarize_agent_task(task))
+    return task
+
+
+def enqueue_gre_apply_and_start(db: Session, endpoint: models.ConnectionEndpoint) -> None:
+    """为 GRE 端点下发部署并启动任务。"""
+
+    apply_task = create_connection_endpoint_task(db, endpoint, GRE_TASKS.apply_config)
+    create_connection_endpoint_task(
+        db,
+        endpoint,
+        GRE_TASKS.start,
+        {"depends_on_task_id": apply_task.id},
+    )
+    endpoint.runtime_status = "starting"
+
+
+def set_endpoint_extra_value(endpoint: models.ConnectionEndpoint, key: str, value: str | None) -> None:
+    """在连接端点 extras 中写入或清理字符串值。"""
+
+    extras = dict(endpoint.extras or {})
+    cleaned = value.strip() if value else None
+    if cleaned:
+        extras[key] = cleaned
+    else:
+        extras.pop(key, None)
+    endpoint.extras = extras
+
+
+def gre_previous_config_cleanup_confirmed(task: models.AgentTask, result: dict) -> bool:
+    """判断 GRE 启动任务是否已经确认清理过旧接口配置。"""
+
+    previous_interface_name = str((task.payload or {}).get("previous_interface_name") or "").strip()
+    if not previous_interface_name:
+        return True
+    cleanup = result.get("previous_config_cleanup")
+    if not isinstance(cleanup, dict):
+        return False
+    return not cleanup.get("dry_run")
+
+
+def record_endpoint_rename(endpoint: models.ConnectionEndpoint, next_name: str) -> None:
+    """记录 GRE 端点改名前的旧接口名，供 Agent 清理旧设备。"""
+
+    if endpoint.interface_name == next_name:
+        return
+    previous_name = (endpoint.extras or {}).get("previous_interface_name")
+    if previous_name == next_name:
+        set_endpoint_extra_value(endpoint, "previous_interface_name", None)
+        return
+    if not previous_name:
+        set_endpoint_extra_value(endpoint, "previous_interface_name", endpoint.interface_name)
+
+
 def build_topology(db: Session) -> schemas.TopologyRead:
     """汇总节点与受管双向链路，供首页拓扑图渲染。"""
 
@@ -1297,6 +1875,9 @@ def build_topology(db: Session) -> schemas.TopologyRead:
         edges.append(
             schemas.TopologyEdge(
                 id=f"wg-{pair[0]}-{pair[1]}",
+                connection_ref=connection_ref(CONNECTION_TYPE_WIREGUARD, interface.id),
+                protocol_type=CONNECTION_TYPE_WIREGUARD,
+                protocol_label="WireGuard",
                 local_node_id=interface.node_id,
                 peer_node_id=peer_interface.node_id,
                 local_interface_id=interface.id,
@@ -1306,6 +1887,43 @@ def build_topology(db: Session) -> schemas.TopologyRead:
                 local_status=interface.runtime_status,
                 peer_status=peer_interface.runtime_status,
                 middleware_type=middleware.get("type") if middleware else None,
+                local_monitor=summarize_monitor(db, local_monitor) if local_monitor else None,
+                peer_monitor=summarize_monitor(db, peer_monitor) if peer_monitor else None,
+            )
+        )
+
+    gre_connections = list(
+        db.scalars(
+            select(models.Connection)
+            .options(
+                selectinload(models.Connection.endpoints).selectinload(models.ConnectionEndpoint.node),
+            )
+            .where(models.Connection.protocol_type == CONNECTION_TYPE_GRE)
+            .order_by(models.Connection.id)
+        )
+    )
+    for connection in gre_connections:
+        endpoints = sorted(connection.endpoints, key=lambda endpoint: 0 if endpoint.role == "local" else 1)
+        if len(endpoints) != 2:
+            continue
+        local_endpoint, peer_endpoint = endpoints
+        local_monitor = connection_endpoint_monitor(db, local_endpoint.id)
+        peer_monitor = connection_endpoint_monitor(db, peer_endpoint.id)
+        edges.append(
+            schemas.TopologyEdge(
+                id=f"gre-{connection.id}",
+                connection_ref=connection_ref(CONNECTION_TYPE_GRE, connection.id),
+                protocol_type=CONNECTION_TYPE_GRE,
+                protocol_label="GRE",
+                local_node_id=local_endpoint.node_id,
+                peer_node_id=peer_endpoint.node_id,
+                local_interface_id=local_endpoint.id,
+                peer_interface_id=peer_endpoint.id,
+                local_interface_name=local_endpoint.interface_name,
+                peer_interface_name=peer_endpoint.interface_name,
+                local_status=local_endpoint.runtime_status,
+                peer_status=peer_endpoint.runtime_status,
+                middleware_type=None,
                 local_monitor=summarize_monitor(db, local_monitor) if local_monitor else None,
                 peer_monitor=summarize_monitor(db, peer_monitor) if peer_monitor else None,
             )
@@ -1364,8 +1982,9 @@ def ensure_unique_interface_name(
     node_id: int,
     name: str,
     exclude_interface_id: int | None = None,
+    exclude_connection_endpoint_id: int | None = None,
 ) -> None:
-    """确保同一节点下 WireGuard 配置名唯一。"""
+    """确保同一节点下本地接口名唯一，避免不同协议生成同名设备。"""
 
     query = select(models.WireGuardInterface).where(
         models.WireGuardInterface.node_id == node_id,
@@ -1375,6 +1994,15 @@ def ensure_unique_interface_name(
         query = query.where(models.WireGuardInterface.id != exclude_interface_id)
     duplicate = db.scalar(query)
     if duplicate:
+        raise HTTPException(status_code=409, detail="interface name already exists on node")
+    endpoint_query = select(models.ConnectionEndpoint).where(
+        models.ConnectionEndpoint.node_id == node_id,
+        models.ConnectionEndpoint.interface_name == name,
+    )
+    if exclude_connection_endpoint_id is not None:
+        endpoint_query = endpoint_query.where(models.ConnectionEndpoint.id != exclude_connection_endpoint_id)
+    endpoint_duplicate = db.scalar(endpoint_query)
+    if endpoint_duplicate:
         raise HTTPException(status_code=409, detail="interface name already exists on node")
 
 
@@ -1488,7 +2116,7 @@ def get_interface_task(
             models.AgentTask.type == task_type,
             models.AgentTask.status.in_(statuses),
             models.AgentTask.payload["interface_id"].as_integer() == interface_id,
-        )
+        ).order_by(models.AgentTask.id)
     )
 
 
@@ -1508,19 +2136,77 @@ def enqueue_interface_task_once(
 ) -> bool:
     """幂等创建接口任务；已存在待执行任务时不重复入队。"""
 
+    changed, _ = enqueue_interface_task_once_with_task(
+        db,
+        interface,
+        task_type,
+        payload_extra=payload_extra,
+        update_pending_payload=update_pending_payload,
+        queue_after_running=queue_after_running,
+    )
+    return changed
+
+
+def enqueue_interface_task_once_with_task(
+    db: Session,
+    interface: models.WireGuardInterface,
+    task_type: str,
+    payload_extra: dict | None = None,
+    update_pending_payload: bool = False,
+    queue_after_running: bool = False,
+) -> tuple[bool, models.AgentTask | None]:
+    """幂等创建接口任务，并返回参与排队的任务对象。"""
+
+    expire_stale_running_agent_tasks(db, node_id=interface.node_id)
     pending_task = get_interface_task(db, interface.id, task_type, ["pending"])
     if pending_task is not None:
         if update_pending_payload:
             pending_task.payload = create_interface_task(interface, task_type, payload_extra=payload_extra).payload
-            return True
-        return False
-    if not queue_after_running and get_interface_task(db, interface.id, task_type, ["running"]) is not None:
-        return False
+            logger.info("更新待执行接口任务 task=%s", summarize_agent_task(pending_task))
+            return True, pending_task
+        logger.debug("复用待执行接口任务 task=%s", summarize_agent_task(pending_task))
+        return False, pending_task
+    running_task = get_interface_task(db, interface.id, task_type, ["running"])
+    if not queue_after_running and running_task is not None:
+        logger.debug("接口已有运行中任务，跳过重复入队 task=%s", summarize_agent_task(running_task))
+        return False, running_task
     node = db.get(models.Node, interface.node_id)
     if node is not None:
         require_task_supported(node, task_type)
-    db.add(create_interface_task(interface, task_type, payload_extra=payload_extra))
-    return True
+    task = create_interface_task(interface, task_type, payload_extra=payload_extra)
+    db.add(task)
+    db.flush()
+    logger.info("创建接口任务 task=%s", summarize_agent_task(task))
+    return True, task
+
+
+def cancel_pending_interface_tasks(
+    db: Session,
+    interface_id: int,
+    task_type: str,
+    reason: str,
+) -> int:
+    """取消指定接口的未执行任务，避免旧 payload 在清理任务之前执行。"""
+
+    now = datetime.utcnow()
+    tasks = list(
+        db.scalars(
+            select(models.AgentTask)
+            .where(
+                models.AgentTask.type == task_type,
+                models.AgentTask.status == "pending",
+                models.AgentTask.payload["interface_id"].as_integer() == interface_id,
+            )
+            .order_by(models.AgentTask.id)
+        )
+    )
+    for task in tasks:
+        task.status = "cancelled"
+        task.result = {"status": "cancelled", "reason": reason}
+        task.finished_at = now
+    if tasks:
+        logger.info("取消待执行接口任务 interface_id=%s task_type=%s count=%d reason=%s", interface_id, task_type, len(tasks), reason)
+    return len(tasks)
 
 
 def mark_import_candidate_available_for_interface(
@@ -1615,21 +2301,49 @@ def enqueue_apply_config(
     driver = connection_driver_for_interface(interface)
     previous_interface_name = str((interface.extras or {}).get("previous_interface_name") or "").strip()
     if previous_interface_name and previous_interface_name != interface.name:
+        logger.info(
+            "接口改名部署将先清理旧接口 node_id=%s interface_id=%s previous=%s current=%s",
+            interface.node_id,
+            interface.id,
+            previous_interface_name,
+            interface.name,
+        )
+        cancel_pending_interface_tasks(
+            db,
+            interface.id,
+            driver.tasks.apply_config,
+            "interface rename cleanup must run before apply_config",
+        )
         previous_payload = {"interface_name": previous_interface_name}
-        enqueue_interface_task_once(
+        _, stop_task = enqueue_interface_task_once_with_task(
             db,
             interface,
             driver.tasks.stop,
             payload_extra=previous_payload,
             update_pending_payload=True,
         )
-        enqueue_interface_task_once(
+        delete_payload = dict(previous_payload)
+        if stop_task is not None:
+            delete_payload["depends_on_task_id"] = stop_task.id
+        _, delete_task = enqueue_interface_task_once_with_task(
             db,
             interface,
             driver.tasks.delete_config,
-            payload_extra=previous_payload,
+            payload_extra=delete_payload,
             update_pending_payload=True,
         )
+        apply_payload = driver.build_apply_payload(interface, enable_on_boot=enable_on_boot)
+        if delete_task is not None:
+            apply_payload["depends_on_task_id"] = delete_task.id
+        changed, _ = enqueue_interface_task_once_with_task(
+            db,
+            interface,
+            driver.tasks.apply_config,
+            payload_extra=apply_payload,
+            update_pending_payload=True,
+            queue_after_running=True,
+        )
+        return changed
     return enqueue_interface_task_once(
         db,
         interface,
@@ -1961,6 +2675,7 @@ def request_agent_upgrade(
     plan = build_agent_upgrade_plan(node, db, target_version=payload.target_version, force=payload.force)
     if plan.upgrade_mode != "self_upgrade" or not plan.target_version or not plan.matched_platform or not plan.matched_asset:
         raise HTTPException(status_code=409, detail=plan.reason or "agent self upgrade is not available")
+    expire_stale_running_agent_tasks(db, node_id=node_id)
     active = db.scalar(
         select(models.AgentTask).where(
             models.AgentTask.node_id == node_id,
@@ -1969,6 +2684,7 @@ def request_agent_upgrade(
         )
     )
     if active:
+        logger.info("复用已有 Agent 升级任务 node_id=%s task=%s", node_id, summarize_agent_task(active))
         return schemas.TaskRequestResult(task_id=active.id, status=active.status, message="升级任务已存在")
     require_task_supported(node, "agent.self_upgrade")
     controller_url = controller_url_for_agent(db)
@@ -1997,6 +2713,13 @@ def request_agent_upgrade(
     node.agent_last_error = None
     db.commit()
     db.refresh(task)
+    logger.info(
+        "创建 Agent 升级任务 node_id=%s target_version=%s platform=%s task=%s",
+        node_id,
+        plan.target_version,
+        plan.matched_platform,
+        summarize_agent_task(task),
+    )
     return schemas.TaskRequestResult(task_id=task.id, status=task.status, message="升级任务已创建")
 
 
@@ -2024,6 +2747,7 @@ def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> s
     db.add(node)
     db.commit()
     db.refresh(node)
+    logger.info("创建节点 node_id=%s name=%s region=%s", node.id, node.name, node.region)
     return schemas.NodeCreateResult(node=node, agent_token=token)
 
 
@@ -2054,6 +2778,7 @@ def update_node(
     node.github_proxy_url = payload.github_proxy_url
     db.commit()
     db.refresh(node)
+    logger.info("更新节点 node_id=%s name=%s region=%s endpoint_count=%d", node.id, node.name, node.region, len(node.endpoint_ips or []))
     return node
 
 
@@ -2076,6 +2801,278 @@ def get_topology(db: Session = Depends(get_db)) -> schemas.TopologyRead:
     """返回首页拓扑图所需的节点和受管链路。"""
 
     return build_topology(db)
+
+
+@app.get("/api/protocols", response_model=list[schemas.ConnectionProtocolRead])
+def list_protocols() -> list[schemas.ConnectionProtocolRead]:
+    """返回当前主控支持创建或展示的连接协议。"""
+
+    return [
+        schemas.ConnectionProtocolRead(
+            type=CONNECTION_TYPE_WIREGUARD,
+            label="WireGuard",
+            description="加密的 UDP 点对点隧道，适合大多数跨公网或 NAT 场景。",
+            managed=True,
+        ),
+        schemas.ConnectionProtocolRead(
+            type=CONNECTION_TYPE_GRE,
+            label="GRE",
+            description="IPv4 GRE L3 隧道，不加密，需要中间网络放行 IP protocol 47。",
+            managed=True,
+            warnings=[
+                "GRE 不加密，请勿直接承载敏感流量",
+                "GRE 需要协议 47 放行，普通 NAT 环境通常不可用",
+            ],
+        ),
+    ]
+
+
+def get_gre_connection_or_404(db: Session, connection_id: int) -> models.Connection:
+    """读取 GRE 连接及其端点，不存在时返回 404。"""
+
+    connection = db.scalar(
+        select(models.Connection)
+        .options(
+            selectinload(models.Connection.endpoints).selectinload(models.ConnectionEndpoint.node),
+        )
+        .where(models.Connection.id == connection_id, models.Connection.protocol_type == CONNECTION_TYPE_GRE)
+    )
+    if connection is None:
+        raise HTTPException(status_code=404, detail="connection not found")
+    return connection
+
+
+@app.get("/api/nodes/{node_id}/connections", response_model=list[schemas.ConnectionRead])
+def list_node_connections(node_id: int, db: Session = Depends(get_db)) -> list[schemas.ConnectionRead]:
+    """列出节点下的通用连接，包含旧 WireGuard 映射和新 GRE 连接。"""
+
+    if db.get(models.Node, node_id) is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    wireguard_interfaces = list(
+        db.scalars(
+            select(models.WireGuardInterface)
+            .options(
+                selectinload(models.WireGuardInterface.node),
+                selectinload(models.WireGuardInterface.peers),
+            )
+            .where(models.WireGuardInterface.node_id == node_id)
+            .order_by(models.WireGuardInterface.name)
+        )
+    )
+    gre_connections = list(
+        db.scalars(
+            select(models.Connection)
+            .options(
+                selectinload(models.Connection.endpoints).selectinload(models.ConnectionEndpoint.node),
+            )
+            .join(models.ConnectionEndpoint)
+            .where(
+                models.Connection.protocol_type == CONNECTION_TYPE_GRE,
+                models.ConnectionEndpoint.node_id == node_id,
+            )
+            .order_by(models.Connection.id)
+        )
+    )
+    connections = [wireguard_connection_read(db, interface) for interface in wireguard_interfaces]
+    connections.extend(gre_connection_read(db, connection) for connection in gre_connections)
+    return connections
+
+
+@app.post("/api/nodes/{node_id}/connections/managed", response_model=schemas.ConnectionRead)
+def create_managed_connection(
+    node_id: int,
+    payload: schemas.GreManagedConnectionCreate,
+    db: Session = Depends(get_db),
+) -> schemas.ConnectionRead:
+    """创建受管 GRE 连接，并下发双方部署启动任务。"""
+
+    if node_id == payload.peer_node_id:
+        raise HTTPException(status_code=400, detail="peer node must be different")
+    validate_gre_payload(payload)
+    local_node = require_online_node(db, node_id)
+    peer_node = require_online_node(db, payload.peer_node_id)
+    require_gre_supported(local_node)
+    require_gre_supported(peer_node)
+    ensure_unique_interface_name(db, node_id, payload.local_interface_name)
+    ensure_unique_interface_name(db, payload.peer_node_id, payload.peer_interface_name)
+    connection = models.Connection(
+        protocol_type=CONNECTION_TYPE_GRE,
+        name=f"{payload.local_interface_name} <-> {payload.peer_interface_name}",
+        source="managed-node",
+        managed=True,
+        status="starting",
+    )
+    local_endpoint = models.ConnectionEndpoint(
+        connection=connection,
+        node_id=node_id,
+        role="local",
+        interface_name=payload.local_interface_name,
+        tunnel_ips=payload.local_tunnel_ips,
+        mtu=payload.mtu,
+        routes=payload.local_routes,
+        runtime_status="starting",
+        protocol_config=gre_protocol_config(payload.local_outer_ip, payload.peer_outer_ip, payload),
+    )
+    peer_endpoint = models.ConnectionEndpoint(
+        connection=connection,
+        node_id=payload.peer_node_id,
+        role="peer",
+        interface_name=payload.peer_interface_name,
+        tunnel_ips=payload.peer_tunnel_ips,
+        mtu=payload.mtu,
+        routes=payload.peer_routes,
+        runtime_status="starting",
+        protocol_config=gre_protocol_config(payload.peer_outer_ip, payload.local_outer_ip, payload),
+    )
+    db.add_all([connection, local_endpoint, peer_endpoint])
+    db.flush()
+    enqueue_gre_apply_and_start(db, local_endpoint)
+    enqueue_gre_apply_and_start(db, peer_endpoint)
+    db.commit()
+    db.refresh(connection)
+    logger.info(
+        "创建 GRE 连接 connection_id=%s local_endpoint_id=%s peer_endpoint_id=%s",
+        connection.id,
+        local_endpoint.id,
+        peer_endpoint.id,
+    )
+    return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
+
+
+@app.get("/api/connections/{raw_connection_ref}", response_model=schemas.ConnectionRead)
+def get_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
+    """读取通用连接详情。"""
+
+    protocol_type, item_id = parse_connection_ref(raw_connection_ref)
+    if protocol_type == CONNECTION_TYPE_WIREGUARD:
+        interface = get_wireguard_config_or_404(item_id, db)
+        return wireguard_connection_read(db, interface)
+    return gre_connection_read(db, get_gre_connection_or_404(db, item_id))
+
+
+@app.patch("/api/connections/{raw_connection_ref}", response_model=schemas.ConnectionRead)
+def update_connection(
+    raw_connection_ref: str,
+    payload: schemas.GreManagedConnectionUpdate,
+    db: Session = Depends(get_db),
+) -> schemas.ConnectionRead:
+    """编辑 GRE 连接并重新下发双方配置。"""
+
+    protocol_type, item_id = parse_connection_ref(raw_connection_ref)
+    if protocol_type != CONNECTION_TYPE_GRE:
+        raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
+    validate_gre_payload(payload)
+    connection = get_gre_connection_or_404(db, item_id)
+    endpoints = sorted(connection.endpoints, key=lambda endpoint: 0 if endpoint.role == "local" else 1)
+    if len(endpoints) != 2:
+        raise HTTPException(status_code=400, detail="gre connection endpoints are incomplete")
+    local_endpoint, peer_endpoint = endpoints
+    local_node = require_online_node(db, local_endpoint.node_id)
+    peer_node = require_online_node(db, peer_endpoint.node_id)
+    require_gre_supported(local_node)
+    require_gre_supported(peer_node)
+    ensure_unique_interface_name(
+        db,
+        local_endpoint.node_id,
+        payload.local_interface_name,
+        exclude_connection_endpoint_id=local_endpoint.id,
+    )
+    ensure_unique_interface_name(
+        db,
+        peer_endpoint.node_id,
+        payload.peer_interface_name,
+        exclude_connection_endpoint_id=peer_endpoint.id,
+    )
+    record_endpoint_rename(local_endpoint, payload.local_interface_name)
+    record_endpoint_rename(peer_endpoint, payload.peer_interface_name)
+    local_endpoint.interface_name = payload.local_interface_name
+    local_endpoint.tunnel_ips = payload.local_tunnel_ips
+    local_endpoint.mtu = payload.mtu
+    local_endpoint.routes = payload.local_routes
+    local_endpoint.protocol_config = gre_protocol_config(payload.local_outer_ip, payload.peer_outer_ip, payload)
+    peer_endpoint.interface_name = payload.peer_interface_name
+    peer_endpoint.tunnel_ips = payload.peer_tunnel_ips
+    peer_endpoint.mtu = payload.mtu
+    peer_endpoint.routes = payload.peer_routes
+    peer_endpoint.protocol_config = gre_protocol_config(payload.peer_outer_ip, payload.local_outer_ip, payload)
+    connection.name = f"{payload.local_interface_name} <-> {payload.peer_interface_name}"
+    connection.status = "starting"
+    enqueue_gre_apply_and_start(db, local_endpoint)
+    enqueue_gre_apply_and_start(db, peer_endpoint)
+    db.commit()
+    logger.info("更新 GRE 连接 connection_id=%s", connection.id)
+    return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
+
+
+@app.post("/api/connections/{raw_connection_ref}/start", response_model=schemas.ConnectionRead)
+def start_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
+    """启动 GRE 连接双方端点。"""
+
+    protocol_type, item_id = parse_connection_ref(raw_connection_ref)
+    if protocol_type != CONNECTION_TYPE_GRE:
+        raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
+    connection = get_gre_connection_or_404(db, item_id)
+    for endpoint in connection.endpoints:
+        require_online_node(db, endpoint.node_id)
+        create_connection_endpoint_task(db, endpoint, GRE_TASKS.start)
+        endpoint.runtime_status = "starting"
+    connection.status = "starting"
+    db.commit()
+    logger.info("启动 GRE 连接 connection_id=%s", connection.id)
+    return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
+
+
+@app.post("/api/connections/{raw_connection_ref}/stop", response_model=schemas.ConnectionRead)
+def stop_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
+    """停止 GRE 连接双方端点。"""
+
+    protocol_type, item_id = parse_connection_ref(raw_connection_ref)
+    if protocol_type != CONNECTION_TYPE_GRE:
+        raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
+    connection = get_gre_connection_or_404(db, item_id)
+    for endpoint in connection.endpoints:
+        require_online_node(db, endpoint.node_id)
+        create_connection_endpoint_task(db, endpoint, GRE_TASKS.stop)
+        endpoint.runtime_status = "stopping"
+    connection.status = "stopping"
+    db.commit()
+    logger.info("停止 GRE 连接 connection_id=%s", connection.id)
+    return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
+
+
+@app.post("/api/connections/{raw_connection_ref}/refresh-status", response_model=schemas.ConnectionRead)
+def refresh_connection_status(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
+    """刷新 GRE 连接双方端点运行状态。"""
+
+    protocol_type, item_id = parse_connection_ref(raw_connection_ref)
+    if protocol_type != CONNECTION_TYPE_GRE:
+        raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
+    connection = get_gre_connection_or_404(db, item_id)
+    for endpoint in connection.endpoints:
+        require_online_node(db, endpoint.node_id)
+        create_connection_endpoint_task(db, endpoint, GRE_TASKS.status)
+    db.commit()
+    logger.info("刷新 GRE 连接状态 connection_id=%s", connection.id)
+    return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
+
+
+@app.delete("/api/connections/{raw_connection_ref}")
+def delete_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> dict[str, str]:
+    """删除 GRE 连接记录，并下发双方清理任务。"""
+
+    protocol_type, item_id = parse_connection_ref(raw_connection_ref)
+    if protocol_type != CONNECTION_TYPE_GRE:
+        raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
+    connection = get_gre_connection_or_404(db, item_id)
+    connection_id = connection.id
+    for endpoint in list(connection.endpoints):
+        require_online_node(db, endpoint.node_id)
+        stop_task = create_connection_endpoint_task(db, endpoint, GRE_TASKS.stop)
+        create_connection_endpoint_task(db, endpoint, GRE_TASKS.delete_config, {"depends_on_task_id": stop_task.id})
+    db.delete(connection)
+    db.commit()
+    logger.info("删除 GRE 连接 connection_id=%s", connection_id)
+    return {"status": "deleted"}
 
 
 @app.get("/api/nodes/{node_id}", response_model=schemas.NodeRead)
@@ -2116,6 +3113,8 @@ def list_node_plugins_for_node(node_id: int, db: Session = Depends(get_db)) -> l
 
 
 def port_inventory_setting_for_node(node_id: int, db: Session) -> models.PortInventorySetting:
+    """读取节点端口台账设置，不存在时创建空设置记录。"""
+
     setting = db.scalar(select(models.PortInventorySetting).where(models.PortInventorySetting.node_id == node_id))
     if setting is None:
         setting = models.PortInventorySetting(node_id=node_id)
@@ -2125,6 +3124,8 @@ def port_inventory_setting_for_node(node_id: int, db: Session) -> models.PortInv
 
 
 def validate_port_inventory_range(range_start: int | None, range_end: int | None) -> None:
+    """校验端口台账范围起止顺序。"""
+
     if range_start is None or range_end is None:
         return
     if range_start > range_end:
@@ -2132,6 +3133,8 @@ def validate_port_inventory_range(range_start: int | None, range_end: int | None
 
 
 def validate_port_inventory_entry(node_id: int, protocol: str, port: int, db: Session, exclude_id: int | None = None) -> None:
+    """校验端口台账条目是否在范围内且不与现有条目重复。"""
+
     setting = db.scalar(select(models.PortInventorySetting).where(models.PortInventorySetting.node_id == node_id))
     if setting and setting.range_start is not None and setting.range_end is not None:
         if not setting.range_start <= port <= setting.range_end:
@@ -2282,6 +3285,13 @@ def request_node_plugin_action(
     db.add(task)
     db.commit()
     db.refresh(task)
+    logger.info(
+        "创建节点插件任务 node_id=%s plugin=%s action=%s task=%s",
+        node_id,
+        plugin_type,
+        action,
+        summarize_agent_task(task),
+    )
     return schemas.NodePluginActionResult(
         task_id=task.id,
         plugin_type=plugin_type,
@@ -2298,6 +3308,10 @@ def get_agent_task_status(task_id: int, db: Session = Depends(get_db)) -> models
     task = db.get(models.AgentTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    if task.status == "running":
+        expire_stale_running_agent_tasks(db, node_id=task.node_id)
+        db.commit()
+        db.refresh(task)
     return task
 
 
@@ -2347,12 +3361,14 @@ def delete_node(node_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
     )
     if interface_count is not None:
         raise HTTPException(status_code=409, detail="node has wireguard configs")
+    node_name = node.name
     for candidate in db.scalars(select(models.ImportCandidate).where(models.ImportCandidate.node_id == node_id)):
         db.delete(candidate)
     for task in db.scalars(select(models.AgentTask).where(models.AgentTask.node_id == node_id)):
         db.delete(task)
     db.delete(node)
     db.commit()
+    logger.info("删除节点 node_id=%s name=%s", node_id, node_name)
     return {"status": "deleted"}
 
 
@@ -2367,6 +3383,7 @@ def rotate_agent_token(node_id: int, db: Session = Depends(get_db)) -> schemas.N
     node.agent_token_value = token
     db.commit()
     db.refresh(node)
+    logger.warning("轮换节点 Agent token node_id=%s name=%s", node.id, node.name)
     return schemas.NodeCreateResult(node=node, agent_token=token)
 
 
@@ -2383,6 +3400,7 @@ def install_node_middleware(
         raise HTTPException(status_code=404, detail="middleware plugin not found")
     if "middleware.mimic" in set(node.agent_capabilities or []):
         node.middleware_install_status = "mimic_ready"
+        logger.info("mimic 已安装，跳过安装任务 node_id=%s", node.id)
         return schemas.TaskRequestResult(task_id=None, status="succeeded", message="mimic already installed")
     require_mimic_install_supported(node)
     task = models.AgentTask(
@@ -2401,6 +3419,7 @@ def install_node_middleware(
     node.middleware_install_status = "mimic_installing"
     db.commit()
     db.refresh(task)
+    logger.info("创建中间层安装任务 node_id=%s plugin=%s task=%s", node.id, plugin, summarize_agent_task(task))
     return schemas.TaskRequestResult(task_id=task.id, status=task.status, message="mimic install task queued")
 
 
@@ -2434,6 +3453,7 @@ def create_interface(
     db.add(interface)
     db.commit()
     db.refresh(interface)
+    logger.info("创建 WireGuard 配置 node_id=%s interface_id=%s name=%s", node_id, interface.id, interface.name)
     return interface
 
 
@@ -2576,6 +3596,14 @@ def create_managed_link(
     db.commit()
     db.refresh(local_interface)
     db.refresh(peer_interface)
+    logger.info(
+        "创建受管连接 local_node_id=%s local_interface_id=%s peer_node_id=%s peer_interface_id=%s middleware=%s",
+        local_interface.node_id,
+        local_interface.id,
+        peer_interface.node_id,
+        peer_interface.id,
+        (middleware or {}).get("type"),
+    )
     return schemas.ManagedLinkCreateResult(local_interface=local_interface, peer_interface=peer_interface)
 
 
@@ -2640,6 +3668,56 @@ def upsert_interface_link_monitor(
         monitor = models.LinkMonitor(
             node_id=interface.node_id,
             interface_id=interface.id,
+            name=name,
+            target_host=payload.target_host,
+            interval_seconds=payload.interval_seconds,
+            retention_days=payload.retention_days,
+            enabled=payload.enabled,
+            next_due_at=now if payload.enabled else None,
+        )
+        db.add(monitor)
+    else:
+        monitor.name = name
+        monitor.target_host = payload.target_host
+        monitor.interval_seconds = payload.interval_seconds
+        monitor.retention_days = payload.retention_days
+        monitor.enabled = payload.enabled
+        monitor.next_due_at = now if payload.enabled else None
+    db.commit()
+    db.refresh(monitor)
+    return monitor_read(db, monitor)
+
+
+@app.get("/api/connection-endpoints/{endpoint_id}/link-monitor", response_model=schemas.LinkMonitorRead | None)
+def get_connection_endpoint_link_monitor(endpoint_id: int, db: Session = Depends(get_db)) -> schemas.LinkMonitorRead | None:
+    """读取通用连接端点绑定的链路监测目标。"""
+
+    endpoint = db.get(models.ConnectionEndpoint, endpoint_id)
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="connection endpoint not found")
+    monitor = connection_endpoint_monitor(db, endpoint_id)
+    return monitor_read(db, monitor) if monitor else None
+
+
+@app.post("/api/connection-endpoints/{endpoint_id}/link-monitor", response_model=schemas.LinkMonitorRead)
+def upsert_connection_endpoint_link_monitor(
+    endpoint_id: int,
+    payload: schemas.LinkMonitorCreate,
+    db: Session = Depends(get_db),
+) -> schemas.LinkMonitorRead:
+    """创建或覆盖通用连接端点的链路监测目标。"""
+
+    endpoint = db.get(models.ConnectionEndpoint, endpoint_id)
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="connection endpoint not found")
+    require_online_node(db, endpoint.node_id)
+    monitor = connection_endpoint_monitor(db, endpoint_id)
+    now = datetime.utcnow()
+    name = (payload.name or f"{endpoint.interface_name} latency").strip()
+    if monitor is None:
+        monitor = models.LinkMonitor(
+            node_id=endpoint.node_id,
+            connection_endpoint_id=endpoint.id,
             name=name,
             target_host=payload.target_host,
             interval_seconds=payload.interval_seconds,
@@ -2820,6 +3898,12 @@ def update_managed_link(
     db.refresh(peer_interface)
     db.refresh(local_peer)
     db.refresh(peer_peer)
+    logger.info(
+        "更新受管连接 local_interface_id=%s peer_interface_id=%s middleware=%s",
+        local_interface.id,
+        peer_interface.id,
+        (middleware or {}).get("type"),
+    )
     return {
         "local_interface": local_interface,
         "peer_interface": peer_interface,
@@ -3029,6 +4113,14 @@ def plan_apply(interface_id: int, db: Session = Depends(get_db)) -> models.Chang
     db.add(plan)
     db.commit()
     db.refresh(plan)
+    logger.info(
+        "生成部署计划 plan_id=%s node_id=%s interface_id=%s interface_name=%s diff_lines=%d",
+        plan.id,
+        interface.node_id,
+        interface.id,
+        interface.name,
+        len(diff.splitlines()),
+    )
     return plan
 
 
@@ -3123,6 +4215,64 @@ def delete_interface(
     return {"status": "deleted"}
 
 
+def create_change_plan_agent_tasks(
+    db: Session,
+    plan: models.ChangePlan,
+    task_type: str,
+    task_payload: dict,
+) -> list[models.AgentTask]:
+    """按计划 payload 创建 Agent 任务；接口改名时附加受依赖保护的清理任务。"""
+
+    interface_id = task_payload.get("interface_id")
+    interface = db.get(models.WireGuardInterface, interface_id) if interface_id else None
+    previous_interface_name = str(task_payload.get("previous_interface_name") or "").strip()
+    if interface is not None and previous_interface_name and previous_interface_name != task_payload.get("interface_name"):
+        driver = connection_driver_for_interface(interface)
+        if task_type == driver.tasks.apply_config:
+            node = db.get(models.Node, task_payload["node_id"])
+            if node is not None:
+                require_task_supported(node, driver.tasks.stop)
+                require_task_supported(node, driver.tasks.delete_config)
+            previous_payload = {
+                "node_id": task_payload["node_id"],
+                "interface_id": interface.id,
+                "interface_name": previous_interface_name,
+            }
+            stop_task = models.AgentTask(
+                node_id=task_payload["node_id"],
+                change_plan_id=plan.id,
+                type=driver.tasks.stop,
+                payload=previous_payload,
+            )
+            db.add(stop_task)
+            db.flush()
+            delete_task = models.AgentTask(
+                node_id=task_payload["node_id"],
+                change_plan_id=plan.id,
+                type=driver.tasks.delete_config,
+                payload={**previous_payload, "depends_on_task_id": stop_task.id},
+            )
+            db.add(delete_task)
+            db.flush()
+            apply_task = models.AgentTask(
+                node_id=task_payload["node_id"],
+                change_plan_id=plan.id,
+                type=task_type,
+                payload={**task_payload, "depends_on_task_id": delete_task.id},
+            )
+            db.add(apply_task)
+            return [stop_task, delete_task, apply_task]
+
+    task = models.AgentTask(
+        node_id=task_payload["node_id"],
+        change_plan_id=plan.id,
+        type=task_type,
+        payload=task_payload,
+    )
+    db.add(task)
+    return [task]
+
+
 @app.post("/api/change-plans/{plan_id}/confirm", response_model=schemas.ChangePlanRead)
 def confirm_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.ChangePlan:
     """确认部署计划，并创建等待 Agent 拉取的任务。"""
@@ -3150,13 +4300,15 @@ def confirm_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.C
         interface = db.get(models.WireGuardInterface, managed_interface_id)
         if interface is not None:
             interface.managed = True
-    task = models.AgentTask(
-        node_id=task_payload["node_id"],
-        change_plan_id=plan.id,
-        type=task_type,
-        payload=task_payload,
+    created_tasks = create_change_plan_agent_tasks(db, plan, task_type, task_payload)
+    db.flush()
+    logger.info(
+        "确认部署计划 plan_id=%s node_id=%s task_type=%s tasks=%s",
+        plan.id,
+        task_payload["node_id"],
+        task_type,
+        [summarize_agent_task(task) for task in created_tasks],
     )
-    db.add(task)
     db.commit()
     db.refresh(plan)
     return plan
@@ -3180,6 +4332,7 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
     if node_uses_openwrt_uci(node):
         raise HTTPException(status_code=409, detail="OpenWrt UCI nodes do not support wg-quick import scan")
     require_task_supported(node, WIREGUARD_TASKS.import_scan)
+    expire_stale_running_agent_tasks(db, node_id=node_id)
 
     existing = db.scalar(
         select(models.AgentTask).where(
@@ -3189,6 +4342,7 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
         )
     )
     if existing is not None:
+        logger.info("复用已有导入扫描任务 node_id=%s task=%s", node_id, summarize_agent_task(existing))
         return schemas.TaskRequestResult(
             task_id=existing.id,
             status=existing.status,
@@ -3203,6 +4357,7 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
     db.add(task)
     db.commit()
     db.refresh(task)
+    logger.info("创建导入扫描任务 node_id=%s task=%s", node_id, summarize_agent_task(task))
     return schemas.TaskRequestResult(
         task_id=task.id,
         status=task.status,
@@ -3392,6 +4547,9 @@ def take_over_imported_interface(interface_id: int, db: Session = Depends(get_db
 def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(get_db)) -> dict[str, str]:
     """Agent 首次注册或重新注册节点信息。"""
     node = require_agent(db, payload.node_id, payload.token)
+    previous_status = node.status
+    previous_version = node.agent_version
+    previous_capabilities = sorted(node.agent_capabilities or [])
     node.hostname = payload.hostname or node.hostname
     node.management_ip = payload.management_ip or node.management_ip
     node.public_ip = payload.public_ip or node.public_ip
@@ -3399,6 +4557,19 @@ def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(
     node.status = "online"
     node.last_seen_at = datetime.utcnow()
     db.commit()
+    current_capabilities = sorted(node.agent_capabilities or [])
+    if previous_status != "online" or previous_version != node.agent_version or previous_capabilities != current_capabilities:
+        logger.info(
+            "Agent 注册 node_id=%s hostname=%s version=%s protocol=%s service=%s capabilities=%s",
+            node.id,
+            node.hostname,
+            node.agent_version,
+            node.agent_protocol_version,
+            (node.agent_platform or {}).get("service_manager"),
+            current_capabilities,
+        )
+    else:
+        logger.debug("Agent 注册刷新 node_id=%s hostname=%s version=%s", node.id, node.hostname, node.agent_version)
     return {"status": "registered"}
 
 
@@ -3406,10 +4577,15 @@ def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(
 def agent_heartbeat(payload: schemas.AgentHeartbeatRequest, db: Session = Depends(get_db)) -> dict[str, str]:
     """Agent 心跳，用于更新节点在线状态。"""
     node = require_agent(db, payload.node_id, payload.token)
+    was_online = is_node_online(node)
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     node.status = "online"
     node.last_seen_at = datetime.utcnow()
     db.commit()
+    if not was_online:
+        logger.info("Agent 心跳恢复在线 node_id=%s hostname=%s version=%s", node.id, node.hostname, node.agent_version)
+    else:
+        logger.debug("Agent 心跳 node_id=%s version=%s", node.id, node.agent_version)
     return {"status": "ok"}
 
 
@@ -3418,19 +4594,41 @@ def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db))
     """Agent 轮询待执行任务，并把任务标记为 running。"""
     node = require_agent(db, payload.node_id, payload.token)
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
-    tasks = list(
+    now = datetime.utcnow()
+    expired_count = expire_stale_running_agent_tasks(db, node_id=payload.node_id, now=now)
+    candidate_tasks = list(
         db.scalars(
             select(models.AgentTask)
             .where(models.AgentTask.node_id == payload.node_id, models.AgentTask.status == "pending")
             .order_by(models.AgentTask.id)
-            .limit(5)
+            .limit(AGENT_TASK_POLL_SCAN_LIMIT)
         )
     )
-    tasks = [task for task in tasks if agent_satisfies_task(node, task.type)]
+    tasks = []
+    for task in candidate_tasks:
+        if not agent_satisfies_task(node, task.type):
+            continue
+        if not is_task_ready_for_poll(db, task, now):
+            continue
+        tasks.append(task)
+        if len(tasks) >= AGENT_TASK_POLL_BATCH_SIZE:
+            break
     for task in tasks:
         task.status = "running"
-        task.started_at = datetime.utcnow()
+        task.started_at = now
     db.commit()
+    if tasks:
+        logger.info(
+            "Agent 拉取任务 node_id=%s count=%d expired_running=%d tasks=%s",
+            payload.node_id,
+            len(tasks),
+            expired_count,
+            [summarize_agent_task(task) for task in tasks],
+        )
+    elif expired_count:
+        logger.info("Agent 本轮未拉取新任务 node_id=%s expired_running=%d", payload.node_id, expired_count)
+    else:
+        logger.debug("Agent 本轮无任务 node_id=%s", payload.node_id)
     return schemas.AgentPollResponse(tasks=[schemas.AgentTaskRead(id=t.id, type=t.type, payload=t.payload) for t in tasks])
 
 
@@ -3446,22 +4644,29 @@ def agent_task_result(
     if task is None or task.node_id != payload.node_id:
         raise HTTPException(status_code=404, detail="task not found")
 
-    task.status = payload.status
-    task.result = payload.result
+    reported_status, reported_result = normalize_agent_task_report(db, task, payload.status, payload.result)
+    task.status = reported_status
+    task.result = reported_result
     task.finished_at = datetime.utcnow()
     node = db.get(models.Node, payload.node_id)
+    log_message = "Agent 上报任务结果 task=%s result=%s"
+    log_args = (summarize_agent_task(task), summarize_task_result(reported_result))
+    if reported_status == "succeeded":
+        logger.info(log_message, *log_args)
+    else:
+        logger.warning(log_message, *log_args)
 
     if task.type == "agent.self_upgrade" and node is not None:
-        reported_status = str(payload.result.get("status") or payload.status)
-        node.agent_update_status = reported_status
-        if payload.status == "failed" or reported_status in {"failed", "rolled_back"}:
-            node.agent_last_error = str(payload.result.get("error") or payload.result)
+        upgrade_status = str(reported_result.get("status") or reported_status)
+        node.agent_update_status = upgrade_status
+        if reported_status == "failed" or upgrade_status in {"failed", "rolled_back"}:
+            node.agent_last_error = str(reported_result.get("error") or reported_result)
         else:
             node.agent_last_error = None
 
     if task.type == "middleware.install" and node is not None and (task.payload or {}).get("plugin") == "mimic":
-        if payload.status == "succeeded":
-            if payload.result.get("reboot_required"):
+        if reported_status == "succeeded":
+            if reported_result.get("reboot_required"):
                 node.middleware_install_status = "mimic_reboot_required"
                 platform = dict(node.agent_platform or {})
                 platform["mimic_reboot_required"] = True
@@ -3471,17 +4676,26 @@ def agent_task_result(
                 platform = dict(node.agent_platform or {})
                 platform.pop("mimic_reboot_required", None)
                 node.agent_platform = platform
-        elif payload.status == "failed":
+        elif reported_status == "failed":
             node.middleware_install_status = "mimic_failed"
 
     if task.change_plan_id:
         plan = db.get(models.ChangePlan, task.change_plan_id)
         if plan is not None:
-            plan.status = "succeeded" if payload.status == "succeeded" else "failed"
+            previous_plan_status = plan.status
+            update_change_plan_task_status(db, plan)
+            if previous_plan_status != plan.status:
+                logger.info(
+                    "部署计划状态变化 plan_id=%s previous=%s current=%s task_id=%s",
+                    plan.id,
+                    previous_plan_status,
+                    plan.status,
+                    task.id,
+                )
 
     # import_scan 的结果由 Agent 返回候选配置，API 在这里转存为 ImportCandidate。
-    if task.type == WIREGUARD_TASKS.import_scan and payload.status == "succeeded":
-        candidates = payload.result.get("candidates", [])
+    if task.type == WIREGUARD_TASKS.import_scan and reported_status == "succeeded":
+        candidates = reported_result.get("candidates", [])
         scanned_paths = {candidate["path"] for candidate in candidates if candidate.get("path")}
         imported_interface_names = existing_interface_names(db, payload.node_id)
         stale_candidates = db.scalars(
@@ -3528,7 +4742,7 @@ def agent_task_result(
             )
 
     interface_id = task.payload.get("interface_id")
-    if interface_id and payload.status == "succeeded":
+    if interface_id and reported_status == "succeeded":
         interface = db.get(models.WireGuardInterface, interface_id)
         if interface is not None:
             driver = connection_driver_for_interface(interface)
@@ -3536,20 +4750,39 @@ def agent_task_result(
                 # 部署成功后记录节点上的已部署配置，后续 Change Plan diff 才能对比真实基线。
                 interface.deployed_config = task.payload.get("config")
                 interface.runtime_status = "running"
-                set_extra_value(interface, "previous_interface_name", None)
+                if should_clear_previous_interface_name(db, task, reported_result):
+                    set_extra_value(interface, "previous_interface_name", None)
             elif task.type == driver.tasks.read_config:
                 if not (
-                    payload.result.get("config_backend") == "openwrt-uci"
-                    and payload.result.get("exists") is False
-                    and not payload.result.get("config")
+                    reported_result.get("config_backend") == "openwrt-uci"
+                    and reported_result.get("exists") is False
+                    and not reported_result.get("config")
                 ):
-                    interface.deployed_config = payload.result.get("config") or ""
+                    interface.deployed_config = reported_result.get("config") or ""
             elif task.type == driver.tasks.start:
                 interface.runtime_status = "running"
             elif task.type == driver.tasks.stop:
                 interface.runtime_status = "stopped"
             elif task.type == driver.tasks.status:
-                interface.runtime_status = payload.result.get("runtime_status") or interface.runtime_status
+                interface.runtime_status = reported_result.get("runtime_status") or interface.runtime_status
+
+    connection_endpoint_id = task.payload.get("connection_endpoint_id")
+    if connection_endpoint_id and reported_status == "succeeded":
+        endpoint = db.get(models.ConnectionEndpoint, connection_endpoint_id)
+        if endpoint is not None and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
+            if task.type == GRE_TASKS.apply_config:
+                endpoint.deployed_config = json.dumps(gre_task_payload(endpoint), ensure_ascii=False, sort_keys=True)
+            elif task.type == GRE_TASKS.start:
+                endpoint.runtime_status = "running"
+                if gre_previous_config_cleanup_confirmed(task, reported_result):
+                    set_endpoint_extra_value(endpoint, "previous_interface_name", None)
+            elif task.type == GRE_TASKS.stop:
+                endpoint.runtime_status = "stopped"
+            elif task.type == GRE_TASKS.status:
+                endpoint.runtime_status = reported_result.get("runtime_status") or endpoint.runtime_status
+            elif task.type == GRE_TASKS.read_config:
+                endpoint.deployed_config = json.dumps(reported_result.get("config") or {}, ensure_ascii=False, sort_keys=True)
+            endpoint.connection.status = gre_connection_status(endpoint.connection)
 
     db.commit()
     return {"status": "recorded"}
@@ -3582,6 +4815,15 @@ def agent_link_monitor_poll(
     node.status = "online"
     node.last_seen_at = now
     db.commit()
+    if monitors:
+        logger.info(
+            "Agent 拉取链路监测目标 node_id=%s count=%d monitor_ids=%s",
+            payload.node_id,
+            len(monitors),
+            [monitor.id for monitor in monitors],
+        )
+    else:
+        logger.debug("Agent 本轮无链路监测目标 node_id=%s", payload.node_id)
     return schemas.AgentLinkMonitorPollResponse(
         monitors=[
             schemas.AgentLinkMonitorRead(
@@ -3603,9 +4845,12 @@ def agent_link_monitor_result(
 
     require_agent(db, payload.node_id, payload.token)
     now = datetime.utcnow()
+    recorded_count = 0
+    failed_count = 0
     for item in payload.results:
         monitor = db.get(models.LinkMonitor, item.monitor_id)
         if monitor is None or monitor.node_id != payload.node_id:
+            logger.warning("忽略未知链路监测结果 node_id=%s monitor_id=%s", payload.node_id, item.monitor_id)
             continue
         checked_at = item.checked_at or now
         db.add(
@@ -3618,6 +4863,9 @@ def agent_link_monitor_result(
             )
         )
         monitor.last_checked_at = checked_at
+        recorded_count += 1
+        if not item.success:
+            failed_count += 1
         cutoff = now - timedelta(days=monitor.retention_days)
         db.execute(
             delete(models.LinkMonitorSample).where(
@@ -3626,6 +4874,15 @@ def agent_link_monitor_result(
             )
         )
     db.commit()
+    if failed_count:
+        logger.warning(
+            "链路监测结果已记录 node_id=%s count=%d failed=%d",
+            payload.node_id,
+            recorded_count,
+            failed_count,
+        )
+    else:
+        logger.info("链路监测结果已记录 node_id=%s count=%d failed=0", payload.node_id, recorded_count)
     return {"status": "recorded"}
 
 

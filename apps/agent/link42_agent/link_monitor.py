@@ -12,7 +12,7 @@ PING_TIME_RE = re.compile(r"time[=<]([0-9.]+)\s*ms")
 
 
 def probe_latency(target_host: str, timeout_seconds: float) -> dict[str, Any]:
-    """Ping a target once and return a Link42 monitor result payload."""
+    """对目标地址执行一次 ping，并返回链路监测结果。"""
 
     ping_bin = ping_command_for_target(target_host)
     if ping_bin is None:
@@ -30,7 +30,7 @@ def probe_latency(target_host: str, timeout_seconds: float) -> dict[str, Any]:
 
 
 def ping_command_for_target(target_host: str) -> str | None:
-    """Pick an IPv4/IPv6 ping binary that works on common Linux and OpenWrt systems."""
+    """按目标地址类型选择常见 Linux/OpenWrt 可用的 ping 命令。"""
 
     if ":" in target_host:
         return shutil.which("ping6") or shutil.which("ping")
@@ -38,6 +38,8 @@ def ping_command_for_target(target_host: str) -> str | None:
 
 
 def result(success: bool, latency_ms: float | None, error: str | None) -> dict[str, Any]:
+    """组装 Agent 上报链路监测结果时使用的统一结构。"""
+
     return {
         "checked_at": datetime.utcnow().isoformat(),
         "success": success,

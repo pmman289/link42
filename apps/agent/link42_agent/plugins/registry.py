@@ -16,7 +16,7 @@ AGENT_NODE_PLUGINS: dict[str, AgentNodePlugin] = {
 
 
 def node_plugin_capabilities(config: AgentConfig | None = None, platform: dict[str, Any] | None = None) -> list[str]:
-    """Return capabilities advertised by detected node plugins."""
+    """返回当前节点检测到的插件能力标识。"""
 
     if config is None:
         config = AgentConfig(server_url="", node_id=0, token="")
@@ -30,7 +30,7 @@ def node_plugin_capabilities(config: AgentConfig | None = None, platform: dict[s
 
 
 def execute_node_plugin_task(task_type: str, payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
-    """Execute a node_plugin.<plugin>.<action> task."""
+    """执行 node_plugin.<plugin>.<action> 形式的插件任务。"""
 
     parts = task_type.split(".")
     if len(parts) != 3 or parts[0] != "node_plugin":

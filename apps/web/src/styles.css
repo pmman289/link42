@@ -1461,6 +1461,127 @@ textarea {
   background: var(--surface-subtle);
 }
 
+.protocolRow {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+}
+
+.protocolBadge {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.protocolSelectModal {
+  width: min(720px, 100%);
+}
+
+.protocolChoice {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.protocolChoiceModal {
+  margin-top: 16px;
+}
+
+.protocolCard {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: flex-start;
+  gap: 12px;
+  min-height: 148px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-solid);
+  color: var(--text);
+  padding: 16px;
+  text-align: left;
+}
+
+.protocolCard:not(:disabled):hover {
+  border-color: var(--accent);
+  background: var(--surface-subtle);
+  transform: translateY(-1px);
+}
+
+.protocolCard:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.protocolCardIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.protocolCardBody {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.protocolCardTitle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.protocolCardTitle strong {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.protocolCardTitle em {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  padding: 3px 8px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.protocolCard small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.protocolCardMeta {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.protocolChoiceHint {
+  margin-top: 12px;
+  border: 1px solid var(--warning);
+  border-radius: 6px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .row {
   width: 100%;
   justify-content: space-between;
@@ -1865,6 +1986,10 @@ textarea {
   }
 
   .connectionActions {
+    grid-template-columns: 1fr;
+  }
+
+  .protocolChoice {
     grid-template-columns: 1fr;
   }
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any, Optional
 from urllib import error, request
 
@@ -9,10 +11,21 @@ from link42_common.version import AGENT_PROTOCOL_VERSION, AGENT_VERSION
 from .config import AgentConfig
 
 
+logger = logging.getLogger("link42.agent.client")
+QUIET_SUCCESS_PATHS = {
+    "/api/agent/register",
+    "/api/agent/heartbeat",
+    "/api/agent/tasks/poll",
+    "/api/agent/link-monitors/poll",
+}
+
+
 class AgentHttpError(RuntimeError):
     """Agent API 请求失败。"""
 
     def __init__(self, status_code: int, path: str, body: str) -> None:
+        """保存 HTTP 状态、路径和响应体，便于上层记录失败原因。"""
+
         self.status_code = status_code
         self.path = path
         self.body = body
@@ -83,7 +96,10 @@ class AgentClient:
         self._post_json("/api/agent/link-monitors/result", {**self.auth_payload(), "results": results})
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """向中心 API 发送 JSON 请求并解析 JSON 响应。"""
+
         data = json.dumps(payload).encode("utf-8")
+        started_at = time.monotonic()
         http_request = request.Request(
             f"{self.config.server_url}{path}",
             data=data,
@@ -93,9 +109,31 @@ class AgentClient:
         try:
             with request.urlopen(http_request, timeout=30) as response:
                 body = response.read().decode("utf-8")
+                if path not in QUIET_SUCCESS_PATHS:
+                    logger.debug(
+                        "Agent API 请求完成 path=%s status=%s duration=%.2fs",
+                        path,
+                        response.getcode(),
+                        time.monotonic() - started_at,
+                    )
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
+            logger.warning(
+                "Agent API 返回错误 path=%s status=%s duration=%.2fs body=%s",
+                path,
+                exc.code,
+                time.monotonic() - started_at,
+                body[:500],
+            )
             raise AgentHttpError(exc.code, path, body) from exc
+        except error.URLError as exc:
+            logger.warning(
+                "Agent API 请求失败 path=%s duration=%.2fs error=%s",
+                path,
+                time.monotonic() - started_at,
+                exc,
+            )
+            raise
         if not body:
             return {}
         return json.loads(body)

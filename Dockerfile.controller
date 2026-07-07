@@ -26,7 +26,14 @@ COPY apps/agent ./apps/agent
 COPY packages ./packages
 COPY udp2raw_sh/udp2raw_bin ./plugins/udp2raw/assets
 COPY dist/controller-agent-releases ./releases/agent
-RUN pip install --no-cache-dir .
+RUN for attempt in 1 2 3; do \
+      pip install --no-cache-dir --timeout 120 --retries 10 . && break; \
+      if [ "$attempt" = 3 ]; then \
+        echo "failed to install Python dependencies after 3 attempts" >&2; \
+        exit 1; \
+      fi; \
+      sleep $((attempt * 10)); \
+    done
 
 COPY --from=web-build /src/apps/web/dist ./web
 

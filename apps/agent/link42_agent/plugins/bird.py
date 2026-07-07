@@ -19,7 +19,7 @@ BIRD_MAX_FILE_BYTES = 512 * 1024
 
 
 class BirdAgentPlugin(AgentNodePlugin):
-    """Edit and validate BIRD configuration files on a node."""
+    """在节点本机编辑、校验并应用 BIRD 配置文件的插件。"""
 
     type = "bird"
     capabilities = [
@@ -35,9 +35,13 @@ class BirdAgentPlugin(AgentNodePlugin):
     actions = {"list", "read", "validate", "apply", "apply_many", "status"}
 
     def detect(self, context: AgentPluginContext) -> dict[str, Any]:
+        """检测 BIRD 和 birdc 命令是否存在。"""
+
         return bird_detect()
 
     def execute(self, action: str, payload: dict[str, Any], context: AgentPluginContext) -> dict[str, Any]:
+        """根据 action 执行 BIRD 配置列表、读取、校验或应用。"""
+
         if action == "list":
             return list_bird_resources()
         if action == "read":
@@ -68,10 +72,14 @@ class BirdAgentPlugin(AgentNodePlugin):
 
 
 def bird_roots() -> list[Path]:
+    """返回 Link42 允许浏览和编辑的 BIRD 配置根路径。"""
+
     return [BIRD_LEGACY_MAIN, BIRD_ROOT]
 
 
 def default_main_config() -> Path | None:
+    """按常见发行版路径选择默认 BIRD 主配置文件。"""
+
     if BIRD_DEFAULT_MAIN.exists():
         return BIRD_DEFAULT_MAIN
     if BIRD_LEGACY_MAIN.exists():
@@ -80,6 +88,8 @@ def default_main_config() -> Path | None:
 
 
 def bird_detect() -> dict[str, Any]:
+    """返回节点上的 BIRD 插件可用性和配置根信息。"""
+
     bird_binary = shutil.which("bird")
     return {
         "plugin_type": "bird",
@@ -92,6 +102,8 @@ def bird_detect() -> dict[str, Any]:
 
 
 def resolve_bird_resource(resource_key: str) -> Path:
+    """校验并解析前端传入的 BIRD 配置资源路径。"""
+
     if not resource_key:
         raise ValueError("resource_key is required")
     path = Path(resource_key)
@@ -109,7 +121,7 @@ def resolve_bird_resource(resource_key: str) -> Path:
 
 
 def is_bird_config_file(path: Path) -> bool:
-    """Return whether a path is an editable BIRD config file."""
+    """判断路径是否属于可编辑的 BIRD 配置文件。"""
 
     try:
         resolved = path.resolve()
@@ -121,6 +133,8 @@ def is_bird_config_file(path: Path) -> bool:
 
 
 def file_sha256(path: Path) -> str:
+    """计算配置文件当前 sha256，用于并发修改检测。"""
+
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
@@ -129,12 +143,16 @@ def file_sha256(path: Path) -> str:
 
 
 def read_text_limited(path: Path) -> str:
+    """读取文本配置并限制最大文件大小。"""
+
     if path.stat().st_size > BIRD_MAX_FILE_BYTES:
         raise ValueError("BIRD config file is too large")
     return path.read_text(encoding="utf-8", errors="replace")
 
 
 def bird_resource(path: Path) -> dict[str, Any]:
+    """把单个 BIRD 配置文件转换为前端文件树需要的资源描述。"""
+
     stat = path.stat()
     return {
         "resource_key": str(path),
@@ -149,6 +167,8 @@ def bird_resource(path: Path) -> dict[str, Any]:
 
 
 def list_bird_resources() -> dict[str, Any]:
+    """递归列出允许编辑的 BIRD 配置文件。"""
+
     files: list[dict[str, Any]] = []
     seen: set[Path] = set()
     for root in bird_roots():
@@ -176,6 +196,8 @@ def list_bird_resources() -> dict[str, Any]:
 
 
 def read_bird_resource(resource_key: str) -> dict[str, Any]:
+    """读取单个 BIRD 配置文件内容和元数据。"""
+
     path = resolve_bird_resource(resource_key)
     if not path.is_file():
         raise ValueError("BIRD resource is not a file")
@@ -186,6 +208,8 @@ def read_bird_resource(resource_key: str) -> dict[str, Any]:
 
 
 def run_bird_config_check(main_config: Path | None = None) -> dict[str, Any]:
+    """调用 bird -p 校验当前主配置和 include 文件。"""
+
     main = main_config or default_main_config()
     if main is None:
         raise ValueError("BIRD main config was not found")
@@ -193,6 +217,8 @@ def run_bird_config_check(main_config: Path | None = None) -> dict[str, Any]:
 
 
 def run_bird_configure() -> dict[str, Any]:
+    """调用 birdc configure 让运行中的 BIRD 重新加载配置。"""
+
     if not shutil.which("birdc"):
         return {
             "command": ["birdc", "configure"],
@@ -204,6 +230,8 @@ def run_bird_configure() -> dict[str, Any]:
 
 
 def validate_bird_resource(resource_key: str, content: str, dry_run: bool = False) -> dict[str, Any]:
+    """临时写入指定文件内容并校验完整 BIRD 配置，随后恢复原文件元数据。"""
+
     path = resolve_bird_resource(resource_key)
     if dry_run:
         return {"valid": True, "dry_run": True, "resource_key": str(path)}
@@ -227,6 +255,8 @@ def validate_bird_resource(resource_key: str, content: str, dry_run: bool = Fals
 
 
 def bird_backup_path(path: Path) -> Path:
+    """生成当前配置文件的带时间戳备份路径。"""
+
     BIRD_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     safe_name = str(path).strip("/").replace("/", "__")
@@ -241,6 +271,8 @@ def apply_bird_resource(
     reload: bool,
     dry_run: bool,
 ) -> dict[str, Any]:
+    """应用单个 BIRD 配置文件，校验或 reload 失败时恢复备份。"""
+
     path = resolve_bird_resource(resource_key)
     if not path.exists() or not path.is_file():
         raise ValueError("BIRD resource does not exist")
@@ -295,6 +327,8 @@ def apply_bird_resource(
 
 
 def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> dict[str, Any]:
+    """一次性应用多个 BIRD 配置文件，并在整体校验失败时全部回滚。"""
+
     if not files:
         raise ValueError("BIRD resources are required")
     changes: list[dict[str, Any]] = []
@@ -384,6 +418,8 @@ def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> di
 
 
 def bird_status() -> dict[str, Any]:
+    """返回 BIRD 插件检测结果和 birdc show status 输出。"""
+
     status_result = run_command(["birdc", "show", "status"], allow_failure=True) if shutil.which("birdc") else None
     return {
         "plugin_type": "bird",
