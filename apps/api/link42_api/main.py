@@ -1718,8 +1718,22 @@ def validate_gre_payload(payload: schemas.GreManagedConnectionCreate | schemas.G
         raise HTTPException(status_code=400, detail="gre risk must be accepted")
     if payload.local_outer_ip == payload.peer_outer_ip:
         raise HTTPException(status_code=400, detail="gre outer addresses must be different")
+    outer = gre_outer_mapping(payload)
+    if outer["local_bind_ip"] == outer["local_remote_ip"] or outer["peer_bind_ip"] == outer["peer_remote_ip"]:
+        raise HTTPException(status_code=400, detail="gre endpoint local and remote addresses must be different")
     if payload.ttl is not None and not payload.pmtudisc:
         raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
+
+
+def gre_outer_mapping(payload: schemas.GreManagedConnectionCreate | schemas.GreManagedConnectionUpdate) -> dict[str, str]:
+    """把标准两地址和可选 NAT/EIP 覆盖字段合并成两端实际 GRE local/remote。"""
+
+    return {
+        "local_bind_ip": payload.local_bind_ip or payload.local_outer_ip,
+        "local_remote_ip": payload.local_remote_ip or payload.peer_outer_ip,
+        "peer_bind_ip": payload.peer_bind_ip or payload.peer_outer_ip,
+        "peer_remote_ip": payload.peer_remote_ip or payload.local_outer_ip,
+    }
 
 
 def gre_protocol_config(local_outer_ip: str, remote_outer_ip: str, payload: schemas.GreManagedConnectionCreate | schemas.GreManagedConnectionUpdate) -> dict:
@@ -1957,6 +1971,12 @@ def monitor_read(db: Session, monitor: models.LinkMonitor, window: timedelta = M
     result = schemas.LinkMonitorRead.model_validate(monitor)
     result.summary = summarize_monitor(db, monitor, window)
     return result
+
+
+def monitor_read_basic(monitor: models.LinkMonitor) -> schemas.LinkMonitorRead:
+    """把监测目标转成基础响应，保存操作不在同步路径里计算历史摘要。"""
+
+    return schemas.LinkMonitorRead.model_validate(monitor)
 
 
 def suggested_monitor_target(interface: models.WireGuardInterface) -> str:
@@ -2895,6 +2915,7 @@ def create_managed_connection(
     require_gre_supported(peer_node)
     ensure_unique_interface_name(db, node_id, payload.local_interface_name)
     ensure_unique_interface_name(db, payload.peer_node_id, payload.peer_interface_name)
+    outer = gre_outer_mapping(payload)
     connection = models.Connection(
         protocol_type=CONNECTION_TYPE_GRE,
         name=f"{payload.local_interface_name} <-> {payload.peer_interface_name}",
@@ -2911,7 +2932,7 @@ def create_managed_connection(
         mtu=payload.mtu,
         routes=payload.local_routes,
         runtime_status="starting",
-        protocol_config=gre_protocol_config(payload.local_outer_ip, payload.peer_outer_ip, payload),
+        protocol_config=gre_protocol_config(outer["local_bind_ip"], outer["local_remote_ip"], payload),
     )
     peer_endpoint = models.ConnectionEndpoint(
         connection=connection,
@@ -2922,7 +2943,7 @@ def create_managed_connection(
         mtu=payload.mtu,
         routes=payload.peer_routes,
         runtime_status="starting",
-        protocol_config=gre_protocol_config(payload.peer_outer_ip, payload.local_outer_ip, payload),
+        protocol_config=gre_protocol_config(outer["peer_bind_ip"], outer["peer_remote_ip"], payload),
     )
     db.add_all([connection, local_endpoint, peer_endpoint])
     db.flush()
@@ -2985,16 +3006,17 @@ def update_connection(
     )
     record_endpoint_rename(local_endpoint, payload.local_interface_name)
     record_endpoint_rename(peer_endpoint, payload.peer_interface_name)
+    outer = gre_outer_mapping(payload)
     local_endpoint.interface_name = payload.local_interface_name
     local_endpoint.tunnel_ips = payload.local_tunnel_ips
     local_endpoint.mtu = payload.mtu
     local_endpoint.routes = payload.local_routes
-    local_endpoint.protocol_config = gre_protocol_config(payload.local_outer_ip, payload.peer_outer_ip, payload)
+    local_endpoint.protocol_config = gre_protocol_config(outer["local_bind_ip"], outer["local_remote_ip"], payload)
     peer_endpoint.interface_name = payload.peer_interface_name
     peer_endpoint.tunnel_ips = payload.peer_tunnel_ips
     peer_endpoint.mtu = payload.mtu
     peer_endpoint.routes = payload.peer_routes
-    peer_endpoint.protocol_config = gre_protocol_config(payload.peer_outer_ip, payload.local_outer_ip, payload)
+    peer_endpoint.protocol_config = gre_protocol_config(outer["peer_bind_ip"], outer["peer_remote_ip"], payload)
     connection.name = f"{payload.local_interface_name} <-> {payload.peer_interface_name}"
     connection.status = "starting"
     enqueue_gre_apply_and_start(db, local_endpoint)
@@ -3685,7 +3707,7 @@ def upsert_interface_link_monitor(
         monitor.next_due_at = now if payload.enabled else None
     db.commit()
     db.refresh(monitor)
-    return monitor_read(db, monitor)
+    return monitor_read_basic(monitor)
 
 
 @app.get("/api/connection-endpoints/{endpoint_id}/link-monitor", response_model=schemas.LinkMonitorRead | None)
@@ -3735,7 +3757,7 @@ def upsert_connection_endpoint_link_monitor(
         monitor.next_due_at = now if payload.enabled else None
     db.commit()
     db.refresh(monitor)
-    return monitor_read(db, monitor)
+    return monitor_read_basic(monitor)
 
 
 @app.patch("/api/link-monitors/{monitor_id}", response_model=schemas.LinkMonitorRead)
@@ -3758,7 +3780,7 @@ def update_link_monitor(
     monitor.next_due_at = datetime.utcnow() if payload.enabled else None
     db.commit()
     db.refresh(monitor)
-    return monitor_read(db, monitor)
+    return monitor_read_basic(monitor)
 
 
 @app.delete("/api/link-monitors/{monitor_id}")
@@ -3794,8 +3816,10 @@ def get_link_monitor_samples(
         )
     )
     summary = summarize_monitor(db, monitor, parsed_window)
+    monitor_data = schemas.LinkMonitorRead.model_validate(monitor)
+    monitor_data.summary = summary
     return schemas.LinkMonitorSamplesResponse(
-        monitor=monitor_read(db, monitor, parsed_window),
+        monitor=monitor_data,
         summary=summary,
         samples=[schemas.LinkMonitorSampleRead.model_validate(sample) for sample in samples],
     )

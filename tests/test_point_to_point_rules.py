@@ -1911,10 +1911,10 @@ def test_create_gre_managed_connection_creates_endpoints_and_tasks() -> None:
                 peer_interface_name="gre-b-a",
                 local_outer_ip="203.0.113.10",
                 peer_outer_ip="198.51.100.20",
-                local_tunnel_ips=["10.42.8.1/30"],
-                peer_tunnel_ips=["10.42.8.2/30"],
-                local_routes=["10.77.0.0/24"],
-                peer_routes=["10.88.0.0/24"],
+                local_tunnel_ips=["10.42.8.1/30", "fd42::1/64"],
+                peer_tunnel_ips=["10.42.8.2/30", "fd42::2/64"],
+                local_routes=["10.77.0.0/24", "fd77::/64"],
+                peer_routes=["10.88.0.0/24", "fd88::/64"],
                 mtu=1476,
                 gre_key="42",
                 ttl=255,
@@ -1940,12 +1940,117 @@ def test_create_gre_managed_connection_creates_endpoints_and_tasks() -> None:
     assert tasks[0].payload["interface_name"] == "gre-a-b"
     assert tasks[0].payload["outer_local_ip"] == "203.0.113.10"
     assert tasks[0].payload["outer_remote_ip"] == "198.51.100.20"
-    assert tasks[0].payload["routes"] == ["10.77.0.0/24"]
+    assert tasks[0].payload["tunnel_ips"] == ["10.42.8.1/30", "fd42::1/64"]
+    assert tasks[0].payload["routes"] == ["10.77.0.0/24", "fd77::/64"]
     assert tasks[1].payload["depends_on_task_id"] == tasks[0].id
     assert tasks[2].payload["interface_name"] == "gre-b-a"
+    assert tasks[2].payload["outer_local_ip"] == "198.51.100.20"
+    assert tasks[2].payload["outer_remote_ip"] == "203.0.113.10"
+    assert tasks[2].payload["tunnel_ips"] == ["10.42.8.2/30", "fd42::2/64"]
+    assert tasks[2].payload["routes"] == ["10.88.0.0/24", "fd88::/64"]
     assert tasks[3].payload["depends_on_task_id"] == tasks[2].id
     assert any(edge.protocol_type == "gre" and edge.protocol_label == "GRE" for edge in topology.edges)
     assert any(connection.protocol_type == "gre" for connection in node_connections)
+
+
+def test_create_gre_managed_connection_supports_nat_outer_mapping() -> None:
+    """验证云 EIP/NAT 场景可单独指定两端 GRE local/remote 外层地址。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="tencguangzhou",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["1.14.226.49", "10.1.0.6"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        node_b = models.Node(
+            name="rcvps",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["38.76.191.46"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        create_managed_connection(
+            node_a.id,
+            GreManagedConnectionCreate(
+                peer_node_id=node_b.id,
+                local_interface_name="gre-t3-rcvps",
+                peer_interface_name="gre-t3-tencgz",
+                local_outer_ip="1.14.226.49",
+                peer_outer_ip="38.76.191.46",
+                local_bind_ip="10.1.0.6",
+                local_tunnel_ips=["10.42.8.1/30"],
+                peer_tunnel_ips=["10.42.8.2/30"],
+                risk_accepted=True,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+
+    assert tasks[0].payload["interface_name"] == "gre-t3-rcvps"
+    assert tasks[0].payload["outer_local_ip"] == "10.1.0.6"
+    assert tasks[0].payload["outer_remote_ip"] == "38.76.191.46"
+    assert tasks[2].payload["interface_name"] == "gre-t3-tencgz"
+    assert tasks[2].payload["outer_local_ip"] == "38.76.191.46"
+    assert tasks[2].payload["outer_remote_ip"] == "1.14.226.49"
+
+
+def test_create_gre_managed_connection_rejects_same_endpoint_outer_mapping() -> None:
+    """验证高级外层映射不能让单端 GRE local 和 remote 相同。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["203.0.113.10"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_managed_connection(
+                node_a.id,
+                GreManagedConnectionCreate(
+                    peer_node_id=node_b.id,
+                    local_interface_name="gre-a-b",
+                    peer_interface_name="gre-b-a",
+                    local_outer_ip="203.0.113.10",
+                    peer_outer_ip="198.51.100.20",
+                    local_bind_ip="198.51.100.20",
+                    local_tunnel_ips=["10.42.8.1/30"],
+                    peer_tunnel_ips=["10.42.8.2/30"],
+                    risk_accepted=True,
+                ),
+                session,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "gre endpoint local and remote addresses must be different"
 
 
 def test_create_gre_managed_connection_rejects_missing_capability() -> None:

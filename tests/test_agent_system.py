@@ -588,8 +588,8 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
             "previous_interface_name": "gre-old",
             "outer_local_ip": "203.0.113.10",
             "outer_remote_ip": "198.51.100.20",
-            "tunnel_ips": ["10.42.8.1/30"],
-            "routes": ["10.77.0.0/24"],
+            "tunnel_ips": ["10.42.8.1/30", "fd42::1/64"],
+            "routes": ["10.77.0.0/24", "fd77::/64"],
             "mtu": 1476,
             "key": "42",
             "ttl": 255,
@@ -622,8 +622,10 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
             "pmtudisc",
         ],
         ["/sbin/ip", "addr", "add", "10.42.8.1/30", "dev", "gre-new"],
+        ["/sbin/ip", "addr", "add", "fd42::1/64", "dev", "gre-new"],
         ["/sbin/ip", "link", "set", "dev", "gre-new", "mtu", "1476", "up"],
         ["/sbin/ip", "route", "replace", "10.77.0.0/24", "dev", "gre-new"],
+        ["/sbin/ip", "-6", "route", "replace", "fd77::/64", "dev", "gre-new"],
         ["/sbin/ip", "link", "del", "gre-old"],
     ]
 

@@ -45,22 +45,15 @@ def _validate_ipv4_address(value: str) -> str:
     return cleaned
 
 
-def _validate_ipv4_cidrs(values: list[str]) -> list[str]:
-    """校验字段必须是 IPv4 CIDR 列表。"""
+def _validate_optional_ipv4_address(value: str | None) -> str | None:
+    """校验可选字段必须是 IPv4 字面量地址，空字符串归一为空。"""
 
-    normalized = []
-    for value in values:
-        cidr = value.strip()
-        if "/" not in cidr:
-            raise ValueError("CIDR value must contain prefix length")
-        try:
-            network = ipaddress.ip_network(cidr, strict=False)
-        except ValueError as exc:
-            raise ValueError(f"invalid IPv4 CIDR value: {cidr}") from exc
-        if network.version != 4:
-            raise ValueError("CIDR value must be IPv4")
-        normalized.append(cidr)
-    return normalized
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return _validate_ipv4_address(cleaned)
 
 
 def _validate_linux_interface_name(value: str) -> str:
@@ -705,6 +698,10 @@ class GreManagedConnectionCreate(BaseModel):
     peer_interface_name: str = Field(min_length=1, max_length=15)
     local_outer_ip: str
     peer_outer_ip: str
+    local_bind_ip: str | None = None
+    local_remote_ip: str | None = None
+    peer_bind_ip: str | None = None
+    peer_remote_ip: str | None = None
     local_tunnel_ips: list[str] = Field(min_length=1)
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_routes: list[str] = Field(default_factory=list)
@@ -738,12 +735,19 @@ class GreManagedConnectionCreate(BaseModel):
 
         return _validate_ipv4_address(value)
 
+    @field_validator("local_bind_ip", "local_remote_ip", "peer_bind_ip", "peer_remote_ip")
+    @classmethod
+    def validate_optional_outer_ip(cls, value: str | None) -> str | None:
+        """校验 GRE 高级外层映射地址为可选 IPv4 字面量。"""
+
+        return _validate_optional_ipv4_address(value)
+
     @field_validator("local_tunnel_ips", "peer_tunnel_ips", "local_routes", "peer_routes")
     @classmethod
-    def validate_ipv4_cidr_fields(cls, values: list[str]) -> list[str]:
-        """校验 GRE 隧道地址和路由都是 IPv4 CIDR。"""
+    def validate_cidr_fields(cls, values: list[str]) -> list[str]:
+        """校验 GRE 隧道地址和路由为合法 IPv4/IPv6 CIDR。"""
 
-        return _validate_ipv4_cidrs(values)
+        return _validate_cidrs(values)
 
     @field_validator("mtu")
     @classmethod
@@ -778,6 +782,10 @@ class GreManagedConnectionUpdate(BaseModel):
     peer_interface_name: str = Field(min_length=1, max_length=15)
     local_outer_ip: str
     peer_outer_ip: str
+    local_bind_ip: str | None = None
+    local_remote_ip: str | None = None
+    peer_bind_ip: str | None = None
+    peer_remote_ip: str | None = None
     local_tunnel_ips: list[str] = Field(min_length=1)
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_routes: list[str] = Field(default_factory=list)
@@ -802,12 +810,19 @@ class GreManagedConnectionUpdate(BaseModel):
 
         return _validate_ipv4_address(value)
 
+    @field_validator("local_bind_ip", "local_remote_ip", "peer_bind_ip", "peer_remote_ip")
+    @classmethod
+    def validate_optional_outer_ip(cls, value: str | None) -> str | None:
+        """校验 GRE 高级外层映射地址为可选 IPv4 字面量。"""
+
+        return _validate_optional_ipv4_address(value)
+
     @field_validator("local_tunnel_ips", "peer_tunnel_ips", "local_routes", "peer_routes")
     @classmethod
-    def validate_ipv4_cidr_fields(cls, values: list[str]) -> list[str]:
-        """校验 GRE 隧道地址和路由都是 IPv4 CIDR。"""
+    def validate_cidr_fields(cls, values: list[str]) -> list[str]:
+        """校验 GRE 隧道地址和路由为合法 IPv4/IPv6 CIDR。"""
 
-        return _validate_ipv4_cidrs(values)
+        return _validate_cidrs(values)
 
     @field_validator("mtu")
     @classmethod

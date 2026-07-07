@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import ipaddress
 import json
 from pathlib import Path
 import shutil
@@ -16,7 +17,7 @@ DEFAULT_GRE_SYSTEMD_UNIT_PATH = "/etc/systemd/system/link42-gre@.service"
 
 @lru_cache(maxsize=1)
 def gre_runtime_supported() -> bool:
-    """判断当前节点是否具备第一版 GRE 运行条件。"""
+    """判断当前节点是否具备 GRE 运行条件。"""
 
     ip_binary = shutil.which("ip")
     if not ip_binary:
@@ -189,6 +190,15 @@ def gre_tunnel_add_command(config: dict[str, Any]) -> list[str]:
     return command
 
 
+def gre_route_replace_command(route: str, interface_name: str) -> list[str]:
+    """根据路由网段版本生成 IPv4 或 IPv6 route replace 命令。"""
+
+    network = ipaddress.ip_network(route, strict=False)
+    if network.version == 6:
+        return [ip_command(), "-6", "route", "replace", route, "dev", interface_name]
+    return [ip_command(), "route", "replace", route, "dev", interface_name]
+
+
 def gre_start_commands(config: dict[str, Any]) -> list[list[str]]:
     """生成启动 GRE 接口所需的命令序列。"""
 
@@ -199,7 +209,7 @@ def gre_start_commands(config: dict[str, Any]) -> list[list[str]]:
         commands.append([ip_command(), "addr", "add", tunnel_ip, "dev", interface_name])
     commands.append([ip_command(), "link", "set", "dev", interface_name, "mtu", str(config["mtu"]), "up"])
     for route in config["routes"]:
-        commands.append([ip_command(), "route", "replace", route, "dev", interface_name])
+        commands.append(gre_route_replace_command(route, interface_name))
     previous_interface_name = config.get("previous_interface_name")
     if previous_interface_name and previous_interface_name != interface_name:
         commands.append([ip_command(), "link", "del", previous_interface_name])

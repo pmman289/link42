@@ -132,6 +132,11 @@ type LinkMonitorSamplesResponse = {
   samples: LinkMonitorSample[];
 };
 
+type MonitorDialogTarget = {
+  key: string;
+  apiPath: string;
+};
+
 type TopologyNode = {
   id: number;
   name: string;
@@ -554,8 +559,12 @@ function validationFieldLabel(loc: ApiValidationIssue["loc"]): string {
     peer_node_id: "对端节点",
     local_interface_name: "本端接口名称",
     peer_interface_name: "对端接口名称",
-    local_outer_ip: "本端外层源 IP",
-    peer_outer_ip: "对端外层源 IP",
+    local_outer_ip: "本端对外地址",
+    peer_outer_ip: "对端对外地址",
+    local_bind_ip: "本端实际绑定 IP",
+    local_remote_ip: "本端连接对端 IP",
+    peer_bind_ip: "对端实际绑定 IP",
+    peer_remote_ip: "对端连接本端 IP",
     local_tunnel_ips: "本端隧道地址",
     peer_tunnel_ips: "对端隧道地址",
     local_routes: "本端经隧道路由",
@@ -617,6 +626,7 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "gre connection endpoints are incomplete": "GRE 连接端点不完整，请重新创建",
   "gre risk must be accepted": "创建或修改 GRE 前需要确认风险提示",
   "gre outer addresses must be different": "GRE 双方外层地址不能相同",
+  "gre endpoint local and remote addresses must be different": "同一端的 GRE 绑定 IP 和连接对端 IP 不能相同",
   "gre ttl requires pmtu discovery": "填写 GRE TTL 时必须启用 PMTU discovery",
   "protocol_type must be gre": "连接协议不匹配，请重新选择连接类型",
   "address must be IPv4": "地址必须是 IPv4",
@@ -1045,6 +1055,11 @@ function greProtocolString(endpoint: ConnectionEndpointItem | null, key: string)
   return typeof value === "string" ? value : "";
 }
 
+// 只在已有配置与标准两地址推导值不一致时显示 GRE 高级外层覆盖值。
+function greOuterOverrideValue(value: string, standardValue: string): string {
+  return value && value !== standardValue ? value : "";
+}
+
 // 读取 GRE 端点协议配置中的布尔字段。
 function greProtocolBoolean(endpoint: ConnectionEndpointItem | null, key: string, fallback: boolean): boolean {
   const value = endpoint?.protocol_config?.[key];
@@ -1282,17 +1297,6 @@ function isValidIpv4Address(value: string): boolean {
   const cleaned = value.trim();
   const ipv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
   return ipv4.test(cleaned);
-}
-
-// 校验 GRE 要求的 IPv4 CIDR 列表。
-function isValidIpv4Cidrs(values: string[]): boolean {
-  return values.every((value) => {
-    const [address, prefixText, ...rest] = value.trim().split("/");
-    if (!address || !prefixText || rest.length) return false;
-    if (!/^\d+$/.test(prefixText)) return false;
-    const prefix = Number(prefixText);
-    return isValidIpv4Address(address) && prefix >= 0 && prefix <= 32;
-  });
 }
 
 // 校验 GRE Key 的可选 32 位无符号整数范围。
@@ -2081,6 +2085,7 @@ function App() {
   const [monitorDialogEndpointRef, setMonitorDialogEndpointRef] = useState<string | null>(null);
   const [monitorWindow, setMonitorWindow] = useState("1h");
   const [monitorDetail, setMonitorDetail] = useState<LinkMonitorSamplesResponse | null>(null);
+  const [monitorDetailTarget, setMonitorDetailTarget] = useState("");
   const [nodePlugins, setNodePlugins] = useState<NodePluginStatus[]>([]);
   const [nodePluginDialogOpen, setNodePluginDialogOpen] = useState(false);
   const [activeNodePluginType, setActiveNodePluginType] = useState("");
@@ -2105,6 +2110,7 @@ function App() {
   const topologyEdgeSelectionRef = useRef<number | null>(null);
   const topologyLocalPositionsRef = useRef<Record<number, { x: number; y: number }>>({});
   const birdSelectedResourceRef = useRef("");
+  const monitorDialogTargetKeyRef = useRef("none");
   // 统一更新当前选中节点，并同步 ref 防止异步刷新串台。
   function selectNodeId(nodeId: number | null) {
     selectedNodeIdRef.current = nodeId;
@@ -2200,6 +2206,9 @@ function App() {
   const monitorDialogActionTarget = monitorDialogConfig
     ? `wireguard:${monitorDialogConfig.id}`
     : monitorDialogEndpoint ? `endpoint:${monitorDialogEndpoint.endpoint_ref}` : "none";
+  const activeMonitorDetail = monitorDialogActionTarget !== "none" && monitorDetailTarget === monitorDialogActionTarget
+    ? monitorDetail
+    : null;
   const selectedNodeOnline = selectedNode ? isNodeSelectable(selectedNode) : false;
   const availableNodePlugins = nodePlugins.filter((plugin) => plugin.available);
   const activeNodePlugin = nodePlugins.find((plugin) => plugin.type === activeNodePluginType) || nodePlugins[0] || null;
@@ -2260,13 +2269,33 @@ function App() {
   const selectedGrePeerNode = selectedGrePeerEndpoint
     ? nodes.find((node) => node.id === selectedGrePeerEndpoint.node_id) || null
     : null;
+  const editGreLocalOuterIpDefault = greProtocolString(selectedGrePeerEndpoint, "outer_remote_ip")
+    || greProtocolString(selectedGreLocalEndpoint, "outer_local_ip");
+  const editGrePeerOuterIpDefault = greProtocolString(selectedGreLocalEndpoint, "outer_remote_ip")
+    || greProtocolString(selectedGrePeerEndpoint, "outer_local_ip");
+  const editGreLocalBindIpDefault = greOuterOverrideValue(
+    greProtocolString(selectedGreLocalEndpoint, "outer_local_ip"),
+    editGreLocalOuterIpDefault,
+  );
+  const editGreLocalRemoteIpDefault = greOuterOverrideValue(
+    greProtocolString(selectedGreLocalEndpoint, "outer_remote_ip"),
+    editGrePeerOuterIpDefault,
+  );
+  const editGrePeerBindIpDefault = greOuterOverrideValue(
+    greProtocolString(selectedGrePeerEndpoint, "outer_local_ip"),
+    editGrePeerOuterIpDefault,
+  );
+  const editGrePeerRemoteIpDefault = greOuterOverrideValue(
+    greProtocolString(selectedGrePeerEndpoint, "outer_remote_ip"),
+    editGreLocalOuterIpDefault,
+  );
   const editGreLocalOuterIpOptions = greOuterIpOptionsFromNode(
     selectedGreLocalNode,
-    greProtocolString(selectedGreLocalEndpoint, "outer_local_ip"),
+    editGreLocalOuterIpDefault,
   );
   const editGrePeerOuterIpOptions = greOuterIpOptionsFromNode(
     selectedGrePeerNode,
-    greProtocolString(selectedGrePeerEndpoint, "outer_local_ip"),
+    editGrePeerOuterIpDefault,
   );
   const selectedConfigIsManagedLink = selectedConfig?.source === "managed-node";
   const selectedConfigIsUnmanagedImport = selectedConfig?.source === "imported" && !selectedConfig.managed;
@@ -2288,6 +2317,21 @@ function App() {
   const managedGrePeerOuterIpOptions = greOuterIpOptionsFromNode(selectedManagedPeerNode);
   const managedGreLocalOuterIpDefault = managedGreLocalOuterIpOptions[0]?.value || "";
   const managedGrePeerOuterIpDefault = managedGrePeerOuterIpOptions[0]?.value || "";
+  const modalOpen = Boolean(
+    topologyFullscreenOpen
+    || topologyResetConfirmOpen
+    || settingsOpen
+    || nodeCreateOpen
+    || editingNodeId
+    || createDialog
+    || selectedConnectionRef?.startsWith("gre:")
+    || selectedConfigId
+    || deleteDialogOpen
+    || monitorDialogConfigId
+    || monitorDialogEndpointRef
+    || nodePluginDialogOpen
+    || nodePluginError,
+  );
   const selectedManagedLinkPeerNode = managedLink
     ? nodes.find((node) => node.id === managedLink.peer_interface.node_id) || null
     : null;
@@ -2570,6 +2614,37 @@ function App() {
     setCreateDialog("managed");
   }
 
+  // 打开 WireGuard 配置的链路监测弹窗，并同步异步请求使用的目标 key。
+  function openConfigMonitorDialog(configId: number) {
+    const key = `wireguard:${configId}`;
+    monitorDialogTargetKeyRef.current = key;
+    setMonitorDetail(null);
+    setMonitorDetailTarget("");
+    setMonitorDialogEndpointRef(null);
+    setMonitorDialogConfigId(configId);
+    setMonitorWindow("1h");
+  }
+
+  // 打开通用连接端点的链路监测弹窗，并同步异步请求使用的目标 key。
+  function openEndpointMonitorDialog(endpointRef: string) {
+    const key = `endpoint:${endpointRef}`;
+    monitorDialogTargetKeyRef.current = key;
+    setMonitorDetail(null);
+    setMonitorDetailTarget("");
+    setMonitorDialogConfigId(null);
+    setMonitorDialogEndpointRef(endpointRef);
+    setMonitorWindow("1h");
+  }
+
+  // 关闭链路监测弹窗，并让未完成的旧请求失效。
+  function closeMonitorDialog() {
+    monitorDialogTargetKeyRef.current = "none";
+    setMonitorDialogConfigId(null);
+    setMonitorDialogEndpointRef(null);
+    setMonitorDetail(null);
+    setMonitorDetailTarget("");
+  }
+
   // 清空登录态和所有依赖登录的页面状态。
   function clearAuthenticatedState() {
     window.localStorage.removeItem(AUTH_TOKEN_KEY);
@@ -2602,8 +2677,7 @@ function App() {
     setManagedCreateMtu("1420");
     setPeerNodeConfigs([]);
     setSettingsOpen(false);
-    setMonitorDialogConfigId(null);
-    setMonitorDetail(null);
+    closeMonitorDialog();
     setPendingActions(new Set());
   }
 
@@ -2801,8 +2875,26 @@ function App() {
     setTopology({ ...data, nodes: mergedNodes });
   }
 
+  // 请求 Agent 刷新当前 GRE 连接状态，供用户手动刷新时使用。
+  async function requestSelectedGreStatusRefresh() {
+    const connectionRef = selectedConnectionRefRef.current;
+    if (!connectionRef || !connectionRef.startsWith("gre:")) return false;
+    await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(connectionRef)}/refresh-status`, { method: "POST" });
+    return true;
+  }
+
+  // 在 GRE 任务下发后安排几次短延迟刷新，避免页面长时间停留在 changing。
+  function scheduleGreConnectionRefresh(nodeId: number) {
+    [1000, 2500, 4500, 7000].forEach((delay) => {
+      window.setTimeout(() => {
+        if (!isCurrentSelectedNode(nodeId)) return;
+        void Promise.all([refreshConnections(nodeId), refreshTopology()]).catch((error) => notify("error", formatUserError(error)));
+      }, delay);
+    });
+  }
+
   // 刷新主页所需的节点、拓扑、配置和弹窗详情。
-  async function refreshHome() {
+  async function refreshHome(options: { requestSelectedGreStatus?: boolean } = {}) {
     await Promise.all([refreshNodes(), refreshTopology()]);
     if (selectedNodeId) {
       await Promise.all([
@@ -2816,6 +2908,13 @@ function App() {
     }
     if (monitorDialogConfigId || monitorDialogEndpointRef) {
       await refreshMonitorDetail().catch(() => undefined);
+    }
+    if (options.requestSelectedGreStatus) {
+      const requested = await requestSelectedGreStatusRefresh();
+      const nodeId = selectedNodeIdRef.current;
+      if (requested && nodeId) {
+        scheduleGreConnectionRefresh(nodeId);
+      }
     }
   }
 
@@ -3239,36 +3338,52 @@ function App() {
     setManagedLink(data);
   }
 
-  // 刷新链路监测详情和样本。
-  function monitorDialogApiPath() {
-    if (monitorDialogConfig) return `/api/wireguard/configs/${monitorDialogConfig.id}/link-monitor`;
-    if (monitorDialogEndpoint) return `/api/connection-endpoints/${monitorDialogEndpoint.id}/link-monitor`;
-    return "";
+  // 获取当前监测弹窗的稳定目标引用，避免异步请求返回后串到其它链路。
+  function monitorDialogTarget(): MonitorDialogTarget | null {
+    if (monitorDialogConfig) {
+      return {
+        key: `wireguard:${monitorDialogConfig.id}`,
+        apiPath: `/api/wireguard/configs/${monitorDialogConfig.id}/link-monitor`,
+      };
+    }
+    if (monitorDialogEndpoint) {
+      return {
+        key: `endpoint:${monitorDialogEndpoint.endpoint_ref}`,
+        apiPath: `/api/connection-endpoints/${monitorDialogEndpoint.id}/link-monitor`,
+      };
+    }
+    return null;
   }
 
   // 刷新链路监测详情和样本。
-  async function refreshMonitorDetail(windowValue = monitorWindow) {
-    const apiPath = monitorDialogApiPath();
-    if (!apiPath) {
+  async function refreshMonitorDetail(windowValue = monitorWindow, target = monitorDialogTarget()) {
+    if (!target) {
       setMonitorDetail(null);
+      setMonitorDetailTarget("");
       return;
     }
-    const monitor = await api<LinkMonitor | null>(apiPath);
+    const monitor = await api<LinkMonitor | null>(target.apiPath);
+    if (monitorDialogTargetKeyRef.current !== target.key) return;
     if (!monitor) {
       setMonitorDetail(null);
+      setMonitorDetailTarget(target.key);
       return;
     }
     const detail = await api<LinkMonitorSamplesResponse>(`/api/link-monitors/${monitor.id}/samples?window=${encodeURIComponent(windowValue)}`);
+    if (monitorDialogTargetKeyRef.current !== target.key) return;
     setMonitorDetail(detail);
+    setMonitorDetailTarget(target.key);
   }
 
   // 保存链路监测配置。
   async function saveLinkMonitor(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const apiPath = monitorDialogApiPath();
-    if (!apiPath || !selectedNodeId) return;
+    const target = monitorDialogTarget();
+    if (!target || !selectedNodeId) return;
+    const nodeId = selectedNodeId;
+    const currentSamples = activeMonitorDetail?.samples || [];
     const form = new FormData(event.currentTarget);
-    await api<LinkMonitor>(apiPath, {
+    const monitor = await api<LinkMonitor>(target.apiPath, {
       method: "POST",
       body: JSON.stringify({
         target_host: String(form.get("target_host") || "").trim(),
@@ -3277,25 +3392,35 @@ function App() {
         enabled: form.get("enabled") === "on",
       }),
     });
-    await refreshMonitorDetail();
-    await Promise.all([
-      refreshConfigs(selectedNodeId, selectedConfigId),
-      refreshConnections(selectedNodeId),
+    if (monitorDialogTargetKeyRef.current === target.key) {
+      setMonitorDetailTarget(target.key);
+      setMonitorDetail({
+        monitor,
+        summary: monitor.summary || activeMonitorDetail?.summary || null,
+        samples: currentSamples,
+      });
+    }
+    void refreshMonitorDetail(monitorWindow, target).catch((error) => notify("error", formatUserError(error)));
+    void Promise.all([
+      refreshConfigs(nodeId, selectedConfigId),
+      refreshConnections(nodeId),
       refreshTopology(),
-    ]);
+    ]).catch((error) => notify("error", formatUserError(error)));
     notify("success", "链路监测已保存。");
   }
 
   // 删除链路监测配置。
   async function deleteLinkMonitor() {
-    if (!monitorDetail || !selectedNodeId) return;
-    await api<{ status: string }>(`/api/link-monitors/${monitorDetail.monitor.id}`, { method: "DELETE" });
+    if (!activeMonitorDetail || !selectedNodeId) return;
+    const nodeId = selectedNodeId;
+    await api<{ status: string }>(`/api/link-monitors/${activeMonitorDetail.monitor.id}`, { method: "DELETE" });
     setMonitorDetail(null);
-    await Promise.all([
-      refreshConfigs(selectedNodeId, selectedConfigId),
-      refreshConnections(selectedNodeId),
+    setMonitorDetailTarget("");
+    void Promise.all([
+      refreshConfigs(nodeId, selectedConfigId),
+      refreshConnections(nodeId),
       refreshTopology(),
-    ]);
+    ]).catch((error) => notify("error", formatUserError(error)));
     notify("success", "链路监测已删除。");
   }
 
@@ -3359,6 +3484,11 @@ function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+
+  useEffect(() => {
+    document.body.classList.toggle("modal-scroll-lock", modalOpen);
+    return () => document.body.classList.remove("modal-scroll-lock");
+  }, [modalOpen]);
 
   useEffect(() => {
     if (nodeCreateOpen) {
@@ -3538,9 +3668,13 @@ function App() {
   }, [selectedConfigId, selectedConfigIsManagedLink, managedLink]);
 
   useEffect(() => {
-    if (!monitorDialogConfigId && !monitorDialogEndpointRef) return;
-    refreshMonitorDetail(monitorWindow).catch((error) => notify("error", formatUserError(error)));
-  }, [monitorDialogConfigId, monitorDialogEndpointRef, monitorWindow]);
+    monitorDialogTargetKeyRef.current = monitorDialogActionTarget;
+    setMonitorDetail(null);
+    setMonitorDetailTarget("");
+    const target = monitorDialogTarget();
+    if (!target) return;
+    refreshMonitorDetail(monitorWindow, target).catch((error) => notify("error", formatUserError(error)));
+  }, [monitorDialogActionTarget, monitorWindow]);
 
   useEffect(() => {
     if (createDialog !== "managed" || managedCreateProtocol !== "wireguard" || udp2rawActive || mimicActive) return;
@@ -4006,6 +4140,10 @@ function App() {
   function readGreCommonPayload(form: FormData) {
     const localOuterIp = String(form.get("local_outer_ip") || "").trim();
     const peerOuterIp = String(form.get("peer_outer_ip") || "").trim();
+    const localBindIp = String(form.get("local_bind_ip") || "").trim();
+    const localRemoteIp = String(form.get("local_remote_ip") || "").trim();
+    const peerBindIp = String(form.get("peer_bind_ip") || "").trim();
+    const peerRemoteIp = String(form.get("peer_remote_ip") || "").trim();
     const localTunnelIps = splitList(String(form.get("local_tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
     const localRoutes = splitList(String(form.get("local_routes") || ""));
@@ -4016,14 +4154,26 @@ function App() {
     if (!isValidIpv4Address(localOuterIp) || !isValidIpv4Address(peerOuterIp)) {
       throw new Error("GRE 外层地址必须填写 IPv4 字面量，不能使用域名或 IPv6");
     }
+    for (const value of [localBindIp, localRemoteIp, peerBindIp, peerRemoteIp].filter(Boolean)) {
+      if (!isValidIpv4Address(value)) {
+        throw new Error("GRE 高级外层映射地址必须填写 IPv4 字面量");
+      }
+    }
     if (localOuterIp === peerOuterIp) {
       throw new Error("GRE 双方外层地址不能相同");
     }
-    if (!isValidIpv4Cidrs(localTunnelIps) || !isValidIpv4Cidrs(peerTunnelIps)) {
-      throw new Error("GRE 隧道地址必须使用 IPv4 CIDR，例如 10.42.8.1/30");
+    const effectiveLocalBindIp = localBindIp || localOuterIp;
+    const effectiveLocalRemoteIp = localRemoteIp || peerOuterIp;
+    const effectivePeerBindIp = peerBindIp || peerOuterIp;
+    const effectivePeerRemoteIp = peerRemoteIp || localOuterIp;
+    if (effectiveLocalBindIp === effectiveLocalRemoteIp || effectivePeerBindIp === effectivePeerRemoteIp) {
+      throw new Error("同一端的 GRE 绑定 IP 和连接对端 IP 不能相同");
     }
-    if (!isValidIpv4Cidrs(localRoutes) || !isValidIpv4Cidrs(peerRoutes)) {
-      throw new Error("经隧道路由必须使用 IPv4 CIDR，例如 10.77.0.0/24");
+    if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
+      throw new Error("GRE 隧道地址必须使用 IPv4 或 IPv6 CIDR，例如 10.42.8.1/30 或 fd42::1/64");
+    }
+    if (!isValidCidrs(localRoutes) || !isValidCidrs(peerRoutes)) {
+      throw new Error("经隧道路由必须使用 IPv4 或 IPv6 CIDR，例如 10.77.0.0/24 或 fd77::/64");
     }
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
@@ -4042,6 +4192,10 @@ function App() {
       peer_interface_name: String(form.get("peer_interface_name") || "").trim(),
       local_outer_ip: localOuterIp,
       peer_outer_ip: peerOuterIp,
+      local_bind_ip: localBindIp || null,
+      local_remote_ip: localRemoteIp || null,
+      peer_bind_ip: peerBindIp || null,
+      peer_remote_ip: peerRemoteIp || null,
       local_tunnel_ips: localTunnelIps,
       peer_tunnel_ips: peerTunnelIps,
       local_routes: localRoutes,
@@ -4087,6 +4241,7 @@ function App() {
     selectConfigId(null);
     selectConnectionRef(connection.connection_ref);
     void Promise.all([refreshConnections(selectedNodeId), refreshTopology()]).catch((error) => notify("error", formatUserError(error)));
+    scheduleGreConnectionRefresh(selectedNodeId);
     notify("success", `GRE 连接 ${connection.name} 已创建，双方部署和启动任务已下发。`);
   }
 
@@ -4102,6 +4257,7 @@ function App() {
       body: JSON.stringify(readGreCommonPayload(new FormData(event.currentTarget))),
     });
     await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
+    scheduleGreConnectionRefresh(selectedNodeId);
     notify("success", "GRE 连接已保存，并已重新下发双方配置。");
   }
 
@@ -4113,6 +4269,7 @@ function App() {
     }
     await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/start`, { method: "POST" });
     await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
+    scheduleGreConnectionRefresh(selectedNodeId);
     notify("success", "GRE 启动任务已创建，等待双方 Agent 执行。");
   }
 
@@ -4124,6 +4281,7 @@ function App() {
     }
     await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/stop`, { method: "POST" });
     await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
+    scheduleGreConnectionRefresh(selectedNodeId);
     notify("success", "GRE 断开任务已创建，等待双方 Agent 执行。");
   }
 
@@ -4583,7 +4741,7 @@ function App() {
           <button className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
             <Settings size={18} />
           </button>
-          <button className="iconButton" onClick={() => void runAction(refreshHome)} title="刷新">
+          <button className="iconButton" onClick={() => void runAction(() => refreshHome({ requestSelectedGreStatus: true }))} title="刷新">
             <RefreshCw size={18} />
           </button>
           <button className="iconButton" onClick={() => void runAction(logout)} title="退出">
@@ -5602,7 +5760,7 @@ function App() {
               {!nodeSupportsGre(selectedNode) && (
                 <div className="empty wideField">当前节点尚未上报 GRE 能力，请确认 Agent 已升级且系统支持 iproute2 GRE。</div>
               )}
-              <FormSection title="基础" hint="GRE 连接会在两个在线受管节点之间创建 IPv4 L3 隧道。">
+              <FormSection title="基础" hint="GRE 连接会在两个在线受管节点之间创建 L3 隧道，外层地址使用 IPv4。">
                 <Field label="对端节点" hint="只显示已在线并上报 GRE 能力的节点。" requiredMark>
                   <select
                     name="peer_node_id"
@@ -5623,8 +5781,8 @@ function App() {
                   <input name="peer_interface_name" placeholder="gre-b-a" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
-              <FormSection title="外层地址" hint="请选择节点地址中的 IPv4，或手动输入双方可互达的 IPv4；不支持域名。">
-                <Field label="本端外层源 IP" requiredMark>
+              <FormSection title="外层地址" hint="标准场景只填写两端对外 IPv4；云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
+                <Field label="本端对外地址" hint="对端访问本端时看到或使用的 IPv4；无 NAT 时也是本端实际绑定 IP。" requiredMark>
                   <EndpointSelect
                     key={`managed-gre-local-outer-${selectedNode.id}-${managedGreLocalOuterIpDefault}`}
                     name="local_outer_ip"
@@ -5634,7 +5792,7 @@ function App() {
                     disabled={!nodeSupportsGre(selectedNode)}
                   />
                 </Field>
-                <Field label="对端外层源 IP" requiredMark>
+                <Field label="对端对外地址" hint="本端访问对端时使用的 IPv4；无 NAT 时也是对端实际绑定 IP。" requiredMark>
                   <EndpointSelect
                     key={`managed-gre-peer-outer-${managedPeerNodeId || "none"}-${managedGrePeerOuterIpDefault}`}
                     name="peer_outer_ip"
@@ -5644,19 +5802,64 @@ function App() {
                     disabled={!nodeSupportsGre(selectedNode) || !managedPeerNodeId}
                   />
                 </Field>
+                <details className="advancedDetails wideField">
+                  <summary>云 NAT/EIP 高级映射</summary>
+                  <div className="advancedGrid">
+                    <Field label="本端实际绑定 IP" hint="写入本端 ip tunnel local；留空使用本端对外地址。">
+                      <EndpointSelect
+                        key={`managed-gre-local-bind-${selectedNode.id}`}
+                        name="local_bind_ip"
+                        defaultValue=""
+                        placeholder={managedGreLocalOuterIpDefault || "10.1.0.6"}
+                        options={managedGreLocalOuterIpOptions}
+                        disabled={!nodeSupportsGre(selectedNode)}
+                      />
+                    </Field>
+                    <Field label="本端连接对端 IP" hint="写入本端 ip tunnel remote；留空使用对端对外地址。">
+                      <EndpointSelect
+                        key={`managed-gre-local-remote-${managedPeerNodeId || "none"}`}
+                        name="local_remote_ip"
+                        defaultValue=""
+                        placeholder={managedGrePeerOuterIpDefault || "198.51.100.20"}
+                        options={managedGrePeerOuterIpOptions}
+                        disabled={!nodeSupportsGre(selectedNode) || !managedPeerNodeId}
+                      />
+                    </Field>
+                    <Field label="对端实际绑定 IP" hint="写入对端 ip tunnel local；留空使用对端对外地址。">
+                      <EndpointSelect
+                        key={`managed-gre-peer-bind-${managedPeerNodeId || "none"}`}
+                        name="peer_bind_ip"
+                        defaultValue=""
+                        placeholder={managedGrePeerOuterIpDefault || "10.1.0.6"}
+                        options={managedGrePeerOuterIpOptions}
+                        disabled={!nodeSupportsGre(selectedNode) || !managedPeerNodeId}
+                      />
+                    </Field>
+                    <Field label="对端连接本端 IP" hint="写入对端 ip tunnel remote；留空使用本端对外地址。">
+                      <EndpointSelect
+                        key={`managed-gre-peer-remote-${selectedNode.id}`}
+                        name="peer_remote_ip"
+                        defaultValue=""
+                        placeholder={managedGreLocalOuterIpDefault || "203.0.113.10"}
+                        options={managedGreLocalOuterIpOptions}
+                        disabled={!nodeSupportsGre(selectedNode)}
+                      />
+                    </Field>
+                  </div>
+                </details>
               </FormSection>
               <FormSection title="隧道地址与路由" hint="路由字段表示经 GRE 到达的远端网段，不是 WireGuard AllowedIPs。">
-                <Field label="本端隧道地址" hint="IPv4 CIDR，例如 10.42.8.1/30。" requiredMark>
-                  <input name="local_tunnel_ips" placeholder="10.42.8.1/30" required disabled={!nodeSupportsGre(selectedNode)} />
+                <Field label="本端隧道地址" hint="IPv4/IPv6 CIDR，可填写多条，使用逗号或换行分隔。" requiredMark>
+                  <textarea name="local_tunnel_ips" rows={2} placeholder="10.42.8.1/30, fd42::1/64" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="对端隧道地址" hint="IPv4 CIDR，例如 10.42.8.2/30。" requiredMark>
-                  <input name="peer_tunnel_ips" placeholder="10.42.8.2/30" required disabled={!nodeSupportsGre(selectedNode)} />
+                <Field label="对端隧道地址" hint="IPv4/IPv6 CIDR，可填写多条，使用逗号或换行分隔。" requiredMark>
+                  <textarea name="peer_tunnel_ips" rows={2} placeholder="10.42.8.2/30, fd42::2/64" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="本端经隧道路由" hint="当前节点经 GRE 到达的对端网段，多个用逗号分隔。">
-                  <input name="local_routes" placeholder="10.77.0.0/24" disabled={!nodeSupportsGre(selectedNode)} />
+                <Field label="本端经隧道路由" hint="当前节点经 GRE 到达的对端网段，多个用逗号或换行分隔。">
+                  <textarea name="local_routes" rows={2} placeholder="10.77.0.0/24, fd77::/64" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="对端经隧道路由" hint="对端节点经 GRE 到达的本网段，多个用逗号分隔。">
-                  <input name="peer_routes" placeholder="10.88.0.0/24" disabled={!nodeSupportsGre(selectedNode)} />
+                <Field label="对端经隧道路由" hint="对端节点经 GRE 到达的本网段，多个用逗号或换行分隔。">
+                  <textarea name="peer_routes" rows={2} placeholder="10.88.0.0/24, fd88::/64" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
               <FormSection title="高级" hint="默认 MTU 1476；GRE Key 可选，填写后双方必须一致。">
@@ -5918,13 +6121,10 @@ function App() {
                                         onClick={(event) => {
                                           event.stopPropagation();
                                           if (item.protocol_type === "wireguard") {
-                                            setMonitorDialogEndpointRef(null);
-                                            setMonitorDialogConfigId(nodeEndpoint?.id || item.id);
+                                            openConfigMonitorDialog(nodeEndpoint?.id || item.id);
                                           } else if (nodeEndpoint) {
-                                            setMonitorDialogConfigId(null);
-                                            setMonitorDialogEndpointRef(nodeEndpoint.endpoint_ref);
+                                            openEndpointMonitorDialog(nodeEndpoint.endpoint_ref);
                                           }
-                                          setMonitorWindow("1h");
                                         }}
                                       />
                                     </span>
@@ -5991,40 +6191,85 @@ function App() {
                     <input name="peer_interface_name" defaultValue={selectedGrePeerEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>
-                <FormSection title="外层地址" hint="请选择节点地址中的 IPv4，或手动输入双方可互达的 IPv4；不支持域名。">
-                  <Field label="本端外层源 IP" requiredMark>
+                <FormSection title="外层地址" hint="标准场景只填写两端对外 IPv4；云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
+                  <Field label="本端对外地址" hint="对端访问本端时看到或使用的 IPv4；无 NAT 时也是本端实际绑定 IP。" requiredMark>
                     <EndpointSelect
-                      key={`edit-gre-local-outer-${selectedGreConnection.connection_ref}-${greProtocolString(selectedGreLocalEndpoint, "outer_local_ip")}`}
+                      key={`edit-gre-local-outer-${selectedGreConnection.connection_ref}-${editGreLocalOuterIpDefault}`}
                       name="local_outer_ip"
-                      defaultValue={greProtocolString(selectedGreLocalEndpoint, "outer_local_ip")}
+                      defaultValue={editGreLocalOuterIpDefault}
                       placeholder={editGreLocalOuterIpOptions[0]?.value || "203.0.113.10"}
                       options={editGreLocalOuterIpOptions}
                       disabled={!selectedGreAllNodesOnline}
                     />
                   </Field>
-                  <Field label="对端外层源 IP" requiredMark>
+                  <Field label="对端对外地址" hint="本端访问对端时使用的 IPv4；无 NAT 时也是对端实际绑定 IP。" requiredMark>
                     <EndpointSelect
-                      key={`edit-gre-peer-outer-${selectedGreConnection.connection_ref}-${greProtocolString(selectedGrePeerEndpoint, "outer_local_ip")}`}
+                      key={`edit-gre-peer-outer-${selectedGreConnection.connection_ref}-${editGrePeerOuterIpDefault}`}
                       name="peer_outer_ip"
-                      defaultValue={greProtocolString(selectedGrePeerEndpoint, "outer_local_ip")}
+                      defaultValue={editGrePeerOuterIpDefault}
                       placeholder={editGrePeerOuterIpOptions[0]?.value || "198.51.100.20"}
                       options={editGrePeerOuterIpOptions}
                       disabled={!selectedGreAllNodesOnline}
                     />
                   </Field>
+                  <details className="advancedDetails wideField" open={Boolean(editGreLocalBindIpDefault || editGreLocalRemoteIpDefault || editGrePeerBindIpDefault || editGrePeerRemoteIpDefault)}>
+                    <summary>云 NAT/EIP 高级映射</summary>
+                    <div className="advancedGrid">
+                      <Field label="本端实际绑定 IP" hint="写入本端 ip tunnel local；留空使用本端对外地址。">
+                        <EndpointSelect
+                          key={`edit-gre-local-bind-${selectedGreConnection.connection_ref}-${editGreLocalBindIpDefault}`}
+                          name="local_bind_ip"
+                          defaultValue={editGreLocalBindIpDefault}
+                          placeholder={editGreLocalOuterIpOptions[0]?.value || "10.1.0.6"}
+                          options={editGreLocalOuterIpOptions}
+                          disabled={!selectedGreAllNodesOnline}
+                        />
+                      </Field>
+                      <Field label="本端连接对端 IP" hint="写入本端 ip tunnel remote；留空使用对端对外地址。">
+                        <EndpointSelect
+                          key={`edit-gre-local-remote-${selectedGreConnection.connection_ref}-${editGreLocalRemoteIpDefault}`}
+                          name="local_remote_ip"
+                          defaultValue={editGreLocalRemoteIpDefault}
+                          placeholder={editGrePeerOuterIpOptions[0]?.value || "198.51.100.20"}
+                          options={editGrePeerOuterIpOptions}
+                          disabled={!selectedGreAllNodesOnline}
+                        />
+                      </Field>
+                      <Field label="对端实际绑定 IP" hint="写入对端 ip tunnel local；留空使用对端对外地址。">
+                        <EndpointSelect
+                          key={`edit-gre-peer-bind-${selectedGreConnection.connection_ref}-${editGrePeerBindIpDefault}`}
+                          name="peer_bind_ip"
+                          defaultValue={editGrePeerBindIpDefault}
+                          placeholder={editGrePeerOuterIpOptions[0]?.value || "10.1.0.6"}
+                          options={editGrePeerOuterIpOptions}
+                          disabled={!selectedGreAllNodesOnline}
+                        />
+                      </Field>
+                      <Field label="对端连接本端 IP" hint="写入对端 ip tunnel remote；留空使用本端对外地址。">
+                        <EndpointSelect
+                          key={`edit-gre-peer-remote-${selectedGreConnection.connection_ref}-${editGrePeerRemoteIpDefault}`}
+                          name="peer_remote_ip"
+                          defaultValue={editGrePeerRemoteIpDefault}
+                          placeholder={editGreLocalOuterIpOptions[0]?.value || "203.0.113.10"}
+                          options={editGreLocalOuterIpOptions}
+                          disabled={!selectedGreAllNodesOnline}
+                        />
+                      </Field>
+                    </div>
+                  </details>
                 </FormSection>
-                <FormSection title="隧道地址与路由" hint="路由字段表示经 GRE 到达的远端网段。">
-                  <Field label="本端隧道地址" requiredMark>
-                    <input name="local_tunnel_ips" defaultValue={selectedGreLocalEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
+                <FormSection title="隧道地址与路由" hint="路由字段表示经 GRE 到达的远端网段，支持 IPv4/IPv6 CIDR。">
+                  <Field label="本端隧道地址" hint="可填写多条，使用逗号或换行分隔。" requiredMark>
+                    <textarea name="local_tunnel_ips" rows={2} defaultValue={selectedGreLocalEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="对端隧道地址" requiredMark>
-                    <input name="peer_tunnel_ips" defaultValue={selectedGrePeerEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
+                  <Field label="对端隧道地址" hint="可填写多条，使用逗号或换行分隔。" requiredMark>
+                    <textarea name="peer_tunnel_ips" rows={2} defaultValue={selectedGrePeerEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="本端经隧道路由">
-                    <input name="local_routes" defaultValue={selectedGreLocalEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
+                  <Field label="本端经隧道路由" hint="多个网段用逗号或换行分隔。">
+                    <textarea name="local_routes" rows={2} defaultValue={selectedGreLocalEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="对端经隧道路由">
-                    <input name="peer_routes" defaultValue={selectedGrePeerEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
+                  <Field label="对端经隧道路由" hint="多个网段用逗号或换行分隔。">
+                    <textarea name="peer_routes" rows={2} defaultValue={selectedGrePeerEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>
                 <FormSection title="高级" hint="GRE Key、TTL 和 PMTU discovery 会同时下发到双方。">
@@ -6427,17 +6672,13 @@ function App() {
               </div>
               <button
                 className="iconButton"
-                onClick={() => {
-                  setMonitorDialogConfigId(null);
-                  setMonitorDialogEndpointRef(null);
-                  setMonitorDetail(null);
-                }}
+                onClick={closeMonitorDialog}
               >
                 <X size={18} />
               </button>
             </header>
             <form
-              key={`monitor-${monitorDialogActionTarget}-${monitorDetail?.monitor.id || "new"}`}
+              key={`monitor-${monitorDialogActionTarget}-${activeMonitorDetail?.monitor.id || "new"}`}
               className="gridForm describedForm"
               onSubmit={(event) => void runAction(() => saveLinkMonitor(event), monitorActionKey(monitorDialogActionTarget, "save"))}
             >
@@ -6445,15 +6686,15 @@ function App() {
                 <input
                   name="target_host"
                   placeholder="10.42.0.2"
-                  defaultValue={monitorDetail?.monitor.target_host || monitorDialogTargetHint}
+                  defaultValue={activeMonitorDetail?.monitor.target_host || monitorDialogTargetHint}
                   required
                 />
               </Field>
               <Field label="刷新频率" hint="1-300 秒，默认 10 秒。">
-                <input name="interval_seconds" inputMode="numeric" defaultValue={monitorDetail?.monitor.interval_seconds || 10} required />
+                <input name="interval_seconds" inputMode="numeric" defaultValue={activeMonitorDetail?.monitor.interval_seconds || 10} required />
               </Field>
               <Field label="保留时间" hint="历史样本保留天数，例如 1、7、30。">
-                <select name="retention_days" defaultValue={monitorDetail?.monitor.retention_days || 7}>
+                <select name="retention_days" defaultValue={activeMonitorDetail?.monitor.retention_days || 7}>
                   <option value="1">1 天</option>
                   <option value="7">7 天</option>
                   <option value="30">30 天</option>
@@ -6461,14 +6702,14 @@ function App() {
                 </select>
               </Field>
               <label className="checkField">
-                <input name="enabled" type="checkbox" defaultChecked={monitorDetail?.monitor.enabled ?? true} />
+                <input name="enabled" type="checkbox" defaultChecked={activeMonitorDetail?.monitor.enabled ?? true} />
                 <span>启用监测</span>
               </label>
               <div className="actionRow wideField">
                 <button type="submit" disabled={actionPending(monitorActionKey(monitorDialogActionTarget, "save"))}>
                   <Check size={16} /> {actionPending(monitorActionKey(monitorDialogActionTarget, "save")) ? "保存中" : "保存监测"}
                 </button>
-                {monitorDetail && (
+                {activeMonitorDetail && (
                   <button
                     type="button"
                     className="danger"
@@ -6494,19 +6735,19 @@ function App() {
               ))}
             </div>
 
-            {monitorDetail?.summary ? (
+            {activeMonitorDetail?.summary ? (
               <>
                 <div className="monitorStats">
-                  <span><strong>{formatLatency(monitorDetail.summary.last_latency_ms)}</strong><small>当前延迟</small></span>
-                  <span><strong>{formatLatency(monitorDetail.summary.avg_latency_ms)}</strong><small>平均延迟</small></span>
-                  <span><strong>{formatLatency(monitorDetail.summary.jitter_ms)}</strong><small>抖动</small></span>
-                  <span><strong>{formatLoss(monitorDetail.summary.packet_loss)}</strong><small>丢包率</small></span>
-                  <span><strong>{monitorDetail.summary.stability_score}</strong><small>稳定度</small></span>
+                  <span><strong>{formatLatency(activeMonitorDetail.summary.last_latency_ms)}</strong><small>当前延迟</small></span>
+                  <span><strong>{formatLatency(activeMonitorDetail.summary.avg_latency_ms)}</strong><small>平均延迟</small></span>
+                  <span><strong>{formatLatency(activeMonitorDetail.summary.jitter_ms)}</strong><small>抖动</small></span>
+                  <span><strong>{formatLoss(activeMonitorDetail.summary.packet_loss)}</strong><small>丢包率</small></span>
+                  <span><strong>{activeMonitorDetail.summary.stability_score}</strong><small>稳定度</small></span>
                 </div>
                 <div className="monitorChart">
                   <ResponsiveContainer width="100%" height={280}>
                     <LineChart
-                      data={monitorDetail.samples.map((sample) => ({
+                      data={activeMonitorDetail.samples.map((sample) => ({
                         time: new Date(sample.checked_at).toLocaleString(),
                         latency: sample.success ? sample.latency_ms : null,
                         status: sample.success ? "ok" : sample.error || "loss",

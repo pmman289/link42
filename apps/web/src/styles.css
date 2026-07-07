@@ -72,6 +72,10 @@ body {
   background: var(--bg);
 }
 
+body.modal-scroll-lock {
+  overflow: hidden;
+}
+
 button,
 input,
 textarea,
@@ -615,6 +619,27 @@ textarea {
 .checkField input {
   width: auto;
   min-height: auto;
+}
+
+.advancedDetails {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  padding: 10px 12px;
+}
+
+.advancedDetails summary {
+  cursor: pointer;
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.advancedGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding-top: 12px;
 }
 
 .endpointListInput {
@@ -1835,12 +1860,14 @@ textarea {
   backdrop-filter: blur(5px);
   padding: 24px;
   animation: fadeIn 0.16s ease-out;
+  overscroll-behavior: contain;
 }
 
 .modalPanel {
   width: min(1040px, 100%);
   max-height: calc(100vh - 48px);
   overflow: auto;
+  overscroll-behavior: contain;
   box-shadow: 0 22px 56px var(--shadow-strong);
   padding-top: 0;
   animation: modalIn 0.2s ease-out;
@@ -1976,7 +2003,8 @@ textarea {
   }
 
   .nodeCreateForm,
-  .gridForm {
+  .gridForm,
+  .advancedGrid {
     grid-template-columns: 1fr;
   }
 
