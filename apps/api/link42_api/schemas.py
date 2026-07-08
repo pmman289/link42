@@ -69,6 +69,19 @@ def _validate_linux_interface_name(value: str) -> str:
     return cleaned
 
 
+def _validate_gre_interface_name(value: str) -> str:
+    """校验 GRE 接口名，兼容 OpenWrt netifd 生成的 gre4-设备名长度。"""
+
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("interface name is required")
+    if len(cleaned) > 10:
+        raise ValueError("GRE interface name must be 10 characters or fewer")
+    if not all(char.isalnum() or char == "_" for char in cleaned):
+        raise ValueError("GRE interface name can only contain letters, numbers, and underscores")
+    return cleaned
+
+
 def _validate_gre_key(value: str | None) -> str | None:
     """校验 GRE Key 为 32 位无符号整数。"""
 
@@ -671,6 +684,7 @@ class ConnectionEndpointRead(BaseModel):
     routes: list[str] = Field(default_factory=list)
     runtime_status: str
     protocol_config: dict[str, Any] = Field(default_factory=dict)
+    last_error: str | None = None
     monitor_summary: LinkMonitorSummary | None = None
 
 
@@ -694,8 +708,8 @@ class GreManagedConnectionCreate(BaseModel):
 
     protocol_type: str = "gre"
     peer_node_id: int
-    local_interface_name: str = Field(min_length=1, max_length=15)
-    peer_interface_name: str = Field(min_length=1, max_length=15)
+    local_interface_name: str = Field(min_length=1, max_length=10)
+    peer_interface_name: str = Field(min_length=1, max_length=10)
     local_outer_ip: str
     peer_outer_ip: str
     local_bind_ip: str | None = None
@@ -724,9 +738,9 @@ class GreManagedConnectionCreate(BaseModel):
     @field_validator("local_interface_name", "peer_interface_name")
     @classmethod
     def validate_interface_name(cls, value: str) -> str:
-        """校验 GRE 接口名符合 Linux 限制。"""
+        """校验 GRE 接口名符合 OpenWrt 和 Linux 双端限制。"""
 
-        return _validate_linux_interface_name(value)
+        return _validate_gre_interface_name(value)
 
     @field_validator("local_outer_ip", "peer_outer_ip")
     @classmethod
@@ -778,8 +792,8 @@ class GreManagedConnectionCreate(BaseModel):
 class GreManagedConnectionUpdate(BaseModel):
     """更新受管 GRE 连接请求。"""
 
-    local_interface_name: str = Field(min_length=1, max_length=15)
-    peer_interface_name: str = Field(min_length=1, max_length=15)
+    local_interface_name: str = Field(min_length=1, max_length=10)
+    peer_interface_name: str = Field(min_length=1, max_length=10)
     local_outer_ip: str
     peer_outer_ip: str
     local_bind_ip: str | None = None
@@ -799,9 +813,9 @@ class GreManagedConnectionUpdate(BaseModel):
     @field_validator("local_interface_name", "peer_interface_name")
     @classmethod
     def validate_interface_name(cls, value: str) -> str:
-        """校验 GRE 接口名符合 Linux 限制。"""
+        """校验 GRE 接口名符合 OpenWrt 和 Linux 双端限制。"""
 
-        return _validate_linux_interface_name(value)
+        return _validate_gre_interface_name(value)
 
     @field_validator("local_outer_ip", "peer_outer_ip")
     @classmethod

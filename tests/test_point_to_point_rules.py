@@ -22,6 +22,7 @@ from link42_api.main import (
     SETTING_CONTROLLER_URL,
     create_managed_link,
     create_managed_connection,
+    gre_connection_read,
     create_node,
     confirm_change_plan,
     delete_interface,
@@ -46,6 +47,7 @@ from link42_api.main import (
     is_node_online,
     is_api_auth_exempt,
     list_import_candidates,
+    list_nodes,
     login,
     mimic_endpoint_payloads,
     normalize_udp2raw_config,
@@ -829,6 +831,50 @@ def test_topology_returns_nodes_and_single_managed_edge() -> None:
     assert topology.edges[0].local_interface_name == "wg-a"
     assert topology.edges[0].peer_interface_name == "wg-b"
     assert topology.edges[0].middleware_type == "mimic"
+
+
+def test_topology_reports_stale_node_offline_without_persisting_status() -> None:
+    """验证拓扑读取只计算离线展示状态，不在 GET 路径里写库。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow() - timedelta(seconds=120),
+        )
+        session.add(node)
+        session.commit()
+
+        topology = build_topology(session)
+
+        assert topology.nodes[0].status == "offline"
+        assert node.status == "online"
+        assert not session.is_modified(node)
+
+
+def test_list_nodes_reports_stale_node_offline_without_dirtying_session() -> None:
+    """验证节点列表读取不会为了展示离线状态污染当前会话。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow() - timedelta(seconds=120),
+        )
+        session.add(node)
+        session.commit()
+
+        nodes = list_nodes(session)
+
+        assert nodes[0].status == "offline"
+        assert node.status == "online"
+        assert not session.is_modified(node)
 
 
 def test_update_node_topology_position_persists_coordinates() -> None:
@@ -1907,8 +1953,8 @@ def test_create_gre_managed_connection_creates_endpoints_and_tasks() -> None:
             node_a.id,
             GreManagedConnectionCreate(
                 peer_node_id=node_b.id,
-                local_interface_name="gre-a-b",
-                peer_interface_name="gre-b-a",
+                local_interface_name="gre_a_b",
+                peer_interface_name="gre_b_a",
                 local_outer_ip="203.0.113.10",
                 peer_outer_ip="198.51.100.20",
                 local_tunnel_ips=["10.42.8.1/30", "fd42::1/64"],
@@ -1930,20 +1976,20 @@ def test_create_gre_managed_connection_creates_endpoints_and_tasks() -> None:
     assert result.protocol_type == "gre"
     assert result.status == "changing"
     assert len(result.endpoints) == 2
-    assert {endpoint.interface_name for endpoint in result.endpoints} == {"gre-a-b", "gre-b-a"}
+    assert {endpoint.interface_name for endpoint in result.endpoints} == {"gre_a_b", "gre_b_a"}
     assert [task.type for task in tasks] == [
         GRE_TASKS.apply_config,
         GRE_TASKS.start,
         GRE_TASKS.apply_config,
         GRE_TASKS.start,
     ]
-    assert tasks[0].payload["interface_name"] == "gre-a-b"
+    assert tasks[0].payload["interface_name"] == "gre_a_b"
     assert tasks[0].payload["outer_local_ip"] == "203.0.113.10"
     assert tasks[0].payload["outer_remote_ip"] == "198.51.100.20"
     assert tasks[0].payload["tunnel_ips"] == ["10.42.8.1/30", "fd42::1/64"]
     assert tasks[0].payload["routes"] == ["10.77.0.0/24", "fd77::/64"]
     assert tasks[1].payload["depends_on_task_id"] == tasks[0].id
-    assert tasks[2].payload["interface_name"] == "gre-b-a"
+    assert tasks[2].payload["interface_name"] == "gre_b_a"
     assert tasks[2].payload["outer_local_ip"] == "198.51.100.20"
     assert tasks[2].payload["outer_remote_ip"] == "203.0.113.10"
     assert tasks[2].payload["tunnel_ips"] == ["10.42.8.2/30", "fd42::2/64"]
@@ -1984,8 +2030,8 @@ def test_create_gre_managed_connection_supports_nat_outer_mapping() -> None:
             node_a.id,
             GreManagedConnectionCreate(
                 peer_node_id=node_b.id,
-                local_interface_name="gre-t3-rcvps",
-                peer_interface_name="gre-t3-tencgz",
+                local_interface_name="gre_t3_rcv",
+                peer_interface_name="gre_t3_ten",
                 local_outer_ip="1.14.226.49",
                 peer_outer_ip="38.76.191.46",
                 local_bind_ip="10.1.0.6",
@@ -1997,12 +2043,42 @@ def test_create_gre_managed_connection_supports_nat_outer_mapping() -> None:
         )
         tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
 
-    assert tasks[0].payload["interface_name"] == "gre-t3-rcvps"
+    assert tasks[0].payload["interface_name"] == "gre_t3_rcv"
     assert tasks[0].payload["outer_local_ip"] == "10.1.0.6"
     assert tasks[0].payload["outer_remote_ip"] == "38.76.191.46"
-    assert tasks[2].payload["interface_name"] == "gre-t3-tencgz"
+    assert tasks[2].payload["interface_name"] == "gre_t3_ten"
     assert tasks[2].payload["outer_local_ip"] == "38.76.191.46"
     assert tasks[2].payload["outer_remote_ip"] == "1.14.226.49"
+
+
+def test_gre_interface_name_rejects_openwrt_unsafe_values() -> None:
+    """验证 GRE 接口名只允许 OpenWrt 兼容的短下划线名称。"""
+
+    with pytest.raises(ValidationError) as hyphen_error:
+        GreManagedConnectionCreate(
+            peer_node_id=2,
+            local_interface_name="gre-a-b",
+            peer_interface_name="gre_b_a",
+            local_outer_ip="203.0.113.10",
+            peer_outer_ip="198.51.100.20",
+            local_tunnel_ips=["10.42.8.1/30"],
+            peer_tunnel_ips=["10.42.8.2/30"],
+            risk_accepted=True,
+        )
+    with pytest.raises(ValidationError) as length_error:
+        GreManagedConnectionCreate(
+            peer_node_id=2,
+            local_interface_name="gre_name_123",
+            peer_interface_name="gre_b_a",
+            local_outer_ip="203.0.113.10",
+            peer_outer_ip="198.51.100.20",
+            local_tunnel_ips=["10.42.8.1/30"],
+            peer_tunnel_ips=["10.42.8.2/30"],
+            risk_accepted=True,
+        )
+
+    assert "GRE interface name can only contain letters, numbers, and underscores" in str(hyphen_error.value)
+    assert "String should have at most 10 characters" in str(length_error.value)
 
 
 def test_create_gre_managed_connection_rejects_same_endpoint_outer_mapping() -> None:
@@ -2037,8 +2113,8 @@ def test_create_gre_managed_connection_rejects_same_endpoint_outer_mapping() -> 
                 node_a.id,
                 GreManagedConnectionCreate(
                     peer_node_id=node_b.id,
-                    local_interface_name="gre-a-b",
-                    peer_interface_name="gre-b-a",
+                    local_interface_name="gre_a_b",
+                    peer_interface_name="gre_b_a",
                     local_outer_ip="203.0.113.10",
                     peer_outer_ip="198.51.100.20",
                     local_bind_ip="198.51.100.20",
@@ -2085,8 +2161,8 @@ def test_create_gre_managed_connection_rejects_missing_capability() -> None:
                 node_a.id,
                 GreManagedConnectionCreate(
                     peer_node_id=node_b.id,
-                    local_interface_name="gre-a-b",
-                    peer_interface_name="gre-b-a",
+                    local_interface_name="gre_a_b",
+                    peer_interface_name="gre_b_a",
                     local_outer_ip="203.0.113.10",
                     peer_outer_ip="198.51.100.20",
                     local_tunnel_ips=["10.42.8.1/30"],
@@ -2132,8 +2208,8 @@ def test_create_gre_managed_connection_rejects_ttl_without_pmtu_discovery() -> N
                 node_a.id,
                 GreManagedConnectionCreate(
                     peer_node_id=node_b.id,
-                    local_interface_name="gre-a-b",
-                    peer_interface_name="gre-b-a",
+                    local_interface_name="gre_a_b",
+                    peer_interface_name="gre_b_a",
                     local_outer_ip="203.0.113.10",
                     peer_outer_ip="198.51.100.20",
                     local_tunnel_ips=["10.42.8.1/30"],
@@ -2169,7 +2245,7 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
         )
         connection = models.Connection(
             protocol_type="gre",
-            name="gre-new",
+            name="gre_new",
             source="managed-node",
             managed=True,
             status="starting",
@@ -2178,7 +2254,7 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
             connection=connection,
             node=node,
             role="local",
-            interface_name="gre-new",
+            interface_name="gre_new",
             tunnel_ips=["10.42.8.1/30"],
             mtu=1476,
             routes=[],
@@ -2190,7 +2266,7 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
                 "ttl": None,
                 "pmtudisc": True,
             },
-            extras={"previous_interface_name": "gre-old"},
+            extras={"previous_interface_name": "gre_old"},
         )
         session.add_all([node, connection, endpoint])
         session.flush()
@@ -2200,8 +2276,8 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
             payload={
                 "node_id": node.id,
                 "connection_endpoint_id": endpoint.id,
-                "interface_name": "gre-new",
-                "previous_interface_name": "gre-old",
+                "interface_name": "gre_new",
+                "previous_interface_name": "gre_old",
             },
         )
         session.add(apply_task)
@@ -2213,7 +2289,7 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
             session,
         )
         session.refresh(endpoint)
-        assert endpoint.extras["previous_interface_name"] == "gre-old"
+        assert endpoint.extras["previous_interface_name"] == "gre_old"
 
         start_task = models.AgentTask(
             node_id=node.id,
@@ -2221,8 +2297,8 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
             payload={
                 "node_id": node.id,
                 "connection_endpoint_id": endpoint.id,
-                "interface_name": "gre-new",
-                "previous_interface_name": "gre-old",
+                "interface_name": "gre_new",
+                "previous_interface_name": "gre_old",
             },
         )
         session.add(start_task)
@@ -2234,13 +2310,89 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
                 node_id=node.id,
                 token="token",
                 status="succeeded",
-                result={"previous_config_cleanup": {"interface_name": "gre-old", "deleted": True}},
+                result={"previous_config_cleanup": {"interface_name": "gre_old", "deleted": True}},
             ),
             session,
         )
         session.refresh(endpoint)
 
     assert "previous_interface_name" not in (endpoint.extras or {})
+
+
+def test_gre_start_failure_marks_endpoint_and_connection_failed(monkeypatch) -> None:
+    """验证 GRE 单端启动失败时端点和连接聚合状态会明确展示失败。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, token_hash: token == "token")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["gre"],
+        )
+        connection = models.Connection(protocol_type="gre", name="gre_ab", source="managed-node", managed=True, status="starting")
+        endpoint = models.ConnectionEndpoint(
+            connection=connection,
+            node=node,
+            role="local",
+            interface_name="gre_ab",
+            tunnel_ips=["10.42.8.1/30"],
+            mtu=1476,
+            routes=[],
+            runtime_status="starting",
+            protocol_config={"outer_local_ip": "203.0.113.10", "outer_remote_ip": "198.51.100.20"},
+        )
+        peer_endpoint = models.ConnectionEndpoint(
+            connection=connection,
+            node=node,
+            role="peer",
+            interface_name="gre_ba",
+            tunnel_ips=["10.42.8.2/30"],
+            mtu=1476,
+            routes=[],
+            runtime_status="running",
+            protocol_config={"outer_local_ip": "198.51.100.20", "outer_remote_ip": "203.0.113.10"},
+        )
+        session.add_all([node, connection, endpoint, peer_endpoint])
+        session.flush()
+        start_task = models.AgentTask(
+            node_id=node.id,
+            type=GRE_TASKS.start,
+            payload={
+                "node_id": node.id,
+                "connection_endpoint_id": endpoint.id,
+                "interface_name": "gre_ab",
+            },
+        )
+        session.add(start_task)
+        session.commit()
+
+        agent_task_result(
+            start_task.id,
+            AgentTaskResultRequest(
+                node_id=node.id,
+                token="token",
+                status="failed",
+                result={"error": "systemd 203/EXEC"},
+            ),
+            session,
+        )
+        session.refresh(endpoint)
+        session.refresh(connection)
+        response = gre_connection_read(session, connection)
+
+        assert endpoint.runtime_status == "failed"
+        assert connection.status == "failed"
+        assert endpoint.extras["last_error"] == "systemd 203/EXEC"
+        assert response.endpoints[0].last_error == "systemd 203/EXEC"
+        assert any("systemd 203/EXEC" in warning for warning in response.warnings)
 
 
 def test_create_managed_link_allows_one_side_without_endpoint(monkeypatch) -> None:
@@ -2658,7 +2810,7 @@ def test_connection_endpoint_link_monitor_is_listed() -> None:
         node_b = models.Node(name="node-b", agent_token_hash="hash-b", status="online", last_seen_at=datetime.utcnow())
         session.add_all([node_a, node_b])
         session.flush()
-        connection = models.Connection(protocol_type="gre", name="gre-a-b", source="managed-node", managed=True)
+        connection = models.Connection(protocol_type="gre", name="gre_a_b", source="managed-node", managed=True)
         endpoint_a = models.ConnectionEndpoint(
             connection=connection,
             node_id=node_a.id,

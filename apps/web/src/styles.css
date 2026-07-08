@@ -1181,6 +1181,13 @@ textarea {
   white-space: pre-wrap;
 }
 
+.dangerText {
+  border-left: 4px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+
 .dangerCheck {
   border: 1px solid var(--danger);
   border-radius: 6px;

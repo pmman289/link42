@@ -4,6 +4,7 @@ from functools import lru_cache
 import ipaddress
 import json
 from pathlib import Path
+import shlex
 import shutil
 import sys
 from typing import Any
@@ -13,6 +14,7 @@ from .system import run_command
 
 DEFAULT_GRE_DIR = "/etc/link42/gre"
 DEFAULT_GRE_SYSTEMD_UNIT_PATH = "/etc/systemd/system/link42-gre@.service"
+OPENWRT_GRE_PROTO_PATH = "/lib/netifd/proto/gre.sh"
 
 
 @lru_cache(maxsize=1)
@@ -25,6 +27,24 @@ def gre_runtime_supported() -> bool:
     result = run_command([ip_binary, "tunnel", "help"], allow_failure=True)
     output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".lower()
     return result["returncode"] == 0 or "gre" in output
+
+
+@lru_cache(maxsize=1)
+def openwrt_gre_supported() -> bool:
+    """判断当前 OpenWrt 节点是否具备 netifd GRE 管理能力。"""
+
+    return bool(
+        shutil.which("uci")
+        and shutil.which("ifup")
+        and shutil.which("ifdown")
+        and Path(OPENWRT_GRE_PROTO_PATH).exists()
+    )
+
+
+def openwrt_gre_available() -> bool:
+    """判断当前任务是否应走 OpenWrt UCI GRE 后端。"""
+
+    return openwrt_gre_supported()
 
 
 def gre_config_dir(path: str | None = None) -> Path:
@@ -63,17 +83,35 @@ def gre_systemd_available() -> bool:
     return bool(shutil.which("systemctl")) and Path("/run/systemd/system").exists()
 
 
+def agent_source_pythonpath() -> str | None:
+    """返回源码运行时需要注入给 systemd 的 Python 模块搜索路径。"""
+
+    agent_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[3]
+    packages_root = repo_root / "packages"
+    paths = [path for path in [agent_root, packages_root] if path.exists()]
+    if not paths:
+        return None
+    return ":".join(str(path) for path in paths)
+
+
 def agent_binary_path() -> str:
-    """返回 systemd unit 调用当前 Agent 的可执行路径。"""
+    """返回 systemd unit 调用当前 Agent 的命令行。"""
 
     discovered = shutil.which("link42-agent")
     if discovered:
-        return discovered
-    return str(Path(sys.argv[0]).resolve())
+        return shlex.quote(discovered)
+    return f"{shlex.quote(sys.executable)} -m link42_agent.main"
 
 
 def render_gre_systemd_unit(config_dir: str | None = None) -> str:
     """渲染 Link42 GRE systemd 模板服务。"""
+
+    service_environment = [f"Environment=LINK42_GRE_DIR={gre_config_dir(config_dir)}"]
+    if not shutil.which("link42-agent"):
+        source_pythonpath = agent_source_pythonpath()
+        if source_pythonpath:
+            service_environment.append(f"Environment=PYTHONPATH={source_pythonpath}")
 
     return "\n".join(
         [
@@ -85,7 +123,7 @@ def render_gre_systemd_unit(config_dir: str | None = None) -> str:
             "[Service]",
             "Type=oneshot",
             "RemainAfterExit=yes",
-            f"Environment=LINK42_GRE_DIR={gre_config_dir(config_dir)}",
+            *service_environment,
             f"ExecStart={agent_binary_path()} gre-start %i",
             f"ExecStop=-{ip_command()} link del %i",
             "",
@@ -167,6 +205,24 @@ def ip_command() -> str:
     return shutil.which("ip") or "ip"
 
 
+def uci_command() -> str:
+    """返回 OpenWrt uci 命令路径。"""
+
+    return shutil.which("uci") or "uci"
+
+
+def ifup_command() -> str:
+    """返回 OpenWrt ifup 命令路径。"""
+
+    return shutil.which("ifup") or "ifup"
+
+
+def ifdown_command() -> str:
+    """返回 OpenWrt ifdown 命令路径。"""
+
+    return shutil.which("ifdown") or "ifdown"
+
+
 def gre_tunnel_add_command(config: dict[str, Any]) -> list[str]:
     """生成创建 GRE tunnel 的 ip 命令。"""
 
@@ -216,6 +272,250 @@ def gre_start_commands(config: dict[str, Any]) -> list[list[str]]:
     return commands
 
 
+def openwrt_gre_addr_section(interface_name: str) -> str:
+    """返回承载 GRE 隧道内地址的 OpenWrt static 接口名。"""
+
+    return f"{interface_name}_addr"
+
+
+def openwrt_gre_device_name(interface_name: str) -> str:
+    """返回 OpenWrt netifd 为 GRE section 生成的内核设备名。"""
+
+    return f"gre4-{interface_name}"
+
+
+def openwrt_route_section(interface_name: str, version: int, index: int) -> str:
+    """返回 Link42 管理的 OpenWrt route/route6 section 名称。"""
+
+    family = "r6" if version == 6 else "r4"
+    return f"{interface_name}_{family}_{index}"
+
+
+def openwrt_gre_managed_sections(uci_show_output: str, interface_name: str) -> list[str]:
+    """从 uci show network 输出中找出指定 GRE 接口的旧 Link42 section。"""
+
+    sections = {interface_name, openwrt_gre_addr_section(interface_name)}
+    marker = f".link42_gre_name='{interface_name}'"
+    for line in uci_show_output.splitlines():
+        if not line.startswith("network.") or marker not in line:
+            continue
+        section = line.removeprefix("network.").split(".", 1)[0]
+        if section:
+            sections.add(section)
+    return sorted(sections, key=lambda value: (value in {interface_name, openwrt_gre_addr_section(interface_name)}, value))
+
+
+def openwrt_delete_gre_config_commands(interface_name: str) -> list[list[str]]:
+    """生成删除 OpenWrt GRE UCI 配置的命令序列。"""
+
+    show_result = run_command([uci_command(), "-q", "show", "network"], allow_failure=True)
+    sections = openwrt_gre_managed_sections(str(show_result.get("stdout") or ""), interface_name)
+    return [[uci_command(), "-q", "delete", f"network.{section}"] for section in sections]
+
+
+def openwrt_route_set_commands(interface_name: str, addr_section: str, routes: list[str]) -> list[list[str]]:
+    """生成 OpenWrt GRE 静态路由 UCI 命令。"""
+
+    commands: list[list[str]] = []
+    ipv4_index = 0
+    ipv6_index = 0
+    for route in routes:
+        network = ipaddress.ip_network(route, strict=False)
+        if network.version == 6:
+            section = openwrt_route_section(interface_name, 6, ipv6_index)
+            ipv6_index += 1
+            commands.extend(
+                [
+                    [uci_command(), "set", f"network.{section}=route6"],
+                    [uci_command(), "set", f"network.{section}.interface={addr_section}"],
+                    [uci_command(), "set", f"network.{section}.target={network.with_prefixlen}"],
+                    [uci_command(), "set", f"network.{section}.link42_gre_name={interface_name}"],
+                ]
+            )
+            continue
+        section = openwrt_route_section(interface_name, 4, ipv4_index)
+        ipv4_index += 1
+        commands.extend(
+            [
+                [uci_command(), "set", f"network.{section}=route"],
+                [uci_command(), "set", f"network.{section}.interface={addr_section}"],
+                [uci_command(), "set", f"network.{section}.target={network.network_address}"],
+                [uci_command(), "set", f"network.{section}.netmask={network.netmask}"],
+                [uci_command(), "set", f"network.{section}.link42_gre_name={interface_name}"],
+            ]
+        )
+    return commands
+
+
+def openwrt_apply_gre_commands(config: dict[str, Any], *, autostart: bool = True) -> list[list[str]]:
+    """生成 OpenWrt GRE UCI 配置命令，隧道地址通过 static alias 承载。"""
+
+    interface_name = config["interface_name"]
+    addr_section = openwrt_gre_addr_section(interface_name)
+    auto_value = "1" if autostart else "0"
+    commands = openwrt_delete_gre_config_commands(interface_name)
+    commands.extend(
+        [
+            [uci_command(), "set", f"network.{interface_name}=interface"],
+            [uci_command(), "set", f"network.{interface_name}.proto=gre"],
+            [uci_command(), "set", f"network.{interface_name}.ipaddr={config['outer_local_ip']}"],
+            [uci_command(), "set", f"network.{interface_name}.peeraddr={config['outer_remote_ip']}"],
+            [uci_command(), "set", f"network.{interface_name}.mtu={config['mtu']}"],
+            [uci_command(), "set", f"network.{interface_name}.df={'1' if config.get('pmtudisc', True) else '0'}"],
+            [uci_command(), "set", f"network.{interface_name}.auto={auto_value}"],
+            [uci_command(), "set", f"network.{interface_name}.link42_managed=1"],
+            [uci_command(), "set", f"network.{interface_name}.link42_gre_name={interface_name}"],
+            [uci_command(), "set", f"network.{addr_section}=interface"],
+            [uci_command(), "set", f"network.{addr_section}.proto=static"],
+            [uci_command(), "set", f"network.{addr_section}.device=@{interface_name}"],
+            [uci_command(), "set", f"network.{addr_section}.auto={auto_value}"],
+            [uci_command(), "set", f"network.{addr_section}.link42_managed=1"],
+            [uci_command(), "set", f"network.{addr_section}.link42_gre_name={interface_name}"],
+        ]
+    )
+    if config.get("ttl") is not None:
+        commands.append([uci_command(), "set", f"network.{interface_name}.ttl={config['ttl']}"])
+    if config.get("key"):
+        commands.append([uci_command(), "set", f"network.{interface_name}.ikey={config['key']}"])
+        commands.append([uci_command(), "set", f"network.{interface_name}.okey={config['key']}"])
+    for tunnel_ip in config["tunnel_ips"]:
+        address = ipaddress.ip_interface(tunnel_ip)
+        field = "ip6addr" if address.version == 6 else "ipaddr"
+        commands.append([uci_command(), "add_list", f"network.{addr_section}.{field}={tunnel_ip}"])
+    commands.extend(openwrt_route_set_commands(interface_name, addr_section, config["routes"]))
+    commands.append([uci_command(), "commit", "network"])
+    return commands
+
+
+def run_openwrt_gre_commands(commands: list[list[str]], allow_delete_failure: bool = True) -> list[dict[str, Any]]:
+    """执行 OpenWrt GRE UCI/ifup 命令并返回每条命令结果。"""
+
+    results: list[dict[str, Any]] = []
+    for command in commands:
+        allow_failure = allow_delete_failure and (
+            command[:3] == [uci_command(), "-q", "delete"]
+            or command[0] == ifdown_command()
+        )
+        results.append(run_command(command, allow_failure=allow_failure))
+    return results
+
+
+def apply_openwrt_gre_config(config: dict[str, Any], config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+    """写入 OpenWrt GRE UCI 配置，不主动拉起接口。"""
+
+    path = write_gre_config(config, config_dir)
+    commands = openwrt_apply_gre_commands(config, autostart=True)
+    if dry_run:
+        return {
+            "changed": True,
+            "dry_run": True,
+            "service_backend": "openwrt-uci",
+            "config_path": str(path),
+            "commands": commands,
+        }
+    results = run_openwrt_gre_commands(commands)
+    return {
+        "changed": True,
+        "service_backend": "openwrt-uci",
+        "config_path": str(path),
+        "commands": results,
+    }
+
+
+def start_openwrt_gre_interface(config: dict[str, Any], config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+    """通过 OpenWrt netifd 启动 GRE 隧道和承载地址的 static 接口。"""
+
+    path = write_gre_config(config, config_dir)
+    addr_section = openwrt_gre_addr_section(config["interface_name"])
+    commands = openwrt_apply_gre_commands(config, autostart=True)
+    commands.extend(
+        [
+            [ifdown_command(), addr_section],
+            [ifdown_command(), config["interface_name"]],
+            [ifup_command(), config["interface_name"]],
+            [ifup_command(), addr_section],
+        ]
+    )
+    if dry_run:
+        return {
+            "changed": True,
+            "dry_run": True,
+            "service_backend": "openwrt-uci",
+            "config_path": str(path),
+            "commands": commands,
+            "runtime_status": "running",
+        }
+    results = run_openwrt_gre_commands(commands)
+    previous_cleanup = delete_openwrt_gre_config_file(config.get("previous_interface_name"), config_dir)
+    return {
+        "changed": True,
+        "service_backend": "openwrt-uci",
+        "config_path": str(path),
+        "commands": results,
+        "previous_config_cleanup": previous_cleanup,
+        "runtime_status": "running",
+    }
+
+
+def stop_openwrt_gre_interface(interface_name: str, dry_run: bool = False) -> dict[str, Any]:
+    """通过 OpenWrt netifd 停止 GRE，并关闭 UCI 自启动。"""
+
+    addr_section = openwrt_gre_addr_section(interface_name)
+    commands = [
+        [ifdown_command(), addr_section],
+        [ifdown_command(), interface_name],
+        [uci_command(), "-q", "set", f"network.{interface_name}.auto=0"],
+        [uci_command(), "-q", "set", f"network.{addr_section}.auto=0"],
+        [uci_command(), "commit", "network"],
+    ]
+    if dry_run:
+        return {
+            "changed": True,
+            "dry_run": True,
+            "service_backend": "openwrt-uci",
+            "commands": commands,
+            "runtime_status": "stopped",
+        }
+    results = []
+    for command in commands:
+        results.append(run_command(command, allow_failure=command[0] in {ifdown_command(), uci_command()} and "-q" in command))
+    return {
+        "changed": True,
+        "service_backend": "openwrt-uci",
+        "commands": results,
+        "runtime_status": "stopped",
+    }
+
+
+def delete_openwrt_gre_config_file(interface_name: str | None, config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+    """删除 OpenWrt GRE UCI 配置和 Link42 JSON 配置。"""
+
+    cleaned = str(interface_name or "").strip()
+    if not cleaned:
+        return {"interface_name": None, "config_path": None, "deleted": False}
+    commands = openwrt_delete_gre_config_commands(cleaned)
+    commands.append([uci_command(), "commit", "network"])
+    if dry_run:
+        config = delete_gre_config_file(cleaned, config_dir, dry_run=True)
+        return {
+            "interface_name": cleaned,
+            "service_backend": "openwrt-uci",
+            "commands": commands,
+            "config_path": config["config_path"],
+            "deleted": config["deleted"],
+            "dry_run": True,
+        }
+    results = run_openwrt_gre_commands(commands)
+    config = delete_gre_config_file(cleaned, config_dir, dry_run=False)
+    return {
+        "interface_name": cleaned,
+        "service_backend": "openwrt-uci",
+        "commands": results,
+        "config_path": config["config_path"],
+        "deleted": config["deleted"],
+    }
+
+
 def gre_systemd_start_commands(config: dict[str, Any]) -> list[list[str]]:
     """生成通过 systemd 启动 GRE 接口所需的命令序列。"""
 
@@ -244,6 +544,8 @@ def apply_gre_config(payload: dict[str, Any], config_dir: str | None = None, dry
     """写入 GRE 配置，不直接改动运行中接口。"""
 
     config = normalize_gre_payload(payload)
+    if openwrt_gre_available():
+        return apply_openwrt_gre_config(config, config_dir, dry_run=dry_run)
     path = write_gre_config(config, config_dir)
     return {"changed": True, "config_path": str(path), "config": config, "dry_run": dry_run}
 
@@ -257,6 +559,8 @@ def start_gre_interface(
     """幂等启动 GRE 接口，已存在时先删除再重建。"""
 
     config = normalize_gre_payload(payload)
+    if use_service and openwrt_gre_available():
+        return start_openwrt_gre_interface(config, config_dir, dry_run=dry_run)
     write_gre_config(config, config_dir)
     commands: list[dict[str, Any]] = []
     if use_service and gre_systemd_available():
@@ -317,6 +621,8 @@ def stop_gre_interface(payload: dict[str, Any], dry_run: bool = False, use_servi
     """幂等停止 GRE 接口，接口不存在也视为成功。"""
 
     interface_name = str(payload["interface_name"]).strip()
+    if use_service and openwrt_gre_available():
+        return stop_openwrt_gre_interface(interface_name, dry_run=dry_run)
     if use_service and gre_systemd_available():
         service_commands = gre_systemd_stop_commands(interface_name)
         if dry_run:
@@ -344,6 +650,31 @@ def stop_gre_interface(payload: dict[str, Any], dry_run: bool = False, use_servi
 def delete_gre_config(payload: dict[str, Any], config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
     """停止 GRE 接口并删除 Link42 管理的配置文件。"""
 
+    if openwrt_gre_available():
+        interface_name = str(payload["interface_name"]).strip()
+        stop_result = stop_openwrt_gre_interface(interface_name, dry_run=dry_run)
+        current_config = delete_openwrt_gre_config_file(interface_name, config_dir, dry_run=dry_run)
+        previous_interface_name = str(payload.get("previous_interface_name") or "").strip() or None
+        previous_stop = None
+        previous_config = None
+        if previous_interface_name and previous_interface_name != interface_name:
+            previous_stop = stop_openwrt_gre_interface(previous_interface_name, dry_run=dry_run)
+            previous_config = delete_openwrt_gre_config_file(previous_interface_name, config_dir, dry_run=dry_run)
+        return {
+            "changed": (
+                bool(stop_result.get("changed"))
+                or bool(current_config.get("deleted"))
+                or bool(previous_stop and previous_stop.get("changed"))
+                or bool(previous_config and previous_config.get("deleted"))
+            ),
+            "service_backend": "openwrt-uci",
+            "stop": stop_result,
+            "config_path": current_config["config_path"],
+            "deleted": current_config["deleted"],
+            "previous_stop": previous_stop,
+            "previous_config": previous_config,
+            "runtime_status": "stopped",
+        }
     stop_result = stop_gre_interface(payload, dry_run=dry_run)
     interface_name = str(payload["interface_name"]).strip()
     current_config = delete_gre_config_file(interface_name, config_dir, dry_run=dry_run)
@@ -388,6 +719,25 @@ def gre_status(payload: dict[str, Any]) -> dict[str, Any]:
     """读取 GRE 接口运行状态。"""
 
     interface_name = str(payload["interface_name"]).strip()
+    if openwrt_gre_available():
+        ifstatus = run_command(["ifstatus", interface_name], allow_failure=True)
+        status_payload: dict[str, Any] = {}
+        if ifstatus["returncode"] == 0:
+            try:
+                status_payload = json.loads(str(ifstatus.get("stdout") or "{}"))
+            except json.JSONDecodeError:
+                status_payload = {}
+        device_name = openwrt_gre_device_name(interface_name)
+        result = run_command([ip_command(), "link", "show", "dev", device_name], allow_failure=True)
+        running = bool(status_payload.get("up")) or (
+            result["returncode"] == 0 and gre_link_stdout_is_running(str(result.get("stdout") or ""))
+        )
+        return {
+            "runtime_status": "running" if running else "stopped",
+            "service_backend": "openwrt-uci",
+            "ifstatus": ifstatus,
+            "link": result,
+        }
     result = run_command([ip_command(), "link", "show", "dev", interface_name], allow_failure=True)
     running = result["returncode"] == 0 and gre_link_stdout_is_running(str(result.get("stdout") or ""))
     return {

@@ -73,6 +73,7 @@ type ConnectionEndpointItem = {
   routes: string[];
   runtime_status: string;
   protocol_config: Record<string, unknown>;
+  last_error: string | null;
   monitor_summary: LinkMonitorSummary | null;
 };
 
@@ -634,6 +635,8 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "interface name is required": "接口名称不能为空",
   "interface name must be 15 characters or fewer": "接口名称不能超过 15 个字符",
   "interface name contains unsupported characters": "接口名称只能包含字母、数字、下划线、点和短横线",
+  "GRE interface name must be 10 characters or fewer": "GRE 接口名称不能超过 10 个字符",
+  "GRE interface name can only contain letters, numbers, and underscores": "GRE 接口名称只能包含字母、数字和下划线",
   "GRE key must be a number": "GRE Key 必须是数字",
   "GRE key must be between 0 and 4294967295": "GRE Key 必须在 0 到 4294967295 之间",
   "MTU must be between 576 and 9000": "MTU 必须在 576-9000 之间",
@@ -1306,6 +1309,11 @@ function isValidGreKey(value: string): boolean {
   if (!/^\d+$/.test(cleaned)) return false;
   const number = Number(cleaned);
   return Number.isSafeInteger(number) && number >= 0 && number <= 4294967295;
+}
+
+// 校验 GRE 接口名，避免 OpenWrt netifd 生成的 gre4-设备名超过内核限制。
+function isValidGreInterfaceName(value: string): boolean {
+  return /^[A-Za-z0-9_]{1,10}$/.test(value.trim());
 }
 
 // 渲染链路监测摘要按钮。
@@ -4138,6 +4146,8 @@ function App() {
 
   // 从 GRE 表单读取两端通用参数，并在前端提前做基础校验。
   function readGreCommonPayload(form: FormData) {
+    const localInterfaceName = String(form.get("local_interface_name") || "").trim();
+    const peerInterfaceName = String(form.get("peer_interface_name") || "").trim();
     const localOuterIp = String(form.get("local_outer_ip") || "").trim();
     const peerOuterIp = String(form.get("peer_outer_ip") || "").trim();
     const localBindIp = String(form.get("local_bind_ip") || "").trim();
@@ -4151,6 +4161,9 @@ function App() {
     const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1476;
     const ttl = optionalInt(form.get("ttl"), "TTL");
     const greKey = String(form.get("gre_key") || "").trim();
+    if (!isValidGreInterfaceName(localInterfaceName) || !isValidGreInterfaceName(peerInterfaceName)) {
+      throw new Error("GRE 接口名称最多 10 个字符，只能包含字母、数字和下划线");
+    }
     if (!isValidIpv4Address(localOuterIp) || !isValidIpv4Address(peerOuterIp)) {
       throw new Error("GRE 外层地址必须填写 IPv4 字面量，不能使用域名或 IPv6");
     }
@@ -4188,8 +4201,8 @@ function App() {
       throw new Error("GRE Key 必须是 0 到 4294967295 之间的整数");
     }
     return {
-      local_interface_name: String(form.get("local_interface_name") || "").trim(),
-      peer_interface_name: String(form.get("peer_interface_name") || "").trim(),
+      local_interface_name: localInterfaceName,
+      peer_interface_name: peerInterfaceName,
       local_outer_ip: localOuterIp,
       peer_outer_ip: peerOuterIp,
       local_bind_ip: localBindIp || null,
@@ -4213,7 +4226,7 @@ function App() {
     event.preventDefault();
     if (!selectedNodeId || !selectedNode) return;
     if (!nodeSupportsGre(selectedNode)) {
-      throw new Error("当前节点尚未上报 GRE 能力，请安装 iproute2 或升级 Agent 后重试");
+      throw new Error("当前节点尚未上报 GRE 能力，请确认系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE，并升级 Agent 后重试");
     }
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
@@ -4223,7 +4236,7 @@ function App() {
       throw new Error("请选择另一个支持 GRE 的在线节点");
     }
     if (!nodeSupportsGre(peerNode)) {
-      throw new Error("对端节点尚未上报 GRE 能力，请安装 iproute2 或升级 Agent 后重试");
+      throw new Error("对端节点尚未上报 GRE 能力，请确认系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE，并升级 Agent 后重试");
     }
     const payload = {
       protocol_type: "gre",
@@ -5758,7 +5771,7 @@ function App() {
               ) : (
                 <>
               {!nodeSupportsGre(selectedNode) && (
-                <div className="empty wideField">当前节点尚未上报 GRE 能力，请确认 Agent 已升级且系统支持 iproute2 GRE。</div>
+                <div className="empty wideField">当前节点尚未上报 GRE 能力，请确认 Agent 已升级且系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE。</div>
               )}
               <FormSection title="基础" hint="GRE 连接会在两个在线受管节点之间创建 L3 隧道，外层地址使用 IPv4。">
                 <Field label="对端节点" hint="只显示已在线并上报 GRE 能力的节点。" requiredMark>
@@ -5774,11 +5787,11 @@ function App() {
                     ))}
                   </select>
                 </Field>
-                <Field label="本端接口名称" hint="Linux 接口名不超过 15 个字符。" requiredMark>
-                  <input name="local_interface_name" placeholder="gre-a-b" required disabled={!nodeSupportsGre(selectedNode)} />
+                <Field label="本端接口名称" hint="GRE 接口名最多 10 个字符，只能包含字母、数字、下划线。" requiredMark>
+                  <input name="local_interface_name" placeholder="gre_a_b" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="对端接口名称" hint="写入对端节点的 GRE 接口名。" requiredMark>
-                  <input name="peer_interface_name" placeholder="gre-b-a" required disabled={!nodeSupportsGre(selectedNode)} />
+                <Field label="对端接口名称" hint="GRE 接口名最多 10 个字符，只能包含字母、数字、下划线。" requiredMark>
+                  <input name="peer_interface_name" placeholder="gre_b_a" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
               <FormSection title="外层地址" hint="标准场景只填写两端对外 IPv4；云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
@@ -6175,6 +6188,17 @@ function App() {
                 ))}
               </div>
             )}
+            {selectedGreConnection.endpoints.some((endpoint) => endpoint.last_error) && (
+              <div className="empty dangerText">
+                {selectedGreConnection.endpoints
+                  .filter((endpoint) => endpoint.last_error)
+                  .map((endpoint) => (
+                    <div key={endpoint.endpoint_ref}>
+                      {endpoint.node_name || endpoint.interface_name}：{endpoint.last_error}
+                    </div>
+                  ))}
+              </div>
+            )}
 
             <section className="modalSection">
               <h3>受管 GRE</h3>
@@ -6184,10 +6208,10 @@ function App() {
                 className="gridForm describedForm"
               >
                 <FormSection title="基础" hint="接口名会写入双方节点，保存后会重新下发并启动双方 GRE。">
-                  <Field label="本端接口名称" hint={`节点：${selectedGreLocalEndpoint.node_name || selectedGreLocalEndpoint.node_id}`} requiredMark>
+                  <Field label="本端接口名称" hint={`节点：${selectedGreLocalEndpoint.node_name || selectedGreLocalEndpoint.node_id}；最多 10 个字符，只能包含字母、数字、下划线。`} requiredMark>
                     <input name="local_interface_name" defaultValue={selectedGreLocalEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="对端接口名称" hint={`节点：${selectedGrePeerEndpoint.node_name || selectedGrePeerEndpoint.node_id}`} requiredMark>
+                  <Field label="对端接口名称" hint={`节点：${selectedGrePeerEndpoint.node_name || selectedGrePeerEndpoint.node_id}；最多 10 个字符，只能包含字母、数字、下划线。`} requiredMark>
                     <input name="peer_interface_name" defaultValue={selectedGrePeerEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>

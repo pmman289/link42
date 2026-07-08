@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+import logging
 from pathlib import Path
 import shutil
 import sqlite3
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
+
+
+logger = logging.getLogger("link42.api.database")
 
 
 # SQLAlchemy 连接参数，不同数据库后端可以在这里做少量兼容处理。
@@ -16,9 +20,11 @@ connect_args = {}
 if settings.database_url.startswith("sqlite"):
     # FastAPI 在线程中处理请求时，SQLite 需要关闭同线程限制。
     connect_args["check_same_thread"] = False
+    # SQLite 默认只等待 5 秒，Agent 心跳和监测结果集中上报时容易误报 database is locked。
+    connect_args["timeout"] = 30
 
 # 全局数据库引擎，由 FastAPI 请求生命周期复用。
-engine = create_engine(settings.database_url, connect_args=connect_args)
+engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
 # 请求级 Session 工厂；关闭 autoflush 可以让写入时机更明确，便于审阅。
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -30,6 +36,25 @@ class Base(DeclarativeBase):
     """所有 SQLAlchemy 模型的基类。"""
 
     pass
+
+
+@event.listens_for(engine, "connect")
+def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+    """为 SQLite 连接设置并发读写相关参数。"""
+
+    if engine.dialect.name != "sqlite":
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            logger.warning("SQLite WAL 模式启用失败 error=%s", exc)
+    finally:
+        cursor.close()
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -272,6 +297,15 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS uq_wg_peer_interface_id
                     ON wg_peers(interface_id)
+                    """
+                )
+            )
+        if table_exists("link_monitor_samples"):
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_monitor_checked_at
+                    ON link_monitor_samples(monitor_id, checked_at)
                     """
                 )
             )

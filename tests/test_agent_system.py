@@ -549,6 +549,31 @@ def test_gre_capability_depends_on_iproute2(monkeypatch) -> None:
     assert "gre" not in main.build_capabilities(platform_info)
 
 
+def test_openwrt_gre_capability_uses_uci_backend(monkeypatch) -> None:
+    """验证 OpenWrt 节点检测到 netifd GRE 后上报 UCI 后端能力。"""
+
+    platform_info = {
+        "service_manager": "openwrt-uci",
+        "kernel_version": "5.4.281",
+        "is_openwrt": True,
+        "os": "linux",
+        "arch": "aarch64",
+        "distro_id": "openwrt",
+        "distro_codename": "21.02",
+        "has_mimic": False,
+    }
+    monkeypatch.setattr(main, "openwrt_gre_supported", lambda: True)
+    monkeypatch.setattr(main, "gre_runtime_supported", lambda: True)
+    monkeypatch.setattr(main, "mimic_installable", lambda platform: False)
+    monkeypatch.setattr(main, "mimic_runtime_supported", lambda platform: False)
+
+    capabilities = main.build_capabilities(platform_info)
+
+    assert "gre" in capabilities
+    assert "gre.openwrt-uci" in capabilities
+    assert "gre.iproute2" not in capabilities
+
+
 def test_run_gre_service_command_outputs_json(monkeypatch, capsys) -> None:
     """验证 systemd 调用的 gre-start 子命令会输出 JSON 结果。"""
 
@@ -584,8 +609,8 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
 
     result = gre.start_gre_interface(
         {
-            "interface_name": "gre-new",
-            "previous_interface_name": "gre-old",
+            "interface_name": "gre_new",
+            "previous_interface_name": "gre_old",
             "outer_local_ip": "203.0.113.10",
             "outer_remote_ip": "198.51.100.20",
             "tunnel_ips": ["10.42.8.1/30", "fd42::1/64"],
@@ -597,18 +622,18 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
         },
         str(tmp_path),
     )
-    saved = (tmp_path / "gre-new.json").read_text(encoding="utf-8")
+    saved = (tmp_path / "gre_new.json").read_text(encoding="utf-8")
 
     assert result["runtime_status"] == "running"
-    assert result["previous_config_cleanup"]["config_path"] == str(tmp_path / "gre-old.json")
-    assert '"interface_name": "gre-new"' in saved
+    assert result["previous_config_cleanup"]["config_path"] == str(tmp_path / "gre_old.json")
+    assert '"interface_name": "gre_new"' in saved
     assert commands == [
-        ["/sbin/ip", "link", "del", "gre-new"],
+        ["/sbin/ip", "link", "del", "gre_new"],
         [
             "/sbin/ip",
             "tunnel",
             "add",
-            "gre-new",
+            "gre_new",
             "mode",
             "gre",
             "local",
@@ -621,12 +646,12 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
             "255",
             "pmtudisc",
         ],
-        ["/sbin/ip", "addr", "add", "10.42.8.1/30", "dev", "gre-new"],
-        ["/sbin/ip", "addr", "add", "fd42::1/64", "dev", "gre-new"],
-        ["/sbin/ip", "link", "set", "dev", "gre-new", "mtu", "1476", "up"],
-        ["/sbin/ip", "route", "replace", "10.77.0.0/24", "dev", "gre-new"],
-        ["/sbin/ip", "-6", "route", "replace", "fd77::/64", "dev", "gre-new"],
-        ["/sbin/ip", "link", "del", "gre-old"],
+        ["/sbin/ip", "addr", "add", "10.42.8.1/30", "dev", "gre_new"],
+        ["/sbin/ip", "addr", "add", "fd42::1/64", "dev", "gre_new"],
+        ["/sbin/ip", "link", "set", "dev", "gre_new", "mtu", "1476", "up"],
+        ["/sbin/ip", "route", "replace", "10.77.0.0/24", "dev", "gre_new"],
+        ["/sbin/ip", "-6", "route", "replace", "fd77::/64", "dev", "gre_new"],
+        ["/sbin/ip", "link", "del", "gre_old"],
     ]
 
 
@@ -659,24 +684,24 @@ def test_gre_delete_config_removes_previous_rename_files(monkeypatch, tmp_path: 
         commands.append(command)
         return command_result(command)
 
-    (tmp_path / "gre-new.json").write_text("{}\n", encoding="utf-8")
-    (tmp_path / "gre-old.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "gre_new.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "gre_old.json").write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
     monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
     monkeypatch.setattr(gre, "run_command", fake_run_command)
 
     result = gre.delete_gre_config(
-        {"interface_name": "gre-new", "previous_interface_name": "gre-old"},
+        {"interface_name": "gre_new", "previous_interface_name": "gre_old"},
         str(tmp_path),
     )
 
     assert result["deleted"] is True
     assert result["previous_config"]["deleted"] is True
-    assert not (tmp_path / "gre-new.json").exists()
-    assert not (tmp_path / "gre-old.json").exists()
+    assert not (tmp_path / "gre_new.json").exists()
+    assert not (tmp_path / "gre_old.json").exists()
     assert commands == [
-        ["/sbin/ip", "link", "del", "gre-new"],
-        ["/sbin/ip", "link", "del", "gre-old"],
+        ["/sbin/ip", "link", "del", "gre_new"],
+        ["/sbin/ip", "link", "del", "gre_old"],
     ]
 
 
@@ -702,6 +727,86 @@ def test_gre_status_accepts_unknown_state_with_up_flag(monkeypatch) -> None:
     assert result["runtime_status"] == "running"
 
 
+def test_openwrt_gre_start_writes_uci_and_reloads_netifd(monkeypatch, tmp_path: Path) -> None:
+    """验证 OpenWrt GRE 启动会写入 UCI 并通过 ifup 拉起隧道和地址接口。"""
+
+    commands: list[tuple[list[str], bool]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """记录 OpenWrt GRE 启动时调用的 UCI 和 netifd 命令。"""
+
+        commands.append((command, allow_failure))
+        if command == ["/sbin/uci", "-q", "show", "network"]:
+            return command_result(command, stdout="network.old_r4_0.link42_gre_name='gre_ab'\n")
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "openwrt_gre_available", lambda: True)
+    monkeypatch.setattr(gre, "uci_command", lambda: "/sbin/uci")
+    monkeypatch.setattr(gre, "ifup_command", lambda: "/sbin/ifup")
+    monkeypatch.setattr(gre, "ifdown_command", lambda: "/sbin/ifdown")
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    result = gre.start_gre_interface(
+        {
+            "interface_name": "gre_ab",
+            "previous_interface_name": "gre_old",
+            "outer_local_ip": "203.0.113.10",
+            "outer_remote_ip": "198.51.100.20",
+            "tunnel_ips": ["10.42.8.1/30", "fd42::1/64"],
+            "routes": ["10.77.0.0/24", "fd77::/64"],
+            "mtu": 1476,
+            "key": "42",
+            "ttl": 255,
+            "pmtudisc": True,
+        },
+        str(tmp_path),
+    )
+    command_values = [command for command, _allow_failure in commands]
+
+    assert result["service_backend"] == "openwrt-uci"
+    assert result["runtime_status"] == "running"
+    assert (tmp_path / "gre_ab.json").exists()
+    assert ["/sbin/uci", "set", "network.gre_ab=interface"] in command_values
+    assert ["/sbin/uci", "set", "network.gre_ab.proto=gre"] in command_values
+    assert ["/sbin/uci", "set", "network.gre_ab.ipaddr=203.0.113.10"] in command_values
+    assert ["/sbin/uci", "set", "network.gre_ab.peeraddr=198.51.100.20"] in command_values
+    assert ["/sbin/uci", "set", "network.gre_ab.ikey=42"] in command_values
+    assert ["/sbin/uci", "set", "network.gre_ab.okey=42"] in command_values
+    assert ["/sbin/uci", "add_list", "network.gre_ab_addr.ipaddr=10.42.8.1/30"] in command_values
+    assert ["/sbin/uci", "add_list", "network.gre_ab_addr.ip6addr=fd42::1/64"] in command_values
+    assert ["/sbin/uci", "set", "network.gre_ab_r4_0.target=10.77.0.0"] in command_values
+    assert ["/sbin/uci", "set", "network.gre_ab_r6_0.target=fd77::/64"] in command_values
+    assert ["/sbin/ifup", "gre_ab"] in command_values
+    assert ["/sbin/ifup", "gre_ab_addr"] in command_values
+    assert any(command == ["/sbin/ifdown", "gre_ab"] and allow_failure for command, allow_failure in commands)
+
+
+def test_openwrt_gre_status_reads_ifstatus_and_generated_device(monkeypatch) -> None:
+    """验证 OpenWrt GRE 状态优先读取 ifstatus，并检查 netifd 生成设备。"""
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 OpenWrt ifstatus 和 ip link 输出。"""
+
+        if command == ["ifstatus", "gre_ab"]:
+            return command_result(command, stdout='{"up": true}\n')
+        if command == ["/sbin/ip", "link", "show", "dev", "gre4-gre_ab"]:
+            return command_result(
+                command,
+                stdout="9: gre4-gre_ab@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> state UNKNOWN\n",
+            )
+        return command_result(command, returncode=1)
+
+    monkeypatch.setattr(gre, "openwrt_gre_available", lambda: True)
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    result = gre.gre_status({"interface_name": "gre_ab"})
+
+    assert result["runtime_status"] == "running"
+    assert result["service_backend"] == "openwrt-uci"
+    assert result["link"]["command"] == ["/sbin/ip", "link", "show", "dev", "gre4-gre_ab"]
+
+
 def test_gre_systemd_start_uses_agent_service_entry(monkeypatch, tmp_path: Path) -> None:
     """验证 systemd 节点会通过 link42-gre@.service 持久化 GRE 接口。"""
 
@@ -709,10 +814,11 @@ def test_gre_systemd_start_uses_agent_service_entry(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(gre, "systemctl_command", lambda: "/bin/systemctl")
     monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
     monkeypatch.setattr(gre, "agent_binary_path", lambda: "/usr/local/bin/link42-agent")
+    monkeypatch.setattr(gre.shutil, "which", lambda binary: "/usr/local/bin/link42-agent" if binary == "link42-agent" else None)
 
     result = gre.start_gre_interface(
         {
-            "interface_name": "gre-a-b",
+            "interface_name": "gre_a_b",
             "outer_local_ip": "203.0.113.10",
             "outer_remote_ip": "198.51.100.20",
             "tunnel_ips": ["10.42.8.1/30"],
@@ -724,11 +830,26 @@ def test_gre_systemd_start_uses_agent_service_entry(monkeypatch, tmp_path: Path)
 
     assert result["service_backend"] == "systemd"
     assert "ExecStart=/usr/local/bin/link42-agent gre-start %i" in result["unit"]["content"]
+    assert "PYTHONPATH=" not in result["unit"]["content"]
     assert result["commands"] == [
         ["/bin/systemctl", "daemon-reload"],
-        ["/bin/systemctl", "enable", "link42-gre@gre-a-b.service"],
-        ["/bin/systemctl", "restart", "link42-gre@gre-a-b.service"],
+        ["/bin/systemctl", "enable", "link42-gre@gre_a_b.service"],
+        ["/bin/systemctl", "restart", "link42-gre@gre_a_b.service"],
     ]
+
+
+def test_gre_systemd_unit_falls_back_to_python_entry(monkeypatch) -> None:
+    """验证未安装 link42-agent 命令时 systemd unit 不直接执行源码文件。"""
+
+    monkeypatch.setattr(gre.shutil, "which", lambda binary: None)
+    monkeypatch.setattr(gre.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(gre, "agent_source_pythonpath", lambda: "/root/repo/link42/apps/agent:/root/repo/link42/packages")
+
+    content = gre.render_gre_systemd_unit("/etc/link42/gre")
+
+    assert "Environment=PYTHONPATH=/root/repo/link42/apps/agent:/root/repo/link42/packages" in content
+    assert "ExecStart=/usr/bin/python3 -m link42_agent.main gre-start %i" in content
+    assert "/root/repo/link42/apps/agent/link42_agent/main.py gre-start" not in content
 
 
 def test_mimic_capability_requires_systemd_kernel_newer_than_61_and_binary(monkeypatch) -> None:

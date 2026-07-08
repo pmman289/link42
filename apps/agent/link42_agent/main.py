@@ -20,7 +20,7 @@ from link42_common.version import AGENT_VERSION
 from .client import AgentClient, AgentHttpError
 from .config import AgentConfig
 from .config import load_config_from_env
-from .gre import gre_runtime_supported, start_gre_from_config
+from .gre import gre_runtime_supported, openwrt_gre_supported, start_gre_from_config
 from .link_monitor import probe_latency
 from .middleware import mimic_official_release_codename_supported
 from .plugins import node_plugin_capabilities
@@ -77,7 +77,12 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
     ]
     if service_manager != "openwrt-uci":
         capabilities.append("wg_quick_import")
-    if gre_runtime_supported():
+    if service_manager == "openwrt-uci" and openwrt_gre_supported():
+        capabilities.extend([
+            "gre",
+            "gre.openwrt-uci",
+        ])
+    elif service_manager != "openwrt-uci" and gre_runtime_supported():
         capabilities.extend([
             "gre",
             "gre.iproute2",

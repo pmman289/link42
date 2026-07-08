@@ -432,6 +432,21 @@ def refresh_node_runtime_status(node: models.Node, now: datetime | None = None) 
     return node
 
 
+def node_runtime_status(node: models.Node, now: datetime | None = None) -> str:
+    """计算节点当前展示状态，不修改数据库对象。"""
+
+    if node.status == "online" and not is_node_online(node, now=now):
+        return "offline"
+    return node.status
+
+
+def node_read_with_runtime_status(node: models.Node, now: datetime | None = None) -> schemas.NodeRead:
+    """把节点转换为响应模型，并用实时心跳结果覆盖展示状态。"""
+
+    result = schemas.NodeRead.model_validate(node)
+    return result.model_copy(update={"status": node_runtime_status(node, now=now)})
+
+
 def parse_version(value: str | None) -> tuple[int, int, int]:
     """把 SemVer 前三段解析成可比较元组。"""
 
@@ -618,6 +633,21 @@ def stop_task_result_failed(result: dict) -> bool:
     """兼容旧 Agent：stop 任务里 wg-quick/ifdown 失败时不应被视为成功。"""
 
     return command_result_failed(result.get("down")) or command_result_failed(result.get("stop"))
+
+
+def agent_task_error_summary(result: dict) -> str | None:
+    """从 Agent 任务结果中提取适合展示给用户的失败摘要。"""
+
+    for key in ["error", "message", "stderr", "stdout"]:
+        value = str(result.get(key) or "").strip()
+        if value:
+            return value[:500]
+    for value in result.values():
+        if isinstance(value, dict):
+            nested = agent_task_error_summary(value)
+            if nested:
+                return nested
+    return None
 
 
 def normalize_agent_task_report(
@@ -1391,9 +1421,7 @@ def require_online_node(db: Session, node_id: int) -> models.Node:
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
-    refresh_node_runtime_status(node)
-    if node.status != "online":
-        db.commit()
+    if node_runtime_status(node) != "online":
         raise HTTPException(status_code=409, detail="agent is offline")
     return node
 
@@ -1597,6 +1625,7 @@ def connection_endpoint_read(db: Session, endpoint: models.ConnectionEndpoint) -
     """把数据库连接端点转成通用 API 响应。"""
 
     monitor = connection_endpoint_monitor(db, endpoint.id)
+    extras = endpoint.extras or {}
     return schemas.ConnectionEndpointRead(
         id=endpoint.id,
         endpoint_ref=connection_endpoint_ref(endpoint),
@@ -1609,6 +1638,7 @@ def connection_endpoint_read(db: Session, endpoint: models.ConnectionEndpoint) -
         routes=endpoint.routes or [],
         runtime_status=endpoint.runtime_status,
         protocol_config=endpoint.protocol_config or {},
+        last_error=str(extras.get("last_error") or "").strip() or None,
         monitor_summary=summarize_monitor(db, monitor) if monitor else None,
     )
 
@@ -1617,12 +1647,12 @@ def gre_connection_status(connection: models.Connection) -> str:
     """根据两端状态聚合 GRE 连接展示状态。"""
 
     statuses = [endpoint.runtime_status for endpoint in connection.endpoints]
+    if any(status == "failed" for status in statuses):
+        return "failed"
     if statuses and all(status == "running" for status in statuses):
         return "running"
     if any(status in {"starting", "stopping"} for status in statuses):
         return "changing"
-    if any(status == "failed" for status in statuses):
-        return "failed"
     return "stopped"
 
 
@@ -1630,6 +1660,11 @@ def gre_connection_read(db: Session, connection: models.Connection) -> schemas.C
     """把 GRE 连接转成通用 API 响应。"""
 
     endpoints = sorted(connection.endpoints, key=lambda endpoint: 0 if endpoint.role == "local" else 1)
+    endpoint_errors = [
+        f"{endpoint.node.name if endpoint.node else endpoint.interface_name}: {str((endpoint.extras or {}).get('last_error') or '').strip()}"
+        for endpoint in endpoints
+        if str((endpoint.extras or {}).get("last_error") or "").strip()
+    ]
     return schemas.ConnectionRead(
         id=connection.id,
         connection_ref=connection_ref(CONNECTION_TYPE_GRE, connection.id),
@@ -1643,7 +1678,8 @@ def gre_connection_read(db: Session, connection: models.Connection) -> schemas.C
         warnings=[
             "GRE 不加密，请勿直接承载敏感流量",
             "GRE 需要中间网络放行 IP protocol 47，普通 NAT 环境通常不可用",
-        ],
+            "OpenWrt 节点创建 GRE 后需要把 GRE 地址接口加入合适的防火墙 zone，否则入向流量可能被防火墙拒绝",
+        ] + endpoint_errors,
     )
 
 
@@ -1842,13 +1878,7 @@ def build_topology(db: Session) -> schemas.TopologyRead:
     """汇总节点与受管双向链路，供首页拓扑图渲染。"""
 
     nodes = list(db.scalars(select(models.Node).order_by(models.Node.id)))
-    changed = False
-    for node in nodes:
-        old_status = node.status
-        refresh_node_runtime_status(node)
-        changed = changed or node.status != old_status
-    if changed:
-        db.commit()
+    now = datetime.utcnow()
 
     interfaces = list(
         db.scalars(
@@ -1948,7 +1978,7 @@ def build_topology(db: Session) -> schemas.TopologyRead:
             schemas.TopologyNode(
                 id=node.id,
                 name=node.name,
-                status=node.status,
+                status=node_runtime_status(node, now=now),
                 hostname=node.hostname,
                 region=node.region,
                 endpoint_ips=node.endpoint_ips or [],
@@ -2676,7 +2706,6 @@ def get_agent_upgrade_plan(
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
-    refresh_node_runtime_status(node)
     return build_agent_upgrade_plan(node, db, target_version=target_version, force=force)
 
 
@@ -2691,7 +2720,6 @@ def request_agent_upgrade(
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
-    refresh_node_runtime_status(node)
     plan = build_agent_upgrade_plan(node, db, target_version=payload.target_version, force=payload.force)
     if plan.upgrade_mode != "self_upgrade" or not plan.target_version or not plan.matched_platform or not plan.matched_asset:
         raise HTTPException(status_code=409, detail=plan.reason or "agent self upgrade is not available")
@@ -2803,17 +2831,12 @@ def update_node(
 
 
 @app.get("/api/nodes", response_model=list[schemas.NodeRead])
-def list_nodes(db: Session = Depends(get_db)) -> list[models.Node]:
+def list_nodes(db: Session = Depends(get_db)) -> list[schemas.NodeRead]:
     """列出所有节点。"""
+
     nodes = list(db.scalars(select(models.Node).order_by(models.Node.id)))
-    changed = False
-    for node in nodes:
-        old_status = node.status
-        refresh_node_runtime_status(node)
-        changed = changed or node.status != old_status
-    if changed:
-        db.commit()
-    return nodes
+    now = datetime.utcnow()
+    return [node_read_with_runtime_status(node, now=now) for node in nodes]
 
 
 @app.get("/api/topology", response_model=schemas.TopologyRead)
@@ -2842,6 +2865,7 @@ def list_protocols() -> list[schemas.ConnectionProtocolRead]:
             warnings=[
                 "GRE 不加密，请勿直接承载敏感流量",
                 "GRE 需要协议 47 放行，普通 NAT 环境通常不可用",
+                "OpenWrt 节点创建 GRE 后需要把 GRE 地址接口加入合适的防火墙 zone，否则入向流量可能被防火墙拒绝",
             ],
         ),
     ]
@@ -3098,17 +3122,13 @@ def delete_connection(raw_connection_ref: str, db: Session = Depends(get_db)) ->
 
 
 @app.get("/api/nodes/{node_id}", response_model=schemas.NodeRead)
-def get_node(node_id: int, db: Session = Depends(get_db)) -> models.Node:
+def get_node(node_id: int, db: Session = Depends(get_db)) -> schemas.NodeRead:
     """读取单个节点详情。"""
+
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
-    old_status = node.status
-    refresh_node_runtime_status(node)
-    if node.status != old_status:
-        db.commit()
-        db.refresh(node)
-    return node
+    return node_read_with_runtime_status(node)
 
 
 @app.get("/api/node-plugins", response_model=list[schemas.NodePluginRead])
@@ -3125,13 +3145,12 @@ def list_node_plugins_for_node(node_id: int, db: Session = Depends(get_db)) -> l
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
-    old_status = node.status
-    refresh_node_runtime_status(node)
-    if node.status != old_status:
-        db.commit()
-        db.refresh(node)
     context = NodePluginContext(node=node, db=db)
-    return [plugin.status_for_node(context) for plugin in NODE_PLUGINS.values()]
+    display_status = node_runtime_status(node)
+    return [
+        {**plugin.status_for_node(context), "node_status": display_status}
+        for plugin in NODE_PLUGINS.values()
+    ]
 
 
 def port_inventory_setting_for_node(node_id: int, db: Session) -> models.PortInventorySetting:
@@ -3288,8 +3307,7 @@ def request_node_plugin_action(
         raise HTTPException(status_code=404, detail="plugin not found")
     if action not in plugin.actions:
         raise HTTPException(status_code=404, detail="plugin action not found")
-    refresh_node_runtime_status(node)
-    if not is_node_online(node):
+    if node_runtime_status(node) != "online":
         raise HTTPException(status_code=409, detail="node is offline")
     context = NodePluginContext(node=node, db=db)
     status = plugin.status_for_node(context)
@@ -4791,6 +4809,12 @@ def agent_task_result(
                 interface.runtime_status = reported_result.get("runtime_status") or interface.runtime_status
 
     connection_endpoint_id = task.payload.get("connection_endpoint_id")
+    if connection_endpoint_id and reported_status == "failed":
+        endpoint = db.get(models.ConnectionEndpoint, connection_endpoint_id)
+        if endpoint is not None and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
+            endpoint.runtime_status = "failed"
+            set_endpoint_extra_value(endpoint, "last_error", agent_task_error_summary(reported_result) or "Agent 任务执行失败")
+            endpoint.connection.status = gre_connection_status(endpoint.connection)
     if connection_endpoint_id and reported_status == "succeeded":
         endpoint = db.get(models.ConnectionEndpoint, connection_endpoint_id)
         if endpoint is not None and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
@@ -4798,10 +4822,12 @@ def agent_task_result(
                 endpoint.deployed_config = json.dumps(gre_task_payload(endpoint), ensure_ascii=False, sort_keys=True)
             elif task.type == GRE_TASKS.start:
                 endpoint.runtime_status = "running"
+                set_endpoint_extra_value(endpoint, "last_error", None)
                 if gre_previous_config_cleanup_confirmed(task, reported_result):
                     set_endpoint_extra_value(endpoint, "previous_interface_name", None)
             elif task.type == GRE_TASKS.stop:
                 endpoint.runtime_status = "stopped"
+                set_endpoint_extra_value(endpoint, "last_error", None)
             elif task.type == GRE_TASKS.status:
                 endpoint.runtime_status = reported_result.get("runtime_status") or endpoint.runtime_status
             elif task.type == GRE_TASKS.read_config:
@@ -4871,6 +4897,8 @@ def agent_link_monitor_result(
     now = datetime.utcnow()
     recorded_count = 0
     failed_count = 0
+    cleanup_cutoffs: dict[int, datetime] = {}
+    last_checked_by_monitor: dict[int, datetime] = {}
     for item in payload.results:
         monitor = db.get(models.LinkMonitor, item.monitor_id)
         if monitor is None or monitor.node_id != payload.node_id:
@@ -4886,14 +4914,19 @@ def agent_link_monitor_result(
                 error=item.error,
             )
         )
-        monitor.last_checked_at = checked_at
+        last_checked_by_monitor[monitor.id] = checked_at
+        cleanup_cutoffs[monitor.id] = now - timedelta(days=monitor.retention_days)
         recorded_count += 1
         if not item.success:
             failed_count += 1
-        cutoff = now - timedelta(days=monitor.retention_days)
+    for monitor_id, checked_at in last_checked_by_monitor.items():
+        monitor = db.get(models.LinkMonitor, monitor_id)
+        if monitor is not None:
+            monitor.last_checked_at = checked_at
+    for monitor_id, cutoff in cleanup_cutoffs.items():
         db.execute(
             delete(models.LinkMonitorSample).where(
-                models.LinkMonitorSample.monitor_id == monitor.id,
+                models.LinkMonitorSample.monitor_id == monitor_id,
                 models.LinkMonitorSample.checked_at < cutoff,
             )
         )
