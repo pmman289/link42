@@ -467,6 +467,16 @@ textarea {
   pointer-events: none;
 }
 
+.topologyFlowNode .topologyCenterHandle {
+  top: 50%;
+  left: 50%;
+  width: 1px;
+  height: 1px;
+  border: 0;
+  background: transparent;
+  transform: translate(-50%, -50%);
+}
+
 .topologyNode {
   position: relative;
   display: grid;
@@ -529,6 +539,9 @@ textarea {
 .topologyEdge .react-flow__edge-path {
   stroke-width: 2.5;
   stroke: #8ea3ad;
+  fill: none;
+  animation: none;
+  vector-effect: non-scaling-stroke;
 }
 
 .topologyEdge.healthy .react-flow__edge-path {
@@ -541,11 +554,44 @@ textarea {
 
 .topologyEdge.critical .react-flow__edge-path {
   stroke: var(--danger);
+  stroke-opacity: 0.36;
 }
 
-.topologyEdge .react-flow__edge-text {
-  fill: #1e2a32;
+.topologyEdgeInteraction {
+  stroke: transparent;
+  stroke-width: 18;
+  fill: none;
+  pointer-events: stroke;
+}
+
+.topologyEdgeBreakMark {
+  pointer-events: none;
+  user-select: none;
+}
+
+.topologyEdgeBreakMark line {
+  stroke: var(--danger);
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.topologyEdgeLabel {
+  position: absolute;
+  z-index: 6;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #1e2a32;
   font-size: 11px;
+  line-height: 1.4;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.topologyEdgeLabel.critical {
+  color: var(--danger);
 }
 
 .topologyEdge .react-flow__edge-textbg {
@@ -1985,10 +2031,17 @@ textarea {
 
 [data-theme="dark"] .topologyEdge.critical .react-flow__edge-path {
   stroke: var(--danger);
+  stroke-opacity: 0.42;
 }
 
-[data-theme="dark"] .topologyEdge .react-flow__edge-text {
-  fill: #e7f0f4;
+[data-theme="dark"] .topologyEdgeLabel {
+  border-color: var(--border-strong);
+  background: rgba(19, 33, 39, 0.94);
+  color: #e7f0f4;
+}
+
+[data-theme="dark"] .topologyEdgeLabel.critical {
+  color: var(--danger);
 }
 
 [data-theme="dark"] .topologyEdge .react-flow__edge-textbg {

@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Check, ChevronDown, ChevronRight, FileText, Folder, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Network, Pencil, Plug, Plus, RefreshCw, Server, Settings, ShieldCheck, Sun, Upload, X } from "lucide-react";
-import { Background, Handle, Position, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
+import { Background, EdgeLabelRenderer, Handle, Position, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type EdgeProps, type EdgeTypes, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import CodeMirror from "@uiw/react-codemirror";
@@ -1167,61 +1167,83 @@ function topologyNodeEndpoint(node: TopologyNode) {
   return node.topology_endpoint || node.endpoint_ips[0] || node.hostname || "未配置地址";
 }
 
-type TopologyHandleId = "top" | "right" | "bottom" | "left";
-
 type TopologyNodePosition = {
   x: number;
   y: number;
 };
 
-const TOPOLOGY_NODE_WIDTH = 178;
-const TOPOLOGY_NODE_HEIGHT = 78;
-
-const topologyHandlePositions: Record<TopologyHandleId, Position> = {
-  top: Position.Top,
-  right: Position.Right,
-  bottom: Position.Bottom,
-  left: Position.Left,
-};
-
-// 按两个节点的相对方位选择最短方向的连线端点。
-function topologyHandlePair(source: TopologyNodePosition | undefined, target: TopologyNodePosition | undefined) {
-  if (!source || !target) {
-    return { sourceHandle: "right" as TopologyHandleId, targetHandle: "left" as TopologyHandleId };
-  }
-  const sourceCenter = {
-    x: source.x + TOPOLOGY_NODE_WIDTH / 2,
-    y: source.y + TOPOLOGY_NODE_HEIGHT / 2,
-  };
-  const targetCenter = {
-    x: target.x + TOPOLOGY_NODE_WIDTH / 2,
-    y: target.y + TOPOLOGY_NODE_HEIGHT / 2,
-  };
-  const dx = targetCenter.x - sourceCenter.x;
-  const dy = targetCenter.y - sourceCenter.y;
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return dx >= 0
-      ? { sourceHandle: "right" as TopologyHandleId, targetHandle: "left" as TopologyHandleId }
-      : { sourceHandle: "left" as TopologyHandleId, targetHandle: "right" as TopologyHandleId };
-  }
-  return dy >= 0
-    ? { sourceHandle: "bottom" as TopologyHandleId, targetHandle: "top" as TopologyHandleId }
-    : { sourceHandle: "top" as TopologyHandleId, targetHandle: "bottom" as TopologyHandleId };
-}
-
-// 渲染拓扑节点四边的 React Flow 连接手柄。
+// 渲染拓扑节点中心的隐藏连接手柄，让连线从节点中心出发。
 function TopologyHandles() {
   return (
     <>
-      {(["top", "right", "bottom", "left"] as TopologyHandleId[]).map((id) => (
-        <React.Fragment key={id}>
-          <Handle id={id} type="source" position={topologyHandlePositions[id]} isConnectable={false} />
-          <Handle id={id} type="target" position={topologyHandlePositions[id]} isConnectable={false} />
-        </React.Fragment>
-      ))}
+      <Handle id="center" type="source" position={Position.Top} className="topologyCenterHandle" isConnectable={false} />
+      <Handle id="center" type="target" position={Position.Top} className="topologyCenterHandle" isConnectable={false} />
     </>
   );
 }
+
+// 渲染拓扑图使用的中心直线边，断开态用小 x 点阵叠在线上标识。
+function TopologyStraightEdge({
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  label,
+  data,
+  markerEnd,
+  style,
+}: EdgeProps) {
+  const edgePath = `M ${sourceX},${sourceY} L ${targetX},${targetY}`;
+  const labelX = (sourceX + targetX) / 2;
+  const labelY = (sourceY + targetY) / 2;
+  const edgeData = data as { tone?: string; disconnected?: boolean } | undefined;
+  const tone = String(edgeData?.tone || "unknown");
+  const classNames = `topologyEdge ${tone}`;
+  const disconnected = Boolean(edgeData?.disconnected);
+  const edgeLength = Math.hypot(targetX - sourceX, targetY - sourceY);
+  const breakMarkCount = disconnected && edgeLength > 0
+    ? Math.min(160, Math.max(1, Math.floor(edgeLength / 11) - 1))
+    : 0;
+  const breakMarkOffset = breakMarkCount > 1 ? (edgeLength - (breakMarkCount - 1) * 11) / 2 : edgeLength / 2;
+  const breakMarks = Array.from({ length: breakMarkCount }, (_, index) => {
+    const distance = breakMarkOffset + index * 11;
+    const ratio = distance / edgeLength;
+    return {
+      x: sourceX + (targetX - sourceX) * ratio,
+      y: sourceY + (targetY - sourceY) * ratio,
+    };
+  });
+  return (
+    <>
+      <g className={classNames}>
+        <path className="react-flow__edge-path topologyEdgePath" d={edgePath} markerEnd={markerEnd} style={style} />
+        <path className="react-flow__edge-interaction topologyEdgeInteraction" d={edgePath} />
+        {breakMarks.map((mark, index) => (
+          <g key={index} className="topologyEdgeBreakMark" transform={`translate(${mark.x} ${mark.y})`}>
+            <line x1="-2.6" y1="-2.6" x2="2.6" y2="2.6" />
+            <line x1="-2.6" y1="2.6" x2="2.6" y2="-2.6" />
+          </g>
+        ))}
+      </g>
+      {label ? (
+        <EdgeLabelRenderer>
+          <div
+            className={`topologyEdgeLabel ${classNames}`}
+            style={{
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+            }}
+          >
+            {label}
+          </div>
+        </EdgeLabelRenderer>
+      ) : null}
+    </>
+  );
+}
+
+const topologyEdgeTypes = {
+  topologyStraight: TopologyStraightEdge,
+} satisfies EdgeTypes;
 
 // 返回节点地域标签，未填写时使用默认提示。
 function nodeRegionLabel(node: Pick<NodeItem, "region">) {
@@ -2467,23 +2489,21 @@ function App() {
   const topologyFlowEdges = useMemo<FlowEdge[]>(() =>
     topologyDisplayEdges.map((edge) => {
       const tone = topologyEdgeTone(edge);
-      const handles = topologyHandlePair(
-        topologyNodePositions[edge.local_node_id],
-        topologyNodePositions[edge.peer_node_id],
-      );
+      const disconnected = edge.links.some((link) => link.local_status !== "running" || link.peer_status !== "running");
       return {
         id: edge.id,
         source: String(edge.local_node_id),
         target: String(edge.peer_node_id),
-        sourceHandle: handles.sourceHandle,
-        targetHandle: handles.targetHandle,
+        sourceHandle: "center",
+        targetHandle: "center",
+        type: "topologyStraight",
         label: topologyEdgeSummary(edge),
-        animated: edge.links.some((link) => link.local_status === "running" && link.peer_status === "running"),
+        animated: false,
         className: `topologyEdge ${tone}`,
-        data: edge,
+        data: { ...edge, tone, disconnected },
       };
     }),
-  [topologyDisplayEdges, topologyNodePositions]);
+  [topologyDisplayEdges]);
 
   // 点击拓扑节点时选中对应节点并滚动到节点详情。
   const handleTopologyNodeClick: NodeMouseHandler = (_event, node) => {
@@ -4633,6 +4653,7 @@ function App() {
           <ReactFlow
             nodes={topologyFlowNodes}
             edges={topologyFlowEdges}
+            edgeTypes={topologyEdgeTypes}
             fitView
             minZoom={0.2}
             maxZoom={1.8}
