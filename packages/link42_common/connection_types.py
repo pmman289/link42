@@ -6,6 +6,8 @@ from dataclasses import dataclass
 CONNECTION_TYPE_WIREGUARD = "wireguard"
 CONNECTION_TYPE_GRE = "gre"
 LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK = "looking_glass.bird.route_lookup"
+LOOKING_GLASS_PING_TASK = "looking_glass.ping"
+LOOKING_GLASS_TRACEROUTE_TASK = "looking_glass.traceroute"
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,14 @@ TASK_REQUIREMENTS = {
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK: {
         "min_agent_version": "0.6.0",
         "capabilities": ["looking_glass.bird.route_lookup"],
+    },
+    LOOKING_GLASS_PING_TASK: {
+        "min_agent_version": "0.6.4",
+        "capabilities": ["looking_glass.ping"],
+    },
+    LOOKING_GLASS_TRACEROUTE_TASK: {
+        "min_agent_version": "0.6.4",
+        "capabilities": ["looking_glass.traceroute"],
     },
     "agent.self_upgrade": {"min_agent_version": "0.2.0", "capabilities": ["agent.self_upgrade"]},
 }

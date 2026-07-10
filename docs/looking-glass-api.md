@@ -8,7 +8,8 @@
 
 - Looking Glass 可以获取节点名称、节点 IP、节点地域和在线状态。
 - Looking Glass 可以请求节点执行 `birdc show route for <ip> all`。
-- BIRD 查询结果默认返回原始输出，由 Looking Glass 自行解析和展示。
+- Looking Glass 可以请求节点执行受限的 `ping` 和 `traceroute` 网络诊断。
+- 查询结果默认返回原始输出，由 Looking Glass 自行解析和展示。
 - 查询采用异步提交、轮询读取结果的方式，适配 Agent 高延迟、离线、排队和超时场景。
 - 外部接口必须有独立鉴权、权限范围、节点访问白名单和限流能力。
 - 外部接口不能暴露主控管理能力、内部任务 ID、节点插件能力或任意命令执行能力。
@@ -215,7 +216,9 @@ cursor      可选，分页游标
       },
       "capabilities": {
         "bird": true,
-        "bird_route_lookup": true
+        "bird_route_lookup": true,
+        "ping": true,
+        "traceroute": true
       }
     }
   ],
@@ -234,6 +237,8 @@ cursor      可选，分页游标
 - `ips.public_ip`：节点公网地址。
 - `ips.endpoint_ips`：节点配置中的入口地址列表，适合 Looking Glass 展示或选择。
 - `capabilities.bird_route_lookup`：节点当前 Agent 是否支持 Looking Glass BIRD 查询。
+- `capabilities.ping`：节点当前 Agent 是否支持 Looking Glass ping 查询。
+- `capabilities.traceroute`：节点当前 Agent 是否支持 Looking Glass traceroute 查询。
 
 节点 IP 返回策略：
 
@@ -269,7 +274,9 @@ looking_glass.nodes.read
   },
   "capabilities": {
     "bird": true,
-    "bird_route_lookup": true
+    "bird_route_lookup": true,
+    "ping": true,
+    "traceroute": true
   }
 }
 ```
@@ -433,6 +440,56 @@ cancelled    被主控取消
 - 过期后 `GET /queries/{query_id}` 返回 `410 result expired`。
 - 查询 ID 是不透明 ID，不暴露内部 `agent_tasks.id`。
 
+### 7.3 ping 查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/ping
+```
+
+请求体：
+
+```json
+{
+  "target": "1.1.1.1",
+  "count": 4,
+  "per_probe_timeout_seconds": 2
+}
+```
+
+校验规则：
+
+- `target` 必须是合法 IP 字面量或普通域名。
+- `count` 范围为 1 到 10，默认 4。
+- `per_probe_timeout_seconds` 范围为 1 到 10，默认 2。
+- 节点 Agent 必须上报 `ping` 能力。
+- 成功提交后返回 `202 Accepted`，`operation` 为 `ping`。
+
+### 7.4 traceroute 查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/traceroute
+```
+
+请求体：
+
+```json
+{
+  "target": "example.com",
+  "max_hops": 30,
+  "wait_seconds": 3,
+  "queries": 3
+}
+```
+
+校验规则：
+
+- `target` 必须是合法 IP 字面量或普通域名。
+- `max_hops` 范围为 1 到 64，默认 30。
+- `wait_seconds` 范围为 1 到 10，默认 3。
+- `queries` 范围为 1 到 5，默认 3。
+- 节点 Agent 必须上报 `traceroute` 能力。
+- 成功提交后返回 `202 Accepted`，`operation` 为 `traceroute`。
+
 ## 8. 高延迟和队列设计
 
 Looking Glass 查询不能阻塞 Link42 的配置部署任务。建议扩展 Agent 任务模型：
@@ -478,6 +535,8 @@ Agent 新增受限任务类型：
 
 ```text
 looking_glass.bird.route_lookup
+looking_glass.ping
+looking_glass.traceroute
 ```
 
 任务 payload：
@@ -494,8 +553,10 @@ Agent 执行要求：
 
 - 固定执行 `birdc show route for <normalized_ip> all`。
 - 使用 argv 调用，例如 `["birdc", "show", "route", "for", normalized_ip, "all"]`。
+- 固定执行 `ping -c <count> -W <timeout> <target>`，`count` 和超时必须由主控限制范围。
+- 固定执行 `traceroute -n -m <max_hops> -w <wait> -q <queries> <target>`，跳数、等待时间和探测次数必须由主控限制范围。
 - 禁止 shell 拼接。
-- 禁止调用方指定 BIRD socket、配置文件、表名或额外参数。
+- 禁止调用方指定 BIRD socket、配置文件、表名、traceroute 协议模式或额外参数。
 - 命令超时后必须杀死子进程并返回 `timeout` 错误。
 - `stdout` 和 `stderr` 分别限制最大 256 KiB，超出后截断并设置 `truncated=true`。
 - 返回 `exit_code`、`stdout`、`stderr`、`truncated`、`duration_ms`。
@@ -506,7 +567,9 @@ Agent 能力上报建议：
 {
   "capabilities": [
     "bird",
-    "looking_glass.bird.route_lookup"
+    "looking_glass.bird.route_lookup",
+    "looking_glass.ping",
+    "looking_glass.traceroute"
   ]
 }
 ```
@@ -517,7 +580,9 @@ Agent 能力上报建议：
 {
   "capabilities": {
     "bird": true,
-    "bird_route_lookup": true
+    "bird_route_lookup": true,
+    "ping": true,
+    "traceroute": true
   }
 }
 ```
@@ -558,7 +623,7 @@ looking_glass_queries
 ## 11. 错误码
 
 ```text
-400 invalid_request          请求格式错误或 IP 非法
+400 invalid_request          请求格式错误、IP 非法或目标地址非法
 401 invalid_api_key          API Key 不存在、禁用或过期
 403 permission_denied        缺少 scope
 404 node_not_found           节点不存在或不在白名单

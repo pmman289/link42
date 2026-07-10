@@ -25,6 +25,8 @@ from link42_common.connection_types import (
     CONNECTION_TYPE_WIREGUARD,
     GRE_TASKS,
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_PING_TASK,
+    LOOKING_GLASS_TRACEROUTE_TASK,
     TASK_REQUIREMENTS,
     WIREGUARD_TASKS,
 )
@@ -99,6 +101,9 @@ def summarize_task_payload(payload: dict | None) -> dict[str, object]:
         "range_start",
         "range_end",
         "ip",
+        "target",
+        "count",
+        "max_hops",
         "command_timeout_seconds",
         "output_limit_bytes",
     ]
@@ -485,6 +490,20 @@ def node_supports_bird_route_lookup(node: models.Node) -> bool:
     return "looking_glass.bird.route_lookup" in capabilities
 
 
+def node_supports_looking_glass_ping(node: models.Node) -> bool:
+    """判断节点 Agent 是否上报 Looking Glass ping 查询能力。"""
+
+    capabilities = set(node.agent_capabilities or [])
+    return "looking_glass.ping" in capabilities
+
+
+def node_supports_looking_glass_traceroute(node: models.Node) -> bool:
+    """判断节点 Agent 是否上报 Looking Glass traceroute 查询能力。"""
+
+    capabilities = set(node.agent_capabilities or [])
+    return "looking_glass.traceroute" in capabilities
+
+
 def looking_glass_node_read(node: models.Node, now: datetime | None = None) -> schemas.LookingGlassNodeRead:
     """把内部节点模型转换成第三方 Looking Glass 可读取的节点信息。"""
 
@@ -504,6 +523,8 @@ def looking_glass_node_read(node: models.Node, now: datetime | None = None) -> s
         capabilities=schemas.LookingGlassNodeCapabilities(
             bird="bird" in capabilities or "looking_glass.bird.route_lookup" in capabilities,
             bird_route_lookup=node_supports_bird_route_lookup(node),
+            ping=node_supports_looking_glass_ping(node),
+            traceroute=node_supports_looking_glass_traceroute(node),
         ),
     )
 
@@ -838,17 +859,21 @@ def get_looking_glass_node(
     return looking_glass_node_read(node)
 
 
-@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/bird/routes:lookup", response_model=schemas.LookingGlassQueryRead)
-def submit_looking_glass_bird_route_lookup(
+def create_looking_glass_query_task(
     node_ref_value: str,
-    payload: schemas.LookingGlassRouteLookupRequest,
     response: Response,
-    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
-    db: Session = Depends(get_db),
+    api_key: models.IntegrationApiKey,
+    db: Session,
+    operation: str,
+    task_type: str,
+    task_payload: dict[str, Any],
+    request_payload: dict[str, Any],
+    fingerprint_value: str,
+    required_capability: str,
+    capability_error_message: str,
 ) -> schemas.LookingGlassQueryRead:
-    """提交 Looking Glass BIRD 路由查询任务，返回可轮询的 query_id。"""
+    """创建 Looking Glass 异步查询任务，并返回可轮询的 query_id。"""
 
-    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
     node_id = parse_node_ref(node_ref_value)
     require_looking_glass_node_access(api_key, node_id)
     node = db.get(models.Node, node_id)
@@ -857,8 +882,8 @@ def submit_looking_glass_bird_route_lookup(
     now = datetime.utcnow()
     if not is_node_online(node, now=now):
         raise api_error(409, "node_offline", "节点当前离线，无法执行查询")
-    if not node_supports_bird_route_lookup(node):
-        raise api_error(409, "capability_missing", "节点不支持 BIRD 路由查询")
+    if required_capability not in set(node.agent_capabilities or []):
+        raise api_error(409, "capability_missing", capability_error_message)
     queued_count = db.scalar(
         select(func.count(models.AgentTask.id)).where(
             models.AgentTask.node_id == node_id,
@@ -868,9 +893,7 @@ def submit_looking_glass_bird_route_lookup(
     )
     if int(queued_count or 0) >= LOOKING_GLASS_QUERY_QUEUE_LIMIT:
         raise api_error(429, "query_queue_full", "节点查询队列已满，请稍后重试")
-    normalized_ip = payload.ip
-    operation = "bird.route_lookup"
-    fingerprint = looking_glass_request_fingerprint(api_key.id, node_id, operation, normalized_ip)
+    fingerprint = looking_glass_request_fingerprint(api_key.id, node_id, operation, fingerprint_value)
     reusable_query = db.scalar(
         select(models.LookingGlassQuery)
         .where(
@@ -894,11 +917,11 @@ def submit_looking_glass_bird_route_lookup(
     expires_at = now + LOOKING_GLASS_RESULT_RETENTION
     task = models.AgentTask(
         node_id=node_id,
-        type=LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+        type=task_type,
         queue="query",
         priority=50,
         payload={
-            "ip": normalized_ip,
+            **task_payload,
             "command_timeout_seconds": LOOKING_GLASS_COMMAND_TIMEOUT_SECONDS,
             "output_limit_bytes": LOOKING_GLASS_OUTPUT_LIMIT_BYTES,
         },
@@ -911,7 +934,7 @@ def submit_looking_glass_bird_route_lookup(
         api_key_id=api_key.id,
         node_id=node_id,
         operation=operation,
-        request={"ip": payload.ip, "normalized_ip": normalized_ip},
+        request=request_payload,
         request_fingerprint=fingerprint,
         status="queued",
         agent_task_id=task.id,
@@ -924,8 +947,104 @@ def submit_looking_glass_bird_route_lookup(
     response.status_code = 202
     response.headers["Location"] = f"{LOOKING_GLASS_API_PREFIX}/queries/{query_record.public_id}"
     response.headers["Retry-After"] = "1"
-    logger.info("创建 Looking Glass BIRD 查询 query_id=%s node_id=%s ip=%s", query_record.public_id, node_id, normalized_ip)
+    logger.info(
+        "创建 Looking Glass 查询 query_id=%s node_id=%s operation=%s request=%s",
+        query_record.public_id,
+        node_id,
+        operation,
+        request_payload,
+    )
     return looking_glass_query_read(query_record)
+
+
+@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/bird/routes:lookup", response_model=schemas.LookingGlassQueryRead)
+def submit_looking_glass_bird_route_lookup(
+    node_ref_value: str,
+    payload: schemas.LookingGlassRouteLookupRequest,
+    response: Response,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """提交 Looking Glass BIRD 路由查询任务，返回可轮询的 query_id。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    normalized_ip = payload.ip
+    return create_looking_glass_query_task(
+        node_ref_value,
+        response,
+        api_key,
+        db,
+        "bird.route_lookup",
+        LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+        {"ip": normalized_ip},
+        {"ip": payload.ip, "normalized_ip": normalized_ip},
+        normalized_ip,
+        "looking_glass.bird.route_lookup",
+        "节点不支持 BIRD 路由查询",
+    )
+
+
+@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/ping", response_model=schemas.LookingGlassQueryRead)
+def submit_looking_glass_ping(
+    node_ref_value: str,
+    payload: schemas.LookingGlassPingRequest,
+    response: Response,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """提交 Looking Glass ping 查询任务，返回可轮询的 query_id。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    request_payload = {
+        "target": payload.target,
+        "count": payload.count,
+        "per_probe_timeout_seconds": payload.per_probe_timeout_seconds,
+    }
+    return create_looking_glass_query_task(
+        node_ref_value,
+        response,
+        api_key,
+        db,
+        "ping",
+        LOOKING_GLASS_PING_TASK,
+        request_payload,
+        request_payload,
+        json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
+        "looking_glass.ping",
+        "节点不支持 ping 查询",
+    )
+
+
+@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/traceroute", response_model=schemas.LookingGlassQueryRead)
+def submit_looking_glass_traceroute(
+    node_ref_value: str,
+    payload: schemas.LookingGlassTracerouteRequest,
+    response: Response,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """提交 Looking Glass traceroute 查询任务，返回可轮询的 query_id。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    request_payload = {
+        "target": payload.target,
+        "max_hops": payload.max_hops,
+        "wait_seconds": payload.wait_seconds,
+        "queries": payload.queries,
+    }
+    return create_looking_glass_query_task(
+        node_ref_value,
+        response,
+        api_key,
+        db,
+        "traceroute",
+        LOOKING_GLASS_TRACEROUTE_TASK,
+        request_payload,
+        request_payload,
+        json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
+        "looking_glass.traceroute",
+        "节点不支持 traceroute 查询",
+    )
 
 
 @app.get(f"{LOOKING_GLASS_API_PREFIX}/queries/{{query_id}}", response_model=schemas.LookingGlassQueryRead)

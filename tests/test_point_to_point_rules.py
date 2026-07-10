@@ -5,7 +5,14 @@ from datetime import datetime, timedelta
 import pytest
 from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
-from link42_common.connection_types import GRE_TASKS, LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK, TASK_REQUIREMENTS, WIREGUARD_TASKS
+from link42_common.connection_types import (
+    GRE_TASKS,
+    LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_PING_TASK,
+    LOOKING_GLASS_TRACEROUTE_TASK,
+    TASK_REQUIREMENTS,
+    WIREGUARD_TASKS,
+)
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
@@ -80,6 +87,8 @@ from link42_api.main import (
     create_looking_glass_token,
     require_looking_glass_api_key,
     submit_looking_glass_bird_route_lookup,
+    submit_looking_glass_ping,
+    submit_looking_glass_traceroute,
     get_looking_glass_query,
 )
 from link42_api.schemas import (
@@ -101,8 +110,10 @@ from link42_api.schemas import (
     AgentUpgradeRequest,
     GreManagedConnectionCreate,
     IntegrationApiTokenCreate,
+    LookingGlassPingRequest,
     LookingGlassQueryRead,
     LookingGlassRouteLookupRequest,
+    LookingGlassTracerouteRequest,
     NodePluginActionRequest,
     PortInventoryEntryCreate,
     PortInventorySettingUpdate,
@@ -2673,6 +2684,63 @@ def test_looking_glass_route_lookup_creates_query_task() -> None:
     assert task.payload["ip"] == "1.1.1.1"
 
 
+def test_looking_glass_ping_and_traceroute_create_query_tasks() -> None:
+    """验证第三方 ping/traceroute 查询会创建独立 query 队列任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.4",
+            agent_capabilities=["looking_glass.ping", "looking_glass.traceroute"],
+        )
+        session.add(node)
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=True,
+        )
+        session.add(api_key)
+        session.commit()
+
+        ping_response = Response()
+        ping_result = submit_looking_glass_ping(
+            f"node_{node.id}",
+            LookingGlassPingRequest(target="Example.COM", count=3),
+            ping_response,
+            api_key,
+            session,
+        )
+        trace_response = Response()
+        trace_result = submit_looking_glass_traceroute(
+            f"node_{node.id}",
+            LookingGlassTracerouteRequest(target="2001:db8::1", max_hops=12, queries=1),
+            trace_response,
+            api_key,
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).where(models.AgentTask.node_id == node.id).order_by(models.AgentTask.id)))
+
+    assert ping_response.status_code == 202
+    assert trace_response.status_code == 202
+    assert ping_result.operation == "ping"
+    assert trace_result.operation == "traceroute"
+    assert [task.type for task in tasks] == [LOOKING_GLASS_PING_TASK, LOOKING_GLASS_TRACEROUTE_TASK]
+    assert tasks[0].payload["target"] == "example.com"
+    assert tasks[0].payload["count"] == 3
+    assert tasks[1].payload["target"] == "2001:db8::1"
+    assert tasks[1].payload["max_hops"] == 12
+
+
 def test_looking_glass_invalid_ip_uses_stable_error_response() -> None:
     """验证第三方 API 的请求校验错误使用文档约定的稳定错误格式。"""
 
@@ -2718,6 +2786,15 @@ def test_looking_glass_invalid_ip_uses_stable_error_response() -> None:
             "message": "请求参数无效",
         }
     }
+
+
+def test_looking_glass_diagnostic_target_rejects_invalid_hostname() -> None:
+    """验证 ping/traceroute 目标只允许 IP 或普通域名。"""
+
+    with pytest.raises(ValidationError):
+        LookingGlassPingRequest(target="bad;uname -a")
+    with pytest.raises(ValidationError):
+        LookingGlassTracerouteRequest(target="-bad.example")
 
 
 def test_looking_glass_query_returns_raw_agent_result() -> None:

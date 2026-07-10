@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from link42_common.connection_types import GRE_TASKS, LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK, WIREGUARD_TASKS
+from link42_common.connection_types import (
+    GRE_TASKS,
+    LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_PING_TASK,
+    LOOKING_GLASS_TRACEROUTE_TASK,
+    WIREGUARD_TASKS,
+)
 
 from .config import AgentConfig
 from .gre import (
@@ -13,7 +19,7 @@ from .gre import (
     start_gre_interface,
     stop_gre_interface,
 )
-from .looking_glass import execute_bird_route_lookup
+from .looking_glass import execute_bird_route_lookup, execute_ping, execute_traceroute
 from .middleware import (
     apply_udp2raw,
     apply_mimic,
@@ -115,6 +121,18 @@ def looking_glass_bird_route_lookup(payload: dict[str, Any], config: AgentConfig
     return execute_bird_route_lookup(payload)
 
 
+def looking_glass_ping(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """执行 Looking Glass 受限 ping 查询任务。"""
+
+    return execute_ping(payload)
+
+
+def looking_glass_traceroute(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """执行 Looking Glass 受限 traceroute 查询任务。"""
+
+    return execute_traceroute(payload)
+
+
 TASK_HANDLERS: dict[str, TaskHandler] = {
     WIREGUARD_TASKS.import_scan: wireguard_import_scan,
     WIREGUARD_TASKS.apply_config: wireguard_apply_config,
@@ -134,6 +152,8 @@ TASK_HANDLERS: dict[str, TaskHandler] = {
     GRE_TASKS.stop: gre_stop,
     GRE_TASKS.delete_config: gre_delete,
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK: looking_glass_bird_route_lookup,
+    LOOKING_GLASS_PING_TASK: looking_glass_ping,
+    LOOKING_GLASS_TRACEROUTE_TASK: looking_glass_traceroute,
     "middleware.install": middleware_install,
     "middleware.udp2raw.apply": lambda payload, config: apply_udp2raw(payload, dry_run=_dry_run(config)),
     "middleware.udp2raw.start": lambda payload, config: start_udp2raw(payload, dry_run=_dry_run(config)),

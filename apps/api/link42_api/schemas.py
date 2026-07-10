@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import ipaddress
+import re
 from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_serializer, field_validator
+
+
+LOOKING_GLASS_TARGET_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
+)
 
 
 def serialize_utc_timestamp(value: datetime | None) -> int | None:
@@ -18,6 +25,19 @@ def serialize_utc_timestamp(value: datetime | None) -> int | None:
     else:
         value = value.astimezone(timezone.utc)
     return int(value.timestamp())
+
+
+def normalize_looking_glass_target(value: str) -> str:
+    """规范化第三方诊断目标，允许 IP 或普通域名。"""
+
+    cleaned = value.strip()
+    try:
+        return str(ipaddress.ip_address(cleaned))
+    except ValueError:
+        pass
+    if LOOKING_GLASS_TARGET_HOSTNAME_RE.fullmatch(cleaned) and ".." not in cleaned:
+        return cleaned.rstrip(".").lower()
+    raise ValueError("target must be a valid IP address or hostname")
 
 
 def _validate_port(value: int | None) -> int | None:
@@ -1400,6 +1420,8 @@ class LookingGlassNodeCapabilities(BaseModel):
 
     bird: bool = False
     bird_route_lookup: bool = False
+    ping: bool = False
+    traceroute: bool = False
 
 
 class LookingGlassNodeRead(BaseModel):
@@ -1442,6 +1464,37 @@ class LookingGlassRouteLookupRequest(BaseModel):
             return str(ipaddress.ip_address(cleaned))
         except ValueError as exc:
             raise ValueError("ip must be a valid IPv4 or IPv6 address") from exc
+
+
+class LookingGlassPingRequest(BaseModel):
+    """Looking Glass ping 查询请求。"""
+
+    target: str
+    count: int = Field(default=4, ge=1, le=10)
+    per_probe_timeout_seconds: int = Field(default=2, ge=1, le=10)
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, value: str) -> str:
+        """校验 ping 目标必须是 IP 或普通域名。"""
+
+        return normalize_looking_glass_target(value)
+
+
+class LookingGlassTracerouteRequest(BaseModel):
+    """Looking Glass traceroute 查询请求。"""
+
+    target: str
+    max_hops: int = Field(default=30, ge=1, le=64)
+    wait_seconds: int = Field(default=3, ge=1, le=10)
+    queries: int = Field(default=3, ge=1, le=5)
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, value: str) -> str:
+        """校验 traceroute 目标必须是 IP 或普通域名。"""
+
+        return normalize_looking_glass_target(value)
 
 
 class LookingGlassQueryError(BaseModel):

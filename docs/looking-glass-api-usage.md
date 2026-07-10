@@ -84,7 +84,9 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
       },
       "capabilities": {
         "bird": true,
-        "bird_route_lookup": true
+        "bird_route_lookup": true,
+        "ping": true,
+        "traceroute": true
       }
     }
   ],
@@ -103,6 +105,8 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
 - `ips.public_ip`：公网地址。
 - `ips.endpoint_ips`：节点入口地址列表。
 - `capabilities.bird_route_lookup`：该节点是否支持 BIRD 路由查询。
+- `capabilities.ping`：该节点是否支持 ping 查询。
+- `capabilities.traceroute`：该节点是否支持 traceroute 查询。
 
 ## 3. 获取节点详情
 
@@ -187,7 +191,65 @@ Retry-After: 1
 
 调用方应保存 `query_id`，随后轮询查询结果。
 
-## 5. 读取查询状态和结果
+## 5. 提交 ping 查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/ping
+```
+
+权限要求：
+
+```text
+looking_glass.bird.route
+```
+
+请求体：
+
+```json
+{
+  "target": "1.1.1.1",
+  "count": 4,
+  "per_probe_timeout_seconds": 2
+}
+```
+
+- `target`：必填，IP 或普通域名。
+- `count`：可选，1 到 10，默认 4。
+- `per_probe_timeout_seconds`：可选，1 到 10，默认 2。
+
+成功时返回 `202 Accepted` 和 `query_id`，`operation` 为 `ping`。
+
+## 6. 提交 traceroute 查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/traceroute
+```
+
+权限要求：
+
+```text
+looking_glass.bird.route
+```
+
+请求体：
+
+```json
+{
+  "target": "example.com",
+  "max_hops": 30,
+  "wait_seconds": 3,
+  "queries": 3
+}
+```
+
+- `target`：必填，IP 或普通域名。
+- `max_hops`：可选，1 到 64，默认 30。
+- `wait_seconds`：可选，1 到 10，默认 3。
+- `queries`：可选，1 到 5，默认 3。
+
+成功时返回 `202 Accepted` 和 `query_id`，`operation` 为 `traceroute`。
+
+## 7. 读取查询状态和结果
 
 ```http
 GET /third-party-api/looking-glass/v1/queries/{query_id}
@@ -293,7 +355,19 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
 
 注意：即使 `status=failed`，`result.stdout` 和 `result.stderr` 仍可能包含原始输出，Looking Glass 可以按需要展示或解析。
 
-## 6. 查询状态
+ping 成功时，`result.command` 类似：
+
+```text
+ping -c 4 -W 2 1.1.1.1
+```
+
+traceroute 成功时，`result.command` 类似：
+
+```text
+traceroute -n -m 30 -w 3 -q 3 example.com
+```
+
+## 8. 查询状态
 
 ```text
 queued       已入队，等待节点 Agent 拉取
@@ -315,16 +389,16 @@ cancelled    查询被取消
 
 结果默认保留 10 分钟。过期后读取查询结果会返回 `410 result_expired`。
 
-## 7. 常见错误
+## 9. 常见错误
 
 ```text
-400 invalid_request          请求格式错误或 IP 非法
+400 invalid_request          请求格式错误、IP 非法或目标地址非法
 401 invalid_api_key          API Token 不存在、禁用、吊销或过期
 403 permission_denied        Token 缺少所需权限
 404 node_not_found           节点不存在或不在 Token 白名单中
 404 query_not_found          查询不存在或不属于当前 Token
 409 node_offline             节点离线
-409 capability_missing       节点不支持 BIRD 路由查询
+409 capability_missing       节点不支持对应查询能力
 410 result_expired           查询结果已过期
 429 query_queue_full         节点查询队列已满
 ```
@@ -340,7 +414,7 @@ cancelled    查询被取消
 }
 ```
 
-## 8. 完整调用流程
+## 10. 完整调用流程
 
 ```bash
 # 1. 读取节点

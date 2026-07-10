@@ -80,6 +80,10 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
             "bird",
             "looking_glass.bird.route_lookup",
         ])
+    if shutil.which("ping"):
+        capabilities.append("looking_glass.ping")
+    if shutil.which("traceroute"):
+        capabilities.append("looking_glass.traceroute")
     if service_manager != "openwrt-uci":
         capabilities.append("wg_quick_import")
     if service_manager == "openwrt-uci" and openwrt_gre_supported():
@@ -204,6 +208,9 @@ def summarize_task(task: dict[str, Any]) -> dict[str, Any]:
         "instance",
         "depends_on_task_id",
         "ip",
+        "target",
+        "count",
+        "max_hops",
         "command_timeout_seconds",
         "output_limit_bytes",
     ]

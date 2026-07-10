@@ -9,7 +9,13 @@ from typing import Any
 
 import pytest
 
-from link42_common.connection_types import GRE_TASKS, LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK, WIREGUARD_TASKS
+from link42_common.connection_types import (
+    GRE_TASKS,
+    LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_PING_TASK,
+    LOOKING_GLASS_TRACEROUTE_TASK,
+    WIREGUARD_TASKS,
+)
 from link42_agent import gre, link_monitor, looking_glass, main, middleware, service_manager, system, upgrade
 from link42_agent.client import AgentHttpError
 from link42_agent.config import AgentConfig
@@ -565,12 +571,18 @@ def test_looking_glass_bird_capability_depends_on_birdc(monkeypatch) -> None:
     monkeypatch.setattr(main, "gre_runtime_supported", lambda: False)
     monkeypatch.setattr(main, "mimic_installable", lambda platform: False)
     monkeypatch.setattr(main, "mimic_runtime_supported", lambda platform: False)
-    monkeypatch.setattr(main.shutil, "which", lambda binary: "/usr/bin/birdc" if binary == "birdc" else None)
+    monkeypatch.setattr(
+        main.shutil,
+        "which",
+        lambda binary: f"/usr/bin/{binary}" if binary in {"birdc", "ping", "traceroute"} else None,
+    )
 
     capabilities = main.build_capabilities(platform_info)
 
     assert "bird" in capabilities
     assert "looking_glass.bird.route_lookup" in capabilities
+    assert "looking_glass.ping" in capabilities
+    assert "looking_glass.traceroute" in capabilities
 
 
 def test_looking_glass_bird_route_lookup_uses_fixed_argv(monkeypatch) -> None:
@@ -597,10 +609,41 @@ def test_looking_glass_bird_route_lookup_uses_fixed_argv(monkeypatch) -> None:
     assert result["exit_code"] == 0
 
 
-def test_looking_glass_bird_route_lookup_task_registered() -> None:
-    """验证 Looking Glass BIRD 查询任务已注册到 Agent 分派表。"""
+def test_looking_glass_ping_and_traceroute_use_fixed_argv(monkeypatch) -> None:
+    """验证 Looking Glass ping/traceroute 只能执行固定命令参数。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run(command, text, capture_output, timeout, check):
+        """记录 subprocess 参数并返回模拟诊断输出。"""
+
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="diagnostic output", stderr="")
+
+    monkeypatch.setattr(
+        looking_glass.shutil,
+        "which",
+        lambda binary: f"/usr/bin/{binary}" if binary in {"ping", "traceroute"} else None,
+    )
+    monkeypatch.setattr(looking_glass.subprocess, "run", fake_run)
+
+    ping_result = looking_glass.execute_ping({"target": "Example.COM", "count": 2, "per_probe_timeout_seconds": 1})
+    traceroute_result = looking_glass.execute_traceroute({"target": "2001:db8::1", "max_hops": 8, "wait_seconds": 2, "queries": 1})
+
+    assert commands == [
+        ["/usr/bin/ping", "-c", "2", "-W", "1", "example.com"],
+        ["/usr/bin/traceroute", "-n", "-m", "8", "-w", "2", "-q", "1", "2001:db8::1"],
+    ]
+    assert ping_result["command"] == "ping -c 2 -W 1 example.com"
+    assert traceroute_result["command"] == "traceroute -n -m 8 -w 2 -q 1 2001:db8::1"
+
+
+def test_looking_glass_tasks_registered() -> None:
+    """验证 Looking Glass 查询任务已注册到 Agent 分派表。"""
 
     assert LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK in TASK_HANDLERS
+    assert LOOKING_GLASS_PING_TASK in TASK_HANDLERS
+    assert LOOKING_GLASS_TRACEROUTE_TASK in TASK_HANDLERS
 
 
 def test_openwrt_gre_capability_uses_uci_backend(monkeypatch) -> None:
