@@ -1282,6 +1282,174 @@ class AgentUpgradeRequest(BaseModel):
     force: bool = False
 
 
+class IntegrationApiTokenCreate(BaseModel):
+    """创建第三方 Looking Glass API Token 请求。"""
+
+    name: str = Field(min_length=1, max_length=120)
+    scopes: list[str] = Field(default_factory=list)
+    allowed_node_ids: list[int] = Field(default_factory=list)
+    expires_at: datetime | None = None
+
+    @field_validator("scopes")
+    @classmethod
+    def validate_scopes(cls, values: list[str]) -> list[str]:
+        """校验第三方 Token 权限范围只包含 Looking Glass 允许项。"""
+
+        allowed = {"looking_glass.nodes.read", "looking_glass.bird.route"}
+        cleaned = sorted({value.strip() for value in values if value.strip()})
+        invalid = [value for value in cleaned if value not in allowed]
+        if invalid:
+            raise ValueError(f"unsupported scopes: {', '.join(invalid)}")
+        if not cleaned:
+            raise ValueError("at least one scope is required")
+        return cleaned
+
+    @field_validator("allowed_node_ids")
+    @classmethod
+    def validate_allowed_node_ids(cls, values: list[int]) -> list[int]:
+        """校验节点白名单 ID 必须为正整数并去重。"""
+
+        cleaned = sorted({int(value) for value in values if int(value) > 0})
+        if not cleaned:
+            raise ValueError("at least one node is required")
+        return cleaned
+
+
+class IntegrationApiTokenUpdate(BaseModel):
+    """更新第三方 Looking Glass API Token 元数据请求。"""
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    scopes: list[str] | None = None
+    allowed_node_ids: list[int] | None = None
+    enabled: bool | None = None
+    expires_at: datetime | None = None
+
+    @field_validator("scopes")
+    @classmethod
+    def validate_optional_scopes(cls, values: list[str] | None) -> list[str] | None:
+        """校验可选权限范围，未传时不修改。"""
+
+        if values is None:
+            return None
+        return IntegrationApiTokenCreate.validate_scopes(values)
+
+    @field_validator("allowed_node_ids")
+    @classmethod
+    def validate_optional_allowed_node_ids(cls, values: list[int] | None) -> list[int] | None:
+        """校验可选节点白名单，未传时不修改。"""
+
+        if values is None:
+            return None
+        return IntegrationApiTokenCreate.validate_allowed_node_ids(values)
+
+
+class IntegrationApiTokenRead(BaseModel):
+    """第三方 Looking Glass API Token 元数据响应，不包含明文 Token。"""
+
+    id: int
+    name: str
+    token_prefix: str
+    token_hint: str
+    scopes: list[str]
+    allowed_node_ids: list[int]
+    enabled: bool
+    expires_at: datetime | None = None
+    last_used_at: datetime | None = None
+    last_used_ip: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    revoked_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class IntegrationApiTokenCreateResult(IntegrationApiTokenRead):
+    """创建或轮换 Token 响应，只有本响应包含明文 Token。"""
+
+    token: str
+
+
+class IntegrationApiTokenList(BaseModel):
+    """第三方 Looking Glass API Token 列表响应。"""
+
+    items: list[IntegrationApiTokenRead]
+
+
+class LookingGlassNodeIps(BaseModel):
+    """Looking Glass 节点 IP 信息响应。"""
+
+    management_ip: str | None = None
+    public_ip: str | None = None
+    endpoint_ips: list[str] = Field(default_factory=list)
+
+
+class LookingGlassNodeCapabilities(BaseModel):
+    """Looking Glass 节点能力响应。"""
+
+    bird: bool = False
+    bird_route_lookup: bool = False
+
+
+class LookingGlassNodeRead(BaseModel):
+    """Looking Glass 节点信息响应。"""
+
+    node_ref: str
+    name: str
+    region: str | None = None
+    online: bool
+    last_seen_at: datetime | None = None
+    ips: LookingGlassNodeIps
+    capabilities: LookingGlassNodeCapabilities
+
+
+class LookingGlassNodeList(BaseModel):
+    """Looking Glass 节点列表响应。"""
+
+    items: list[LookingGlassNodeRead]
+    next_cursor: str | None = None
+
+
+class LookingGlassRouteLookupRequest(BaseModel):
+    """Looking Glass BIRD 路由查询请求。"""
+
+    ip: str
+
+    @field_validator("ip")
+    @classmethod
+    def validate_ip(cls, value: str) -> str:
+        """校验查询目标必须是 IPv4 或 IPv6 字面量。"""
+
+        cleaned = value.strip()
+        try:
+            return str(ipaddress.ip_address(cleaned))
+        except ValueError as exc:
+            raise ValueError("ip must be a valid IPv4 or IPv6 address") from exc
+
+
+class LookingGlassQueryError(BaseModel):
+    """Looking Glass 查询错误响应体。"""
+
+    code: str
+    message: str
+
+
+class LookingGlassQueryRead(BaseModel):
+    """Looking Glass 查询状态和结果响应。"""
+
+    query_id: str
+    status: str
+    node_ref: str
+    operation: str
+    request: dict[str, Any]
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    deadline_at: datetime | None = None
+    expires_at: datetime | None = None
+    result: dict[str, Any] | None = None
+    error: LookingGlassQueryError | None = None
+
+
 class AgentTaskStatusRead(BaseModel):
     """Agent 任务状态响应。"""
 

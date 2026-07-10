@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+import hashlib
 import ipaddress
 import logging
 import re
@@ -12,7 +13,9 @@ import subprocess
 import sys
 import time
 from typing import Any
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
@@ -21,10 +24,11 @@ from link42_common.connection_types import (
     CONNECTION_TYPE_GRE,
     CONNECTION_TYPE_WIREGUARD,
     GRE_TASKS,
+    LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
     TASK_REQUIREMENTS,
     WIREGUARD_TASKS,
 )
-from sqlalchemy import String, delete, or_, select
+from sqlalchemy import String, delete, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from link42_common.security import generate_token, hash_token, verify_token
@@ -139,6 +143,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class LookingGlassApiError(Exception):
+    """第三方 Looking Glass API 使用的稳定错误对象。"""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        """保存 HTTP 状态码、机器可读错误码和用户可读错误信息。"""
+
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+@app.exception_handler(LookingGlassApiError)
+async def looking_glass_api_error_handler(request: Request, exc: LookingGlassApiError) -> JSONResponse:
+    """把 Looking Glass 专用异常渲染成第三方 API 文档约定的错误格式。"""
+
+    logger.warning(
+        "Looking Glass API 请求被拒绝 method=%s path=%s status=%s code=%s",
+        request.method,
+        request.url.path,
+        exc.status_code,
+        exc.code,
+    )
+    return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}})
+
+
+@app.exception_handler(RequestValidationError)
+async def looking_glass_validation_error_handler(request: Request, exc: RequestValidationError):
+    """把第三方 Looking Glass 请求校验错误转换成稳定错误格式。"""
+
+    if request.url.path.startswith(LOOKING_GLASS_API_PREFIX):
+        logger.warning(
+            "Looking Glass API 请求参数无效 method=%s path=%s errors=%s",
+            request.method,
+            request.url.path,
+            scrub_text_for_log(exc.errors(), limit=300),
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "invalid_request", "message": "请求参数无效"}},
+        )
+    return await request_validation_exception_handler(request, exc)
+
 DEFAULT_ADMIN_USERNAME = "pmman"
 ADMIN_USERNAME = DEFAULT_ADMIN_USERNAME
 SETTING_ADMIN_USERNAME = "admin_username"
@@ -155,6 +203,16 @@ MONITOR_SUMMARY_WINDOW = timedelta(hours=1)
 AGENT_TASK_RUNNING_TIMEOUT = timedelta(hours=2)
 AGENT_TASK_POLL_BATCH_SIZE = 5
 AGENT_TASK_POLL_SCAN_LIMIT = 50
+LOOKING_GLASS_API_PREFIX = "/third-party-api/looking-glass/v1"
+LOOKING_GLASS_NODE_READ_SCOPE = "looking_glass.nodes.read"
+LOOKING_GLASS_BIRD_ROUTE_SCOPE = "looking_glass.bird.route"
+LOOKING_GLASS_QUERY_QUEUE_LIMIT = 20
+LOOKING_GLASS_QUEUE_TIMEOUT = timedelta(seconds=10)
+LOOKING_GLASS_COMMAND_TIMEOUT_SECONDS = 8
+LOOKING_GLASS_TOTAL_DEADLINE = timedelta(seconds=15)
+LOOKING_GLASS_RESULT_RETENTION = timedelta(minutes=10)
+LOOKING_GLASS_CACHE_WINDOW = timedelta(seconds=5)
+LOOKING_GLASS_OUTPUT_LIMIT_BYTES = 256 * 1024
 
 
 def uploaded_logo_path() -> Path | None:
@@ -221,7 +279,7 @@ def mount_web_panel() -> None:
     def serve_web_fallback(path: str) -> FileResponse:
         """为前端路由提供 index.html 兜底，同时不接管 API 路径。"""
 
-        if path.startswith("api/"):
+        if path.startswith(("api/", "third-party-api/")):
             raise HTTPException(status_code=404, detail="not found")
         return FileResponse(index_file)
 
@@ -334,6 +392,212 @@ def require_web_session(request: Request, db: Session) -> None:
         raise HTTPException(status_code=401, detail="not authenticated")
 
 
+def generate_integration_token() -> tuple[str, str, str]:
+    """生成第三方集成 Token，并返回明文、可检索前缀和尾部提示。"""
+
+    public_id = secrets.token_hex(8)
+    secret = secrets.token_urlsafe(32)
+    token_prefix = f"l42lg_{public_id}"
+    token = f"{token_prefix}_{secret}"
+    return token, token_prefix, token[-10:]
+
+
+def integration_token_prefix(token: str) -> str | None:
+    """从第三方 Token 中提取可用于数据库检索的前缀。"""
+
+    parts = token.split("_", 2)
+    if len(parts) != 3 or parts[0] != "l42lg" or not parts[1]:
+        return None
+    return f"{parts[0]}_{parts[1]}"
+
+
+def api_error(status_code: int, code: str, message: str) -> LookingGlassApiError:
+    """生成第三方 API 使用的稳定错误结构。"""
+
+    return LookingGlassApiError(status_code=status_code, code=code, message=message)
+
+
+def require_looking_glass_api_key(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> models.IntegrationApiKey:
+    """校验 Looking Glass 第三方 API Token，并返回对应授权记录。"""
+
+    token = bearer_token_from_request(request)
+    prefix = integration_token_prefix(token or "")
+    if not token or not prefix:
+        raise api_error(401, "invalid_api_key", "API Token 无效或已过期")
+    api_key = db.scalar(select(models.IntegrationApiKey).where(models.IntegrationApiKey.token_prefix == prefix))
+    now = datetime.utcnow()
+    if (
+        api_key is None
+        or not api_key.enabled
+        or api_key.revoked_at is not None
+        or (api_key.expires_at is not None and api_key.expires_at <= now)
+        or not verify_token(token, api_key.token_hash)
+    ):
+        logger.warning("第三方 API Token 鉴权失败 prefix=%s path=%s", prefix, request.url.path)
+        raise api_error(401, "invalid_api_key", "API Token 无效或已过期")
+    api_key.last_used_at = now
+    api_key.last_used_ip = request.client.host if request.client else None
+    db.commit()
+    db.refresh(api_key)
+    return api_key
+
+
+def require_looking_glass_scope(api_key: models.IntegrationApiKey, scope: str) -> None:
+    """校验第三方 API Token 是否包含指定权限范围。"""
+
+    if scope not in set(api_key.scopes or []):
+        raise api_error(403, "permission_denied", "API Token 缺少访问权限")
+
+
+def require_looking_glass_node_access(api_key: models.IntegrationApiKey, node_id: int) -> None:
+    """校验第三方 API Token 是否允许访问指定节点。"""
+
+    allowed_node_ids = {int(value) for value in api_key.allowed_node_ids or []}
+    if node_id not in allowed_node_ids:
+        raise api_error(404, "node_not_found", "节点不存在")
+
+
+def parse_node_ref(node_ref: str) -> int:
+    """解析第三方 API 使用的节点引用。"""
+
+    match = re.fullmatch(r"node_(\d+)", node_ref.strip())
+    if not match:
+        raise api_error(404, "node_not_found", "节点不存在")
+    return int(match.group(1))
+
+
+def node_ref(node_id: int) -> str:
+    """生成第三方 API 使用的节点引用。"""
+
+    return f"node_{node_id}"
+
+
+def node_supports_bird_route_lookup(node: models.Node) -> bool:
+    """判断节点 Agent 是否上报 Looking Glass BIRD 查询能力。"""
+
+    capabilities = set(node.agent_capabilities or [])
+    return "looking_glass.bird.route_lookup" in capabilities
+
+
+def looking_glass_node_read(node: models.Node, now: datetime | None = None) -> schemas.LookingGlassNodeRead:
+    """把内部节点模型转换成第三方 Looking Glass 可读取的节点信息。"""
+
+    online = is_node_online(node, now=now)
+    capabilities = set(node.agent_capabilities or [])
+    return schemas.LookingGlassNodeRead(
+        node_ref=node_ref(node.id),
+        name=node.name,
+        region=node.region,
+        online=online,
+        last_seen_at=node.last_seen_at,
+        ips=schemas.LookingGlassNodeIps(
+            management_ip=node.management_ip,
+            public_ip=node.public_ip,
+            endpoint_ips=node.endpoint_ips or [],
+        ),
+        capabilities=schemas.LookingGlassNodeCapabilities(
+            bird="bird" in capabilities or "looking_glass.bird.route_lookup" in capabilities,
+            bird_route_lookup=node_supports_bird_route_lookup(node),
+        ),
+    )
+
+
+def looking_glass_query_public_id() -> str:
+    """生成不暴露内部自增 ID 的 Looking Glass 查询 ID。"""
+
+    return f"lgq_{secrets.token_urlsafe(18)}"
+
+
+def looking_glass_request_fingerprint(api_key_id: int, node_id: int, operation: str, normalized_ip: str) -> str:
+    """生成短时间复用查询结果所需的请求指纹。"""
+
+    raw = f"{api_key_id}:{node_id}:{operation}:{normalized_ip}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def looking_glass_query_read(query: models.LookingGlassQuery) -> schemas.LookingGlassQueryRead:
+    """把 Looking Glass 查询模型转换成第三方 API 响应。"""
+
+    error = None
+    if query.error_code or query.error_message:
+        error = schemas.LookingGlassQueryError(
+            code=query.error_code or "query_failed",
+            message=query.error_message or "查询失败",
+        )
+    return schemas.LookingGlassQueryRead(
+        query_id=query.public_id,
+        status=query.status,
+        node_ref=node_ref(query.node_id),
+        operation=query.operation,
+        request=query.request or {},
+        created_at=query.created_at,
+        started_at=query.started_at,
+        finished_at=query.finished_at,
+        deadline_at=query.deadline_at,
+        expires_at=query.expires_at,
+        result=query.result,
+        error=error,
+    )
+
+
+def refresh_looking_glass_query_from_task(query: models.LookingGlassQuery, now: datetime | None = None) -> None:
+    """根据内部 AgentTask 状态刷新 Looking Glass 查询状态和结果。"""
+
+    now = now or datetime.utcnow()
+    task = query.agent_task
+    if task is None:
+        if query.status in {"queued", "running"} and query.deadline_at and query.deadline_at <= now:
+            query.status = "failed"
+            query.error_code = "query_timeout"
+            query.error_message = "查询等待 Agent 执行超时"
+            query.finished_at = now
+        return
+    if task.status == "pending":
+        if task.deadline_at and task.deadline_at <= now:
+            task.status = "failed"
+            task.finished_at = now
+            task.result = {
+                "error_code": "query_timeout",
+                "error": "query queue timeout before agent polling",
+            }
+            query.status = "failed"
+            query.error_code = "query_timeout"
+            query.error_message = "查询等待 Agent 执行超时"
+            query.finished_at = now
+        else:
+            query.status = "queued"
+    elif task.status == "running":
+        query.status = "running"
+        query.started_at = query.started_at or task.started_at
+    elif task.status == "succeeded":
+        query.started_at = query.started_at or task.started_at
+        query.finished_at = query.finished_at or task.finished_at or now
+        query.result = task.result or {}
+        if isinstance(task.result, dict) and task.result.get("error_code"):
+            query.status = "failed"
+            query.error_code = str(task.result.get("error_code"))
+            query.error_message = str(task.result.get("error") or "查询执行失败")[:500]
+        else:
+            query.status = "succeeded"
+            query.error_code = None
+            query.error_message = None
+    elif task.status in {"failed", "cancelled"}:
+        result = task.result or {}
+        query.status = "failed" if task.status == "failed" else "cancelled"
+        query.started_at = query.started_at or task.started_at
+        query.finished_at = query.finished_at or task.finished_at or now
+        query.error_code = str(result.get("error_code") or result.get("code") or task.status)
+        query.error_message = str(result.get("error") or result.get("message") or "查询执行失败")[:500]
+    if query.status in {"queued", "running"} and query.deadline_at and query.deadline_at <= now:
+        query.status = "failed"
+        query.error_code = "query_timeout"
+        query.error_message = "查询执行超时"
+        query.finished_at = now
+
+
 @app.middleware("http")
 async def require_api_authentication(request: Request, call_next):
     """为所有非白名单 API 统一加 Web 鉴权，避免遗漏单个路由。"""
@@ -375,6 +639,318 @@ async def require_api_authentication(request: Request, call_next):
     else:
         logger.debug("HTTP 请求完成 method=%s path=%s status=%s duration=%.2fs", request.method, request.url.path, response.status_code, duration)
     return response
+
+
+def ensure_allowed_nodes_exist(db: Session, node_ids: list[int]) -> None:
+    """校验 Token 节点白名单中的节点都存在。"""
+
+    existing_ids = set(db.scalars(select(models.Node.id).where(models.Node.id.in_(node_ids))))
+    missing_ids = sorted(set(node_ids) - existing_ids)
+    if missing_ids:
+        raise HTTPException(status_code=400, detail=f"nodes not found: {missing_ids}")
+
+
+def token_read_with_plaintext(api_key: models.IntegrationApiKey, token: str) -> schemas.IntegrationApiTokenCreateResult:
+    """生成包含一次性明文 Token 的管理端响应。"""
+
+    base = schemas.IntegrationApiTokenRead.model_validate(api_key).model_dump()
+    return schemas.IntegrationApiTokenCreateResult(**base, token=token)
+
+
+@app.get("/api/integrations/looking-glass/tokens", response_model=schemas.IntegrationApiTokenList)
+def list_looking_glass_tokens(db: Session = Depends(get_db)) -> schemas.IntegrationApiTokenList:
+    """列出 Looking Glass 第三方 API Token 元数据。"""
+
+    tokens = list(db.scalars(select(models.IntegrationApiKey).order_by(models.IntegrationApiKey.id)))
+    return schemas.IntegrationApiTokenList(items=[schemas.IntegrationApiTokenRead.model_validate(token) for token in tokens])
+
+
+@app.post("/api/integrations/looking-glass/tokens", response_model=schemas.IntegrationApiTokenCreateResult)
+def create_looking_glass_token(
+    payload: schemas.IntegrationApiTokenCreate,
+    db: Session = Depends(get_db),
+) -> schemas.IntegrationApiTokenCreateResult:
+    """创建 Looking Glass 第三方 API Token，并仅本次返回明文。"""
+
+    ensure_allowed_nodes_exist(db, payload.allowed_node_ids)
+    token, token_prefix, token_hint = generate_integration_token()
+    api_key = models.IntegrationApiKey(
+        name=payload.name.strip(),
+        token_prefix=token_prefix,
+        token_hash=hash_token(token),
+        token_hint=token_hint,
+        scopes=payload.scopes,
+        allowed_node_ids=payload.allowed_node_ids,
+        enabled=True,
+        expires_at=payload.expires_at,
+        created_by=admin_username(db),
+    )
+    db.add(api_key)
+    db.commit()
+    db.refresh(api_key)
+    logger.info("创建 Looking Glass API Token id=%s prefix=%s scopes=%s", api_key.id, api_key.token_prefix, api_key.scopes)
+    return token_read_with_plaintext(api_key, token)
+
+
+@app.patch("/api/integrations/looking-glass/tokens/{token_id}", response_model=schemas.IntegrationApiTokenRead)
+def update_looking_glass_token(
+    token_id: int,
+    payload: schemas.IntegrationApiTokenUpdate,
+    db: Session = Depends(get_db),
+) -> models.IntegrationApiKey:
+    """更新 Looking Glass 第三方 API Token 元数据。"""
+
+    api_key = db.get(models.IntegrationApiKey, token_id)
+    if api_key is None:
+        raise HTTPException(status_code=404, detail="token not found")
+    if payload.allowed_node_ids is not None:
+        ensure_allowed_nodes_exist(db, payload.allowed_node_ids)
+        api_key.allowed_node_ids = payload.allowed_node_ids
+    if payload.name is not None:
+        api_key.name = payload.name.strip()
+    if payload.scopes is not None:
+        api_key.scopes = payload.scopes
+    if payload.enabled is not None:
+        api_key.enabled = payload.enabled
+    if "expires_at" in payload.model_fields_set:
+        api_key.expires_at = payload.expires_at
+    db.commit()
+    db.refresh(api_key)
+    logger.info("更新 Looking Glass API Token id=%s enabled=%s scopes=%s", api_key.id, api_key.enabled, api_key.scopes)
+    return api_key
+
+
+@app.post("/api/integrations/looking-glass/tokens/{token_id}/rotate", response_model=schemas.IntegrationApiTokenCreateResult)
+def rotate_looking_glass_token(token_id: int, db: Session = Depends(get_db)) -> schemas.IntegrationApiTokenCreateResult:
+    """轮换 Looking Glass 第三方 API Token，并仅本次返回新明文。"""
+
+    api_key = db.get(models.IntegrationApiKey, token_id)
+    if api_key is None:
+        raise HTTPException(status_code=404, detail="token not found")
+    token, token_prefix, token_hint = generate_integration_token()
+    api_key.token_prefix = token_prefix
+    api_key.token_hash = hash_token(token)
+    api_key.token_hint = token_hint
+    api_key.enabled = True
+    api_key.revoked_at = None
+    db.commit()
+    db.refresh(api_key)
+    logger.info("轮换 Looking Glass API Token id=%s prefix=%s", api_key.id, api_key.token_prefix)
+    return token_read_with_plaintext(api_key, token)
+
+
+@app.post("/api/integrations/looking-glass/tokens/{token_id}/revoke", response_model=schemas.IntegrationApiTokenRead)
+def revoke_looking_glass_token(token_id: int, db: Session = Depends(get_db)) -> models.IntegrationApiKey:
+    """吊销 Looking Glass 第三方 API Token 并保留审计记录。"""
+
+    api_key = db.get(models.IntegrationApiKey, token_id)
+    if api_key is None:
+        raise HTTPException(status_code=404, detail="token not found")
+    api_key.enabled = False
+    api_key.revoked_at = datetime.utcnow()
+    db.commit()
+    db.refresh(api_key)
+    logger.info("吊销 Looking Glass API Token id=%s prefix=%s", api_key.id, api_key.token_prefix)
+    return api_key
+
+
+@app.delete("/api/integrations/looking-glass/tokens/{token_id}")
+def delete_looking_glass_token(token_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
+    """删除未使用或误创建的 Looking Glass 第三方 API Token。"""
+
+    api_key = db.get(models.IntegrationApiKey, token_id)
+    if api_key is None:
+        raise HTTPException(status_code=404, detail="token not found")
+    query_count = db.scalar(
+        select(func.count(models.LookingGlassQuery.id)).where(models.LookingGlassQuery.api_key_id == token_id)
+    )
+    if int(query_count or 0) > 0:
+        raise HTTPException(status_code=409, detail="token has query audit records; revoke it instead")
+    db.delete(api_key)
+    db.commit()
+    logger.info("删除 Looking Glass API Token id=%s", token_id)
+    return {"status": "deleted"}
+
+
+@app.get(f"{LOOKING_GLASS_API_PREFIX}/nodes", response_model=schemas.LookingGlassNodeList)
+def list_looking_glass_nodes(
+    region: str | None = None,
+    online: bool | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassNodeList:
+    """返回第三方 Looking Glass 可展示的节点信息列表。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_NODE_READ_SCOPE)
+    limit = max(1, min(int(limit or 100), 500))
+    allowed_node_ids = sorted({int(value) for value in api_key.allowed_node_ids or []})
+    if not allowed_node_ids:
+        return schemas.LookingGlassNodeList(items=[], next_cursor=None)
+    cursor_id = 0
+    if cursor:
+        try:
+            cursor_id = max(0, int(cursor))
+        except ValueError as exc:
+            raise api_error(400, "invalid_request", "分页游标无效") from exc
+    query = (
+        select(models.Node)
+        .where(models.Node.id.in_(allowed_node_ids), models.Node.id > cursor_id)
+        .order_by(models.Node.id)
+        .limit(limit + 1)
+    )
+    if region is not None:
+        query = query.where(models.Node.region == region)
+    nodes = list(db.scalars(query))
+    now = datetime.utcnow()
+    filtered_nodes: list[models.Node] = []
+    for node in nodes:
+        node_online = is_node_online(node, now=now)
+        if online is not None and node_online != online:
+            continue
+        filtered_nodes.append(node)
+    page_nodes = filtered_nodes[:limit]
+    next_cursor = str(page_nodes[-1].id) if len(filtered_nodes) > limit and page_nodes else None
+    return schemas.LookingGlassNodeList(
+        items=[looking_glass_node_read(node, now=now) for node in page_nodes],
+        next_cursor=next_cursor,
+    )
+
+
+@app.get(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}", response_model=schemas.LookingGlassNodeRead)
+def get_looking_glass_node(
+    node_ref_value: str,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassNodeRead:
+    """返回第三方 Looking Glass 可展示的单个节点信息。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_NODE_READ_SCOPE)
+    node_id = parse_node_ref(node_ref_value)
+    require_looking_glass_node_access(api_key, node_id)
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise api_error(404, "node_not_found", "节点不存在")
+    return looking_glass_node_read(node)
+
+
+@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/bird/routes:lookup", response_model=schemas.LookingGlassQueryRead)
+def submit_looking_glass_bird_route_lookup(
+    node_ref_value: str,
+    payload: schemas.LookingGlassRouteLookupRequest,
+    response: Response,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """提交 Looking Glass BIRD 路由查询任务，返回可轮询的 query_id。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    node_id = parse_node_ref(node_ref_value)
+    require_looking_glass_node_access(api_key, node_id)
+    node = db.get(models.Node, node_id)
+    if node is None:
+        raise api_error(404, "node_not_found", "节点不存在")
+    now = datetime.utcnow()
+    if not is_node_online(node, now=now):
+        raise api_error(409, "node_offline", "节点当前离线，无法执行查询")
+    if not node_supports_bird_route_lookup(node):
+        raise api_error(409, "capability_missing", "节点不支持 BIRD 路由查询")
+    queued_count = db.scalar(
+        select(func.count(models.AgentTask.id)).where(
+            models.AgentTask.node_id == node_id,
+            models.AgentTask.queue == "query",
+            models.AgentTask.status.in_(["pending", "running"]),
+        )
+    )
+    if int(queued_count or 0) >= LOOKING_GLASS_QUERY_QUEUE_LIMIT:
+        raise api_error(429, "query_queue_full", "节点查询队列已满，请稍后重试")
+    normalized_ip = payload.ip
+    operation = "bird.route_lookup"
+    fingerprint = looking_glass_request_fingerprint(api_key.id, node_id, operation, normalized_ip)
+    reusable_query = db.scalar(
+        select(models.LookingGlassQuery)
+        .where(
+            models.LookingGlassQuery.api_key_id == api_key.id,
+            models.LookingGlassQuery.node_id == node_id,
+            models.LookingGlassQuery.request_fingerprint == fingerprint,
+            models.LookingGlassQuery.created_at >= now - LOOKING_GLASS_CACHE_WINDOW,
+            models.LookingGlassQuery.status.in_(["queued", "running", "succeeded"]),
+        )
+        .order_by(models.LookingGlassQuery.id.desc())
+    )
+    if reusable_query is not None:
+        refresh_looking_glass_query_from_task(reusable_query, now=now)
+        db.commit()
+        response.status_code = 202
+        response.headers["Location"] = f"{LOOKING_GLASS_API_PREFIX}/queries/{reusable_query.public_id}"
+        response.headers["Retry-After"] = "1"
+        return looking_glass_query_read(reusable_query)
+    deadline_at = now + LOOKING_GLASS_TOTAL_DEADLINE
+    task_deadline_at = now + LOOKING_GLASS_QUEUE_TIMEOUT
+    expires_at = now + LOOKING_GLASS_RESULT_RETENTION
+    task = models.AgentTask(
+        node_id=node_id,
+        type=LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+        queue="query",
+        priority=50,
+        payload={
+            "ip": normalized_ip,
+            "command_timeout_seconds": LOOKING_GLASS_COMMAND_TIMEOUT_SECONDS,
+            "output_limit_bytes": LOOKING_GLASS_OUTPUT_LIMIT_BYTES,
+        },
+        deadline_at=task_deadline_at,
+    )
+    db.add(task)
+    db.flush()
+    query_record = models.LookingGlassQuery(
+        public_id=looking_glass_query_public_id(),
+        api_key_id=api_key.id,
+        node_id=node_id,
+        operation=operation,
+        request={"ip": payload.ip, "normalized_ip": normalized_ip},
+        request_fingerprint=fingerprint,
+        status="queued",
+        agent_task_id=task.id,
+        deadline_at=deadline_at,
+        expires_at=expires_at,
+    )
+    db.add(query_record)
+    db.commit()
+    db.refresh(query_record)
+    response.status_code = 202
+    response.headers["Location"] = f"{LOOKING_GLASS_API_PREFIX}/queries/{query_record.public_id}"
+    response.headers["Retry-After"] = "1"
+    logger.info("创建 Looking Glass BIRD 查询 query_id=%s node_id=%s ip=%s", query_record.public_id, node_id, normalized_ip)
+    return looking_glass_query_read(query_record)
+
+
+@app.get(f"{LOOKING_GLASS_API_PREFIX}/queries/{{query_id}}", response_model=schemas.LookingGlassQueryRead)
+def get_looking_glass_query(
+    query_id: str,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """读取 Looking Glass 查询状态和原始结果。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    query_record = db.scalar(
+        select(models.LookingGlassQuery).where(
+            models.LookingGlassQuery.public_id == query_id,
+            models.LookingGlassQuery.api_key_id == api_key.id,
+        )
+    )
+    if query_record is None:
+        raise api_error(404, "query_not_found", "查询不存在")
+    now = datetime.utcnow()
+    if query_record.expires_at and query_record.expires_at <= now:
+        query_record.status = "expired"
+        db.commit()
+        raise api_error(410, "result_expired", "查询结果已过期")
+    refresh_looking_glass_query_from_task(query_record, now=now)
+    db.commit()
+    db.refresh(query_record)
+    return looking_glass_query_read(query_record)
 
 
 @app.on_event("startup")
@@ -566,6 +1142,35 @@ def expire_stale_running_agent_tasks(
             len(tasks),
             [task.id for task in tasks],
         )
+    return len(tasks)
+
+
+def expire_overdue_pending_agent_tasks(
+    db: Session,
+    node_id: int | None = None,
+    now: datetime | None = None,
+) -> int:
+    """回收超过 deadline 仍未被 Agent 拉取的 pending 任务。"""
+
+    now = now or datetime.utcnow()
+    query = select(models.AgentTask).where(
+        models.AgentTask.status == "pending",
+        models.AgentTask.deadline_at.is_not(None),
+        models.AgentTask.deadline_at <= now,
+    )
+    if node_id is not None:
+        query = query.where(models.AgentTask.node_id == node_id)
+    tasks = list(db.scalars(query.order_by(models.AgentTask.id)))
+    for task in tasks:
+        task.status = "failed"
+        task.finished_at = now
+        task.result = {
+            "error_code": "query_timeout" if task.queue == "query" else "task_timeout",
+            "error": "task deadline expired before agent polling",
+        }
+    if tasks:
+        db.flush()
+        logger.warning("回收过期待执行任务 node_id=%s count=%d task_ids=%s", node_id, len(tasks), [task.id for task in tasks])
     return len(tasks)
 
 
@@ -4638,11 +5243,12 @@ def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db))
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     now = datetime.utcnow()
     expired_count = expire_stale_running_agent_tasks(db, node_id=payload.node_id, now=now)
+    expired_pending_count = expire_overdue_pending_agent_tasks(db, node_id=payload.node_id, now=now)
     candidate_tasks = list(
         db.scalars(
             select(models.AgentTask)
             .where(models.AgentTask.node_id == payload.node_id, models.AgentTask.status == "pending")
-            .order_by(models.AgentTask.id)
+            .order_by(models.AgentTask.queue == "query", models.AgentTask.priority, models.AgentTask.id)
             .limit(AGENT_TASK_POLL_SCAN_LIMIT)
         )
     )
@@ -4664,11 +5270,16 @@ def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db))
             "Agent 拉取任务 node_id=%s count=%d expired_running=%d tasks=%s",
             payload.node_id,
             len(tasks),
-            expired_count,
+            expired_count + expired_pending_count,
             [summarize_agent_task(task) for task in tasks],
         )
-    elif expired_count:
-        logger.info("Agent 本轮未拉取新任务 node_id=%s expired_running=%d", payload.node_id, expired_count)
+    elif expired_count or expired_pending_count:
+        logger.info(
+            "Agent 本轮未拉取新任务 node_id=%s expired_running=%d expired_pending=%d",
+            payload.node_id,
+            expired_count,
+            expired_pending_count,
+        )
     else:
         logger.debug("Agent 本轮无任务 node_id=%s", payload.node_id)
     return schemas.AgentPollResponse(tasks=[schemas.AgentTaskRead(id=t.id, type=t.type, payload=t.payload) for t in tasks])
@@ -4833,6 +5444,12 @@ def agent_task_result(
             elif task.type == GRE_TASKS.read_config:
                 endpoint.deployed_config = json.dumps(reported_result.get("config") or {}, ensure_ascii=False, sort_keys=True)
             endpoint.connection.status = gre_connection_status(endpoint.connection)
+
+    looking_glass_query = db.scalar(
+        select(models.LookingGlassQuery).where(models.LookingGlassQuery.agent_task_id == task.id)
+    )
+    if looking_glass_query is not None:
+        refresh_looking_glass_query_from_task(looking_glass_query)
 
     db.commit()
     return {"status": "recorded"}

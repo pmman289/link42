@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
-from fastapi import HTTPException
-from link42_common.connection_types import GRE_TASKS, TASK_REQUIREMENTS, WIREGUARD_TASKS
+from fastapi import HTTPException, Response
+from fastapi.testclient import TestClient
+from link42_common.connection_types import GRE_TASKS, LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK, TASK_REQUIREMENTS, WIREGUARD_TASKS
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ from link42_api.main import (
     SETTING_ADMIN_SESSION_HASH,
     SETTING_ADMIN_USERNAME,
     SETTING_CONTROLLER_URL,
+    app,
     create_managed_link,
     create_managed_connection,
     gre_connection_read,
@@ -39,6 +41,7 @@ from link42_api.main import (
     ensure_unique_interface_name,
     expire_stale_running_agent_tasks,
     get_controller_settings,
+    get_db,
     list_node_connections,
     get_setting,
     list_node_plugins_for_node,
@@ -74,6 +77,10 @@ from link42_api.main import (
     get_port_inventory,
     update_port_inventory_range,
     update_node_topology_position,
+    create_looking_glass_token,
+    require_looking_glass_api_key,
+    submit_looking_glass_bird_route_lookup,
+    get_looking_glass_query,
 )
 from link42_api.schemas import (
     AgentTaskResultRequest,
@@ -93,6 +100,8 @@ from link42_api.schemas import (
     AgentLinkMonitorResultRequest,
     AgentUpgradeRequest,
     GreManagedConnectionCreate,
+    IntegrationApiTokenCreate,
+    LookingGlassRouteLookupRequest,
     NodePluginActionRequest,
     PortInventoryEntryCreate,
     PortInventorySettingUpdate,
@@ -2583,6 +2592,188 @@ def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeyp
     assert node.agent_version == "0.1.0"
     assert node.agent_capabilities == ["service:systemd", "wg_quick_import", "wireguard"]
     assert [task.type for task in response.tasks] == ["wireguard.import_scan"]
+
+
+def test_create_looking_glass_token_returns_plaintext_once() -> None:
+    """验证管理端创建 Looking Glass Token 时只把明文放在创建响应中。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", endpoint_ips=["203.0.113.1"])
+        session.add(node)
+        session.commit()
+        result = create_looking_glass_token(
+            IntegrationApiTokenCreate(
+                name="public-lg",
+                scopes=["looking_glass.nodes.read", "looking_glass.bird.route"],
+                allowed_node_ids=[node.id],
+            ),
+            session,
+        )
+        stored = session.get(models.IntegrationApiKey, result.id)
+
+    assert result.token.startswith(f"{result.token_prefix}_")
+    assert result.token_hint == result.token[-10:]
+    assert stored is not None
+    assert stored.token_hash != result.token
+    assert verify_token(result.token, stored.token_hash)
+
+
+def test_looking_glass_route_lookup_creates_query_task() -> None:
+    """验证第三方 BIRD 查询会创建 query 队列任务并返回 opaque query_id。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            region="华南",
+            management_ip="10.0.0.1",
+            public_ip="203.0.113.1",
+            endpoint_ips=["203.0.113.1"],
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["looking_glass.bird.route_lookup"],
+        )
+        session.add(node)
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=True,
+        )
+        session.add(api_key)
+        session.commit()
+
+        response = Response()
+        result = submit_looking_glass_bird_route_lookup(
+            f"node_{node.id}",
+            LookingGlassRouteLookupRequest(ip="1.1.1.1"),
+            response,
+            api_key,
+            session,
+        )
+        task = session.scalar(select(models.AgentTask).where(models.AgentTask.node_id == node.id))
+
+    assert response.status_code == 202
+    assert response.headers["Location"] == f"/third-party-api/looking-glass/v1/queries/{result.query_id}"
+    assert result.status == "queued"
+    assert result.query_id.startswith("lgq_")
+    assert task is not None
+    assert task.type == LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK
+    assert task.queue == "query"
+    assert task.payload["ip"] == "1.1.1.1"
+
+
+def test_looking_glass_invalid_ip_uses_stable_error_response() -> None:
+    """验证第三方 API 的请求校验错误使用文档约定的稳定错误格式。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        api_key = models.IntegrationApiKey(
+            id=1,
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[1],
+            enabled=True,
+        )
+
+        def override_api_key() -> models.IntegrationApiKey:
+            """为 TestClient 请求提供已认证的第三方 Token。"""
+
+            return api_key
+
+        def override_db():
+            """为 TestClient 请求提供临时数据库会话。"""
+
+            yield session
+
+        app.dependency_overrides[require_looking_glass_api_key] = override_api_key
+        app.dependency_overrides[get_db] = override_db
+        try:
+            response = TestClient(app).post(
+                "/third-party-api/looking-glass/v1/nodes/node_1/bird/routes:lookup",
+                json={"ip": "1.1.1.1;uname -a"},
+            )
+        finally:
+            app.dependency_overrides.pop(require_looking_glass_api_key, None)
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_request",
+            "message": "请求参数无效",
+        }
+    }
+
+
+def test_looking_glass_query_returns_raw_agent_result() -> None:
+    """验证 Looking Glass 查询完成后返回 Agent 上报的原始 stdout/stderr。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash")
+        session.add(node)
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=True,
+        )
+        task = models.AgentTask(
+            node_id=node.id,
+            type=LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+            queue="query",
+            status="succeeded",
+            result={
+                "command": "birdc show route for 1.1.1.1 all",
+                "exit_code": 0,
+                "stdout": "raw route output",
+                "stderr": "",
+                "truncated": False,
+            },
+            started_at=datetime.utcnow(),
+            finished_at=datetime.utcnow(),
+        )
+        session.add_all([api_key, task])
+        session.flush()
+        query = models.LookingGlassQuery(
+            public_id="lgq_test",
+            api_key_id=api_key.id,
+            node_id=node.id,
+            operation="bird.route_lookup",
+            request={"ip": "1.1.1.1", "normalized_ip": "1.1.1.1"},
+            request_fingerprint="fp",
+            status="running",
+            agent_task_id=task.id,
+            expires_at=datetime.utcnow() + timedelta(minutes=10),
+        )
+        session.add(query)
+        session.commit()
+
+        result = get_looking_glass_query("lgq_test", api_key, session)
+
+    assert result.status == "succeeded"
+    assert result.result is not None
+    assert result.result["stdout"] == "raw route output"
+    assert result.error is None
 
 
 def test_agent_poll_honors_task_dependencies(monkeypatch) -> None:
