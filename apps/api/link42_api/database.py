@@ -38,6 +38,31 @@ class Base(DeclarativeBase):
     pass
 
 
+def purge_deleted_looking_glass_tokens(connection) -> None:
+    """清理旧版本软删除遗留的 Looking Glass Token 和关联查询记录。"""
+
+    connection.execute(
+        text(
+            """
+            DELETE FROM looking_glass_queries
+            WHERE api_key_id IN (
+                SELECT id
+                FROM integration_api_keys
+                WHERE enabled = 0 AND revoked_at IS NOT NULL
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            """
+            DELETE FROM integration_api_keys
+            WHERE enabled = 0 AND revoked_at IS NOT NULL
+            """
+        )
+    )
+
+
 @event.listens_for(engine, "connect")
 def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
     """为 SQLite 连接设置并发读写相关参数。"""
@@ -341,6 +366,9 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             connection.execute(text("CREATE INDEX ix_looking_glass_queries_agent_task_id ON looking_glass_queries(agent_task_id)"))
             connection.execute(text("CREATE INDEX ix_looking_glass_queries_status ON looking_glass_queries(status)"))
             connection.execute(text("CREATE INDEX ix_looking_glass_queries_request_fingerprint ON looking_glass_queries(request_fingerprint)"))
+
+        if table_exists("integration_api_keys") and table_exists("looking_glass_queries"):
+            purge_deleted_looking_glass_tokens(connection)
 
         if table_exists("wg_peers"):
             # 先清理历史遗留的重复对端，保留每个配置最早创建的一条记录。

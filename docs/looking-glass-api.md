@@ -174,8 +174,14 @@ Token 列表响应不返回明文：
 吊销和删除规则：
 
 - `revoke` 设置 `enabled=false` 和 `revoked_at`，保留审计记录。
-- `DELETE` 仅用于删除未使用或误创建的 Token；已经使用过的 Token 推荐只吊销不硬删除。
+- `DELETE` 会先让 Token 失效，再删除 Token 元数据和它关联的 Looking Glass 查询记录。
 - 被吊销、禁用或过期的 Token 调用第三方接口统一返回 `401 invalid_api_key`。
+
+来源 IP 记录：
+
+- `last_used_ip` 优先使用 `X-Forwarded-For` 的第一个合法 IP。
+- 如果没有 `X-Forwarded-For`，再依次尝试 `X-Real-IP`、`CF-Connecting-IP` 和 `Forwarded`。
+- 没有反向代理转发头时，使用直连客户端 IP。
 
 ## 6. 节点信息接口
 

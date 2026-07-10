@@ -19,6 +19,7 @@ from link42_common.connection_types import (
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from link42_api.database import Base
 from link42_api import models
@@ -138,7 +139,7 @@ from link42_api.wireguard_service import (
     count_enabled_peers,
     render_interface_config,
 )
-from link42_api.database import backup_sqlite_database_for_upgrade, ensure_sqlite_point_to_point_constraints
+from link42_api.database import backup_sqlite_database_for_upgrade, ensure_sqlite_point_to_point_constraints, purge_deleted_looking_glass_tokens
 
 
 def test_count_enabled_peers_ignores_disabled_peer() -> None:
@@ -207,7 +208,11 @@ def test_wireguard_connection_driver_exposes_standard_tasks() -> None:
 def test_node_plugin_status_reports_missing_capability() -> None:
     """验证节点插件宿主会报告 Agent 能力缺口。"""
 
-    engine = create_engine("sqlite:///:memory:")
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
         node = models.Node(
@@ -232,7 +237,11 @@ def test_node_plugin_status_reports_missing_capability() -> None:
 def test_node_plugin_status_checks_agent_version() -> None:
     """验证插件可用状态同时受 Agent 版本和 capability 约束。"""
 
-    engine = create_engine("sqlite:///:memory:")
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
         node = models.Node(
@@ -2641,8 +2650,8 @@ def test_create_looking_glass_token_returns_plaintext_once() -> None:
     assert verify_token(result.token, stored.token_hash)
 
 
-def test_delete_looking_glass_token_revokes_even_with_query_audit() -> None:
-    """验证删除 Looking Glass Token 等同吊销，不因已有查询审计记录阻止用户操作。"""
+def test_delete_looking_glass_token_removes_token_and_query_audit() -> None:
+    """验证删除 Looking Glass Token 会同时删除 Token 和关联查询记录。"""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -2661,10 +2670,11 @@ def test_delete_looking_glass_token_revokes_even_with_query_audit() -> None:
         )
         session.add(api_key)
         session.flush()
+        token_id = api_key.id
         session.add(
             models.LookingGlassQuery(
                 public_id="lgq_test",
-                api_key_id=api_key.id,
+                api_key_id=token_id,
                 node_id=node.id,
                 operation="bird.route_lookup",
                 request={"ip": "1.1.1.1"},
@@ -2674,15 +2684,126 @@ def test_delete_looking_glass_token_revokes_even_with_query_audit() -> None:
         )
         session.commit()
 
-        result = delete_looking_glass_token(api_key.id, session)
-        stored = session.get(models.IntegrationApiKey, api_key.id)
-        audit_count = session.scalar(select(models.LookingGlassQuery).where(models.LookingGlassQuery.api_key_id == api_key.id))
+        result = delete_looking_glass_token(token_id, session)
+        stored = session.get(models.IntegrationApiKey, token_id)
+        audit = session.scalar(select(models.LookingGlassQuery).where(models.LookingGlassQuery.api_key_id == token_id))
 
-    assert result == {"status": "revoked"}
+    assert result == {"status": "deleted"}
+    assert stored is None
+    assert audit is None
+
+
+def test_purge_deleted_looking_glass_tokens_removes_legacy_soft_deleted_rows() -> None:
+    """验证数据库升级清理会移除旧版本软删除留下的 Token 和查询记录。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash")
+        session.add(node)
+        session.flush()
+        deleted_key = models.IntegrationApiKey(
+            name="deleted-lg",
+            token_prefix="l42lg_deleted",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=False,
+            revoked_at=datetime.utcnow(),
+        )
+        active_key = models.IntegrationApiKey(
+            name="active-lg",
+            token_prefix="l42lg_active",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=True,
+        )
+        session.add_all([deleted_key, active_key])
+        session.flush()
+        deleted_id = deleted_key.id
+        active_id = active_key.id
+        session.add_all(
+            [
+                models.LookingGlassQuery(
+                    public_id="lgq_deleted",
+                    api_key_id=deleted_id,
+                    node_id=node.id,
+                    operation="bird.route_lookup",
+                    request={},
+                    request_fingerprint="deleted",
+                    status="succeeded",
+                ),
+                models.LookingGlassQuery(
+                    public_id="lgq_active",
+                    api_key_id=active_id,
+                    node_id=node.id,
+                    operation="bird.route_lookup",
+                    request={},
+                    request_fingerprint="active",
+                    status="succeeded",
+                ),
+            ]
+        )
+        session.commit()
+
+    with engine.begin() as connection:
+        purge_deleted_looking_glass_tokens(connection)
+
+    with Session(engine) as session:
+        assert session.get(models.IntegrationApiKey, deleted_id) is None
+        assert session.scalar(select(models.LookingGlassQuery).where(models.LookingGlassQuery.api_key_id == deleted_id)) is None
+        assert session.get(models.IntegrationApiKey, active_id) is not None
+        assert session.scalar(select(models.LookingGlassQuery).where(models.LookingGlassQuery.api_key_id == active_id)) is not None
+
+
+def test_looking_glass_token_last_used_ip_uses_forwarded_header() -> None:
+    """验证第三方 API Token 来源 IP 优先使用反向代理转发头。"""
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    token = "l42lg_proxy_secret"
+    with Session(engine) as session:
+        api_key = models.IntegrationApiKey(
+            id=1,
+            name="public-lg",
+            token_prefix="l42lg_proxy",
+            token_hash=hash_token(token),
+            token_hint="hint",
+            scopes=["looking_glass.nodes.read"],
+            allowed_node_ids=[1],
+            enabled=True,
+        )
+        session.add(api_key)
+        session.commit()
+
+        def override_db():
+            """为 TestClient 请求提供临时数据库会话。"""
+
+            yield session
+
+        app.dependency_overrides[get_db] = override_db
+        try:
+            response = TestClient(app).get(
+                "/third-party-api/looking-glass/v1/nodes",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Forwarded-For": "203.0.113.10, 10.0.0.1",
+                },
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+        stored = session.get(models.IntegrationApiKey, 1)
+
+    assert response.status_code == 200
     assert stored is not None
-    assert stored.enabled is False
-    assert stored.revoked_at is not None
-    assert audit_count is not None
+    assert stored.last_used_ip == "203.0.113.10"
 
 
 def test_looking_glass_route_lookup_creates_query_task() -> None:

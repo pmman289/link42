@@ -2996,9 +2996,9 @@ function App() {
     notify("success", "API Token 已吊销。");
   }
 
-  // 删除 Looking Glass Token 时按吊销处理，保留历史查询审计。
+  // 删除 Looking Glass Token，并清理它关联的历史查询记录。
   async function deleteLookingGlassToken(token: LookingGlassApiToken) {
-    if (!window.confirm(`确定删除 ${token.name}？删除后该 Token 会立即失效，历史查询记录会保留。`)) return;
+    if (!window.confirm(`确定删除 ${token.name}？删除后该 Token 会立即失效，相关查询记录也会被清理。`)) return;
     await api<{ status: string }>(`/api/integrations/looking-glass/tokens/${token.id}`, {
       method: "DELETE",
     });
@@ -3006,7 +3006,7 @@ function App() {
       setRevealedLookingGlassToken(null);
     }
     await refreshLookingGlassTokens();
-    notify("success", "API Token 已删除并失效。");
+    notify("success", "API Token 已删除。");
   }
 
   // 刷新节点列表。

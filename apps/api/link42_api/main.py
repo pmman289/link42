@@ -430,6 +430,47 @@ def api_error(status_code: int, code: str, message: str) -> LookingGlassApiError
     return LookingGlassApiError(status_code=status_code, code=code, message=message)
 
 
+def normalized_header_ip(value: str) -> str | None:
+    """从反向代理来源头中提取合法 IP，无法识别时返回空。"""
+
+    candidate = value.strip().strip('"')
+    if not candidate:
+        return None
+    if candidate.startswith("[") and "]" in candidate:
+        candidate = candidate[1 : candidate.index("]")]
+    elif candidate.count(":") == 1 and "." in candidate:
+        candidate = candidate.split(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def request_source_ip(request: Request) -> str | None:
+    """获取请求真实来源 IP，兼容常见反向代理转发头。"""
+
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        for value in x_forwarded_for.split(","):
+            parsed = normalized_header_ip(value)
+            if parsed:
+                return parsed
+    for header_name in ["x-real-ip", "cf-connecting-ip"]:
+        parsed = normalized_header_ip(request.headers.get(header_name, ""))
+        if parsed:
+            return parsed
+    forwarded = request.headers.get("forwarded")
+    if forwarded:
+        for section in forwarded.split(","):
+            for item in section.split(";"):
+                key, _, value = item.strip().partition("=")
+                if key.lower() == "for":
+                    parsed = normalized_header_ip(value)
+                    if parsed:
+                        return parsed
+    return request.client.host if request.client else None
+
+
 def require_looking_glass_api_key(
     request: Request,
     db: Session = Depends(get_db),
@@ -452,7 +493,7 @@ def require_looking_glass_api_key(
         logger.warning("第三方 API Token 鉴权失败 prefix=%s path=%s", prefix, request.url.path)
         raise api_error(401, "invalid_api_key", "API Token 无效或已过期")
     api_key.last_used_at = now
-    api_key.last_used_ip = request.client.host if request.client else None
+    api_key.last_used_ip = request_source_ip(request)
     db.commit()
     db.refresh(api_key)
     return api_key
@@ -809,16 +850,23 @@ def revoke_looking_glass_token(token_id: int, db: Session = Depends(get_db)) -> 
 
 @app.delete("/api/integrations/looking-glass/tokens/{token_id}")
 def delete_looking_glass_token(token_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
-    """删除 Looking Glass 第三方 API Token 时按吊销处理，保留查询审计记录。"""
+    """彻底删除 Looking Glass 第三方 API Token 和关联查询记录。"""
 
     api_key = db.get(models.IntegrationApiKey, token_id)
     if api_key is None:
         raise HTTPException(status_code=404, detail="token not found")
+    token_prefix = api_key.token_prefix
+    query_count = db.scalar(
+        select(func.count(models.LookingGlassQuery.id)).where(models.LookingGlassQuery.api_key_id == token_id)
+    )
     api_key.enabled = False
-    api_key.revoked_at = api_key.revoked_at or datetime.utcnow()
+    api_key.revoked_at = datetime.utcnow()
+    db.flush()
+    db.execute(delete(models.LookingGlassQuery).where(models.LookingGlassQuery.api_key_id == token_id))
+    db.delete(api_key)
     db.commit()
-    logger.info("删除 Looking Glass API Token 已按吊销处理 id=%s prefix=%s", api_key.id, api_key.token_prefix)
-    return {"status": "revoked"}
+    logger.info("删除 Looking Glass API Token id=%s prefix=%s queries=%s", token_id, token_prefix, int(query_count or 0))
+    return {"status": "deleted"}
 
 
 @app.get(f"{LOOKING_GLASS_API_PREFIX}/nodes", response_model=schemas.LookingGlassNodeList)

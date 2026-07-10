@@ -12,6 +12,8 @@
 
 第三方接口里的时间字段统一使用 Unix 秒级时间戳，例如 `1783675800`。判断查询是否超时时，直接比较当前 Unix 时间和 `deadline_at`。
 
+如果 Link42 主控位于反向代理后方，Token 的最后来源 IP 会优先使用 `X-Forwarded-For`、`X-Real-IP`、`CF-Connecting-IP` 或 `Forwarded` 中的合法客户端 IP。
+
 ## 1. 鉴权
 
 所有第三方 API 请求都需要携带：
