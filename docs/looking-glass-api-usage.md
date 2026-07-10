@@ -10,6 +10,8 @@
 
 管理端 Token 由 Link42 管理员在主控面板的“系统设置 -> Looking Glass API Token”中生成。Looking Glass 服务只保存生成出的 Token，并通过 Bearer Token 调用第三方 API。
 
+第三方接口里的时间字段统一使用 Unix 秒级时间戳，例如 `1783675800`。判断查询是否超时时，直接比较当前 Unix 时间和 `deadline_at`。
+
 ## 1. 鉴权
 
 所有第三方 API 请求都需要携带：
@@ -74,7 +76,7 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
       "name": "tencguangzhou",
       "region": "华南",
       "online": true,
-      "last_seen_at": "2026-07-10T09:30:00Z",
+      "last_seen_at": 1783675800,
       "ips": {
         "management_ip": "10.1.0.6",
         "public_ip": "1.14.226.49",
@@ -96,7 +98,7 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
 - `name`：节点名称。
 - `region`：节点地域。
 - `online`：节点 Agent 是否在线。
-- `last_seen_at`：节点最后心跳时间。
+- `last_seen_at`：节点最后心跳时间，Unix 秒级时间戳。
 - `ips.management_ip`：管理地址。
 - `ips.public_ip`：公网地址。
 - `ips.endpoint_ips`：节点入口地址列表。
@@ -173,11 +175,11 @@ Retry-After: 1
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
+  "created_at": 1783675800,
   "started_at": null,
   "finished_at": null,
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z",
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400,
   "result": null,
   "error": null
 }
@@ -216,11 +218,11 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
-  "started_at": "2026-07-10T09:30:01Z",
+  "created_at": 1783675800,
+  "started_at": 1783675801,
   "finished_at": null,
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z",
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400,
   "result": null,
   "error": null
 }
@@ -238,11 +240,11 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
-  "started_at": "2026-07-10T09:30:01Z",
-  "finished_at": "2026-07-10T09:30:02Z",
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z",
+  "created_at": 1783675800,
+  "started_at": 1783675801,
+  "finished_at": 1783675802,
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400,
   "result": {
     "command": "birdc show route for 1.1.1.1 all",
     "exit_code": 0,
@@ -267,11 +269,11 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
-  "started_at": "2026-07-10T09:30:01Z",
-  "finished_at": "2026-07-10T09:30:02Z",
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z",
+  "created_at": 1783675800,
+  "started_at": 1783675801,
+  "finished_at": 1783675802,
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400,
   "result": {
     "command": "birdc show route for 1.1.1.1 all",
     "exit_code": 1,
@@ -308,7 +310,7 @@ cancelled    查询被取消
 第一次等待 500ms
 之后按 1s、2s 间隔退避
 响应头有 Retry-After 时优先使用 Retry-After
-超过 deadline_at 后停止等待并提示超时
+超过 deadline_at 后停止等待并提示超时，deadline_at 是 Unix 秒级时间戳
 ```
 
 结果默认保留 10 分钟。过期后读取查询结果会返回 `410 result_expired`。

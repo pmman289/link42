@@ -8,8 +8,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
 
-def serialize_utc_datetime(value: datetime | None) -> str | None:
-    """把数据库里的 UTC 时间序列化成带 Z 后缀的第三方 API 时间。"""
+def serialize_utc_timestamp(value: datetime | None) -> int | None:
+    """把数据库里的 UTC 时间序列化成 Unix 秒级时间戳。"""
 
     if value is None:
         return None
@@ -17,7 +17,7 @@ def serialize_utc_datetime(value: datetime | None) -> str | None:
         value = value.replace(tzinfo=timezone.utc)
     else:
         value = value.astimezone(timezone.utc)
-    return value.isoformat().replace("+00:00", "Z")
+    return int(value.timestamp())
 
 
 def _validate_port(value: int | None) -> int | None:
@@ -1414,10 +1414,10 @@ class LookingGlassNodeRead(BaseModel):
     capabilities: LookingGlassNodeCapabilities
 
     @field_serializer("last_seen_at")
-    def serialize_last_seen_at(self, value: datetime | None) -> str | None:
-        """让第三方节点接口返回明确的 UTC 时间，避免调用方按本地时区误判。"""
+    def serialize_last_seen_at(self, value: datetime | None) -> int | None:
+        """让第三方节点接口返回时间戳，避免调用方解析时区。"""
 
-        return serialize_utc_datetime(value)
+        return serialize_utc_timestamp(value)
 
 
 class LookingGlassNodeList(BaseModel):
@@ -1468,10 +1468,10 @@ class LookingGlassQueryRead(BaseModel):
     error: LookingGlassQueryError | None = None
 
     @field_serializer("created_at", "started_at", "finished_at", "deadline_at", "expires_at")
-    def serialize_query_datetime(self, value: datetime | None) -> str | None:
-        """让第三方查询接口返回明确的 UTC 时间，避免调用方按本地时区误判。"""
+    def serialize_query_datetime(self, value: datetime | None) -> int | None:
+        """让第三方查询接口返回时间戳，避免调用方解析时区。"""
 
-        return serialize_utc_datetime(value)
+        return serialize_utc_timestamp(value)
 
 
 class AgentTaskStatusRead(BaseModel):

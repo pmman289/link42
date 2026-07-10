@@ -30,6 +30,8 @@
 
 版本号放在路径中，后续如果响应结构需要破坏性调整，可以新增 `/v2`，保留 `/v1` 兼容。
 
+第三方接口里的时间字段统一使用 Unix 秒级时间戳，例如 `1783675800`。调用方判断超时时直接比较当前 Unix 时间和 `deadline_at`。
+
 实现要求：
 
 - `/third-party-api/looking-glass/v1` 必须使用独立路由和独立鉴权依赖。
@@ -205,7 +207,7 @@ cursor      可选，分页游标
       "name": "tencguangzhou",
       "region": "华南",
       "online": true,
-      "last_seen_at": "2026-07-10T09:30:00Z",
+      "last_seen_at": 1783675800,
       "ips": {
         "management_ip": "10.1.0.6",
         "public_ip": "1.14.226.49",
@@ -227,7 +229,7 @@ cursor      可选，分页游标
 - `name`：节点名称。
 - `region`：节点地域。没有配置时返回空字符串或 `null`，建议前端按“未分组”展示。
 - `online`：根据 Agent 心跳计算的在线状态。
-- `last_seen_at`：最后一次 Agent 心跳时间。
+- `last_seen_at`：最后一次 Agent 心跳时间，Unix 秒级时间戳。
 - `ips.management_ip`：节点管理地址。
 - `ips.public_ip`：节点公网地址。
 - `ips.endpoint_ips`：节点配置中的入口地址列表，适合 Looking Glass 展示或选择。
@@ -259,7 +261,7 @@ looking_glass.nodes.read
   "name": "tencguangzhou",
   "region": "华南",
   "online": true,
-  "last_seen_at": "2026-07-10T09:30:00Z",
+  "last_seen_at": 1783675800,
   "ips": {
     "management_ip": "10.1.0.6",
     "public_ip": "1.14.226.49",
@@ -320,9 +322,9 @@ Retry-After: 1
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z"
+  "created_at": 1783675800,
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400
 }
 ```
 
@@ -350,11 +352,11 @@ looking_glass.bird.route
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
-  "started_at": "2026-07-10T09:30:01Z",
+  "created_at": 1783675800,
+  "started_at": 1783675801,
   "finished_at": null,
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z",
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400,
   "result": null,
   "error": null
 }
@@ -372,11 +374,11 @@ looking_glass.bird.route
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
-  "started_at": "2026-07-10T09:30:01Z",
-  "finished_at": "2026-07-10T09:30:02Z",
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z",
+  "created_at": 1783675800,
+  "started_at": 1783675801,
+  "finished_at": 1783675802,
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400,
   "result": {
     "command": "birdc show route for 1.1.1.1 all",
     "exit_code": 0,
@@ -401,11 +403,11 @@ looking_glass.bird.route
     "ip": "1.1.1.1",
     "normalized_ip": "1.1.1.1"
   },
-  "created_at": "2026-07-10T09:30:00Z",
-  "started_at": "2026-07-10T09:30:01Z",
-  "finished_at": "2026-07-10T09:30:02Z",
-  "deadline_at": "2026-07-10T09:30:15Z",
-  "expires_at": "2026-07-10T09:40:00Z",
+  "created_at": 1783675800,
+  "started_at": 1783675801,
+  "finished_at": 1783675802,
+  "deadline_at": 1783675860,
+  "expires_at": 1783676400,
   "result": null,
   "error": {
     "code": "command_failed",
@@ -467,7 +469,7 @@ agent_tasks
 首次 500ms 后轮询
 之后 1s、2s 退避
 收到 Retry-After 时优先遵守服务端建议
-超过 deadline_at 后停止等待并提示超时
+超过 deadline_at 后停止等待并提示超时，deadline_at 是 Unix 秒级时间戳
 ```
 
 ## 9. Agent 执行约束

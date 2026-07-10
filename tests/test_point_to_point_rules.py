@@ -2777,8 +2777,8 @@ def test_looking_glass_query_returns_raw_agent_result() -> None:
     assert result.error is None
 
 
-def test_looking_glass_query_response_datetimes_include_utc_timezone() -> None:
-    """验证第三方查询响应的时间带 UTC 时区，避免调用方按本地时区误判超时。"""
+def test_looking_glass_query_response_datetimes_are_unix_timestamps() -> None:
+    """验证第三方查询响应的时间是 Unix 时间戳，避免调用方解析时区。"""
 
     body = LookingGlassQueryRead(
         query_id="lgq_time",
@@ -2791,9 +2791,9 @@ def test_looking_glass_query_response_datetimes_include_utc_timezone() -> None:
         expires_at=datetime(2026, 7, 10, 6, 9, 31),
     ).model_dump(mode="json")
 
-    assert body["created_at"] == "2026-07-10T05:59:31Z"
-    assert body["deadline_at"] == "2026-07-10T06:00:31Z"
-    assert body["expires_at"] == "2026-07-10T06:09:31Z"
+    assert body["created_at"] == 1783663171
+    assert body["deadline_at"] == 1783663231
+    assert body["expires_at"] == 1783663771
 
 
 def test_looking_glass_agent_result_updates_query_status() -> None:
