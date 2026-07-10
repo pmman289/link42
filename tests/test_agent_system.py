@@ -11,7 +11,10 @@ import pytest
 
 from link42_common.connection_types import (
     GRE_TASKS,
+    LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK,
+    LOOKING_GLASS_BIRD_PROTOCOLS_TASK,
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK,
     LOOKING_GLASS_PING_TASK,
     LOOKING_GLASS_TRACEROUTE_TASK,
     WIREGUARD_TASKS,
@@ -581,6 +584,8 @@ def test_looking_glass_bird_capability_depends_on_birdc(monkeypatch) -> None:
 
     assert "bird" in capabilities
     assert "looking_glass.bird.route_lookup" in capabilities
+    assert "looking_glass.bird.routes_by_origin_as" in capabilities
+    assert "looking_glass.bird.protocols" in capabilities
     assert "looking_glass.ping" in capabilities
     assert "looking_glass.traceroute" in capabilities
 
@@ -607,6 +612,52 @@ def test_looking_glass_bird_route_lookup_uses_fixed_argv(monkeypatch) -> None:
     assert result["command"] == "birdc show route for 2001:db8::1 all"
     assert result["stdout"] == "raw output"
     assert result["exit_code"] == 0
+
+
+def test_looking_glass_bird_routes_by_origin_as_uses_fixed_argv(monkeypatch) -> None:
+    """验证 Looking Glass BIRD ASN 路由查询只能执行固定 birdc 参数。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run(command, text, capture_output, timeout, check):
+        """记录 subprocess 参数并返回模拟 birdc 输出。"""
+
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="asn routes", stderr="")
+
+    monkeypatch.setattr(looking_glass.shutil, "which", lambda binary: "/usr/sbin/birdc" if binary == "birdc" else None)
+    monkeypatch.setattr(looking_glass.subprocess, "run", fake_run)
+
+    result = looking_glass.execute_bird_routes_by_origin_as({"asn": "64512"})
+
+    assert commands == [["/usr/sbin/birdc", "show", "route", "where", "bgp_path.last", "=", "64512", "all", "primary"]]
+    assert result["command"] == "birdc show route where bgp_path.last = 64512 all primary"
+    assert result["stdout"] == "asn routes"
+
+
+def test_looking_glass_bird_protocol_queries_use_fixed_argv(monkeypatch) -> None:
+    """验证 Looking Glass BIRD 协议查询只能执行固定 birdc 参数。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run(command, text, capture_output, timeout, check):
+        """记录 subprocess 参数并返回模拟 birdc 输出。"""
+
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="protocol output", stderr="")
+
+    monkeypatch.setattr(looking_glass.shutil, "which", lambda binary: "/usr/sbin/birdc" if binary == "birdc" else None)
+    monkeypatch.setattr(looking_glass.subprocess, "run", fake_run)
+
+    list_result = looking_glass.execute_bird_protocols({"command_timeout_seconds": 3, "output_limit_bytes": 20})
+    detail_result = looking_glass.execute_bird_protocol_detail({"protocol_name": "bgp_peer-1"})
+
+    assert commands == [
+        ["/usr/sbin/birdc", "show", "protocols"],
+        ["/usr/sbin/birdc", "show", "protocols", "all", "bgp_peer-1"],
+    ]
+    assert list_result["command"] == "birdc show protocols"
+    assert detail_result["command"] == "birdc show protocols all bgp_peer-1"
 
 
 def test_looking_glass_ping_and_traceroute_use_fixed_argv(monkeypatch) -> None:
@@ -642,6 +693,9 @@ def test_looking_glass_tasks_registered() -> None:
     """验证 Looking Glass 查询任务已注册到 Agent 分派表。"""
 
     assert LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK in TASK_HANDLERS
+    assert LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK in TASK_HANDLERS
+    assert LOOKING_GLASS_BIRD_PROTOCOLS_TASK in TASK_HANDLERS
+    assert LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK in TASK_HANDLERS
     assert LOOKING_GLASS_PING_TASK in TASK_HANDLERS
     assert LOOKING_GLASS_TRACEROUTE_TASK in TASK_HANDLERS
 

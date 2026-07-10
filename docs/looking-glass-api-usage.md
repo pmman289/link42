@@ -85,6 +85,8 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
       "capabilities": {
         "bird": true,
         "bird_route_lookup": true,
+        "bird_routes_by_origin_as": true,
+        "bird_protocols": true,
         "ping": true,
         "traceroute": true
       }
@@ -105,6 +107,8 @@ curl -H "Authorization: Bearer l42lg_xxx_xxx" \
 - `ips.public_ip`：公网地址。
 - `ips.endpoint_ips`：节点入口地址列表。
 - `capabilities.bird_route_lookup`：该节点是否支持 BIRD 路由查询。
+- `capabilities.bird_routes_by_origin_as`：该节点是否支持按来源 ASN 查询 BIRD 路由。
+- `capabilities.bird_protocols`：该节点是否支持 BIRD 协议状态和协议详情查询。
 - `capabilities.ping`：该节点是否支持 ping 查询。
 - `capabilities.traceroute`：该节点是否支持 traceroute 查询。
 
@@ -191,7 +195,35 @@ Retry-After: 1
 
 调用方应保存 `query_id`，随后轮询查询结果。
 
-## 5. 提交 ping 查询
+## 5. 提交 BIRD ASN 路由查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/bird/routes:lookup-origin-as
+```
+
+权限要求：
+
+```text
+looking_glass.bird.route
+```
+
+请求体：
+
+```json
+{
+  "asn": 64512
+}
+```
+
+`asn` 必须是 1 到 4294967295 的整数。Agent 固定执行：
+
+```text
+birdc show route where bgp_path.last = 64512 all primary
+```
+
+成功时返回 `202 Accepted` 和 `query_id`，`operation` 为 `bird.routes_by_origin_as`。
+
+## 6. 提交 ping 查询
 
 ```http
 POST /third-party-api/looking-glass/v1/nodes/{node_ref}/ping
@@ -219,7 +251,55 @@ looking_glass.bird.route
 
 成功时返回 `202 Accepted` 和 `query_id`，`operation` 为 `ping`。
 
-## 6. 提交 traceroute 查询
+## 7. 提交 BIRD 协议状态查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/bird/protocols:lookup
+```
+
+权限要求：
+
+```text
+looking_glass.bird.route
+```
+
+该接口不需要请求体。Agent 固定执行：
+
+```text
+birdc show protocols
+```
+
+成功时返回 `202 Accepted` 和 `query_id`，`operation` 为 `bird.protocols`。
+
+## 8. 提交 BIRD 协议详情查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/bird/protocols:lookup-detail
+```
+
+权限要求：
+
+```text
+looking_glass.bird.route
+```
+
+请求体：
+
+```json
+{
+  "protocol_name": "bgp_peer1"
+}
+```
+
+`protocol_name` 只允许 1 到 64 个字符，可使用字母、数字、`_`、`.`、`:`、`-`，且首字符必须是字母、数字或 `_`。Agent 固定执行：
+
+```text
+birdc show protocols all bgp_peer1
+```
+
+成功时返回 `202 Accepted` 和 `query_id`，`operation` 为 `bird.protocol_detail`。
+
+## 9. 提交 traceroute 查询
 
 ```http
 POST /third-party-api/looking-glass/v1/nodes/{node_ref}/traceroute
@@ -249,7 +329,7 @@ looking_glass.bird.route
 
 成功时返回 `202 Accepted` 和 `query_id`，`operation` 为 `traceroute`。
 
-## 7. 读取查询状态和结果
+## 10. 读取查询状态和结果
 
 ```http
 GET /third-party-api/looking-glass/v1/queries/{query_id}
@@ -367,7 +447,25 @@ traceroute 成功时，`result.command` 类似：
 traceroute -n -m 30 -w 3 -q 3 example.com
 ```
 
-## 8. 查询状态
+BIRD ASN 路由查询成功时，`result.command` 类似：
+
+```text
+birdc show route where bgp_path.last = 64512 all primary
+```
+
+BIRD 协议状态查询成功时，`result.command` 为：
+
+```text
+birdc show protocols
+```
+
+BIRD 协议详情查询成功时，`result.command` 类似：
+
+```text
+birdc show protocols all bgp_peer1
+```
+
+## 11. 查询状态
 
 ```text
 queued       已入队，等待节点 Agent 拉取
@@ -389,7 +487,7 @@ cancelled    查询被取消
 
 结果默认保留 10 分钟。过期后读取查询结果会返回 `410 result_expired`。
 
-## 9. 常见错误
+## 12. 常见错误
 
 ```text
 400 invalid_request          请求格式错误、IP 非法或目标地址非法
@@ -414,7 +512,7 @@ cancelled    查询被取消
 }
 ```
 
-## 10. 完整调用流程
+## 13. 完整调用流程
 
 ```bash
 # 1. 读取节点

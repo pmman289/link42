@@ -16,6 +16,9 @@ TARGET_HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
+PROTOCOL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")
+MIN_BGP_ASN = 1
+MAX_BGP_ASN = 4294967295
 
 
 def normalized_ip(value: object) -> str:
@@ -40,6 +43,27 @@ def normalized_target(value: object) -> str:
     if TARGET_HOSTNAME_RE.fullmatch(text) and ".." not in text:
         return text.rstrip(".").lower()
     raise ValueError("target must be a valid IP address or hostname")
+
+
+def normalized_protocol_name(value: object) -> str:
+    """校验 BIRD 协议名称，避免空白和命令控制字符进入 birdc 参数。"""
+
+    name = str(value or "").strip()
+    if PROTOCOL_NAME_RE.fullmatch(name):
+        return name
+    raise ValueError("protocol_name must use 1-64 characters: letters, numbers, _, ., :, -")
+
+
+def normalized_bgp_asn(value: object) -> int:
+    """校验并规范化 BGP ASN，只允许 1 到 4294967295 的整数。"""
+
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d+", text):
+        raise ValueError("asn must be an integer between 1 and 4294967295")
+    parsed = int(text)
+    if MIN_BGP_ASN <= parsed <= MAX_BGP_ASN:
+        return parsed
+    raise ValueError("asn must be an integer between 1 and 4294967295")
 
 
 def positive_float(value: object, default: float) -> float:
@@ -159,6 +183,57 @@ def execute_bird_route_lookup(payload: dict[str, Any]) -> dict[str, Any]:
     result["command"] = f"birdc show route for {target_ip} all"
     if result.get("error_code") == "command_failed":
         result["error"] = "BIRD 查询执行失败"
+    return result
+
+
+def execute_bird_routes_by_origin_as(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行受限的 birdc show route where bgp_path.last = <asn> all primary 查询并返回原始输出。"""
+
+    asn = normalized_bgp_asn(payload.get("asn"))
+    timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS)
+    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    command = [
+        birdc_binary(),
+        "show",
+        "route",
+        "where",
+        "bgp_path.last",
+        "=",
+        str(asn),
+        "all",
+        "primary",
+    ]
+    result = run_fixed_command(command, timeout, output_limit, f"BIRD ASN 路由查询超过 {timeout:g} 秒未返回")
+    result["command"] = f"birdc show route where bgp_path.last = {asn} all primary"
+    if result.get("error_code") == "command_failed":
+        result["error"] = "BIRD ASN 路由查询执行失败"
+    return result
+
+
+def execute_bird_protocols(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行受限的 birdc show protocols 查询并返回原始输出。"""
+
+    timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS)
+    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    command = [birdc_binary(), "show", "protocols"]
+    result = run_fixed_command(command, timeout, output_limit, f"BIRD 协议状态查询超过 {timeout:g} 秒未返回")
+    result["command"] = "birdc show protocols"
+    if result.get("error_code") == "command_failed":
+        result["error"] = "BIRD 协议状态查询执行失败"
+    return result
+
+
+def execute_bird_protocol_detail(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行受限的 birdc show protocols all <protocol_name> 查询并返回原始输出。"""
+
+    protocol_name = normalized_protocol_name(payload.get("protocol_name"))
+    timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS)
+    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    command = [birdc_binary(), "show", "protocols", "all", protocol_name]
+    result = run_fixed_command(command, timeout, output_limit, f"BIRD 协议详情查询超过 {timeout:g} 秒未返回")
+    result["command"] = f"birdc show protocols all {protocol_name}"
+    if result.get("error_code") == "command_failed":
+        result["error"] = "BIRD 协议详情查询执行失败"
     return result
 
 

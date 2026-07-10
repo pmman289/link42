@@ -24,7 +24,10 @@ from link42_common.connection_types import (
     CONNECTION_TYPE_GRE,
     CONNECTION_TYPE_WIREGUARD,
     GRE_TASKS,
+    LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK,
+    LOOKING_GLASS_BIRD_PROTOCOLS_TASK,
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK,
     LOOKING_GLASS_PING_TASK,
     LOOKING_GLASS_TRACEROUTE_TASK,
     TASK_REQUIREMENTS,
@@ -101,7 +104,9 @@ def summarize_task_payload(payload: dict | None) -> dict[str, object]:
         "range_start",
         "range_end",
         "ip",
+        "asn",
         "target",
+        "protocol_name",
         "count",
         "max_hops",
         "command_timeout_seconds",
@@ -490,6 +495,20 @@ def node_supports_bird_route_lookup(node: models.Node) -> bool:
     return "looking_glass.bird.route_lookup" in capabilities
 
 
+def node_supports_bird_routes_by_origin_as(node: models.Node) -> bool:
+    """判断节点 Agent 是否上报 Looking Glass BIRD ASN 路由查询能力。"""
+
+    capabilities = set(node.agent_capabilities or [])
+    return "looking_glass.bird.routes_by_origin_as" in capabilities
+
+
+def node_supports_bird_protocols(node: models.Node) -> bool:
+    """判断节点 Agent 是否上报 Looking Glass BIRD 协议查询能力。"""
+
+    capabilities = set(node.agent_capabilities or [])
+    return "looking_glass.bird.protocols" in capabilities
+
+
 def node_supports_looking_glass_ping(node: models.Node) -> bool:
     """判断节点 Agent 是否上报 Looking Glass ping 查询能力。"""
 
@@ -521,8 +540,18 @@ def looking_glass_node_read(node: models.Node, now: datetime | None = None) -> s
             endpoint_ips=node.endpoint_ips or [],
         ),
         capabilities=schemas.LookingGlassNodeCapabilities(
-            bird="bird" in capabilities or "looking_glass.bird.route_lookup" in capabilities,
+            bird=bool(
+                {
+                    "bird",
+                    "looking_glass.bird.route_lookup",
+                    "looking_glass.bird.routes_by_origin_as",
+                    "looking_glass.bird.protocols",
+                }
+                & capabilities
+            ),
             bird_route_lookup=node_supports_bird_route_lookup(node),
+            bird_routes_by_origin_as=node_supports_bird_routes_by_origin_as(node),
+            bird_protocols=node_supports_bird_protocols(node),
             ping=node_supports_looking_glass_ping(node),
             traceroute=node_supports_looking_glass_traceroute(node),
         ),
@@ -780,20 +809,16 @@ def revoke_looking_glass_token(token_id: int, db: Session = Depends(get_db)) -> 
 
 @app.delete("/api/integrations/looking-glass/tokens/{token_id}")
 def delete_looking_glass_token(token_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
-    """删除未使用或误创建的 Looking Glass 第三方 API Token。"""
+    """删除 Looking Glass 第三方 API Token 时按吊销处理，保留查询审计记录。"""
 
     api_key = db.get(models.IntegrationApiKey, token_id)
     if api_key is None:
         raise HTTPException(status_code=404, detail="token not found")
-    query_count = db.scalar(
-        select(func.count(models.LookingGlassQuery.id)).where(models.LookingGlassQuery.api_key_id == token_id)
-    )
-    if int(query_count or 0) > 0:
-        raise HTTPException(status_code=409, detail="token has query audit records; revoke it instead")
-    db.delete(api_key)
+    api_key.enabled = False
+    api_key.revoked_at = api_key.revoked_at or datetime.utcnow()
     db.commit()
-    logger.info("删除 Looking Glass API Token id=%s", token_id)
-    return {"status": "deleted"}
+    logger.info("删除 Looking Glass API Token 已按吊销处理 id=%s prefix=%s", api_key.id, api_key.token_prefix)
+    return {"status": "revoked"}
 
 
 @app.get(f"{LOOKING_GLASS_API_PREFIX}/nodes", response_model=schemas.LookingGlassNodeList)
@@ -981,6 +1006,85 @@ def submit_looking_glass_bird_route_lookup(
         normalized_ip,
         "looking_glass.bird.route_lookup",
         "节点不支持 BIRD 路由查询",
+    )
+
+
+@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/bird/routes:lookup-origin-as", response_model=schemas.LookingGlassQueryRead)
+def submit_looking_glass_bird_routes_by_origin_as(
+    node_ref_value: str,
+    payload: schemas.LookingGlassRoutesByOriginAsRequest,
+    response: Response,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """提交 Looking Glass BIRD ASN 路由查询任务，返回可轮询的 query_id。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    request_payload = {"asn": payload.asn}
+    return create_looking_glass_query_task(
+        node_ref_value,
+        response,
+        api_key,
+        db,
+        "bird.routes_by_origin_as",
+        LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK,
+        request_payload,
+        request_payload,
+        str(payload.asn),
+        "looking_glass.bird.routes_by_origin_as",
+        "节点不支持 BIRD ASN 路由查询",
+    )
+
+
+@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/bird/protocols:lookup", response_model=schemas.LookingGlassQueryRead)
+def submit_looking_glass_bird_protocols(
+    node_ref_value: str,
+    response: Response,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """提交 Looking Glass BIRD 协议列表查询任务，返回可轮询的 query_id。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    return create_looking_glass_query_task(
+        node_ref_value,
+        response,
+        api_key,
+        db,
+        "bird.protocols",
+        LOOKING_GLASS_BIRD_PROTOCOLS_TASK,
+        {},
+        {},
+        "bird.protocols",
+        "looking_glass.bird.protocols",
+        "节点不支持 BIRD 协议状态查询",
+    )
+
+
+@app.post(f"{LOOKING_GLASS_API_PREFIX}/nodes/{{node_ref_value}}/bird/protocols:lookup-detail", response_model=schemas.LookingGlassQueryRead)
+def submit_looking_glass_bird_protocol_detail(
+    node_ref_value: str,
+    payload: schemas.LookingGlassProtocolDetailRequest,
+    response: Response,
+    api_key: models.IntegrationApiKey = Depends(require_looking_glass_api_key),
+    db: Session = Depends(get_db),
+) -> schemas.LookingGlassQueryRead:
+    """提交 Looking Glass BIRD 单个协议详情查询任务，返回可轮询的 query_id。"""
+
+    require_looking_glass_scope(api_key, LOOKING_GLASS_BIRD_ROUTE_SCOPE)
+    request_payload = {"protocol_name": payload.protocol_name}
+    return create_looking_glass_query_task(
+        node_ref_value,
+        response,
+        api_key,
+        db,
+        "bird.protocol_detail",
+        LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK,
+        request_payload,
+        request_payload,
+        payload.protocol_name,
+        "looking_glass.bird.protocols",
+        "节点不支持 BIRD 协议详情查询",
     )
 
 

@@ -13,6 +13,9 @@ LOOKING_GLASS_TARGET_HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
+LOOKING_GLASS_BIRD_PROTOCOL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")
+MIN_BGP_ASN = 1
+MAX_BGP_ASN = 4294967295
 
 
 def serialize_utc_timestamp(value: datetime | None) -> int | None:
@@ -38,6 +41,27 @@ def normalize_looking_glass_target(value: str) -> str:
     if LOOKING_GLASS_TARGET_HOSTNAME_RE.fullmatch(cleaned) and ".." not in cleaned:
         return cleaned.rstrip(".").lower()
     raise ValueError("target must be a valid IP address or hostname")
+
+
+def normalize_bird_protocol_name(value: str) -> str:
+    """规范化 BIRD 协议名称，只允许 birdc 固定参数可安全接收的标识符。"""
+
+    cleaned = value.strip()
+    if LOOKING_GLASS_BIRD_PROTOCOL_NAME_RE.fullmatch(cleaned):
+        return cleaned
+    raise ValueError("protocol_name must use 1-64 characters: letters, numbers, _, ., :, -")
+
+
+def normalize_bgp_asn(value: int | str) -> int:
+    """规范化第三方 BIRD ASN 查询参数，只允许 32 位 BGP ASN。"""
+
+    text = str(value).strip()
+    if not re.fullmatch(r"\d+", text):
+        raise ValueError("asn must be an integer between 1 and 4294967295")
+    parsed = int(text)
+    if MIN_BGP_ASN <= parsed <= MAX_BGP_ASN:
+        return parsed
+    raise ValueError("asn must be an integer between 1 and 4294967295")
 
 
 def _validate_port(value: int | None) -> int | None:
@@ -1420,6 +1444,8 @@ class LookingGlassNodeCapabilities(BaseModel):
 
     bird: bool = False
     bird_route_lookup: bool = False
+    bird_routes_by_origin_as: bool = False
+    bird_protocols: bool = False
     ping: bool = False
     traceroute: bool = False
 
@@ -1464,6 +1490,32 @@ class LookingGlassRouteLookupRequest(BaseModel):
             return str(ipaddress.ip_address(cleaned))
         except ValueError as exc:
             raise ValueError("ip must be a valid IPv4 or IPv6 address") from exc
+
+
+class LookingGlassRoutesByOriginAsRequest(BaseModel):
+    """Looking Glass BIRD ASN 路由查询请求。"""
+
+    asn: int
+
+    @field_validator("asn", mode="before")
+    @classmethod
+    def validate_asn(cls, value: int | str) -> int:
+        """校验 ASN 必须是 1 到 4294967295 的整数。"""
+
+        return normalize_bgp_asn(value)
+
+
+class LookingGlassProtocolDetailRequest(BaseModel):
+    """Looking Glass BIRD 协议详情查询请求。"""
+
+    protocol_name: str
+
+    @field_validator("protocol_name")
+    @classmethod
+    def validate_protocol_name(cls, value: str) -> str:
+        """校验 BIRD 协议名不能包含空白、shell 控制符或超长内容。"""
+
+        return normalize_bird_protocol_name(value)
 
 
 class LookingGlassPingRequest(BaseModel):

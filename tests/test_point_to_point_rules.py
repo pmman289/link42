@@ -7,7 +7,10 @@ from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
 from link42_common.connection_types import (
     GRE_TASKS,
+    LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK,
+    LOOKING_GLASS_BIRD_PROTOCOLS_TASK,
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK,
     LOOKING_GLASS_PING_TASK,
     LOOKING_GLASS_TRACEROUTE_TASK,
     TASK_REQUIREMENTS,
@@ -85,8 +88,12 @@ from link42_api.main import (
     update_port_inventory_range,
     update_node_topology_position,
     create_looking_glass_token,
+    delete_looking_glass_token,
     require_looking_glass_api_key,
+    submit_looking_glass_bird_protocol_detail,
+    submit_looking_glass_bird_protocols,
     submit_looking_glass_bird_route_lookup,
+    submit_looking_glass_bird_routes_by_origin_as,
     submit_looking_glass_ping,
     submit_looking_glass_traceroute,
     get_looking_glass_query,
@@ -111,8 +118,10 @@ from link42_api.schemas import (
     GreManagedConnectionCreate,
     IntegrationApiTokenCreate,
     LookingGlassPingRequest,
+    LookingGlassProtocolDetailRequest,
     LookingGlassQueryRead,
     LookingGlassRouteLookupRequest,
+    LookingGlassRoutesByOriginAsRequest,
     LookingGlassTracerouteRequest,
     NodePluginActionRequest,
     PortInventoryEntryCreate,
@@ -2632,6 +2641,50 @@ def test_create_looking_glass_token_returns_plaintext_once() -> None:
     assert verify_token(result.token, stored.token_hash)
 
 
+def test_delete_looking_glass_token_revokes_even_with_query_audit() -> None:
+    """验证删除 Looking Glass Token 等同吊销，不因已有查询审计记录阻止用户操作。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash")
+        session.add(node)
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=True,
+        )
+        session.add(api_key)
+        session.flush()
+        session.add(
+            models.LookingGlassQuery(
+                public_id="lgq_test",
+                api_key_id=api_key.id,
+                node_id=node.id,
+                operation="bird.route_lookup",
+                request={"ip": "1.1.1.1"},
+                request_fingerprint="fingerprint",
+                status="succeeded",
+            )
+        )
+        session.commit()
+
+        result = delete_looking_glass_token(api_key.id, session)
+        stored = session.get(models.IntegrationApiKey, api_key.id)
+        audit_count = session.scalar(select(models.LookingGlassQuery).where(models.LookingGlassQuery.api_key_id == api_key.id))
+
+    assert result == {"status": "revoked"}
+    assert stored is not None
+    assert stored.enabled is False
+    assert stored.revoked_at is not None
+    assert audit_count is not None
+
+
 def test_looking_glass_route_lookup_creates_query_task() -> None:
     """验证第三方 BIRD 查询会创建 query 队列任务并返回 opaque query_id。"""
 
@@ -2682,6 +2735,106 @@ def test_looking_glass_route_lookup_creates_query_task() -> None:
     assert task.type == LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK
     assert task.queue == "query"
     assert task.payload["ip"] == "1.1.1.1"
+
+
+def test_looking_glass_routes_by_origin_as_creates_query_task() -> None:
+    """验证第三方 BIRD ASN 路由查询会创建 query 队列任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.6",
+            agent_capabilities=["looking_glass.bird.routes_by_origin_as"],
+        )
+        session.add(node)
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=True,
+        )
+        session.add(api_key)
+        session.commit()
+
+        response = Response()
+        result = submit_looking_glass_bird_routes_by_origin_as(
+            f"node_{node.id}",
+            LookingGlassRoutesByOriginAsRequest(asn=64512),
+            response,
+            api_key,
+            session,
+        )
+        task = session.scalar(select(models.AgentTask).where(models.AgentTask.node_id == node.id))
+
+    assert response.status_code == 202
+    assert result.operation == "bird.routes_by_origin_as"
+    assert result.request == {"asn": 64512}
+    assert task is not None
+    assert task.type == LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK
+    assert task.payload["asn"] == 64512
+
+
+def test_looking_glass_bird_protocol_queries_create_query_tasks() -> None:
+    """验证第三方 BIRD 协议查询会创建对应 query 队列任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.6",
+            agent_capabilities=["looking_glass.bird.protocols"],
+        )
+        session.add(node)
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[node.id],
+            enabled=True,
+        )
+        session.add(api_key)
+        session.commit()
+
+        protocols_response = Response()
+        protocols_result = submit_looking_glass_bird_protocols(
+            f"node_{node.id}",
+            protocols_response,
+            api_key,
+            session,
+        )
+        detail_response = Response()
+        detail_result = submit_looking_glass_bird_protocol_detail(
+            f"node_{node.id}",
+            LookingGlassProtocolDetailRequest(protocol_name="bgp_peer-1"),
+            detail_response,
+            api_key,
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).where(models.AgentTask.node_id == node.id).order_by(models.AgentTask.id)))
+
+    assert protocols_response.status_code == 202
+    assert detail_response.status_code == 202
+    assert protocols_result.operation == "bird.protocols"
+    assert detail_result.operation == "bird.protocol_detail"
+    assert [task.type for task in tasks] == [LOOKING_GLASS_BIRD_PROTOCOLS_TASK, LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK]
+    assert tasks[0].payload["command_timeout_seconds"] == 15
+    assert tasks[1].payload["protocol_name"] == "bgp_peer-1"
 
 
 def test_looking_glass_ping_and_traceroute_create_query_tasks() -> None:
@@ -2788,6 +2941,100 @@ def test_looking_glass_invalid_ip_uses_stable_error_response() -> None:
     }
 
 
+def test_looking_glass_invalid_protocol_name_uses_stable_error_response() -> None:
+    """验证第三方 BIRD 协议详情接口的参数错误使用稳定错误格式。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        api_key = models.IntegrationApiKey(
+            id=1,
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[1],
+            enabled=True,
+        )
+
+        def override_api_key() -> models.IntegrationApiKey:
+            """为 TestClient 请求提供已认证的第三方 Token。"""
+
+            return api_key
+
+        def override_db():
+            """为 TestClient 请求提供临时数据库会话。"""
+
+            yield session
+
+        app.dependency_overrides[require_looking_glass_api_key] = override_api_key
+        app.dependency_overrides[get_db] = override_db
+        try:
+            response = TestClient(app).post(
+                "/third-party-api/looking-glass/v1/nodes/node_1/bird/protocols:lookup-detail",
+                json={"protocol_name": "bgp peer"},
+            )
+        finally:
+            app.dependency_overrides.pop(require_looking_glass_api_key, None)
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_request",
+            "message": "请求参数无效",
+        }
+    }
+
+
+def test_looking_glass_invalid_asn_uses_stable_error_response() -> None:
+    """验证第三方 BIRD ASN 路由接口的参数错误使用稳定错误格式。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        api_key = models.IntegrationApiKey(
+            id=1,
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.bird.route"],
+            allowed_node_ids=[1],
+            enabled=True,
+        )
+
+        def override_api_key() -> models.IntegrationApiKey:
+            """为 TestClient 请求提供已认证的第三方 Token。"""
+
+            return api_key
+
+        def override_db():
+            """为 TestClient 请求提供临时数据库会话。"""
+
+            yield session
+
+        app.dependency_overrides[require_looking_glass_api_key] = override_api_key
+        app.dependency_overrides[get_db] = override_db
+        try:
+            response = TestClient(app).post(
+                "/third-party-api/looking-glass/v1/nodes/node_1/bird/routes:lookup-origin-as",
+                json={"asn": "64512;uname"},
+            )
+        finally:
+            app.dependency_overrides.pop(require_looking_glass_api_key, None)
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "invalid_request",
+            "message": "请求参数无效",
+        }
+    }
+
+
 def test_looking_glass_diagnostic_target_rejects_invalid_hostname() -> None:
     """验证 ping/traceroute 目标只允许 IP 或普通域名。"""
 
@@ -2795,6 +3042,24 @@ def test_looking_glass_diagnostic_target_rejects_invalid_hostname() -> None:
         LookingGlassPingRequest(target="bad;uname -a")
     with pytest.raises(ValidationError):
         LookingGlassTracerouteRequest(target="-bad.example")
+
+
+def test_looking_glass_protocol_name_rejects_invalid_value() -> None:
+    """验证 BIRD 协议详情查询拒绝带空白或控制符的协议名。"""
+
+    with pytest.raises(ValidationError):
+        LookingGlassProtocolDetailRequest(protocol_name="bgp peer")
+    with pytest.raises(ValidationError):
+        LookingGlassProtocolDetailRequest(protocol_name="bgp;uname")
+
+
+def test_looking_glass_asn_rejects_invalid_value() -> None:
+    """验证 BIRD ASN 路由查询拒绝非法 ASN。"""
+
+    with pytest.raises(ValidationError):
+        LookingGlassRoutesByOriginAsRequest(asn=0)
+    with pytest.raises(ValidationError):
+        LookingGlassRoutesByOriginAsRequest(asn="64512;uname")
 
 
 def test_looking_glass_query_returns_raw_agent_result() -> None:

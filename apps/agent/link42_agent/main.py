@@ -79,6 +79,8 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
         capabilities.extend([
             "bird",
             "looking_glass.bird.route_lookup",
+            "looking_glass.bird.routes_by_origin_as",
+            "looking_glass.bird.protocols",
         ])
     if shutil.which("ping"):
         capabilities.append("looking_glass.ping")

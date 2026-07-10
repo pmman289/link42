@@ -4,7 +4,10 @@ from typing import Any, Callable
 
 from link42_common.connection_types import (
     GRE_TASKS,
+    LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK,
+    LOOKING_GLASS_BIRD_PROTOCOLS_TASK,
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+    LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK,
     LOOKING_GLASS_PING_TASK,
     LOOKING_GLASS_TRACEROUTE_TASK,
     WIREGUARD_TASKS,
@@ -19,7 +22,14 @@ from .gre import (
     start_gre_interface,
     stop_gre_interface,
 )
-from .looking_glass import execute_bird_route_lookup, execute_ping, execute_traceroute
+from .looking_glass import (
+    execute_bird_protocol_detail,
+    execute_bird_protocols,
+    execute_bird_route_lookup,
+    execute_bird_routes_by_origin_as,
+    execute_ping,
+    execute_traceroute,
+)
 from .middleware import (
     apply_udp2raw,
     apply_mimic,
@@ -121,6 +131,24 @@ def looking_glass_bird_route_lookup(payload: dict[str, Any], config: AgentConfig
     return execute_bird_route_lookup(payload)
 
 
+def looking_glass_bird_routes_by_origin_as(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """执行 Looking Glass 受限 BIRD ASN 路由查询任务。"""
+
+    return execute_bird_routes_by_origin_as(payload)
+
+
+def looking_glass_bird_protocols(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """执行 Looking Glass 受限 BIRD 协议列表查询任务。"""
+
+    return execute_bird_protocols(payload)
+
+
+def looking_glass_bird_protocol_detail(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
+    """执行 Looking Glass 受限 BIRD 协议详情查询任务。"""
+
+    return execute_bird_protocol_detail(payload)
+
+
 def looking_glass_ping(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
     """执行 Looking Glass 受限 ping 查询任务。"""
 
@@ -152,6 +180,9 @@ TASK_HANDLERS: dict[str, TaskHandler] = {
     GRE_TASKS.stop: gre_stop,
     GRE_TASKS.delete_config: gre_delete,
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK: looking_glass_bird_route_lookup,
+    LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK: looking_glass_bird_routes_by_origin_as,
+    LOOKING_GLASS_BIRD_PROTOCOLS_TASK: looking_glass_bird_protocols,
+    LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK: looking_glass_bird_protocol_detail,
     LOOKING_GLASS_PING_TASK: looking_glass_ping,
     LOOKING_GLASS_TRACEROUTE_TASK: looking_glass_traceroute,
     "middleware.install": middleware_install,

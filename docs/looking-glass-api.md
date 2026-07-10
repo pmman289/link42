@@ -8,6 +8,8 @@
 
 - Looking Glass 可以获取节点名称、节点 IP、节点地域和在线状态。
 - Looking Glass 可以请求节点执行 `birdc show route for <ip> all`。
+- Looking Glass 可以请求节点执行 `birdc show route where bgp_path.last = <asn> all primary`。
+- Looking Glass 可以请求节点执行 `birdc show protocols` 和 `birdc show protocols all <protocol name>`。
 - Looking Glass 可以请求节点执行受限的 `ping` 和 `traceroute` 网络诊断。
 - 查询结果默认返回原始输出，由 Looking Glass 自行解析和展示。
 - 查询采用异步提交、轮询读取结果的方式，适配 Agent 高延迟、离线、排队和超时场景。
@@ -217,6 +219,8 @@ cursor      可选，分页游标
       "capabilities": {
         "bird": true,
         "bird_route_lookup": true,
+        "bird_routes_by_origin_as": true,
+        "bird_protocols": true,
         "ping": true,
         "traceroute": true
       }
@@ -237,6 +241,8 @@ cursor      可选，分页游标
 - `ips.public_ip`：节点公网地址。
 - `ips.endpoint_ips`：节点配置中的入口地址列表，适合 Looking Glass 展示或选择。
 - `capabilities.bird_route_lookup`：节点当前 Agent 是否支持 Looking Glass BIRD 查询。
+- `capabilities.bird_routes_by_origin_as`：节点当前 Agent 是否支持按来源 ASN 查询 BIRD 路由。
+- `capabilities.bird_protocols`：节点当前 Agent 是否支持 Looking Glass BIRD 协议状态和协议详情查询。
 - `capabilities.ping`：节点当前 Agent 是否支持 Looking Glass ping 查询。
 - `capabilities.traceroute`：节点当前 Agent 是否支持 Looking Glass traceroute 查询。
 
@@ -275,6 +281,8 @@ looking_glass.nodes.read
   "capabilities": {
     "bird": true,
     "bird_route_lookup": true,
+    "bird_routes_by_origin_as": true,
+    "bird_protocols": true,
     "ping": true,
     "traceroute": true
   }
@@ -440,7 +448,28 @@ cancelled    被主控取消
 - 过期后 `GET /queries/{query_id}` 返回 `410 result expired`。
 - 查询 ID 是不透明 ID，不暴露内部 `agent_tasks.id`。
 
-### 7.3 ping 查询
+### 7.3 BIRD ASN 路由查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/bird/routes:lookup-origin-as
+```
+
+请求体：
+
+```json
+{
+  "asn": 64512
+}
+```
+
+校验规则：
+
+- `asn` 必须是 1 到 4294967295 的整数。
+- 节点 Agent 必须上报 `bird_routes_by_origin_as` 能力。
+- 成功提交后返回 `202 Accepted`，`operation` 为 `bird.routes_by_origin_as`。
+- Agent 固定执行 `birdc show route where bgp_path.last = <asn> all primary`，返回原始 stdout/stderr。
+
+### 7.4 ping 查询
 
 ```http
 POST /third-party-api/looking-glass/v1/nodes/{node_ref}/ping
@@ -464,7 +493,42 @@ POST /third-party-api/looking-glass/v1/nodes/{node_ref}/ping
 - 节点 Agent 必须上报 `ping` 能力。
 - 成功提交后返回 `202 Accepted`，`operation` 为 `ping`。
 
-### 7.4 traceroute 查询
+### 7.5 BIRD 协议状态查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/bird/protocols:lookup
+```
+
+请求体为空。
+
+校验规则：
+
+- 节点 Agent 必须上报 `bird_protocols` 能力。
+- 成功提交后返回 `202 Accepted`，`operation` 为 `bird.protocols`。
+- Agent 固定执行 `birdc show protocols`，返回原始 stdout/stderr。
+
+### 7.6 BIRD 协议详情查询
+
+```http
+POST /third-party-api/looking-glass/v1/nodes/{node_ref}/bird/protocols:lookup-detail
+```
+
+请求体：
+
+```json
+{
+  "protocol_name": "bgp_peer1"
+}
+```
+
+校验规则：
+
+- `protocol_name` 只允许 1 到 64 个字符，可使用字母、数字、`_`、`.`、`:`、`-`，且首字符必须是字母、数字或 `_`。
+- 节点 Agent 必须上报 `bird_protocols` 能力。
+- 成功提交后返回 `202 Accepted`，`operation` 为 `bird.protocol_detail`。
+- Agent 固定执行 `birdc show protocols all <protocol_name>`，返回原始 stdout/stderr。
+
+### 7.7 traceroute 查询
 
 ```http
 POST /third-party-api/looking-glass/v1/nodes/{node_ref}/traceroute
@@ -535,6 +599,9 @@ Agent 新增受限任务类型：
 
 ```text
 looking_glass.bird.route_lookup
+looking_glass.bird.routes_by_origin_as
+looking_glass.bird.protocols
+looking_glass.bird.protocol_detail
 looking_glass.ping
 looking_glass.traceroute
 ```
@@ -552,6 +619,9 @@ looking_glass.traceroute
 Agent 执行要求：
 
 - 固定执行 `birdc show route for <normalized_ip> all`。
+- 固定执行 `birdc show route where bgp_path.last = <asn> all primary`，ASN 必须通过主控和 Agent 双重校验。
+- 固定执行 `birdc show protocols`。
+- 固定执行 `birdc show protocols all <protocol_name>`，协议名必须通过主控和 Agent 双重校验。
 - 使用 argv 调用，例如 `["birdc", "show", "route", "for", normalized_ip, "all"]`。
 - 固定执行 `ping -c <count> -W <timeout> <target>`，`count` 和超时必须由主控限制范围。
 - 固定执行 `traceroute -n -m <max_hops> -w <wait> -q <queries> <target>`，跳数、等待时间和探测次数必须由主控限制范围。
@@ -568,6 +638,8 @@ Agent 能力上报建议：
   "capabilities": [
     "bird",
     "looking_glass.bird.route_lookup",
+    "looking_glass.bird.routes_by_origin_as",
+    "looking_glass.bird.protocols",
     "looking_glass.ping",
     "looking_glass.traceroute"
   ]
@@ -581,6 +653,8 @@ Agent 能力上报建议：
   "capabilities": {
     "bird": true,
     "bird_route_lookup": true,
+    "bird_routes_by_origin_as": true,
+    "bird_protocols": true,
     "ping": true,
     "traceroute": true
   }

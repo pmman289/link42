@@ -6,6 +6,9 @@ from dataclasses import dataclass
 CONNECTION_TYPE_WIREGUARD = "wireguard"
 CONNECTION_TYPE_GRE = "gre"
 LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK = "looking_glass.bird.route_lookup"
+LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK = "looking_glass.bird.routes_by_origin_as"
+LOOKING_GLASS_BIRD_PROTOCOLS_TASK = "looking_glass.bird.protocols"
+LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK = "looking_glass.bird.protocol_detail"
 LOOKING_GLASS_PING_TASK = "looking_glass.ping"
 LOOKING_GLASS_TRACEROUTE_TASK = "looking_glass.traceroute"
 
@@ -79,6 +82,18 @@ TASK_REQUIREMENTS = {
     LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK: {
         "min_agent_version": "0.6.0",
         "capabilities": ["looking_glass.bird.route_lookup"],
+    },
+    LOOKING_GLASS_BIRD_ROUTES_BY_ORIGIN_AS_TASK: {
+        "min_agent_version": "0.6.6",
+        "capabilities": ["looking_glass.bird.routes_by_origin_as"],
+    },
+    LOOKING_GLASS_BIRD_PROTOCOLS_TASK: {
+        "min_agent_version": "0.6.6",
+        "capabilities": ["looking_glass.bird.protocols"],
+    },
+    LOOKING_GLASS_BIRD_PROTOCOL_DETAIL_TASK: {
+        "min_agent_version": "0.6.6",
+        "capabilities": ["looking_glass.bird.protocols"],
     },
     LOOKING_GLASS_PING_TASK: {
         "min_agent_version": "0.6.4",
