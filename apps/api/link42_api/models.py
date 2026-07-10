@@ -328,13 +328,65 @@ class AgentTask(TimestampMixin, Base):
     )
     type: Mapped[str] = mapped_column(String(80))
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    queue: Mapped[str] = mapped_column(String(32), default="control", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     node: Mapped[Node] = relationship(back_populates="tasks")
     change_plan: Mapped[ChangePlan | None] = relationship(back_populates="tasks")
+
+
+class IntegrationApiKey(TimestampMixin, Base):
+    """第三方集成 API Token 元数据，明文 token 只在创建或轮换时返回一次。"""
+
+    __tablename__ = "integration_api_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    token_prefix: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    token_hash: Mapped[str] = mapped_column(String(128))
+    token_hint: Mapped[str] = mapped_column(String(16))
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    allowed_node_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_used_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    looking_glass_queries: Mapped[list[LookingGlassQuery]] = relationship(back_populates="api_key")
+
+
+class LookingGlassQuery(TimestampMixin, Base):
+    """Looking Glass 外部查询记录，隔离外部 query_id 和内部 AgentTask ID。"""
+
+    __tablename__ = "looking_glass_queries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    api_key_id: Mapped[int] = mapped_column(ForeignKey("integration_api_keys.id"), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
+    operation: Mapped[str] = mapped_column(String(80))
+    request: Mapped[dict] = mapped_column(JSON, default=dict)
+    request_fingerprint: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    agent_task_id: Mapped[int | None] = mapped_column(ForeignKey("agent_tasks.id"), nullable=True, index=True)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    api_key: Mapped[IntegrationApiKey] = relationship(back_populates="looking_glass_queries")
+    node: Mapped[Node] = relationship()
+    agent_task: Mapped[AgentTask | None] = relationship()
 
 
 class LinkMonitor(TimestampMixin, Base):

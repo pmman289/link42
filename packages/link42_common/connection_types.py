@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 CONNECTION_TYPE_WIREGUARD = "wireguard"
 CONNECTION_TYPE_GRE = "gre"
+LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK = "looking_glass.bird.route_lookup"
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,10 @@ TASK_REQUIREMENTS = {
     "node_plugin.bird.apply_many": {"min_agent_version": "0.5.9", "capabilities": ["node_plugin.bird"]},
     "node_plugin.bird.status": {"min_agent_version": "0.5.8", "capabilities": ["node_plugin.bird"]},
     "node_plugin.port_inventory.scan": {"min_agent_version": "0.5.10", "capabilities": ["node_plugin.port_inventory"]},
+    LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK: {
+        "min_agent_version": "0.6.0",
+        "capabilities": ["looking_glass.bird.route_lookup"],
+    },
     "agent.self_upgrade": {"min_agent_version": "0.2.0", "capabilities": ["agent.self_upgrade"]},
 }
 

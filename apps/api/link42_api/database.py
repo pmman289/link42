@@ -272,10 +272,75 @@ def ensure_sqlite_point_to_point_constraints() -> None:
         if task_columns:
             add_column("agent_tasks", task_columns, "change_plan_id", "INTEGER")
             add_column("agent_tasks", task_columns, "payload", "JSON DEFAULT '{}'")
+            add_column("agent_tasks", task_columns, "queue", "VARCHAR(32) DEFAULT 'control'")
+            add_column("agent_tasks", task_columns, "priority", "INTEGER DEFAULT 100")
             add_column("agent_tasks", task_columns, "status", "VARCHAR(32) DEFAULT 'pending'")
             add_column("agent_tasks", task_columns, "result", "JSON")
             add_column("agent_tasks", task_columns, "started_at", "DATETIME")
             add_column("agent_tasks", task_columns, "finished_at", "DATETIME")
+            add_column("agent_tasks", task_columns, "deadline_at", "DATETIME")
+
+        if not table_exists("integration_api_keys"):
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE integration_api_keys (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        name VARCHAR(120) NOT NULL,
+                        token_prefix VARCHAR(80) NOT NULL,
+                        token_hash VARCHAR(128) NOT NULL,
+                        token_hint VARCHAR(16) NOT NULL,
+                        scopes JSON DEFAULT '[]' NOT NULL,
+                        allowed_node_ids JSON DEFAULT '[]' NOT NULL,
+                        enabled BOOLEAN DEFAULT 1 NOT NULL,
+                        expires_at DATETIME,
+                        last_used_at DATETIME,
+                        last_used_ip VARCHAR(64),
+                        created_by VARCHAR(80),
+                        revoked_at DATETIME,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT uq_integration_api_keys_token_prefix UNIQUE (token_prefix)
+                    )
+                    """
+                )
+            )
+            connection.execute(text("CREATE INDEX ix_integration_api_keys_token_prefix ON integration_api_keys(token_prefix)"))
+
+        if not table_exists("looking_glass_queries"):
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE looking_glass_queries (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        public_id VARCHAR(64) NOT NULL,
+                        api_key_id INTEGER NOT NULL,
+                        node_id INTEGER NOT NULL,
+                        operation VARCHAR(80) NOT NULL,
+                        request JSON DEFAULT '{}' NOT NULL,
+                        request_fingerprint VARCHAR(128) NOT NULL,
+                        status VARCHAR(32) DEFAULT 'queued' NOT NULL,
+                        agent_task_id INTEGER,
+                        result JSON,
+                        error_code VARCHAR(80),
+                        error_message TEXT,
+                        started_at DATETIME,
+                        finished_at DATETIME,
+                        deadline_at DATETIME,
+                        expires_at DATETIME,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT uq_looking_glass_queries_public_id UNIQUE (public_id)
+                    )
+                    """
+                )
+            )
+            connection.execute(text("CREATE INDEX ix_looking_glass_queries_public_id ON looking_glass_queries(public_id)"))
+            connection.execute(text("CREATE INDEX ix_looking_glass_queries_api_key_id ON looking_glass_queries(api_key_id)"))
+            connection.execute(text("CREATE INDEX ix_looking_glass_queries_node_id ON looking_glass_queries(node_id)"))
+            connection.execute(text("CREATE INDEX ix_looking_glass_queries_agent_task_id ON looking_glass_queries(agent_task_id)"))
+            connection.execute(text("CREATE INDEX ix_looking_glass_queries_status ON looking_glass_queries(status)"))
+            connection.execute(text("CREATE INDEX ix_looking_glass_queries_request_fingerprint ON looking_glass_queries(request_fingerprint)"))
 
         if table_exists("wg_peers"):
             # 先清理历史遗留的重复对端，保留每个配置最早创建的一条记录。

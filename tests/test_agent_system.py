@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-from link42_common.connection_types import GRE_TASKS, WIREGUARD_TASKS
-from link42_agent import gre, link_monitor, main, middleware, service_manager, system, upgrade
+from link42_common.connection_types import GRE_TASKS, LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK, WIREGUARD_TASKS
+from link42_agent import gre, link_monitor, looking_glass, main, middleware, service_manager, system, upgrade
 from link42_agent.client import AgentHttpError
 from link42_agent.config import AgentConfig
 from link42_agent.plugins import bird
@@ -547,6 +547,60 @@ def test_gre_capability_depends_on_iproute2(monkeypatch) -> None:
 
     monkeypatch.setattr(main, "gre_runtime_supported", lambda: False)
     assert "gre" not in main.build_capabilities(platform_info)
+
+
+def test_looking_glass_bird_capability_depends_on_birdc(monkeypatch) -> None:
+    """验证检测到 birdc 时 Agent 上报 Looking Glass BIRD 查询能力。"""
+
+    platform_info = {
+        "service_manager": "systemd",
+        "kernel_version": "6.6.12",
+        "is_openwrt": False,
+        "os": "linux",
+        "arch": "x86_64",
+        "distro_id": "debian",
+        "distro_codename": "bookworm",
+        "has_mimic": False,
+    }
+    monkeypatch.setattr(main, "gre_runtime_supported", lambda: False)
+    monkeypatch.setattr(main, "mimic_installable", lambda platform: False)
+    monkeypatch.setattr(main, "mimic_runtime_supported", lambda platform: False)
+    monkeypatch.setattr(main.shutil, "which", lambda binary: "/usr/bin/birdc" if binary == "birdc" else None)
+
+    capabilities = main.build_capabilities(platform_info)
+
+    assert "bird" in capabilities
+    assert "looking_glass.bird.route_lookup" in capabilities
+
+
+def test_looking_glass_bird_route_lookup_uses_fixed_argv(monkeypatch) -> None:
+    """验证 Looking Glass BIRD 查询只能执行固定 birdc 参数。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run(command, text, capture_output, timeout, check):
+        """记录 subprocess 参数并返回模拟 birdc 输出。"""
+
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="raw output", stderr="")
+
+    monkeypatch.setattr(looking_glass.shutil, "which", lambda binary: "/usr/sbin/birdc" if binary == "birdc" else None)
+    monkeypatch.setattr(looking_glass.subprocess, "run", fake_run)
+
+    result = looking_glass.execute_bird_route_lookup(
+        {"ip": "2001:db8::1", "command_timeout_seconds": 3, "output_limit_bytes": 20}
+    )
+
+    assert commands == [["/usr/sbin/birdc", "show", "route", "for", "2001:db8::1", "all"]]
+    assert result["command"] == "birdc show route for 2001:db8::1 all"
+    assert result["stdout"] == "raw output"
+    assert result["exit_code"] == 0
+
+
+def test_looking_glass_bird_route_lookup_task_registered() -> None:
+    """验证 Looking Glass BIRD 查询任务已注册到 Agent 分派表。"""
+
+    assert LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK in TASK_HANDLERS
 
 
 def test_openwrt_gre_capability_uses_uci_backend(monkeypatch) -> None:

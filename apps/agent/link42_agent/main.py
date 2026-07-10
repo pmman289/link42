@@ -75,6 +75,11 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
         "link.monitor",
         f"service:{service_manager}",
     ]
+    if shutil.which("birdc"):
+        capabilities.extend([
+            "bird",
+            "looking_glass.bird.route_lookup",
+        ])
     if service_manager != "openwrt-uci":
         capabilities.append("wg_quick_import")
     if service_manager == "openwrt-uci" and openwrt_gre_supported():
