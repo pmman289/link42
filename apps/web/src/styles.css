@@ -1930,6 +1930,10 @@ textarea {
   width: min(560px, 100%);
 }
 
+.settingsModal {
+  width: min(860px, 100%);
+}
+
 .modalHeader {
   position: sticky;
   top: 0;
@@ -1961,9 +1965,134 @@ textarea {
 }
 
 .modalSection h3 {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   margin: 0;
   font-size: 15px;
   letter-spacing: 0;
+}
+
+.sectionHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.sectionHeader .muted {
+  margin-bottom: 0;
+}
+
+.tokenManager {
+  gap: 14px;
+}
+
+.tokenCreateGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.tokenCreateGrid > button {
+  grid-column: 1 / -1;
+}
+
+.checkGroup,
+.nodeCheckGrid,
+.tokenList {
+  display: grid;
+  gap: 8px;
+}
+
+.nodeCheckGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.nodeCheckItem {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-solid);
+  padding: 9px;
+}
+
+.nodeCheckItem > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.nodeCheckItem strong,
+.nodeCheckItem small {
+  overflow-wrap: anywhere;
+}
+
+.nodeCheckItem small {
+  color: var(--muted);
+}
+
+.tokenReveal,
+.tokenListItem {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  padding: 12px;
+}
+
+.tokenReveal {
+  border-color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.tokenReveal strong,
+.tokenReveal small,
+.tokenMeta strong,
+.tokenMeta span,
+.tokenMeta small {
+  display: block;
+}
+
+.tokenReveal small,
+.tokenMeta small {
+  color: var(--muted);
+}
+
+.tokenListItem {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.tokenListItem.disabledToken {
+  opacity: 0.72;
+}
+
+.tokenMeta {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tokenMeta span {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  color: var(--muted-strong);
+  overflow-wrap: anywhere;
+}
+
+.tokenActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .pluginStatus {
@@ -2079,6 +2208,20 @@ textarea {
 
   .protocolChoice {
     grid-template-columns: 1fr;
+  }
+
+  .tokenCreateGrid,
+  .nodeCheckGrid,
+  .tokenListItem {
+    grid-template-columns: 1fr;
+  }
+
+  .tokenActions {
+    justify-content: stretch;
+  }
+
+  .tokenActions button {
+    width: 100%;
   }
 
   .nodePluginEntry {

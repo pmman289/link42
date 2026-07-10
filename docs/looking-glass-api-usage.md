@@ -8,7 +8,7 @@
 /third-party-api/looking-glass/v1
 ```
 
-管理端 Token 由 Link42 管理员在主控中生成。Looking Glass 服务只保存生成出的 Token，并通过 Bearer Token 调用第三方 API。
+管理端 Token 由 Link42 管理员在主控面板的“系统设置 -> Looking Glass API Token”中生成。Looking Glass 服务只保存生成出的 Token，并通过 Bearer Token 调用第三方 API。
 
 ## 1. 鉴权
 

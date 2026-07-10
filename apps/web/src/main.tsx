@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Check, ChevronDown, ChevronRight, FileText, Folder, GitBranch, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Network, Pencil, Plug, Plus, RefreshCw, Server, Settings, ShieldCheck, Sun, Upload, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Copy, FileText, Folder, GitBranch, KeyRound, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Network, Pencil, Plug, Plus, RefreshCw, Server, Settings, ShieldCheck, Sun, Trash2, Upload, X } from "lucide-react";
 import { Background, EdgeLabelRenderer, Handle, Position, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type EdgeProps, type EdgeTypes, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -401,6 +401,36 @@ type ControllerSettings = {
 type BrandingSettings = {
   site_title: string;
   site_logo_url: string;
+};
+
+type LookingGlassApiToken = {
+  id: number;
+  name: string;
+  token_prefix: string;
+  token_hint: string;
+  scopes: string[];
+  allowed_node_ids: number[];
+  enabled: boolean;
+  expires_at: string | null;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+  created_at: string;
+  updated_at: string;
+  revoked_at: string | null;
+};
+
+type LookingGlassApiTokenList = {
+  items: LookingGlassApiToken[];
+};
+
+type LookingGlassApiTokenCreateResult = LookingGlassApiToken & {
+  token: string;
+};
+
+type RevealedLookingGlassToken = {
+  name: string;
+  token: string;
+  token_prefix: string;
 };
 
 type Toast = {
@@ -1123,6 +1153,25 @@ function formatLatency(value: number | null | undefined) {
 // 格式化丢包率数值。
 function formatLoss(value: number | null | undefined) {
   return typeof value === "number" ? `${(value * 100).toFixed(value > 0.01 ? 1 : 0)}%` : "--";
+}
+
+// 格式化 API 返回的时间，空值展示为未记录。
+function formatDateTime(value: string | null | undefined): string {
+  if (!value) return "未记录";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+// 把 datetime-local 表单值转换成 ISO 字符串，空值返回 null。
+function localDateTimeToIso(value: FormDataEntryValue | null): string | null {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error("过期时间格式无效");
+  }
+  return date.toISOString();
 }
 
 // 计算单条拓扑链路的健康状态。
@@ -2072,6 +2121,8 @@ function App() {
   const [siteLogoUrl, setSiteLogoUrl] = useState(DEFAULT_SITE_LOGO_URL);
   const [settingsLogoPreviewUrl, setSettingsLogoPreviewUrl] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [lookingGlassTokens, setLookingGlassTokens] = useState<LookingGlassApiToken[]>([]);
+  const [revealedLookingGlassToken, setRevealedLookingGlassToken] = useState<RevealedLookingGlassToken | null>(null);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
   const [topologyDraftPositions, setTopologyDraftPositions] = useState<Record<number, { x: number; y: number }>>({});
@@ -2705,6 +2756,8 @@ function App() {
     setManagedCreateMtu("1420");
     setPeerNodeConfigs([]);
     setSettingsOpen(false);
+    setLookingGlassTokens([]);
+    setRevealedLookingGlassToken(null);
     closeMonitorDialog();
     setPendingActions(new Set());
   }
@@ -2805,6 +2858,12 @@ function App() {
     setSiteLogoUrl(data.site_logo_url || DEFAULT_SITE_LOGO_URL);
   }
 
+  // 刷新 Looking Glass 第三方 API Token 列表。
+  async function refreshLookingGlassTokens() {
+    const data = await api<LookingGlassApiTokenList>("/api/integrations/looking-glass/tokens");
+    setLookingGlassTokens(data.items || []);
+  }
+
   // 未登录时读取公开品牌配置。
   async function refreshBranding() {
     const data = await api<BrandingSettings>("/api/branding", { skipAuth: true });
@@ -2871,6 +2930,86 @@ function App() {
       }
       return file ? URL.createObjectURL(file) : "";
     });
+  }
+
+  // 创建 Looking Glass 第三方 API Token，并显示一次性明文。
+  async function createLookingGlassToken(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const scopes = form.getAll("lg_scopes").map(String).filter(Boolean);
+    const allowedNodeIds = form.getAll("lg_node_ids").map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0);
+    if (scopes.length === 0) {
+      throw new Error("请至少选择一个 API 权限");
+    }
+    if (allowedNodeIds.length === 0) {
+      throw new Error("请至少选择一个允许访问的节点");
+    }
+    const result = await api<LookingGlassApiTokenCreateResult>("/api/integrations/looking-glass/tokens", {
+      method: "POST",
+      body: JSON.stringify({
+        name: String(form.get("lg_name") || "").trim(),
+        scopes,
+        allowed_node_ids: allowedNodeIds,
+        expires_at: localDateTimeToIso(form.get("lg_expires_at")),
+      }),
+    });
+    setRevealedLookingGlassToken({
+      name: result.name,
+      token: result.token,
+      token_prefix: result.token_prefix,
+    });
+    formElement.reset();
+    await refreshLookingGlassTokens();
+    notify("success", "Looking Glass API Token 已生成。");
+  }
+
+  // 复制当前显示的一次性 Looking Glass Token。
+  async function copyLookingGlassToken() {
+    if (!revealedLookingGlassToken) return;
+    await navigator.clipboard.writeText(revealedLookingGlassToken.token);
+    notify("success", "API Token 已复制。");
+  }
+
+  // 轮换指定 Looking Glass Token，旧 Token 会立即失效。
+  async function rotateLookingGlassToken(token: LookingGlassApiToken) {
+    if (!window.confirm(`确定轮换 ${token.name} 的 API Token？旧 Token 会立即失效。`)) return;
+    const result = await api<LookingGlassApiTokenCreateResult>(`/api/integrations/looking-glass/tokens/${token.id}/rotate`, {
+      method: "POST",
+    });
+    setRevealedLookingGlassToken({
+      name: result.name,
+      token: result.token,
+      token_prefix: result.token_prefix,
+    });
+    await refreshLookingGlassTokens();
+    notify("success", "API Token 已轮换。");
+  }
+
+  // 吊销指定 Looking Glass Token，保留审计记录。
+  async function revokeLookingGlassToken(token: LookingGlassApiToken) {
+    if (!window.confirm(`确定吊销 ${token.name}？吊销后使用该 Token 的 Looking Glass 将无法访问。`)) return;
+    await api<LookingGlassApiToken>(`/api/integrations/looking-glass/tokens/${token.id}/revoke`, {
+      method: "POST",
+    });
+    if (revealedLookingGlassToken?.token_prefix === token.token_prefix) {
+      setRevealedLookingGlassToken(null);
+    }
+    await refreshLookingGlassTokens();
+    notify("success", "API Token 已吊销。");
+  }
+
+  // 删除未使用的 Looking Glass Token。
+  async function deleteLookingGlassToken(token: LookingGlassApiToken) {
+    if (!window.confirm(`确定删除 ${token.name}？已有查询审计记录的 Token 只能吊销。`)) return;
+    await api<{ status: string }>(`/api/integrations/looking-glass/tokens/${token.id}`, {
+      method: "DELETE",
+    });
+    if (revealedLookingGlassToken?.token_prefix === token.token_prefix) {
+      setRevealedLookingGlassToken(null);
+    }
+    await refreshLookingGlassTokens();
+    notify("success", "API Token 已删除。");
   }
 
   // 刷新节点列表。
@@ -3517,6 +3656,16 @@ function App() {
     document.body.classList.toggle("modal-scroll-lock", modalOpen);
     return () => document.body.classList.remove("modal-scroll-lock");
   }, [modalOpen]);
+
+  useEffect(() => {
+    if (!authToken || !settingsOpen) return;
+    refreshLookingGlassTokens().catch((error) => notify("error", formatUserError(error)));
+  }, [authToken, settingsOpen]);
+
+  useEffect(() => {
+    if (settingsOpen) return;
+    setRevealedLookingGlassToken(null);
+  }, [settingsOpen]);
 
   useEffect(() => {
     if (nodeCreateOpen) {
@@ -5204,7 +5353,7 @@ function App() {
 
       {settingsOpen && (
         <div className="modalBackdrop" role="presentation">
-          <section className="modalPanel compactModal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <section className="modalPanel settingsModal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
             <header className="modalHeader">
               <div>
                 <h2 id="settings-title"><Settings size={18} /> 系统设置</h2>
@@ -5235,6 +5384,131 @@ function App() {
               </Field>
               <button type="submit" disabled={actionPending("settings:save")}><Check size={16} /> {actionPending("settings:save") ? "保存中" : "保存设置"}</button>
             </form>
+            <section className="modalSection tokenManager">
+              <div className="sectionHeader">
+                <div>
+                  <h3><KeyRound size={17} /> Looking Glass API Token</h3>
+                  <p className="muted">给独立 Looking Glass 服务调用第三方 API 使用。明文 Token 只会在创建或轮换后显示一次。</p>
+                </div>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={actionPending("lg-token:refresh")}
+                  onClick={() => void runAction(refreshLookingGlassTokens, "lg-token:refresh")}
+                >
+                  <RefreshCw size={16} /> {actionPending("lg-token:refresh") ? "刷新中" : "刷新"}
+                </button>
+              </div>
+              {revealedLookingGlassToken && (
+                <div className="tokenReveal">
+                  <div>
+                    <strong>{revealedLookingGlassToken.name}</strong>
+                    <small>请现在复制保存，关闭设置后不会再次显示。</small>
+                  </div>
+                  <div className="tokenBox">{revealedLookingGlassToken.token}</div>
+                  <button type="button" className="secondary" onClick={() => void runAction(copyLookingGlassToken, "lg-token:copy")}>
+                    <Copy size={16} /> 复制 Token
+                  </button>
+                </div>
+              )}
+              <form className="tokenCreateGrid" onSubmit={(event) => void runAction(() => createLookingGlassToken(event), "lg-token:create")}>
+                <Field label="Token 名称">
+                  <input name="lg_name" placeholder="public-looking-glass" required />
+                </Field>
+                <Field label="过期时间" hint="留空表示不设置固定过期时间。">
+                  <input name="lg_expires_at" type="datetime-local" />
+                </Field>
+                <div className="field wideField">
+                  <span className="fieldLabel">
+                    权限<span className="requiredMark" aria-label="必填">*</span>
+                  </span>
+                  <div className="checkGroup">
+                    <label className="checkField">
+                      <input type="checkbox" name="lg_scopes" value="looking_glass.nodes.read" defaultChecked />
+                      <span>读取节点列表和节点详情</span>
+                    </label>
+                    <label className="checkField">
+                      <input type="checkbox" name="lg_scopes" value="looking_glass.bird.route" defaultChecked />
+                      <span>执行 BIRD route lookup 查询</span>
+                    </label>
+                  </div>
+                </div>
+                <div className="field wideField">
+                  <span className="fieldLabel">
+                    允许访问的节点<span className="requiredMark" aria-label="必填">*</span>
+                  </span>
+                  {nodes.length > 0 ? (
+                    <div className="nodeCheckGrid">
+                      {nodes.map((node) => (
+                        <label key={node.id} className="nodeCheckItem">
+                          <input type="checkbox" name="lg_node_ids" value={node.id} defaultChecked />
+                          <span>
+                            <strong>{node.name}</strong>
+                            <small>{node.region || "未设置地域"} · {node.status === "online" ? "在线" : "离线"}</small>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="empty">还没有节点，创建节点后才能生成 Looking Glass API Token。</div>
+                  )}
+                </div>
+                <button type="submit" disabled={nodes.length === 0 || actionPending("lg-token:create")}>
+                  <Plus size={16} /> {actionPending("lg-token:create") ? "生成中" : "生成 Token"}
+                </button>
+              </form>
+              <div className="tokenList">
+                {lookingGlassTokens.length === 0 ? (
+                  <div className="empty">尚未创建 Looking Glass API Token。</div>
+                ) : (
+                  lookingGlassTokens.map((token) => (
+                    <div key={token.id} className={`tokenListItem ${token.enabled && !token.revoked_at ? "" : "disabledToken"}`}>
+                      <div className="tokenMeta">
+                        <strong>{token.name}</strong>
+                        <span>{token.token_prefix}...{token.token_hint}</span>
+                        <small>
+                          {token.enabled && !token.revoked_at ? "已启用" : "已停用"}
+                          {" · 节点 "}
+                          {token.allowed_node_ids.length}
+                          {" · 权限 "}
+                          {token.scopes.length}
+                          {" · 最后使用 "}
+                          {formatDateTime(token.last_used_at)}
+                        </small>
+                        {token.last_used_ip && <small>最后来源：{token.last_used_ip}</small>}
+                        <small>过期时间：{formatDateTime(token.expires_at)}</small>
+                      </div>
+                      <div className="tokenActions">
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={actionPending(`lg-token:rotate:${token.id}`)}
+                          onClick={() => void runAction(() => rotateLookingGlassToken(token), `lg-token:rotate:${token.id}`)}
+                        >
+                          <RefreshCw size={16} /> {actionPending(`lg-token:rotate:${token.id}`) ? "轮换中" : "轮换"}
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary"
+                          disabled={!token.enabled || Boolean(token.revoked_at) || actionPending(`lg-token:revoke:${token.id}`)}
+                          onClick={() => void runAction(() => revokeLookingGlassToken(token), `lg-token:revoke:${token.id}`)}
+                        >
+                          <X size={16} /> {actionPending(`lg-token:revoke:${token.id}`) ? "吊销中" : "吊销"}
+                        </button>
+                        <button
+                          type="button"
+                          className="danger"
+                          disabled={actionPending(`lg-token:delete:${token.id}`)}
+                          onClick={() => void runAction(() => deleteLookingGlassToken(token), `lg-token:delete:${token.id}`)}
+                        >
+                          <Trash2 size={16} /> {actionPending(`lg-token:delete:${token.id}`) ? "删除中" : "删除"}
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </section>
           </section>
         </div>
       )}

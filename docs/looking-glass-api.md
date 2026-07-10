@@ -86,7 +86,7 @@ looking_glass.bird.route        # 发起 BIRD route lookup 查询
 
 ## 5. API Token 生成和管理
 
-API Token 由 Link42 管理员在主控面板中生成，不在第三方公开接口中提供自助生成能力。Token 管理接口属于 Link42 自用管理接口，可以继续放在现有 `/api` 命名空间，并使用 Web 管理员会话鉴权。
+API Token 由 Link42 管理员在主控面板的“系统设置 -> Looking Glass API Token”中生成，不在第三方公开接口中提供自助生成能力。Token 管理接口属于 Link42 自用管理接口，可以继续放在现有 `/api` 命名空间，并使用 Web 管理员会话鉴权。
 
 管理端接口建议：
 
