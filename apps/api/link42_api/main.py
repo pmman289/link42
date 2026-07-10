@@ -98,6 +98,9 @@ def summarize_task_payload(payload: dict | None) -> dict[str, object]:
         "depends_on_task_id",
         "range_start",
         "range_end",
+        "ip",
+        "command_timeout_seconds",
+        "output_limit_bytes",
     ]
     return {key: payload[key] for key in safe_keys if key in payload}
 
@@ -207,9 +210,9 @@ LOOKING_GLASS_API_PREFIX = "/third-party-api/looking-glass/v1"
 LOOKING_GLASS_NODE_READ_SCOPE = "looking_glass.nodes.read"
 LOOKING_GLASS_BIRD_ROUTE_SCOPE = "looking_glass.bird.route"
 LOOKING_GLASS_QUERY_QUEUE_LIMIT = 20
-LOOKING_GLASS_QUEUE_TIMEOUT = timedelta(seconds=10)
-LOOKING_GLASS_COMMAND_TIMEOUT_SECONDS = 8
-LOOKING_GLASS_TOTAL_DEADLINE = timedelta(seconds=15)
+LOOKING_GLASS_QUEUE_TIMEOUT = timedelta(seconds=30)
+LOOKING_GLASS_COMMAND_TIMEOUT_SECONDS = 15
+LOOKING_GLASS_TOTAL_DEADLINE = timedelta(seconds=60)
 LOOKING_GLASS_RESULT_RETENTION = timedelta(minutes=10)
 LOOKING_GLASS_CACHE_WINDOW = timedelta(seconds=5)
 LOOKING_GLASS_OUTPUT_LIMIT_BYTES = 256 * 1024

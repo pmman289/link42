@@ -101,6 +101,7 @@ from link42_api.schemas import (
     AgentUpgradeRequest,
     GreManagedConnectionCreate,
     IntegrationApiTokenCreate,
+    LookingGlassQueryRead,
     LookingGlassRouteLookupRequest,
     NodePluginActionRequest,
     PortInventoryEntryCreate,
@@ -2774,6 +2775,82 @@ def test_looking_glass_query_returns_raw_agent_result() -> None:
     assert result.result is not None
     assert result.result["stdout"] == "raw route output"
     assert result.error is None
+
+
+def test_looking_glass_query_response_datetimes_include_utc_timezone() -> None:
+    """验证第三方查询响应的时间带 UTC 时区，避免调用方按本地时区误判超时。"""
+
+    body = LookingGlassQueryRead(
+        query_id="lgq_time",
+        status="queued",
+        node_ref="node_1",
+        operation="bird.route_lookup",
+        request={"ip": "1.1.1.1", "normalized_ip": "1.1.1.1"},
+        created_at=datetime(2026, 7, 10, 5, 59, 31),
+        deadline_at=datetime(2026, 7, 10, 6, 0, 31),
+        expires_at=datetime(2026, 7, 10, 6, 9, 31),
+    ).model_dump(mode="json")
+
+    assert body["created_at"] == "2026-07-10T05:59:31Z"
+    assert body["deadline_at"] == "2026-07-10T06:00:31Z"
+    assert body["expires_at"] == "2026-07-10T06:09:31Z"
+
+
+def test_looking_glass_agent_result_updates_query_status() -> None:
+    """验证 Agent 上报查询结果后会立即回写 Looking Glass query 状态。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash=hash_token("token"))
+        session.add(node)
+        session.flush()
+        task = models.AgentTask(
+            node_id=node.id,
+            type=LOOKING_GLASS_BIRD_ROUTE_LOOKUP_TASK,
+            queue="query",
+            status="running",
+            payload={"ip": "1.1.1.1"},
+            started_at=datetime.utcnow(),
+        )
+        session.add(task)
+        session.flush()
+        query = models.LookingGlassQuery(
+            public_id="lgq_report",
+            api_key_id=1,
+            node_id=node.id,
+            operation="bird.route_lookup",
+            request={"ip": "1.1.1.1", "normalized_ip": "1.1.1.1"},
+            request_fingerprint="fp",
+            status="running",
+            agent_task_id=task.id,
+            deadline_at=datetime.utcnow() + timedelta(seconds=60),
+            expires_at=datetime.utcnow() + timedelta(minutes=10),
+        )
+        session.add(query)
+        session.commit()
+
+        agent_task_result(
+            task.id,
+            AgentTaskResultRequest(
+                node_id=node.id,
+                token="token",
+                status="succeeded",
+                result={
+                    "command": "birdc show route for 1.1.1.1 all",
+                    "exit_code": 0,
+                    "stdout": "raw route output",
+                    "stderr": "",
+                    "truncated": False,
+                },
+            ),
+            session,
+        )
+        session.refresh(query)
+
+    assert query.status == "succeeded"
+    assert query.result is not None
+    assert query.result["stdout"] == "raw route output"
 
 
 def test_agent_poll_honors_task_dependencies(monkeypatch) -> None:

@@ -203,6 +203,9 @@ def summarize_task(task: dict[str, Any]) -> dict[str, Any]:
         "mode",
         "instance",
         "depends_on_task_id",
+        "ip",
+        "command_timeout_seconds",
+        "output_limit_bytes",
     ]
     return {
         "id": task.get("id"),
