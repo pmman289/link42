@@ -2937,11 +2937,8 @@ function App() {
     event.preventDefault();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
-    const scopes = form.getAll("lg_scopes").map(String).filter(Boolean);
+    const scopes = ["looking_glass.nodes.read", "looking_glass.bird.route"];
     const allowedNodeIds = form.getAll("lg_node_ids").map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0);
-    if (scopes.length === 0) {
-      throw new Error("请至少选择一个 API 权限");
-    }
     if (allowedNodeIds.length === 0) {
       throw new Error("请至少选择一个允许访问的节点");
     }
@@ -5420,25 +5417,10 @@ function App() {
                 </Field>
                 <div className="field wideField">
                   <span className="fieldLabel">
-                    权限<span className="requiredMark" aria-label="必填">*</span>
-                  </span>
-                  <div className="checkGroup">
-                    <label className="checkField">
-                      <input type="checkbox" name="lg_scopes" value="looking_glass.nodes.read" defaultChecked />
-                      <span>读取节点列表和节点详情</span>
-                    </label>
-                    <label className="checkField">
-                      <input type="checkbox" name="lg_scopes" value="looking_glass.bird.route" defaultChecked />
-                      <span>执行 BIRD route lookup 查询</span>
-                    </label>
-                  </div>
-                </div>
-                <div className="field wideField">
-                  <span className="fieldLabel">
                     允许访问的节点<span className="requiredMark" aria-label="必填">*</span>
                   </span>
                   {nodes.length > 0 ? (
-                    <div className="nodeCheckGrid">
+                    <div className="tokenNodeList">
                       {nodes.map((node) => (
                         <label key={node.id} className="nodeCheckItem">
                           <input type="checkbox" name="lg_node_ids" value={node.id} defaultChecked />

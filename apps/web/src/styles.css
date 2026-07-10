@@ -2002,26 +2002,42 @@ textarea {
   grid-column: 1 / -1;
 }
 
-.checkGroup,
-.nodeCheckGrid,
+.tokenNodeList,
 .tokenList {
   display: grid;
   gap: 8px;
 }
 
-.nodeCheckGrid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+.tokenNodeList {
+  max-height: 260px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  padding: 6px;
 }
 
 .nodeCheckItem {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
   min-width: 0;
-  border: 1px solid var(--border);
+  border: 0;
   border-radius: 6px;
-  background: var(--surface-solid);
-  padding: 9px;
+  background: transparent;
+  padding: 8px 9px;
+}
+
+.nodeCheckItem:hover {
+  background: var(--surface-muted);
+}
+
+.nodeCheckItem input {
+  width: 16px;
+  min-height: 16px;
+  margin: 0;
 }
 
 .nodeCheckItem > span {
@@ -2211,7 +2227,6 @@ textarea {
   }
 
   .tokenCreateGrid,
-  .nodeCheckGrid,
   .tokenListItem {
     grid-template-columns: 1fr;
   }
