@@ -10,6 +10,7 @@ import sys
 from typing import Any
 
 from .system import run_command
+from .validation import atomic_write_text, managed_child_path, validate_interface_name
 
 
 DEFAULT_GRE_DIR = "/etc/link42/gre"
@@ -56,7 +57,8 @@ def gre_config_dir(path: str | None = None) -> Path:
 def gre_config_path(interface_name: str, config_dir: str | None = None) -> Path:
     """返回指定 GRE 接口的 Link42 配置文件路径。"""
 
-    return gre_config_dir(config_dir) / f"{interface_name}.json"
+    name = validate_interface_name(interface_name)
+    return managed_child_path(gre_config_dir(config_dir), f"{name}.json")
 
 
 def gre_systemd_unit_path() -> Path:
@@ -68,7 +70,7 @@ def gre_systemd_unit_path() -> Path:
 def gre_systemd_unit_name(interface_name: str) -> str:
     """返回指定 GRE 接口对应的 systemd unit 名称。"""
 
-    return f"link42-gre@{interface_name}.service"
+    return f"link42-gre@{validate_interface_name(interface_name)}.service"
 
 
 def systemctl_command() -> str:
@@ -150,8 +152,12 @@ def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """清洗 Agent GRE 任务 payload，确保后续渲染字段稳定。"""
 
     config = {
-        "interface_name": str(payload["interface_name"]).strip(),
-        "previous_interface_name": str(payload.get("previous_interface_name") or "").strip() or None,
+        "interface_name": validate_interface_name(payload["interface_name"]),
+        "previous_interface_name": (
+            validate_interface_name(payload["previous_interface_name"], "previous interface name")
+            if str(payload.get("previous_interface_name") or "").strip()
+            else None
+        ),
         "outer_local_ip": str(payload["outer_local_ip"]).strip(),
         "outer_remote_ip": str(payload["outer_remote_ip"]).strip(),
         "tunnel_ips": [str(item).strip() for item in payload.get("tunnel_ips") or [] if str(item).strip()],
@@ -171,7 +177,7 @@ def write_gre_config(config: dict[str, Any], config_dir: str | None = None) -> P
 
     target = gre_config_path(config["interface_name"], config_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(target, json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
     return target
 
 
@@ -192,7 +198,7 @@ def delete_gre_config_file(interface_name: str | None, config_dir: str | None = 
 def read_gre_config(payload: dict[str, Any], config_dir: str | None = None) -> dict[str, Any]:
     """读取 Link42 管理的 GRE 配置文件。"""
 
-    interface_name = str(payload["interface_name"]).strip()
+    interface_name = validate_interface_name(payload["interface_name"])
     path = gre_config_path(interface_name, config_dir)
     if not path.exists():
         return {"exists": False, "config_path": str(path), "config": None}
@@ -620,7 +626,7 @@ def gre_systemd_stop_commands(interface_name: str) -> list[list[str]]:
 def stop_gre_interface(payload: dict[str, Any], dry_run: bool = False, use_service: bool = True) -> dict[str, Any]:
     """幂等停止 GRE 接口，接口不存在也视为成功。"""
 
-    interface_name = str(payload["interface_name"]).strip()
+    interface_name = validate_interface_name(payload["interface_name"])
     if use_service and openwrt_gre_available():
         return stop_openwrt_gre_interface(interface_name, dry_run=dry_run)
     if use_service and gre_systemd_available():
@@ -651,10 +657,11 @@ def delete_gre_config(payload: dict[str, Any], config_dir: str | None = None, dr
     """停止 GRE 接口并删除 Link42 管理的配置文件。"""
 
     if openwrt_gre_available():
-        interface_name = str(payload["interface_name"]).strip()
+        interface_name = validate_interface_name(payload["interface_name"])
         stop_result = stop_openwrt_gre_interface(interface_name, dry_run=dry_run)
         current_config = delete_openwrt_gre_config_file(interface_name, config_dir, dry_run=dry_run)
-        previous_interface_name = str(payload.get("previous_interface_name") or "").strip() or None
+        previous_value = str(payload.get("previous_interface_name") or "").strip()
+        previous_interface_name = validate_interface_name(previous_value, "previous interface name") if previous_value else None
         previous_stop = None
         previous_config = None
         if previous_interface_name and previous_interface_name != interface_name:
@@ -676,9 +683,10 @@ def delete_gre_config(payload: dict[str, Any], config_dir: str | None = None, dr
             "runtime_status": "stopped",
         }
     stop_result = stop_gre_interface(payload, dry_run=dry_run)
-    interface_name = str(payload["interface_name"]).strip()
+    interface_name = validate_interface_name(payload["interface_name"])
     current_config = delete_gre_config_file(interface_name, config_dir, dry_run=dry_run)
-    previous_interface_name = str(payload.get("previous_interface_name") or "").strip() or None
+    previous_value = str(payload.get("previous_interface_name") or "").strip()
+    previous_interface_name = validate_interface_name(previous_value, "previous interface name") if previous_value else None
     previous_stop = None
     previous_config = None
     if previous_interface_name and previous_interface_name != interface_name:
@@ -718,7 +726,7 @@ def gre_link_stdout_is_running(stdout: str) -> bool:
 def gre_status(payload: dict[str, Any]) -> dict[str, Any]:
     """读取 GRE 接口运行状态。"""
 
-    interface_name = str(payload["interface_name"]).strip()
+    interface_name = validate_interface_name(payload["interface_name"])
     if openwrt_gre_available():
         ifstatus = run_command(["ifstatus", interface_name], allow_failure=True)
         status_payload: dict[str, Any] = {}

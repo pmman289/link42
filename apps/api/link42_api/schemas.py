@@ -30,6 +30,29 @@ def serialize_utc_timestamp(value: datetime | None) -> int | None:
     return int(value.timestamp())
 
 
+def redact_wireguard_response_secrets(value: Any) -> Any:
+    """递归隐藏响应对象里的 WireGuard 私钥、预共享密钥和配置行。"""
+
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if normalized in {"private_key", "private_key_value", "preshared_key", "preshared_key_value"}:
+                result[str(key)] = "<REDACTED>" if item else item
+            else:
+                result[str(key)] = redact_wireguard_response_secrets(item)
+        return result
+    if isinstance(value, list):
+        return [redact_wireguard_response_secrets(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(
+            r"(?im)^([ +\-]*)(PrivateKey|PresharedKey)(\s*=\s*).*$",
+            r"\1\2\3<REDACTED>",
+            value,
+        )
+    return value
+
+
 def normalize_looking_glass_target(value: str) -> str:
     """规范化第三方诊断目标，允许 IP 或普通域名。"""
 
@@ -243,7 +266,6 @@ class NodeRead(BaseModel):
     topology_x: float | None = None
     topology_y: float | None = None
     topology_locked: bool = False
-    agent_token_value: str | None
     agent_version: str | None = None
     agent_protocol_version: int | None = None
     agent_capabilities: list[str] = Field(default_factory=list)
@@ -510,6 +532,7 @@ class InterfaceUpdate(BaseModel):
     tunnel_ips: list[str] = Field(default_factory=list)
     listen_port: int | None = None
     private_key: str | None = None
+    clear_private_key: bool = False
     public_key: str | None = None
     mtu: int | None = 1420
     table_name: str | None = None
@@ -928,7 +951,7 @@ class InterfaceRead(BaseModel):
     name: str
     tunnel_ips: list[str]
     listen_port: int | None
-    private_key_value: str | None
+    has_private_key: bool = False
     public_key: str | None
     mtu: int | None
     table_name: str | None
@@ -954,6 +977,7 @@ class PeerCreate(BaseModel):
     name: str | None = None
     public_key: str = Field(min_length=1)
     preshared_key: str | None = None
+    clear_preshared_key: bool = False
     endpoint_host: str | None = None
     endpoint_port: int | None = None
     allowed_ips: list[str] = Field(default_factory=list)
@@ -993,7 +1017,7 @@ class PeerRead(BaseModel):
     peer_interface_id: int | None
     name: str | None
     public_key: str
-    preshared_key_value: str | None
+    has_preshared_key: bool = False
     endpoint_host: str | None
     endpoint_port: int | None
     allowed_ips: list[str]
@@ -1207,7 +1231,6 @@ class ImportCandidateRead(BaseModel):
     node_id: int
     path: str
     interface_name: str
-    parsed: dict[str, Any]
     warnings: list[str]
     imported: bool
 
@@ -1229,12 +1252,30 @@ class ChangePlanRead(BaseModel):
     summary: str
     affected_node_ids: list[int]
     diff: str
-    payload: dict[str, Any]
     confirmed_at: datetime | None
     task_status: str | None = None
     task_result: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
+
+    @field_validator("diff", mode="before")
+    @classmethod
+    def redact_diff_secrets(cls, value: object) -> str:
+        """隐藏部署 diff 中的 WireGuard 私钥和预共享密钥正文。"""
+
+        text = str(redact_wireguard_response_secrets(str(value or "")))
+        return re.sub(
+            r'(?i)("(?:private_key|preshared_key)"\s*:\s*")[^"]*(")',
+            r"\1<REDACTED>\2",
+            text,
+        )
+
+    @field_validator("task_result", mode="before")
+    @classmethod
+    def redact_task_result_secrets(cls, value: Any) -> Any:
+        """隐藏部署任务结果中回显的 WireGuard 密钥。"""
+
+        return redact_wireguard_response_secrets(value)
 
 
 class TaskRequestResult(BaseModel):
@@ -1244,6 +1285,13 @@ class TaskRequestResult(BaseModel):
     status: str
     message: str
     result: dict[str, Any] | None = None
+
+    @field_validator("result", mode="before")
+    @classmethod
+    def redact_result_secrets(cls, value: Any) -> Any:
+        """隐藏复用任务响应里可能回显的 WireGuard 密钥。"""
+
+        return redact_wireguard_response_secrets(value)
 
 
 class NodePluginActionRead(BaseModel):
@@ -1565,6 +1613,13 @@ class AgentTaskStatusRead(BaseModel):
     result: dict[str, Any] | None
 
     model_config = {"from_attributes": True}
+
+    @field_validator("result", mode="before")
+    @classmethod
+    def redact_result_secrets(cls, value: Any) -> Any:
+        """隐藏任务状态响应中的 WireGuard 密钥，同时保留业务输出结构。"""
+
+        return redact_wireguard_response_secrets(value)
 
 
 class AgentRegisterRequest(BaseModel):

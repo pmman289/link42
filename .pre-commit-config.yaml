@@ -1,0 +1,8 @@
+repos:
+  - repo: local
+    hooks:
+      - id: link42-secret-scan
+        name: Link42 凭据扫描
+        entry: scripts/security/scan-secrets.sh
+        language: system
+        pass_filenames: false

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +30,24 @@ class Settings(BaseSettings):
     agent_offline_after_seconds: int = 15
     # 主控日志等级；排查问题时可设为 DEBUG。
     log_level: str = "INFO"
+    # Web 会话空闲和绝对有效期；Bearer 与 Cookie 会话使用同一服务端状态。
+    web_session_idle_seconds: int = 8 * 60 * 60
+    web_session_absolute_seconds: int = 7 * 24 * 60 * 60
+    # HTTPS 部署应保持自动模式；仅明确设为 true/false 时强制 Cookie Secure 属性。
+    web_cookie_secure: str = "auto"
+    # 仅信任这些直连代理的来源头，多个 CIDR 用逗号分隔。
+    trusted_proxy_cidrs: str = ""
+    # 需要跨源访问时显式配置，多个来源用逗号分隔；默认仅允许同源。
+    cors_allowed_origins: str = ""
+
+    @field_validator("web_session_idle_seconds", "web_session_absolute_seconds")
+    @classmethod
+    def validate_positive_timeout(cls, value: int) -> int:
+        """拒绝无效会话时长，避免误配置成永久会话。"""
+
+        if value < 60:
+            raise ValueError("session timeout must be at least 60 seconds")
+        return value
 
 
 # 全局配置实例，应用启动后各模块通过它读取运行参数。

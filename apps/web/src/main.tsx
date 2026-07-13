@@ -27,7 +27,6 @@ type NodeItem = {
   topology_x: number | null;
   topology_y: number | null;
   topology_locked: boolean;
-  agent_token_value: string | null;
   agent_version: string | null;
   agent_protocol_version: number | null;
   agent_capabilities: string[];
@@ -45,7 +44,7 @@ type ConfigItem = {
   name: string;
   tunnel_ips: string[];
   listen_port: number | null;
-  private_key_value: string | null;
+  has_private_key: boolean;
   public_key: string | null;
   mtu: number | null;
   source: string;
@@ -186,7 +185,7 @@ type PeerItem = {
   interface_id: number;
   name: string | null;
   public_key: string;
-  preshared_key_value: string | null;
+  has_preshared_key: boolean;
   allowed_ips: string[];
   endpoint_host: string | null;
   endpoint_port: number | null;
@@ -449,7 +448,6 @@ const DEFAULT_CONTROLLER_URL =
   import.meta.env.VITE_LINK42_CONTROLLER_URL || API_BASE;
 const DEFAULT_SITE_TITLE = "Link42";
 const DEFAULT_SITE_LOGO_URL = "/logo.png";
-const AUTH_TOKEN_KEY = "link42.authToken";
 const AUTH_EXPIRED_EVENT = "link42:auth-expired";
 const THEME_KEY = "link42.theme";
 const TASK_POLL_INTERVAL_MS = 2000;
@@ -502,20 +500,19 @@ function optionalInt(value: FormDataEntryValue | null, label = "数值"): number
 
 async function api<T>(path: string, options?: RequestInit & { skipAuth?: boolean }): Promise<T> {
   // 统一封装 fetch，集中处理 JSON 和错误信息。
-  const token = options?.skipAuth ? "" : window.localStorage.getItem(AUTH_TOKEN_KEY);
   const { skipAuth: _skipAuth, headers, ...fetchOptions } = options || {};
   const response = await fetch(`${API_BASE}${path}`, {
     ...fetchOptions,
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(!options?.skipAuth ? { "X-Link42-CSRF": "1" } : {}),
       ...(headers || {}),
     },
   });
   if (!response.ok) {
     const text = await response.text();
     if (response.status === 401 && path !== "/api/auth/login") {
-      window.localStorage.removeItem(AUTH_TOKEN_KEY);
       window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
     }
     throw new Error(formatApiError(response.status, text, response.statusText));
@@ -1490,15 +1487,15 @@ function endpointSourceLabel(source: EndpointOption["source"]) {
 }
 
 // 生成用户在节点上安装 Agent 的 shell 命令。
-function buildAgentCommand(node: NodeItem, controllerUrl: string = DEFAULT_CONTROLLER_URL): string {
-  if (!node.agent_token_value) return "";
+function buildAgentCommand(node: NodeItem, token: string, controllerUrl: string = DEFAULT_CONTROLLER_URL): string {
+  if (!token) return "";
   return [
     "curl -fsSL https://get.pmman.tech/sh/link42-agent.sh",
     "|",
     "sudo env",
     `LINK42_SERVER_URL=${shellArg(controllerUrl)}`,
     `LINK42_NODE_ID=${shellArg(String(node.id))}`,
-    `LINK42_AGENT_TOKEN=${shellArg(node.agent_token_value)}`,
+    `LINK42_AGENT_TOKEN=${shellArg(token)}`,
     "sh",
   ].join(" ");
 }
@@ -2109,7 +2106,7 @@ function validateUdp2RawForm(udp2raw: Record<string, unknown> | null, localListe
 function App() {
   // Link42 主界面组件，集中承载节点和连接管理流程。
   // 页面状态保持在顶层，避免在当前单页应用里引入额外状态管理。
-  const [authToken, setAuthToken] = useState(() => window.localStorage.getItem(AUTH_TOKEN_KEY) || "");
+  const [authToken, setAuthToken] = useState("cookie");
   const [authChecked, setAuthChecked] = useState(false);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [loginError, setLoginError] = useState("");
@@ -2122,6 +2119,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [lookingGlassTokens, setLookingGlassTokens] = useState<LookingGlassApiToken[]>([]);
   const [revealedLookingGlassToken, setRevealedLookingGlassToken] = useState<RevealedLookingGlassToken | null>(null);
+  const [revealedAgentToken, setRevealedAgentToken] = useState<{ nodeId: number; token: string } | null>(null);
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
   const [topologyDraftPositions, setTopologyDraftPositions] = useState<Record<number, { x: number; y: number }>>({});
@@ -2725,7 +2723,6 @@ function App() {
 
   // 清空登录态和所有依赖登录的页面状态。
   function clearAuthenticatedState() {
-    window.localStorage.removeItem(AUTH_TOKEN_KEY);
     setAuthToken("");
     setCurrentUser(null);
     setNodes([]);
@@ -2757,6 +2754,7 @@ function App() {
     setSettingsOpen(false);
     setLookingGlassTokens([]);
     setRevealedLookingGlassToken(null);
+    setRevealedAgentToken(null);
     closeMonitorDialog();
     setPendingActions(new Set());
   }
@@ -2835,8 +2833,7 @@ function App() {
       setLoginError(formatUserError(error).replace(/^401:\s*/, ""));
       return;
     }
-    window.localStorage.setItem(AUTH_TOKEN_KEY, result.token);
-    setAuthToken(result.token);
+    setAuthToken("cookie");
     setCurrentUser(result.username);
     await refreshSettings();
     await refreshHome();
@@ -3923,6 +3920,7 @@ function App() {
         `节点已创建，当前离线。节点 ID：${result.node.id}`,
         `Agent 令牌：${result.agent_token}`,
         `主控地址：${controllerUrl}`,
+        `启动命令：${buildAgentCommand(result.node, result.agent_token, controllerUrl)}`,
       ].join("\n"),
     );
     formElement.reset();
@@ -3966,7 +3964,8 @@ function App() {
     if (!editingNode) return;
     const result = await api<NodeCreateResult>(`/api/nodes/${editingNode.id}/rotate-agent-token`, { method: "POST" });
     setNodes((items) => items.map((item) => item.id === result.node.id ? result.node : item));
-    notify("success", "Agent 令牌已轮换，旧令牌已失效。");
+    setRevealedAgentToken({ nodeId: result.node.id, token: result.agent_token });
+    notify("success", "Agent 令牌已轮换，旧令牌已失效；新令牌仅在当前弹窗显示。");
   }
 
   // 删除当前编辑的节点，并在删除当前节点时清理选中状态。
@@ -3986,6 +3985,7 @@ function App() {
       setPlan(null);
     }
     setEditingNodeId(null);
+    setRevealedAgentToken(null);
     await refreshNodes();
     notify("success", "节点已删除。");
   }
@@ -3993,7 +3993,8 @@ function App() {
   // 复制当前节点的 Agent 启动命令到剪贴板。
   async function copyAgentCommand() {
     if (!editingNode) return;
-    const command = buildAgentCommand(editingNode, controllerUrl);
+    const token = revealedAgentToken?.nodeId === editingNode.id ? revealedAgentToken.token : "";
+    const command = buildAgentCommand(editingNode, token, controllerUrl);
     if (!command) {
       throw new Error("当前节点没有可查看的 Agent 令牌，请先轮换令牌");
     }
@@ -4161,6 +4162,7 @@ function App() {
       tunnel_ips: tunnelIps,
       listen_port: listenPort,
       private_key: form.get("private_key") || null,
+      clear_private_key: form.get("clear_private_key") === "on",
       public_key: form.get("public_key") || null,
       mtu,
       table_name: form.get("table_name") || null,
@@ -4501,6 +4503,7 @@ function App() {
         name: form.get("name") || null,
         public_key: form.get("public_key"),
         preshared_key: form.get("preshared_key") || null,
+        clear_preshared_key: form.get("clear_preshared_key") === "on",
         endpoint_host: form.get("endpoint_host") || null,
         endpoint_port: endpointPort,
         allowed_ips: allowedIps,
@@ -5515,7 +5518,10 @@ function App() {
                 <h2 id="node-edit-title"><Server size={18} /> 节点设置</h2>
                 <p className="muted">节点 ID：{editingNode.id} / {nodeStatusLabel(editingNode.status)}</p>
               </div>
-              <button className="iconButton" onClick={() => setEditingNodeId(null)}>
+              <button className="iconButton" onClick={() => {
+                setEditingNodeId(null);
+                setRevealedAgentToken(null);
+              }}>
                 <X size={18} />
               </button>
             </header>
@@ -5566,17 +5572,23 @@ function App() {
             </section>
             <section className="modalSection">
               <h3>Agent 令牌</h3>
-              {editingNode.agent_token_value ? (
-                <pre className="tokenBox">{editingNode.agent_token_value}</pre>
+              {revealedAgentToken?.nodeId === editingNode.id ? (
+                <pre className="tokenBox">{revealedAgentToken.token}</pre>
               ) : (
-                <div className="empty">该节点创建时未保存明文令牌，请轮换后查看。</div>
+                <div className="empty">主控不保存 Agent 明文令牌；需要重新安装时请先轮换。</div>
               )}
               <div className="empty">
                 Agent {editingNode.agent_version || "未知版本"} / {nodeSystemLabel(editingNode)}
                 <br />
                 {(editingNode.agent_capabilities || []).join(", ") || "尚未上报能力"}
               </div>
-              <pre className="tokenBox">{buildAgentCommand(editingNode, controllerUrl) || "轮换令牌后显示 Agent 启动命令。"}</pre>
+              <pre className="tokenBox">
+                {buildAgentCommand(
+                  editingNode,
+                  revealedAgentToken?.nodeId === editingNode.id ? revealedAgentToken.token : "",
+                  controllerUrl,
+                ) || "轮换令牌后显示 Agent 启动命令。"}
+              </pre>
               <div className="actionRow">
                 <button className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
                 <button className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "rotate-token"))} onClick={() => void runAction(rotateNodeToken, nodeActionKey(editingNode.id, "rotate-token"))}>轮换令牌</button>
@@ -6248,7 +6260,10 @@ function App() {
                         <button
                           className="iconButton nodeEditButton"
                           title="编辑节点"
-                          onClick={() => setEditingNodeId(node.id)}
+                          onClick={() => {
+                            setRevealedAgentToken(null);
+                            setEditingNodeId(node.id);
+                          }}
                         >
                           <Pencil size={16} />
                         </button>
@@ -6801,9 +6816,13 @@ function App() {
                     <Field label="本端公钥" hint="44 位 base64；受管连接会自动生成。">
                       <input name="public_key" placeholder="粘贴本端公钥" defaultValue={selectedConfig.public_key || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="本端私钥" hint="可信面板会明文保存并渲染到配置文件。" wide>
-                      <textarea name="private_key" placeholder="粘贴本端私钥" defaultValue={selectedConfig.private_key_value || ""} disabled={!selectedNodeOnline} />
+                    <Field label="本端私钥" hint={selectedConfig.has_private_key ? "私钥已加密保存；留空保持不变。" : "尚未保存私钥。"} wide>
+                      <textarea name="private_key" placeholder={selectedConfig.has_private_key ? "留空保持现有私钥" : "粘贴本端私钥"} disabled={!selectedNodeOnline} />
                     </Field>
+                    <label className="checkField wideField">
+                      <input name="clear_private_key" type="checkbox" disabled={!selectedNodeOnline || !selectedConfig.has_private_key} />
+                      <span>清除已保存的本端私钥</span>
+                    </label>
                     <Field label="接口高级配置" hint="逐行写入 [Interface] 后，例如 PostUp/PostDown。保存前请确认这些配置行能被 WireGuard 识别。" wide>
                       <textarea name="interface_custom_config" placeholder="PostUp = ..." defaultValue={selectedConfig.interface_custom_config || ""} disabled={!selectedNodeOnline} />
                     </Field>
@@ -6826,9 +6845,13 @@ function App() {
                     <Field label="对端公钥" hint="必填，44 位 base64。">
                       <input name="public_key" placeholder="粘贴对端公钥" defaultValue={peer?.public_key || ""} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="预共享密钥" hint="可选，填写后会渲染 PresharedKey。">
-                      <input name="preshared_key" placeholder="粘贴预共享密钥" defaultValue={peer?.preshared_key_value || ""} disabled={!selectedNodeOnline} />
+                    <Field label="预共享密钥" hint={peer?.has_preshared_key ? "密钥已加密保存；留空保持不变。" : "可选，填写后会渲染 PresharedKey。"}>
+                      <input name="preshared_key" placeholder={peer?.has_preshared_key ? "留空保持现有密钥" : "粘贴预共享密钥"} disabled={!selectedNodeOnline} />
                     </Field>
+                    <label className="checkField wideField">
+                      <input name="clear_preshared_key" type="checkbox" disabled={!selectedNodeOnline || !peer?.has_preshared_key} />
+                      <span>清除已保存的预共享密钥</span>
+                    </label>
                     <Field label="允许路由" hint="写入 [Peer] 的允许路由字段（AllowedIPs）；CIDR 格式，多个值用逗号分隔。">
                       <input name="allowed_ips" placeholder="10.42.0.2/32" defaultValue={peer?.allowed_ips.join(", ") || ""} disabled={!selectedNodeOnline} />
                     </Field>

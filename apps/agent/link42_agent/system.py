@@ -15,6 +15,7 @@ from typing import Any, Optional
 from link42_wireguard import parse_wg_quick, parsed_interface_to_dict
 
 from .service_manager import DirectWgQuickManager, OpenWrtUciManager, UnsupportedServiceManager, detect_service_manager
+from .validation import atomic_write_text, managed_child_path, validate_interface_name
 
 
 # wg-quick 默认配置目录；可通过环境变量覆盖，便于测试和非标准系统布局。
@@ -242,11 +243,12 @@ def apply_wireguard_config(
     本地体验模式下 dry_run=True，只写配置和备份，不调用 wg-quick 改动网络。
     """
 
-    interface_name = payload["interface_name"]
+    interface_name = validate_interface_name(payload["interface_name"])
     config_text = payload["config"]
     enable_on_boot = bool(payload.get("enable_on_boot"))
     manager = detect_service_manager(run_command)
-    previous_interface_name = str(payload.get("previous_interface_name") or "").strip() or None
+    previous_value = str(payload.get("previous_interface_name") or "").strip()
+    previous_interface_name = validate_interface_name(previous_value, "previous interface name") if previous_value else None
     rename_cleanup = cleanup_previous_wireguard_interface(
         previous_interface_name,
         interface_name,
@@ -262,7 +264,7 @@ def apply_wireguard_config(
     if isinstance(manager, UnsupportedServiceManager):
         raise RuntimeError(manager.state(interface_name)["message"])
 
-    target = Path(wireguard_dir) / f"{interface_name}.conf"
+    target = wireguard_config_path(wireguard_dir, interface_name)
     target.parent.mkdir(parents=True, exist_ok=True)
     service_state = manager.state(interface_name)
 
@@ -272,7 +274,7 @@ def apply_wireguard_config(
         shutil.copy2(target, backup)
         backup_path = str(backup)
 
-    target.write_text(config_text, encoding="utf-8")
+    atomic_write_text(target, config_text)
 
     if dry_run:
         return {
@@ -340,9 +342,13 @@ def cleanup_previous_wireguard_interface(
 ) -> dict[str, Any] | None:
     """清理改名后遗留的旧接口和旧配置文件。"""
 
-    if not previous_interface_name or previous_interface_name == interface_name:
+    interface_name = validate_interface_name(interface_name)
+    if not previous_interface_name:
         return None
-    target = Path(wireguard_dir) / f"{previous_interface_name}.conf"
+    previous_interface_name = validate_interface_name(previous_interface_name, "previous interface name")
+    if previous_interface_name == interface_name:
+        return None
+    target = wireguard_config_path(wireguard_dir, previous_interface_name)
     if dry_run:
         return {
             "changed": False,
@@ -408,11 +414,18 @@ def rotate_wireguard_backup(target: Path) -> Path:
     return backup
 
 
+def wireguard_config_path(wireguard_dir: str, interface_name: object) -> Path:
+    """生成受管目录内的 WireGuard 配置路径并拒绝符号链接穿越。"""
+
+    name = validate_interface_name(interface_name)
+    return managed_child_path(wireguard_dir, f"{name}.conf")
+
+
 def read_wireguard_config(payload: dict[str, Any], wireguard_dir: str = DEFAULT_WIREGUARD_DIR) -> dict[str, Any]:
     """读取本机已写入的 WireGuard 配置，用于生成真实部署 diff。"""
 
-    interface_name = payload["interface_name"]
-    target = Path(wireguard_dir) / f"{interface_name}.conf"
+    interface_name = validate_interface_name(payload["interface_name"])
+    target = wireguard_config_path(wireguard_dir, interface_name)
     manager = detect_service_manager(run_command)
     if isinstance(manager, OpenWrtUciManager):
         return {
@@ -431,7 +444,7 @@ def read_wireguard_config(payload: dict[str, Any], wireguard_dir: str = DEFAULT_
 def get_wireguard_status(payload: dict[str, Any]) -> dict[str, Any]:
     """查询 WireGuard 接口当前是否存在于内核状态中。"""
 
-    interface_name = payload["interface_name"]
+    interface_name = validate_interface_name(payload["interface_name"])
     result = run_command(["wg", "show", interface_name], allow_failure=True)
     runtime_status = "running" if result["returncode"] == 0 else "stopped"
     return {
@@ -444,6 +457,7 @@ def get_wireguard_status(payload: dict[str, Any]) -> dict[str, Any]:
 def assert_wireguard_stopped(interface_name: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
     """确认接口已经不在内核 WireGuard 状态中。"""
 
+    interface_name = validate_interface_name(interface_name)
     current = get_wireguard_status({"interface_name": interface_name})
     if current["runtime_status"] == "running":
         detail = ""
@@ -459,6 +473,7 @@ def assert_wireguard_stopped(interface_name: str, result: dict[str, Any] | None 
 def disable_wireguard_service(interface_name: str, manager: Any, service_state: dict[str, Any]) -> dict[str, Any] | None:
     """删除配置文件前关闭 wg-quick 开机自启，避免重启后启动缺失配置。"""
 
+    interface_name = validate_interface_name(interface_name)
     if isinstance(manager, OpenWrtUciManager) or isinstance(manager, UnsupportedServiceManager):
         return None
     if not service_state.get("managed"):
@@ -475,7 +490,7 @@ def disable_wireguard_service(interface_name: str, manager: Any, service_state: 
 def start_wireguard_interface(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     """启动指定 WireGuard 接口。"""
 
-    interface_name = payload["interface_name"]
+    interface_name = validate_interface_name(payload["interface_name"])
     if dry_run:
         return {"changed": False, "dry_run": True, "message": "dry-run enabled, wg-quick up was not executed"}
     current = get_wireguard_status(payload)
@@ -495,7 +510,7 @@ def start_wireguard_interface(payload: dict[str, Any], dry_run: bool = False) ->
 def stop_wireguard_interface(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     """关闭指定 WireGuard 接口。"""
 
-    interface_name = payload["interface_name"]
+    interface_name = validate_interface_name(payload["interface_name"])
     if dry_run:
         return {"changed": False, "dry_run": True, "message": "dry-run enabled, wg-quick down was not executed"}
     current = get_wireguard_status(payload)
@@ -523,8 +538,8 @@ def delete_wireguard_config(
 ) -> dict[str, Any]:
     """删除指定 WireGuard 配置文件；调用方必须先确认接口已停止。"""
 
-    interface_name = payload["interface_name"]
-    target = Path(wireguard_dir) / f"{interface_name}.conf"
+    interface_name = validate_interface_name(payload["interface_name"])
+    target = wireguard_config_path(wireguard_dir, interface_name)
     manager = detect_service_manager(run_command)
     if dry_run:
         return {

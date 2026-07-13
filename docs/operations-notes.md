@@ -25,10 +25,10 @@
 - 当前实测节点：
   - `node_id=2`
   - `name=nodetest`
-  - `agent_token=l42agent_YGhpdQRV5yBGkWhOo9Rxs9UzCmEqFW8x822OR7ETgsI`
+  - `agent_token=<REDACTED_AGENT_TOKEN>`
 - 清库后旧 token 全部失效；最近一轮双节点测试曾使用：
-  - `node1=l42agent_dWpxQBthT_4drtsuK_EDWEbtKXVl937RUchLawszIII`
-  - `node2=l42agent_hfx1eUJL5Gg8mLHTtOsujqRECLalGL5jrwpe_noWjzM`
+  - `node1=<REDACTED_AGENT_TOKEN>`
+  - `node2=<REDACTED_AGENT_TOKEN>`
 - 单机可以模拟两个 Agent，但要避免接口名冲突；真实 `/etc/wireguard` 模式下两个 Agent 会操作同一台机器的同一套 WireGuard 环境。
 
 ## 数据库

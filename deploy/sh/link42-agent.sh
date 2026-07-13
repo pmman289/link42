@@ -321,25 +321,65 @@ download_agent() {
   fi
 
   sha_url="$url.sha256"
-  if command -v sha256sum >/dev/null 2>&1; then
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsL "$sha_url" -o "$tmp_sha" || true
-    elif command -v wget >/dev/null 2>&1; then
-      wget -q -O "$tmp_sha" "$sha_url" || true
-    fi
-    if [ -s "$tmp_sha" ]; then
-      expected="$(awk '{print $1}' "$tmp_sha")"
-      actual="$(sha256sum "$tmp_file" | awk '{print $1}')"
-      [ "$expected" = "$actual" ] || fail "sha256 mismatch for downloaded agent"
-    else
-      log "sha256 file not found; skipping checksum verification"
-    fi
+  command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required to verify the downloaded agent"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsL "$sha_url" -o "$tmp_sha" || fail "failed to download agent checksum: $sha_url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$tmp_sha" "$sha_url" || fail "failed to download agent checksum: $sha_url"
   fi
+  expected="$(awk 'NR == 1 {print $1}' "$tmp_sha")"
+  case "$expected" in
+    *[!0-9a-fA-F]*|'') fail "invalid sha256 file for downloaded agent" ;;
+  esac
+  [ "${#expected}" -eq 64 ] || fail "invalid sha256 file for downloaded agent"
+  actual="$(sha256sum "$tmp_file" | awk '{print $1}')"
+  [ "$expected" = "$actual" ] || fail "sha256 mismatch for downloaded agent"
 
   if [ "$AGENT_INSTALL_MODE" = "source" ]; then
     rm -rf "$INSTALL_DIR/src"
     mkdir -p "$INSTALL_DIR/src"
-    tar -xzf "$tmp_file" -C "$INSTALL_DIR/src"
+    python3 - "$tmp_file" "$INSTALL_DIR/src" <<'PY' || fail "unsafe agent source archive"
+from pathlib import PurePosixPath
+import os
+from pathlib import Path
+import shutil
+import sys
+import tarfile
+
+destination = Path(sys.argv[2]).resolve()
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    members = archive.getmembers()
+    if len(members) > 10000 or sum(member.size for member in members) > 64 * 1024 * 1024:
+        raise SystemExit("agent source archive exceeds safety limits")
+    for member in members:
+        path = PurePosixPath(member.name)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or not path.parts
+            or member.issym()
+            or member.islnk()
+            or not (member.isdir() or member.isfile())
+        ):
+            raise SystemExit(f"unsafe archive member: {member.name}")
+    for member in members:
+        target = destination.joinpath(*PurePosixPath(member.name).parts)
+        target.resolve().relative_to(destination)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            target.chmod(0o755)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit(f"cannot read archive member: {member.name}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags, 0o755 if member.mode & 0o111 else 0o644)
+        with source, os.fdopen(descriptor, "wb") as output:
+            shutil.copyfileobj(source, output)
+PY
     cat > "$BIN_PATH" <<EOF
 #!/bin/sh
 set -eu

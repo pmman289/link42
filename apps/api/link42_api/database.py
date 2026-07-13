@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 import logging
+import json
 from pathlib import Path
 import shutil
 import sqlite3
@@ -10,6 +11,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
+from .secret_store import ENCRYPTED_PREFIX, encrypt_text, protect_json_value
 
 
 logger = logging.getLogger("link42.api.database")
@@ -30,6 +32,15 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 # 升级前数据库备份文件名；固定一个文件，避免长期运行后堆积备份。
 UPGRADE_BACKUP_SUFFIX = ".previous-version.db"
+SENSITIVE_TEXT_COLUMNS = {
+    "wg_interfaces": ["private_key_value", "deployed_config"],
+    "wg_peers": ["preshared_key_value"],
+}
+SENSITIVE_JSON_COLUMNS = {
+    "import_candidates": ["parsed"],
+    "change_plans": ["diff", "payload"],
+    "agent_tasks": ["payload", "result"],
+}
 
 
 class Base(DeclarativeBase):
@@ -135,6 +146,88 @@ def backup_sqlite_database_for_upgrade() -> Path | None:
     return backup_path
 
 
+def protect_sqlite_sensitive_values(path: Path) -> int:
+    """加密指定 SQLite 文件中的旧敏感明文，并清除可恢复 Agent Token。"""
+
+    changed = 0
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "nodes" in tables:
+            node_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
+            }
+        else:
+            node_columns = set()
+        if "agent_token_value" in node_columns:
+            changed += connection.execute(
+                "UPDATE nodes SET agent_token_value = NULL WHERE agent_token_value IS NOT NULL"
+            ).rowcount
+        for table, columns in SENSITIVE_TEXT_COLUMNS.items():
+            if table not in tables:
+                continue
+            existing_columns = {
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column in columns:
+                if column not in existing_columns:
+                    continue
+                rows = connection.execute(
+                    f"SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL"
+                ).fetchall()
+                for row_id, value in rows:
+                    text_value = str(value)
+                    if text_value.startswith(ENCRYPTED_PREFIX):
+                        continue
+                    connection.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                        (encrypt_text(text_value), row_id),
+                    )
+                    changed += 1
+        for table, columns in SENSITIVE_JSON_COLUMNS.items():
+            if table not in tables:
+                continue
+            existing_columns = {
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column in columns:
+                if column not in existing_columns:
+                    continue
+                rows = connection.execute(
+                    f"SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL"
+                ).fetchall()
+                for row_id, value in rows:
+                    try:
+                        parsed = json.loads(str(value))
+                    except json.JSONDecodeError:
+                        parsed = str(value)
+                    protected = protect_json_value(parsed)
+                    if protected == parsed:
+                        continue
+                    connection.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                        (json.dumps(protected, ensure_ascii=False, separators=(",", ":")), row_id),
+                    )
+                    changed += 1
+        connection.commit()
+    return changed
+
+
+def protect_sensitive_database_values(backup_path: Path | None = None) -> int:
+    """迁移当前 SQLite 数据库及升级备份，确保备份中也不保留敏感明文。"""
+
+    source = sqlite_database_path()
+    if source is None:
+        return 0
+    engine.dispose()
+    changed = protect_sqlite_sensitive_values(source)
+    if backup_path and backup_path.exists():
+        changed += protect_sqlite_sensitive_values(backup_path)
+    return changed
+
+
 def ensure_sqlite_point_to_point_constraints() -> None:
     """为旧 SQLite 数据库补齐点对点约束。
 
@@ -187,7 +280,6 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("nodes", node_columns, "topology_locked", "BOOLEAN DEFAULT 0")
             add_column("nodes", node_columns, "status", "VARCHAR(32) DEFAULT 'offline'")
             add_column("nodes", node_columns, "agent_token_hash", "VARCHAR(128) DEFAULT ''")
-            add_column("nodes", node_columns, "agent_token_value", "TEXT")
             add_column("nodes", node_columns, "agent_version", "VARCHAR(32)")
             add_column("nodes", node_columns, "agent_protocol_version", "INTEGER")
             add_column("nodes", node_columns, "agent_capabilities", "JSON DEFAULT '[]'")

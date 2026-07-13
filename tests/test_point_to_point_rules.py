@@ -1694,8 +1694,8 @@ def test_confirm_change_plan_rejects_empty_diff() -> None:
     assert exc_info.value.detail == "change plan has no diff"
 
 
-def test_create_node_stores_viewable_agent_token() -> None:
-    """验证可信面板可再次查看新创建节点的 Agent token。"""
+def test_create_node_only_returns_agent_token_once() -> None:
+    """验证新节点只在创建响应返回 Agent 明文令牌，数据库仅保存哈希。"""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -1705,7 +1705,8 @@ def test_create_node_stores_viewable_agent_token() -> None:
 
     assert result.agent_token.startswith("l42agent_")
     assert node is not None
-    assert node.agent_token_value == result.agent_token
+    assert verify_token(result.agent_token, node.agent_token_hash)
+    assert not hasattr(node, "agent_token_value")
 
 
 def test_create_node_stores_github_proxy_url() -> None:
@@ -1929,9 +1930,9 @@ def test_create_managed_link_creates_both_sides_with_generated_keys(monkeypatch)
         )
         tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.node_id)))
 
-    assert result.local_interface.private_key_value == "local-private"
+    assert result.local_interface.has_private_key is True
     assert result.local_interface.public_key == "local-public"
-    assert result.peer_interface.private_key_value == "peer-private"
+    assert result.peer_interface.has_private_key is True
     assert result.peer_interface.public_key == "peer-public"
     assert result.local_interface.runtime_status == "starting"
     assert result.peer_interface.runtime_status == "starting"
@@ -2811,8 +2812,12 @@ def test_purge_deleted_looking_glass_tokens_removes_legacy_soft_deleted_rows() -
         assert session.scalar(select(models.LookingGlassQuery).where(models.LookingGlassQuery.api_key_id == active_id)) is not None
 
 
-def test_looking_glass_token_last_used_ip_uses_forwarded_header() -> None:
+def test_looking_glass_token_last_used_ip_uses_forwarded_header(monkeypatch) -> None:
     """验证第三方 API Token 来源 IP 优先使用反向代理转发头。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main.settings, "trusted_proxy_cidrs", "127.0.0.0/8")
 
     engine = create_engine(
         "sqlite://",
@@ -2842,7 +2847,7 @@ def test_looking_glass_token_last_used_ip_uses_forwarded_header() -> None:
 
         app.dependency_overrides[get_db] = override_db
         try:
-            response = TestClient(app).get(
+            response = TestClient(app, client=("127.0.0.1", 50000)).get(
                 "/third-party-api/looking-glass/v1/nodes",
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -4109,7 +4114,6 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
         node = models.Node(
             name="node-a",
             agent_token_hash="hash",
-            agent_token_value="token&with space",
             status="online",
             agent_version="0.1.0",
             agent_capabilities=["wireguard", "wg_quick_import", "service:systemd"],
@@ -4127,7 +4131,7 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
     assert plan.manual_command is not None
     assert "LINK42_AGENT_VERSION=0.2.0" in plan.manual_command
     assert "LINK42_NODE_ID=" in plan.manual_command
-    assert "LINK42_AGENT_TOKEN='token&with space'" in plan.manual_command
+    assert "LINK42_AGENT_TOKEN='<ROTATE_TOKEN_IN_PANEL>'" in plan.manual_command
 
 
 def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) -> None:
@@ -4163,7 +4167,6 @@ def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) 
         node = models.Node(
             name="node-a",
             agent_token_hash="hash",
-            agent_token_value="token",
             status="online",
             agent_version="0.2.0",
             agent_capabilities=["wireguard", "agent.self_upgrade", "service:systemd"],
@@ -4933,7 +4936,7 @@ def test_sqlite_point_to_point_repair_can_create_unique_index(monkeypatch) -> No
     assert "deployed_config" in columns
     assert "runtime_status" in columns
     assert "endpoint_ips" in node_columns
-    assert "agent_token_value" in node_columns
+    assert "agent_token_value" not in node_columns
 
 
 def test_sqlite_upgrade_backup_keeps_single_file(monkeypatch, tmp_path) -> None:

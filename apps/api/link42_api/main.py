@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import hashlib
 import ipaddress
 import logging
+import os
 import re
 from pathlib import Path
 import secrets
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -34,17 +37,33 @@ from link42_common.connection_types import (
     WIREGUARD_TASKS,
 )
 from sqlalchemy import String, delete, func, or_, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, selectinload
 
-from link42_common.security import generate_token, hash_token, verify_token
+from link42_common.security import (
+    generate_token,
+    hash_password,
+    hash_token,
+    password_hash_needs_update,
+    verify_password,
+    verify_token,
+)
 from link42_common.version import AGENT_VERSION, CONTROLLER_VERSION
 
 from . import models, schemas
 from .config import settings
 from .connection_drivers import connection_driver_for_interface
-from .database import get_db, init_db
+from .database import (
+    get_db,
+    init_db,
+    protect_sensitive_database_values,
+    protect_sqlite_sensitive_values,
+    sqlite_database_path,
+)
+from .http_security import RequestBodyLimitMiddleware
 from .node_plugins import NODE_PLUGINS, get_node_plugin
 from .node_plugins.base import NodePluginContext
+from .secret_store import load_master_key
 from .wireguard_service import (
     build_apply_plan,
     build_apply_payload_from_config,
@@ -147,11 +166,12 @@ logging.getLogger("uvicorn.access").disabled = True
 
 # FastAPI 应用实例，所有 API 路由都挂载在这里。
 app = FastAPI(title="Link42 API", version=CONTROLLER_VERSION)
+app.add_middleware(RequestBodyLimitMiddleware)
+cors_origins = [item.strip() for item in settings.cors_allowed_origins.split(",") if item.strip()]
 app.add_middleware(
     CORSMiddleware,
-    # 第一版定位小型内网系统，允许前端预览服务跨端口访问 API。
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=cors_origins,
+    allow_credentials=bool(cors_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -205,6 +225,9 @@ ADMIN_USERNAME = DEFAULT_ADMIN_USERNAME
 SETTING_ADMIN_USERNAME = "admin_username"
 SETTING_ADMIN_PASSWORD_HASH = "admin_password_hash"
 SETTING_ADMIN_SESSION_HASH = "admin_session_hash"
+SETTING_ADMIN_SESSION_ISSUED_AT = "admin_session_issued_at"
+SETTING_ADMIN_SESSION_LAST_USED_AT = "admin_session_last_used_at"
+SETTING_ADMIN_INITIAL_PASSWORD_PENDING = "admin_initial_password_pending"
 SETTING_CONTROLLER_URL = "controller_url"
 SETTING_SITE_TITLE = "site_title"
 SETTING_SITE_LOGO_URL = "site_logo_url"
@@ -226,6 +249,13 @@ LOOKING_GLASS_TOTAL_DEADLINE = timedelta(seconds=60)
 LOOKING_GLASS_RESULT_RETENTION = timedelta(minutes=10)
 LOOKING_GLASS_CACHE_WINDOW = timedelta(seconds=5)
 LOOKING_GLASS_OUTPUT_LIMIT_BYTES = 256 * 1024
+WEB_SESSION_COOKIE = "link42_session"
+WEB_CSRF_HEADER = "x-link42-csrf"
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
+LOGIN_FAILURES: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+LOGIN_FAILURES_LOCK = threading.Lock()
+LOGIN_CONCURRENCY = threading.BoundedSemaphore(2)
 
 
 def uploaded_logo_path() -> Path | None:
@@ -315,9 +345,10 @@ def set_setting(db: Session, key: str, value: str) -> None:
 
 
 def ensure_admin_credentials() -> None:
-    """首次启动时生成单用户管理员密码，并输出到容器日志。"""
+    """首次启动时生成管理员密码，并写入权限受限的引导文件。"""
 
     db = next(get_db())
+    password: str | None = None
     try:
         if get_setting(db, SETTING_ADMIN_PASSWORD_HASH):
             if not get_setting(db, SETTING_ADMIN_USERNAME):
@@ -326,14 +357,46 @@ def ensure_admin_credentials() -> None:
             return
         password = secrets.token_urlsafe(18)
         set_setting(db, SETTING_ADMIN_USERNAME, DEFAULT_ADMIN_USERNAME)
-        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_token(password))
+        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_password(password))
+        set_setting(db, SETTING_ADMIN_INITIAL_PASSWORD_PENDING, "1")
         set_setting(db, SETTING_CONTROLLER_URL, get_setting(db, SETTING_CONTROLLER_URL) or "")
         set_setting(db, SETTING_SITE_TITLE, get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE)
         set_setting(db, SETTING_SITE_LOGO_URL, get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL)
         db.commit()
     finally:
         db.close()
-    logger.warning("Link42 初始登录信息 username=%s password=%s", DEFAULT_ADMIN_USERNAME, password)
+    if password is None:
+        return
+    password_path = Path(settings.config_dir) / "initial-admin-password"
+    if password_path.is_symlink():
+        raise RuntimeError("initial admin password path must not be a symbolic link")
+    password_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = password_path.with_name(f".{password_path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(f"username={DEFAULT_ADMIN_USERNAME}\npassword={password}\n".encode("utf-8"))
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.replace(password_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    password_path.chmod(0o600)
+    logger.warning(
+        "Link42 初始登录信息 username=%s password=%s backup_path=%s",
+        DEFAULT_ADMIN_USERNAME,
+        password,
+        password_path,
+    )
+
+
+def remove_initial_password_file() -> None:
+    """管理员修改密码后删除不再有效的初始密码文件。"""
+
+    path = Path(settings.config_dir) / "initial-admin-password"
+    if path.exists() and not path.is_symlink() and path.is_file():
+        path.unlink()
 
 
 def controller_version_in_database() -> str | None:
@@ -359,6 +422,18 @@ def record_controller_version() -> None:
         db.close()
 
 
+def database_target_for_log() -> str:
+    """返回不含用户名和密码的数据库类型及目标摘要。"""
+
+    url = make_url(settings.database_url)
+    if url.get_backend_name() == "sqlite":
+        return f"sqlite:{url.database or ':memory:'}"
+    host = url.host or "local"
+    port = f":{url.port}" if url.port else ""
+    database = f"/{url.database}" if url.database else ""
+    return f"{url.get_backend_name()}://{host}{port}{database}"
+
+
 def admin_username(db: Session) -> str:
     """读取当前管理员用户名，旧库默认 pmman。"""
 
@@ -373,6 +448,16 @@ def bearer_token_from_request(request: Request) -> str | None:
     if scheme.lower() != "bearer" or not token.strip():
         return None
     return token.strip()
+
+
+def web_session_token_from_request(request: Request) -> tuple[str | None, str | None]:
+    """优先读取 Bearer 会话，并兼容浏览器使用的 HttpOnly Cookie。"""
+
+    bearer = bearer_token_from_request(request)
+    if bearer:
+        return bearer, "bearer"
+    cookie = request.cookies.get(WEB_SESSION_COOKIE, "").strip()
+    return (cookie, "cookie") if cookie else (None, None)
 
 
 def is_api_auth_exempt(path: str) -> bool:
@@ -397,12 +482,44 @@ def is_api_auth_exempt(path: str) -> bool:
 
 
 def require_web_session(request: Request, db: Session) -> None:
-    """校验 Web 管理端会话 token。"""
+    """校验 Web 管理端会话 token、空闲有效期和绝对有效期。"""
 
-    token = bearer_token_from_request(request)
+    token, _source = web_session_token_from_request(request)
     session_hash = get_setting(db, SETTING_ADMIN_SESSION_HASH)
     if not token or not session_hash or not verify_token(token, session_hash):
         raise HTTPException(status_code=401, detail="not authenticated")
+    now = time.time()
+    try:
+        issued_at = float(get_setting(db, SETTING_ADMIN_SESSION_ISSUED_AT) or now)
+        last_used_at = float(get_setting(db, SETTING_ADMIN_SESSION_LAST_USED_AT) or issued_at)
+    except ValueError:
+        issued_at = now
+        last_used_at = now
+    if (
+        now - issued_at > settings.web_session_absolute_seconds
+        or now - last_used_at > settings.web_session_idle_seconds
+    ):
+        clear_web_session(db)
+        db.commit()
+        raise HTTPException(status_code=401, detail="session expired")
+    if now - last_used_at >= 60 or not get_setting(db, SETTING_ADMIN_SESSION_ISSUED_AT):
+        set_setting(db, SETTING_ADMIN_SESSION_ISSUED_AT, str(issued_at))
+        set_setting(db, SETTING_ADMIN_SESSION_LAST_USED_AT, str(now))
+        db.commit()
+
+
+def clear_web_session(db: Session) -> None:
+    """清除服务端保存的单用户 Web 会话。"""
+
+    set_setting(db, SETTING_ADMIN_SESSION_HASH, "")
+    set_setting(db, SETTING_ADMIN_SESSION_ISSUED_AT, "")
+    set_setting(db, SETTING_ADMIN_SESSION_LAST_USED_AT, "")
+
+
+def request_uses_cookie_session(request: Request) -> bool:
+    """判断当前 Web 请求是否依赖 Cookie 而非显式 Bearer Token。"""
+
+    return not bearer_token_from_request(request) and bool(request.cookies.get(WEB_SESSION_COOKIE))
 
 
 def generate_integration_token() -> tuple[str, str, str]:
@@ -446,29 +563,136 @@ def normalized_header_ip(value: str) -> str | None:
         return None
 
 
-def request_source_ip(request: Request) -> str | None:
-    """获取请求真实来源 IP，兼容常见反向代理转发头。"""
+def request_direct_peer_is_trusted(request: Request) -> bool:
+    """判断 TCP 直连来源是否属于管理员配置的可信反向代理网段。"""
 
-    x_forwarded_for = request.headers.get("x-forwarded-for")
-    if x_forwarded_for:
-        for value in x_forwarded_for.split(","):
-            parsed = normalized_header_ip(value)
+    direct_ip = normalized_header_ip(request.client.host) if request.client else None
+    if not direct_ip:
+        return False
+    address = ipaddress.ip_address(direct_ip)
+    for value in settings.trusted_proxy_cidrs.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            if address in ipaddress.ip_network(value, strict=False):
+                return True
+        except ValueError:
+            logger.warning("忽略无效可信代理 CIDR value=%s", value)
+    return False
+
+
+def request_source_ip(request: Request) -> str | None:
+    """获取来源 IP，仅对显式配置的可信代理接受转发头。"""
+
+    direct_ip = normalized_header_ip(request.client.host) if request.client else None
+    if request_direct_peer_is_trusted(request):
+        x_forwarded_for = request.headers.get("x-forwarded-for")
+        if x_forwarded_for:
+            for value in x_forwarded_for.split(","):
+                parsed = normalized_header_ip(value)
+                if parsed:
+                    return parsed
+        for header_name in ["x-real-ip", "cf-connecting-ip"]:
+            parsed = normalized_header_ip(request.headers.get(header_name, ""))
             if parsed:
                 return parsed
-    for header_name in ["x-real-ip", "cf-connecting-ip"]:
-        parsed = normalized_header_ip(request.headers.get(header_name, ""))
-        if parsed:
-            return parsed
-    forwarded = request.headers.get("forwarded")
-    if forwarded:
-        for section in forwarded.split(","):
-            for item in section.split(";"):
-                key, _, value = item.strip().partition("=")
-                if key.lower() == "for":
-                    parsed = normalized_header_ip(value)
-                    if parsed:
-                        return parsed
-    return request.client.host if request.client else None
+        forwarded = request.headers.get("forwarded")
+        if forwarded:
+            for section in forwarded.split(","):
+                for item in section.split(";"):
+                    key, _, value = item.strip().partition("=")
+                    if key.lower() == "for":
+                        parsed = normalized_header_ip(value)
+                        if parsed:
+                            return parsed
+    return direct_ip or (request.client.host if request.client else None)
+
+
+def login_rate_key(request: Request, username: str) -> tuple[str, str]:
+    """生成登录限流键，同时约束来源和账号两个维度。"""
+
+    return request_source_ip(request) or "unknown", username.strip().casefold()[:80]
+
+
+def login_retry_after(key: tuple[str, str], now: float | None = None) -> int:
+    """返回登录失败窗口内需要等待的秒数，未受限时返回零。"""
+
+    current = time.monotonic() if now is None else now
+    rate_keys = [key, (key[0], "*"), ("*", key[1])]
+    with LOGIN_FAILURES_LOCK:
+        retry_after = 0
+        for rate_key in rate_keys:
+            failures = LOGIN_FAILURES[rate_key]
+            while failures and current - failures[0] >= LOGIN_FAILURE_WINDOW_SECONDS:
+                failures.popleft()
+            if not failures:
+                LOGIN_FAILURES.pop(rate_key, None)
+            elif len(failures) >= LOGIN_FAILURE_LIMIT:
+                retry_after = max(
+                    retry_after,
+                    max(1, int(LOGIN_FAILURE_WINDOW_SECONDS - (current - failures[0]))),
+                )
+        return retry_after
+
+
+def record_login_failure(key: tuple[str, str]) -> None:
+    """记录一次失败登录，并保持内存表大小有界。"""
+
+    current = time.monotonic()
+    with LOGIN_FAILURES_LOCK:
+        for rate_key in [key, (key[0], "*"), ("*", key[1])]:
+            failures = LOGIN_FAILURES[rate_key]
+            while failures and current - failures[0] >= LOGIN_FAILURE_WINDOW_SECONDS:
+                failures.popleft()
+            failures.append(current)
+        if len(LOGIN_FAILURES) > 4096:
+            for stale_key in list(LOGIN_FAILURES)[:1024]:
+                if stale_key != key:
+                    LOGIN_FAILURES.pop(stale_key, None)
+
+
+def clear_login_failures(key: tuple[str, str]) -> None:
+    """成功登录后清除对应来源和账号的失败记录。"""
+
+    with LOGIN_FAILURES_LOCK:
+        for rate_key in [key, (key[0], "*"), ("*", key[1])]:
+            LOGIN_FAILURES.pop(rate_key, None)
+
+
+def cookie_should_be_secure(request: Request) -> bool:
+    """按显式配置或请求协议决定会话 Cookie 是否仅通过 HTTPS 发送。"""
+
+    configured = settings.web_cookie_secure.strip().lower()
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    if configured in {"0", "false", "no", "off"}:
+        return False
+    forwarded_https = (
+        request_direct_peer_is_trusted(request)
+        and request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https"
+    )
+    return request.url.scheme == "https" or forwarded_https
+
+
+def set_web_session_cookie(response: Response, request: Request, token: str) -> None:
+    """写入 HttpOnly、SameSite=Strict 的 Web 会话 Cookie。"""
+
+    response.set_cookie(
+        WEB_SESSION_COOKIE,
+        token,
+        max_age=settings.web_session_absolute_seconds,
+        httponly=True,
+        secure=cookie_should_be_secure(request),
+        samesite="strict",
+        path="/",
+    )
+
+
+def clear_web_session_cookie(response: Response) -> None:
+    """让浏览器立即删除 Web 会话 Cookie。"""
+
+    response.delete_cookie(WEB_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
 
 
 def require_looking_glass_api_key(
@@ -692,6 +916,13 @@ async def require_api_authentication(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
     if request.url.path.startswith("/api/") and not is_api_auth_exempt(request.url.path):
+        if (
+            request.method not in {"GET", "HEAD", "OPTIONS"}
+            and request_uses_cookie_session(request)
+            and request.headers.get(WEB_CSRF_HEADER) != "1"
+        ):
+            response = JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
+            return add_security_headers(request, response)
         db = next(get_db())
         try:
             require_web_session(request, db)
@@ -703,7 +934,8 @@ async def require_api_authentication(request: Request, call_next):
                 request.client.host if request.client else None,
                 exc.status_code,
             )
-            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            return add_security_headers(request, response)
         finally:
             db.close()
     try:
@@ -724,6 +956,26 @@ async def require_api_authentication(request: Request, call_next):
         logger.warning("HTTP 请求被拒绝 method=%s path=%s status=%s duration=%.2fs", request.method, request.url.path, response.status_code, duration)
     else:
         logger.debug("HTTP 请求完成 method=%s path=%s status=%s duration=%.2fs", request.method, request.url.path, response.status_code, duration)
+    return add_security_headers(request, response)
+
+
+def add_security_headers(request: Request, response: Response) -> Response:
+    """为浏览器响应增加 CSP 和常用纵深防御响应头。"""
+
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+        "font-src 'self' data:; connect-src 'self'",
+    )
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    if request.url.path.startswith(("/api/", LOOKING_GLASS_API_PREFIX)):
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
@@ -1205,26 +1457,35 @@ def get_looking_glass_query(
 def on_startup() -> None:
     """应用启动时初始化数据库。"""
     logger.info(
-        "Link42 主控启动 version=%s database_url=%s config_dir=%s web_dist_dir=%s log_level=%s",
+        "Link42 主控启动 version=%s database=%s config_dir=%s web_dist_dir=%s log_level=%s",
         CONTROLLER_VERSION,
-        settings.database_url,
+        database_target_for_log(),
         settings.config_dir,
         settings.web_dist_dir,
         settings.log_level,
     )
-    previous_version = controller_version_in_database()
-    if previous_version != CONTROLLER_VERSION:
+    sqlite_path = sqlite_database_path()
+    database_existed = sqlite_path is None or sqlite_path.exists()
+    previous_version = controller_version_in_database() if database_existed else None
+    backup_path = None
+    load_master_key()
+    if database_existed and previous_version != CONTROLLER_VERSION:
         from .database import backup_sqlite_database_for_upgrade
 
         backup_path = backup_sqlite_database_for_upgrade()
         if backup_path:
+            protected_backup_count = protect_sqlite_sensitive_values(backup_path)
             logger.info(
-                "升级前数据库备份完成 path=%s previous_version=%s current_version=%s",
+                "升级前数据库备份完成 path=%s previous_version=%s current_version=%s protected=%s",
                 backup_path,
                 previous_version,
                 CONTROLLER_VERSION,
+                protected_backup_count,
             )
     init_db()
+    protected_count = protect_sensitive_database_values()
+    if protected_count:
+        logger.warning("敏感数据库字段迁移完成 count=%s", protected_count)
     ensure_admin_credentials()
     record_controller_version()
     logger.info("Link42 主控启动完成 version=%s", CONTROLLER_VERSION)
@@ -1649,8 +1910,7 @@ def build_agent_manual_upgrade_command(node: models.Node, target_version: str | 
     if controller_url:
         env_values["LINK42_SERVER_URL"] = controller_url
     env_values["LINK42_NODE_ID"] = str(node.id)
-    if node.agent_token_value:
-        env_values["LINK42_AGENT_TOKEN"] = node.agent_token_value
+    env_values["LINK42_AGENT_TOKEN"] = "<ROTATE_TOKEN_IN_PANEL>"
     env_parts = [f"{key}={shlex.quote(value)}" for key, value in env_values.items()]
     return f"curl -fsSL {shlex.quote(settings.agent_install_script_url)} | sudo env {' '.join(env_parts)} sh"
 
@@ -2933,8 +3193,12 @@ def set_unique_peer(
         existing_peer = existing_peers[0]
         existing_peer.name = payload.name
         existing_peer.public_key = payload.public_key
-        existing_peer.preshared_key_ref = "local-db" if payload.preshared_key else None
-        existing_peer.preshared_key_value = payload.preshared_key
+        if payload.preshared_key:
+            existing_peer.preshared_key_ref = "local-db"
+            existing_peer.preshared_key_value = payload.preshared_key
+        elif payload.clear_preshared_key:
+            existing_peer.preshared_key_ref = None
+            existing_peer.preshared_key_value = None
         existing_peer.endpoint_host = payload.endpoint_host
         existing_peer.endpoint_port = payload.endpoint_port
         existing_peer.allowed_ips = payload.allowed_ips
@@ -3392,26 +3656,67 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/auth/login", response_model=schemas.LoginResult)
 def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)) -> schemas.LoginResult:
-    """单用户登录，成功后返回 Web 管理端 Bearer token。"""
+    """验证单用户凭据、迁移旧密码哈希并签发新会话。"""
 
     password_hash = get_setting(db, SETTING_ADMIN_PASSWORD_HASH)
     username = admin_username(db)
-    if payload.username != username or not password_hash or not verify_token(payload.password, password_hash):
+    if payload.username != username or not password_hash or not verify_password(payload.password, password_hash):
         raise HTTPException(status_code=401, detail="invalid username or password")
+    if password_hash_needs_update(password_hash):
+        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_password(payload.password))
     token = generate_token("l42web")
+    now = time.time()
     set_setting(db, SETTING_ADMIN_SESSION_HASH, hash_token(token))
+    set_setting(db, SETTING_ADMIN_SESSION_ISSUED_AT, str(now))
+    set_setting(db, SETTING_ADMIN_SESSION_LAST_USED_AT, str(now))
     db.commit()
     return schemas.LoginResult(token=token, username=username)
 
 
+@app.post("/api/auth/login", response_model=schemas.LoginResult)
+def login_endpoint(
+    payload: schemas.LoginRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> schemas.LoginResult:
+    """对登录请求执行来源限流，并把会话写入安全 Cookie。"""
+
+    key = login_rate_key(request, payload.username)
+    retry_after = login_retry_after(key)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="too many login attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
+    if not LOGIN_CONCURRENCY.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="too many concurrent login attempts",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        try:
+            result = login(payload, db)
+        except HTTPException:
+            record_login_failure(key)
+            raise
+    finally:
+        LOGIN_CONCURRENCY.release()
+    clear_login_failures(key)
+    set_web_session_cookie(response, request, result.token)
+    return result
+
+
 @app.post("/api/auth/logout")
-def logout(db: Session = Depends(get_db)) -> dict[str, str]:
+def logout(response: Response, db: Session = Depends(get_db)) -> dict[str, str]:
     """退出当前 Web 管理端会话。"""
 
-    set_setting(db, SETTING_ADMIN_SESSION_HASH, "")
+    clear_web_session(db)
     db.commit()
+    clear_web_session_cookie(response)
     return {"status": "logged out"}
 
 
@@ -3463,9 +3768,12 @@ def update_controller_settings(
     if payload.site_logo_url is not None:
         set_setting(db, SETTING_SITE_LOGO_URL, payload.site_logo_url.strip() or DEFAULT_SITE_LOGO_URL)
     if payload.new_password:
-        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_token(payload.new_password))
-        set_setting(db, SETTING_ADMIN_SESSION_HASH, "")
+        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_password(payload.new_password))
+        set_setting(db, SETTING_ADMIN_INITIAL_PASSWORD_PENDING, "")
+        clear_web_session(db)
     db.commit()
+    if payload.new_password:
+        remove_initial_password_file()
     return schemas.ControllerSettingsRead(
         controller_url=controller_url,
         username=username,
@@ -3481,11 +3789,14 @@ async def upload_site_logo(
 ) -> schemas.ControllerSettingsRead:
     """上传站点 Logo 到配置目录，便于 Docker bind mount 持久化。"""
 
-    data = await request.body()
+    data_buffer = bytearray()
+    async for chunk in request.stream():
+        if len(data_buffer) + len(chunk) > BRANDING_LOGO_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="logo file must be no larger than 3 MiB")
+        data_buffer.extend(chunk)
+    data = bytes(data_buffer)
     if not data:
         raise HTTPException(status_code=400, detail="logo file is required")
-    if len(data) > BRANDING_LOGO_MAX_BYTES:
-        raise HTTPException(status_code=400, detail="logo file must be no larger than 3 MiB")
     suffix = detect_logo_extension(request.headers.get("content-type", ""), data)
     logo_dir = Path(settings.config_dir) / "branding"
     logo_dir.mkdir(parents=True, exist_ok=True)
@@ -3643,7 +3954,6 @@ def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> s
         github_proxy_url=payload.github_proxy_url,
         status="offline",
         agent_token_hash=hash_token(token),
-        agent_token_value=token,
     )
     db.add(node)
     db.commit()
@@ -4273,7 +4583,6 @@ def rotate_agent_token(node_id: int, db: Session = Depends(get_db)) -> schemas.N
         raise HTTPException(status_code=404, detail="node not found")
     token = generate_token("l42agent")
     node.agent_token_hash = hash_token(token)
-    node.agent_token_value = token
     db.commit()
     db.refresh(node)
     logger.warning("轮换节点 Agent token node_id=%s name=%s", node.id, node.name)
@@ -4907,8 +5216,12 @@ def update_interface(
     interface.name = payload.name
     interface.tunnel_ips = payload.tunnel_ips
     interface.listen_port = payload.listen_port
-    interface.private_key_ref = "local-db" if payload.private_key else None
-    interface.private_key_value = payload.private_key
+    if payload.private_key:
+        interface.private_key_ref = "local-db"
+        interface.private_key_value = payload.private_key
+    elif payload.clear_private_key:
+        interface.private_key_ref = None
+        interface.private_key_value = None
     interface.public_key = payload.public_key
     interface.mtu = payload.mtu
     interface.table_name = payload.table_name

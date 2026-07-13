@@ -119,7 +119,7 @@ DELETE /api/integrations/looking-glass/tokens/{token_id}
 {
   "id": 1,
   "name": "public-looking-glass",
-  "token": "l42lg_01JZEXAMPLE_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "token": "<REDACTED_LOOKING_GLASS_TOKEN>",
   "token_prefix": "l42lg_01JZEXAMPLE",
   "token_hint": "xxxxxxwxyz",
   "scopes": ["looking_glass.nodes.read", "looking_glass.bird.route"],

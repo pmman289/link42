@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from .database import Base
+from .secret_store import EncryptedJSON, EncryptedText
 
 
 class TimestampMixin:
@@ -42,7 +43,6 @@ class Node(TimestampMixin, Base):
     topology_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     agent_token_hash: Mapped[str] = mapped_column(String(128))
-    agent_token_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     agent_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     agent_protocol_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agent_capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -78,7 +78,7 @@ class WireGuardInterface(TimestampMixin, Base):
     tunnel_ips: Mapped[list[str]] = mapped_column(JSON, default=list)
     listen_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     private_key_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    private_key_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    private_key_value: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     public_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mtu: Mapped[int | None] = mapped_column(Integer, nullable=True)
     fwmark: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -91,7 +91,7 @@ class WireGuardInterface(TimestampMixin, Base):
     source: Mapped[str] = mapped_column(String(32), default="created")
     managed: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    deployed_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deployed_config: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     runtime_status: Mapped[str] = mapped_column(String(32), default="stopped")
     import_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     extras: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -113,6 +113,12 @@ class WireGuardInterface(TimestampMixin, Base):
         """返回导入或编辑时保留的 Interface 自定义配置片段。"""
 
         return (self.extras or {}).get("custom_config")
+
+    @property
+    def has_private_key(self) -> bool:
+        """仅返回是否保存私钥，避免普通 API 暴露密钥正文。"""
+
+        return bool(self.private_key_value)
 
     @property
     def primary_peer_endpoint_host(self) -> str | None:
@@ -159,7 +165,7 @@ class WireGuardPeer(TimestampMixin, Base):
     name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     public_key: Mapped[str] = mapped_column(String(128))
     preshared_key_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    preshared_key_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preshared_key_value: Mapped[str | None] = mapped_column(EncryptedText(), nullable=True)
     endpoint_host: Mapped[str | None] = mapped_column(String(255), nullable=True)
     endpoint_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     allowed_ips: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -179,6 +185,12 @@ class WireGuardPeer(TimestampMixin, Base):
         """返回导入或编辑时保留的 Peer 自定义配置片段。"""
 
         return (self.extras or {}).get("custom_config")
+
+    @property
+    def has_preshared_key(self) -> bool:
+        """仅返回是否保存预共享密钥，避免普通 API 暴露密钥正文。"""
+
+        return bool(self.preshared_key_value)
 
 
 class Connection(TimestampMixin, Base):
@@ -242,7 +254,7 @@ class ImportCandidate(TimestampMixin, Base):
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
     path: Mapped[str] = mapped_column(String(512))
     interface_name: Mapped[str] = mapped_column(String(32))
-    parsed: Mapped[dict] = mapped_column(JSON)
+    parsed: Mapped[dict] = mapped_column(EncryptedJSON())
     warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
     imported: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -290,8 +302,8 @@ class ChangePlan(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="draft")
     summary: Mapped[str] = mapped_column(Text)
     affected_node_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
-    diff: Mapped[str] = mapped_column(Text, default="")
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    diff: Mapped[str] = mapped_column(EncryptedText(), default="")
+    payload: Mapped[dict] = mapped_column(EncryptedJSON(), default=dict)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     tasks: Mapped[list[AgentTask]] = relationship(
         back_populates="change_plan",
@@ -327,11 +339,11 @@ class AgentTask(TimestampMixin, Base):
         nullable=True,
     )
     type: Mapped[str] = mapped_column(String(80))
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict] = mapped_column(EncryptedJSON(), default=dict)
     queue: Mapped[str] = mapped_column(String(32), default="control", index=True)
     priority: Mapped[int] = mapped_column(Integer, default=100)
     status: Mapped[str] = mapped_column(String(32), default="pending")
-    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    result: Mapped[dict | None] = mapped_column(EncryptedJSON(), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

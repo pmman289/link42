@@ -1,0 +1,25 @@
+name: Security checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: 扫描明文凭据
+        run: scripts/security/scan-secrets.sh
+      - name: 审计前端依赖
+        run: npm audit --prefix apps/web --audit-level=high

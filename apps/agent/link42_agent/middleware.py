@@ -15,6 +15,12 @@ from urllib import request
 from .config import AgentConfig
 from .service_manager import OpenWrtUciManager, detect_service_manager
 from .system import kernel_newer_than, mimic_runtime_health, mimic_runtime_ready, read_os_release, run_command
+from .validation import (
+    atomic_write_text,
+    managed_child_path,
+    validate_instance_name as validate_managed_instance_name,
+    validate_interface_name,
+)
 
 
 UDP2RAW_BIN = Path("/usr/local/bin/udp2raw")
@@ -364,7 +370,7 @@ def apply_mimic(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any
     instance = validate_instance_name(str(payload["instance"]))
     bind_interface = validate_mimic_interface(str(payload["bind_interface"]))
     snippet = build_mimic_snippet(payload)
-    config_path = MIMIC_SYSTEM_CONFIG_DIR / f"{bind_interface}.conf"
+    config_path = mimic_system_config_path(bind_interface)
     if dry_run:
         rendered = render_mimic_config(bind_interface, instance, snippet)
         return {
@@ -413,7 +419,7 @@ def delete_mimic(payload: dict[str, Any], dry_run: bool = False) -> dict[str, An
 
     instance = validate_instance_name(str(payload["instance"]))
     bind_interface = validate_mimic_interface(str(payload["bind_interface"]))
-    config_path = MIMIC_SYSTEM_CONFIG_DIR / f"{bind_interface}.conf"
+    config_path = mimic_system_config_path(bind_interface)
     if dry_run:
         return {"changed": False, "dry_run": True, "instance": instance, "bind_interface": bind_interface}
     instance_path = mimic_instance_path(bind_interface, instance)
@@ -440,8 +446,8 @@ def apply_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, A
     """写入 udp2raw 单实例配置并重启服务。"""
 
     args = build_udp2raw_args(payload)
-    mode = payload["mode"]
-    instance = payload["instance"]
+    mode = validate_mode(str(payload["mode"]))
+    instance = validate_instance_name(str(payload["instance"]))
     config_file = config_file_for_mode(mode)
     if dry_run:
         return {"changed": False, "dry_run": True, "args": args, "config_file": str(config_file)}
@@ -466,7 +472,7 @@ def stop_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, An
 def delete_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     """删除指定 udp2raw 实例配置和对应服务。"""
 
-    instance = payload["instance"]
+    instance = validate_instance_name(str(payload["instance"]))
     modes = payload_modes(payload)
     if dry_run:
         return {"changed": False, "dry_run": True, "instance": instance, "modes": modes}
@@ -481,7 +487,7 @@ def delete_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, 
 def status_udp2raw(payload: dict[str, Any]) -> dict[str, Any]:
     """查询指定 udp2raw 实例在各角色配置中的服务状态。"""
 
-    instance = payload["instance"]
+    instance = validate_instance_name(str(payload["instance"]))
     return {mode: service_status(mode, instance) for mode in payload_modes(payload)}
 
 
@@ -656,14 +662,13 @@ def config_file_for_mode(mode: str) -> Path:
 def unit_name(mode: str, instance: str) -> str:
     """生成 systemd udp2raw 实例 unit 名称。"""
 
-    return f"link42-udp2raw-{mode}@{instance}.service"
+    return f"link42-udp2raw-{validate_mode(mode)}@{validate_instance_name(instance)}.service"
 
 
 def init_name(mode: str, instance: str) -> str:
     """生成 OpenWrt procd init 脚本名称。"""
 
-    validate_instance_name(instance)
-    return f"link42-udp2raw-{mode}-{instance}"
+    return f"link42-udp2raw-{validate_mode(mode)}-{validate_instance_name(instance)}"
 
 
 def init_path(mode: str, instance: str) -> Path:
@@ -675,9 +680,7 @@ def init_path(mode: str, instance: str) -> Path:
 def validate_instance_name(instance: str) -> str:
     """校验中间层实例名只包含服务名安全字符。"""
 
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", instance):
-        raise ValueError("udp2raw instance contains unsupported characters")
-    return instance
+    return validate_managed_instance_name(instance, "udp2raw instance")
 
 
 def udp2raw_service_backend() -> str:
@@ -912,7 +915,7 @@ def remove_instance(path: Path, instance: str) -> None:
 def service_action(payload: dict[str, Any], action: str, dry_run: bool = False) -> dict[str, Any]:
     """对 payload 指向的 udp2raw 实例执行 start/stop/status 等服务动作。"""
 
-    instance = payload["instance"]
+    instance = validate_instance_name(str(payload["instance"]))
     changed = False
     commands = []
     modes = payload_modes(payload)
@@ -934,7 +937,7 @@ def payload_modes(payload: dict[str, Any]) -> list[str]:
     mode = payload.get("mode")
     if mode:
         return [validate_mode(str(mode))]
-    instance = payload["instance"]
+    instance = validate_instance_name(str(payload["instance"]))
     modes = [mode for mode in ["server", "client"] if instance_exists(config_file_for_mode(mode), instance)]
     return modes or ["server", "client"]
 
@@ -981,28 +984,35 @@ def write_mimic_system_config(path: Path, content: str) -> None:
     """写入 mimic 系统配置文件并设置可读权限。"""
 
     ensure_mimic_layout()
-    path.write_text(content, encoding="utf-8")
+    atomic_write_text(path, content, mode=0o644)
     path.chmod(0o644)
 
 
 def validate_mimic_interface(name: str) -> str:
     """校验 mimic 绑定接口名只包含安全字符。"""
 
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", name):
-        raise ValueError("mimic bind interface contains unsupported characters")
-    return name
+    return validate_interface_name(name, "mimic bind interface")
 
 
 def mimic_unit_name(bind_interface: str) -> str:
     """生成 mimic systemd 实例 unit 名称。"""
 
-    return f"mimic@{bind_interface}.service"
+    return f"mimic@{validate_mimic_interface(bind_interface)}.service"
 
 
 def mimic_instance_path(bind_interface: str, instance: str) -> Path:
     """返回 Link42 管理的单个 mimic 实例片段路径。"""
 
-    return MIMIC_CONFIG_DIR / bind_interface / f"{instance}.conf"
+    interface_name = validate_mimic_interface(bind_interface)
+    instance_name = validate_instance_name(instance)
+    return managed_child_path(MIMIC_CONFIG_DIR, interface_name, f"{instance_name}.conf")
+
+
+def mimic_system_config_path(bind_interface: str) -> Path:
+    """返回受管 mimic 系统配置路径并拒绝符号链接穿越。"""
+
+    interface_name = validate_mimic_interface(bind_interface)
+    return managed_child_path(MIMIC_SYSTEM_CONFIG_DIR, f"{interface_name}.conf")
 
 
 def build_mimic_snippet(payload: dict[str, Any]) -> str:
@@ -1046,7 +1056,7 @@ def render_mimic_config(bind_interface: str, instance: str | None = None, snippe
     """合并原有 mimic 配置和 Link42 管理片段，生成最终系统配置。"""
 
     snippets: list[str] = []
-    directory = MIMIC_CONFIG_DIR / bind_interface
+    directory = managed_child_path(MIMIC_CONFIG_DIR, validate_mimic_interface(bind_interface))
     if directory.exists():
         snippets.extend(path.read_text(encoding="utf-8").strip() for path in sorted(directory.glob("*.conf")))
     if instance and snippet:
@@ -1060,7 +1070,7 @@ def render_mimic_config(bind_interface: str, instance: str | None = None, snippe
     link42_block = ""
     if snippets:
         link42_block = f"{MIMIC_BLOCK_BEGIN}\n" + "\n\n".join(snippets).strip() + f"\n{MIMIC_BLOCK_END}\n"
-    config_path = MIMIC_SYSTEM_CONFIG_DIR / f"{bind_interface}.conf"
+    config_path = mimic_system_config_path(bind_interface)
     base = strip_mimic_link42_block(config_path.read_text(encoding="utf-8") if config_path.exists() else "")
     parts = [part for part in [base.strip(), link42_block.strip()] if part]
     return "\n\n".join(parts).rstrip() + ("\n" if parts else "")

@@ -30,8 +30,8 @@
   - 容器支持 systemd、WireGuard、tcpdump，可真实启动 Agent 和 udp2raw systemd service；默认保留容器，不要随手删除。
 - 用户可能会要求清空数据库从头测，此时可以删除 `link42.db` 后重启 API。
 - 最近创建过两个本机测试节点，token 如下；如果数据库已清空则这些 token 已失效：
-  - `node1=l42agent_dWpxQBthT_4drtsuK_EDWEbtKXVl937RUchLawszIII`
-  - `node2=l42agent_hfx1eUJL5Gg8mLHTtOsujqRECLalGL5jrwpe_noWjzM`
+  - `node1=<REDACTED_AGENT_TOKEN>`
+  - `node2=<REDACTED_AGENT_TOKEN>`
 - 单机可同时跑两个 Agent 进程模拟两个节点，但必须为每个进程设置不同的 `LINK42_NODE_ID`、`LINK42_AGENT_TOKEN`，并谨慎处理真实 `/etc/wireguard` 接口名冲突。
 
 ## 最近完成的关键功能
@@ -128,7 +128,7 @@ npm run preview -- --host 0.0.0.0 --port 5173
 
 ```bash
 cd /root/repo/link42
-setsid env LINK42_SERVER_URL=http://192.168.123.20:8000 LINK42_NODE_ID=2 LINK42_AGENT_TOKEN=l42agent_YGhpdQRV5yBGkWhOo9Rxs9UzCmEqFW8x822OR7ETgsI LINK42_WIREGUARD_DIR=/etc/wireguard LINK42_AGENT_DRY_RUN=0 LINK42_POLL_INTERVAL=2 .venv/bin/python -m link42_agent.main > /tmp/link42-agent-node2.log 2>&1 < /dev/null &
+setsid env LINK42_SERVER_URL=http://192.168.123.20:8000 LINK42_NODE_ID=2 LINK42_AGENT_TOKEN=<REDACTED_AGENT_TOKEN> LINK42_WIREGUARD_DIR=/etc/wireguard LINK42_AGENT_DRY_RUN=0 LINK42_POLL_INTERVAL=2 .venv/bin/python -m link42_agent.main > /tmp/link42-agent-node2.log 2>&1 < /dev/null &
 ```
 
 构建 x64 Agent 二进制：

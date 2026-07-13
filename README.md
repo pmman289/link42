@@ -40,11 +40,13 @@ docker run -d \
 http://<主控IP>:8000
 ```
 
-首次启动会自动生成登录密码，在容器日志里查看：
+首次启动会自动生成登录密码，可在容器日志中查看：
 
 ```bash
 docker logs link42
 ```
+
+密码也会写入权限为 `0600` 的 `/opt/link42/config/initial-admin-password`；修改管理员密码后，该文件会被自动删除。
 
 登录后建议先进入“设置”，确认主控访问地址，例如：
 
@@ -189,7 +191,13 @@ LINK42_DATABASE_URL=sqlite:////link42/data/link42.db
 LINK42_CONFIG_DIR=/link42/config
 LINK42_WEB_DIST_DIR=/opt/link42/web
 LINK42_AGENT_OFFLINE_AFTER_SECONDS=15
+LINK42_WEB_SESSION_IDLE_SECONDS=28800
+LINK42_WEB_SESSION_ABSOLUTE_SECONDS=604800
+LINK42_TRUSTED_PROXY_CIDRS=127.0.0.1/32
+LINK42_CORS_ALLOWED_ORIGINS=
 ```
+
+主控会在配置目录生成 `master.key`，用于加密 WireGuard 密钥和任务敏感内容。备份数据库时必须同时单独备份该文件，但不要把它和数据库放进同一个公开归档。反向代理部署只有在 `LINK42_TRUSTED_PROXY_CIDRS` 明确包含代理地址后，主控才会采用代理传入的真实来源 IP。
 
 Agent：
 
