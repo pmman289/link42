@@ -564,8 +564,9 @@ def run_command(
     *,
     timeout: float | None = None,
     env: dict[str, str] | None = None,
+    log_failure: bool = True,
 ) -> dict[str, Any]:
-    """执行系统命令，并返回可上报给 API 的结构化结果。"""
+    """执行系统命令，并按调用场景决定是否记录预期失败。"""
 
     effective_timeout = timeout if timeout is not None else command_timeout_seconds()
     effective_env = subprocess_env()
@@ -585,7 +586,8 @@ def run_command(
         )
     except subprocess.TimeoutExpired as exc:
         duration = time.monotonic() - started_at
-        logger.warning("系统命令超时 command=%s timeout=%s duration=%.2fs", safe_command, effective_timeout, duration)
+        log_method = logger.warning if log_failure else logger.debug
+        log_method("系统命令超时 command=%s timeout=%s duration=%.2fs", safe_command, effective_timeout, duration)
         result = {
             "command": safe_command,
             "returncode": 124,
@@ -606,7 +608,8 @@ def run_command(
     if completed.returncode == 0:
         logger.debug("系统命令完成 command=%s returncode=%s duration=%.2fs", safe_command, completed.returncode, duration)
     else:
-        logger.warning(
+        log_method = logger.warning if log_failure else logger.debug
+        log_method(
             "系统命令失败 command=%s returncode=%s duration=%.2fs stderr=%s",
             safe_command,
             completed.returncode,

@@ -464,12 +464,13 @@ def run_once(
     if hasattr(client, "poll_link_monitors") and hasattr(client, "report_link_monitor_results"):
         monitors = client.poll_link_monitors(snapshot.capabilities, snapshot.platform)
         if monitors:
-            logger.info("开始执行链路监测 count=%d monitor_ids=%s", len(monitors), [item.get("id") for item in monitors])
+            logger.debug("开始执行链路监测 count=%d monitor_ids=%s", len(monitors), [item.get("id") for item in monitors])
         monitor_results = probe_link_monitors(monitors)
         if monitor_results:
             client.report_link_monitor_results(monitor_results)
             failed_count = sum(1 for item in monitor_results if not item.get("success"))
-            logger.info(
+            log_method = logger.warning if failed_count else logger.debug
+            log_method(
                 "链路监测结果已上报 count=%d failed=%d monitor_ids=%s",
                 len(monitor_results),
                 failed_count,

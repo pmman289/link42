@@ -24,7 +24,7 @@ def gre_runtime_supported() -> bool:
     ip_binary = shutil.which("ip")
     if not ip_binary:
         return False
-    result = run_command([ip_binary, "tunnel", "help"], allow_failure=True)
+    result = run_command([ip_binary, "tunnel", "help"], allow_failure=True, log_failure=False)
     output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".lower()
     return result["returncode"] == 0 or "gre" in output
 

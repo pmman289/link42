@@ -99,6 +99,23 @@ def test_run_command_masks_sensitive_arguments(monkeypatch) -> None:
     assert "network.wg0.private_key=***" in str(exc_info.value)
 
 
+def test_run_command_can_suppress_expected_failure_warning(monkeypatch, caplog) -> None:
+    """验证能力探测等预期非零退出不会污染生产 WARNING 日志。"""
+
+    def fake_run(command: list[str], **kwargs: Any):
+        """模拟通过非零退出码输出帮助信息的系统命令。"""
+
+        return subprocess.CompletedProcess(command, 255, stdout="", stderr="Usage: ip tunnel ... mode gre")
+
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    with caplog.at_level("WARNING", logger="link42.agent.system"):
+        result = system.run_command(["ip", "tunnel", "help"], allow_failure=True, log_failure=False)
+
+    assert result["returncode"] == 255
+    assert "系统命令失败" not in caplog.text
+
+
 def test_node_plugin_port_inventory_capability_and_scan(monkeypatch, tmp_path) -> None:
     """验证 Agent 侧端口台账插件会上报能力并能扫描 WireGuard ListenPort。"""
 
@@ -560,6 +577,30 @@ def test_gre_capability_depends_on_iproute2(monkeypatch) -> None:
 
     monkeypatch.setattr(main, "gre_runtime_supported", lambda: False)
     assert "gre" not in main.build_capabilities(platform_info)
+
+
+def test_gre_runtime_probe_treats_help_exit_as_expected(monkeypatch) -> None:
+    """验证 ip tunnel help 非零退出时仍按输出识别 GRE，并关闭失败告警。"""
+
+    seen: dict[str, Any] = {}
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """记录 GRE 能力探测参数并返回 iproute2 常见帮助结果。"""
+
+        seen.update({"command": command, "allow_failure": allow_failure, **kwargs})
+        return command_result(command, returncode=255, stdout="Usage: ip tunnel mode gre")
+
+    gre.gre_runtime_supported.cache_clear()
+    monkeypatch.setattr(gre.shutil, "which", lambda binary: "/usr/sbin/ip" if binary == "ip" else None)
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    assert gre.gre_runtime_supported() is True
+    assert seen == {
+        "command": ["/usr/sbin/ip", "tunnel", "help"],
+        "allow_failure": True,
+        "log_failure": False,
+    }
+    gre.gre_runtime_supported.cache_clear()
 
 
 def test_looking_glass_bird_capability_depends_on_birdc(monkeypatch) -> None:
@@ -2503,6 +2544,8 @@ def test_run_once_polls_and_reports_link_monitors(monkeypatch, tmp_path: Path) -
     """验证 Agent 每轮会执行到期链路监测并上报结果。"""
 
     reported: list[dict[str, Any]] = []
+    info_messages: list[str] = []
+    debug_messages: list[str] = []
 
     class FakeClient:
         """模拟 AgentClient 与主控交互。"""
@@ -2525,10 +2568,60 @@ def test_run_once_polls_and_reports_link_monitors(monkeypatch, tmp_path: Path) -
     use_service_binaries(monkeypatch, systemd=True)
     monkeypatch.setattr(system, "run_command", lambda command, allow_failure: command_result(command))
     monkeypatch.setattr(main, "probe_latency", lambda target, timeout: {"success": True, "latency_ms": 12.3, "error": None, "checked_at": "2026-06-30T00:00:00"})
+    monkeypatch.setattr(main.logger, "info", lambda message, *args: info_messages.append(message % args))
+    monkeypatch.setattr(main.logger, "debug", lambda message, *args: debug_messages.append(message % args))
 
     main.run_once(FakeClient(), str(tmp_path))
 
     assert reported == [{"monitor_id": 7, "success": True, "latency_ms": 12.3, "error": None, "checked_at": "2026-06-30T00:00:00"}]
+    assert not any("链路监测" in message for message in info_messages)
+    assert any("开始执行链路监测" in message for message in debug_messages)
+    assert any("链路监测结果已上报 count=1 failed=0" in message for message in debug_messages)
+
+
+def test_run_once_warns_when_link_monitor_fails(monkeypatch, tmp_path: Path) -> None:
+    """验证链路监测失败仍保留 WARNING，便于生产环境发现异常。"""
+
+    warning_messages: list[str] = []
+
+    class FakeClient:
+        """模拟仅包含链路监测交互的 AgentClient。"""
+
+        def heartbeat(self, capabilities: list[str], platform: dict[str, Any]) -> None:
+            """模拟 Agent 心跳。"""
+
+            return None
+
+        def poll_tasks(self, capabilities: list[str], platform: dict[str, Any]) -> list[dict[str, Any]]:
+            """模拟没有普通任务。"""
+
+            return []
+
+        def poll_link_monitors(self, capabilities: list[str], platform: dict[str, Any]) -> list[dict[str, Any]]:
+            """返回一个到期监测目标。"""
+
+            return [{"id": 8, "target_host": "10.42.0.3", "timeout_seconds": 1}]
+
+        def report_link_monitor_results(self, results: list[dict[str, Any]]) -> None:
+            """确认失败结果仍会正常上报。"""
+
+            assert results[0]["success"] is False
+
+    monkeypatch.setattr(
+        main,
+        "probe_latency",
+        lambda target, timeout: {
+            "success": False,
+            "latency_ms": None,
+            "error": "timeout",
+            "checked_at": "2026-06-30T00:00:00",
+        },
+    )
+    monkeypatch.setattr(main.logger, "warning", lambda message, *args: warning_messages.append(message % args))
+
+    main.run_once(FakeClient(), AgentConfig("https://controller", 1, "token"), main.AgentSnapshot([], {}))
+
+    assert warning_messages == ["链路监测结果已上报 count=1 failed=1 monitor_ids=[8]"]
 
 
 def test_probe_link_monitors_runs_in_parallel(monkeypatch) -> None:
