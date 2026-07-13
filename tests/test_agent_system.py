@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import threading
 from typing import Any
+from urllib import error
 
 import pytest
 
@@ -19,8 +21,10 @@ from link42_common.connection_types import (
     LOOKING_GLASS_TRACEROUTE_TASK,
     WIREGUARD_TASKS,
 )
+from link42_common.version import AGENT_VERSION
+from link42_agent import client as agent_client
 from link42_agent import gre, link_monitor, looking_glass, main, middleware, service_manager, system, upgrade
-from link42_agent.client import AgentHttpError
+from link42_agent.client import AgentClient, AgentConnectionError, AgentHttpError
 from link42_agent.config import AgentConfig
 from link42_agent.plugins import bird
 from link42_agent.plugins import port_inventory
@@ -1513,6 +1517,110 @@ def test_agent_main_reports_401_without_traceback(monkeypatch, capsys) -> None:
     output = capsys.readouterr().out
     assert "agent authentication failed" in output
     assert "Traceback" not in output
+
+
+def test_agent_client_reports_dns_failure_in_chinese(monkeypatch) -> None:
+    """验证主控域名解析失败时转换为明确的中文连接错误。"""
+
+    def fake_urlopen(request_obj: Any, timeout: int) -> None:
+        """模拟主控域名无法解析。"""
+
+        assert request_obj.get_header("User-agent") == f"Link42-Agent/{AGENT_VERSION}"
+        assert request_obj.get_header("Accept") == "application/json"
+        raise error.URLError(socket.gaierror(-5, "No address associated with hostname"))
+
+    monkeypatch.setattr(agent_client.request, "urlopen", fake_urlopen)
+    client = AgentClient(AgentConfig("https://wrong.example", 1, "token"))
+
+    with pytest.raises(AgentConnectionError) as caught:
+        client.register("node-a")
+
+    assert caught.value.server_url == "https://wrong.example"
+    assert caught.value.path == "/api/agent/register"
+    assert caught.value.reason == "主控域名无法解析"
+    assert str(caught.value) == "无法连接主控 https://wrong.example：主控域名无法解析"
+
+
+def test_agent_main_reports_connection_failure_without_traceback(monkeypatch, capsys) -> None:
+    """验证主控无法连接时提示检查地址，并避免持续输出底层 traceback。"""
+
+    class FakeClient:
+        """模拟连接主控失败的 AgentClient。"""
+
+        def __init__(self, config: AgentConfig) -> None:
+            """初始化测试替身对象。"""
+
+            self.config = config
+
+        def register(self, hostname: str, capabilities: list[str], platform: dict[str, Any]) -> None:
+            """模拟 Agent 注册时域名解析失败。"""
+
+            raise AgentConnectionError(self.config.server_url, "/api/agent/register", "主控域名无法解析")
+
+    def fake_sleep(seconds: int) -> None:
+        """结束首轮重试，避免测试进入无限循环。"""
+
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "load_config_from_env", lambda: AgentConfig("https://wrong.example", 1, "token"))
+    monkeypatch.setattr(main, "AgentClient", FakeClient)
+    monkeypatch.setattr(main, "get_hostname", lambda: "node-a")
+    monkeypatch.setattr(main, "collect_agent_snapshot", lambda: main.AgentSnapshot(["wireguard"], {}))
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    output = capsys.readouterr().out
+    assert "无法连接主控 https://wrong.example：主控域名无法解析" in output
+    assert "请检查 LINK42_SERVER_URL、DNS 和网络连接" in output
+    assert "Traceback" not in output
+    assert "urllib.error.URLError" not in output
+
+
+def test_agent_main_explains_cdn_403_without_duplicate_warning(monkeypatch, capsys) -> None:
+    """验证 CDN 拒绝 Agent 请求时输出可操作提示且不重复记录响应。"""
+
+    class FakeClient:
+        """模拟收到 CDN 403 的 AgentClient。"""
+
+        def __init__(self, config: AgentConfig) -> None:
+            """初始化测试替身对象。"""
+
+            self.config = config
+
+        def register(self, hostname: str, capabilities: list[str], platform: dict[str, Any]) -> None:
+            """模拟 Cloudflare 拒绝注册请求。"""
+
+            raise AgentHttpError(403, "/api/agent/register", "error code: 1010")
+
+    def fake_sleep(seconds: int) -> None:
+        """结束首轮重试，避免测试进入无限循环。"""
+
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "load_config_from_env", lambda: AgentConfig("https://controller.example", 1, "token"))
+    monkeypatch.setattr(main, "AgentClient", FakeClient)
+    monkeypatch.setattr(main, "get_hostname", lambda: "node-a")
+    monkeypatch.setattr(main, "collect_agent_snapshot", lambda: main.AgentSnapshot(["wireguard"], {}))
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    output = capsys.readouterr().out
+    assert "主控或前置 CDN/WAF 拒绝了 Agent 请求（HTTP 403）" in output
+    assert "请检查是否对 /api/agent/* 启用了浏览器质询或访问限制" in output
+    assert output.count("error code: 1010") == 1
+    assert "Traceback" not in output
+
+
+@pytest.mark.parametrize("server_url", ["controller.example", "ftp://controller.example", "https://"])
+def test_agent_client_rejects_invalid_controller_url(server_url: str) -> None:
+    """验证格式错误的主控地址会得到清晰提示。"""
+
+    with pytest.raises(AgentConnectionError, match="主控地址格式无效"):
+        AgentClient(AgentConfig(server_url, 1, "token"))
 
 
 def test_agent_install_script_openwrt_init_defines_rc_common_hooks() -> None:

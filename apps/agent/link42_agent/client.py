@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+import ssl
 import time
 from typing import Any, Optional
 from urllib import error, request
+from urllib.parse import urlsplit
 
 from link42_common.version import AGENT_PROTOCOL_VERSION, AGENT_VERSION
 
@@ -12,6 +15,7 @@ from .config import AgentConfig
 
 
 logger = logging.getLogger("link42.agent.client")
+AGENT_USER_AGENT = f"Link42-Agent/{AGENT_VERSION}"
 QUIET_SUCCESS_PATHS = {
     "/api/agent/register",
     "/api/agent/heartbeat",
@@ -32,12 +36,55 @@ class AgentHttpError(RuntimeError):
         super().__init__(f"HTTP {status_code} for {path}: {body}")
 
 
+class AgentConnectionError(RuntimeError):
+    """Agent 无法连接主控。"""
+
+    def __init__(self, server_url: str, path: str, reason: str) -> None:
+        """保存主控地址、请求路径和便于用户理解的失败原因。"""
+
+        self.server_url = server_url
+        self.path = path
+        self.reason = reason
+        super().__init__(f"无法连接主控 {server_url}：{reason}")
+
+
+def validate_server_url(server_url: str) -> None:
+    """校验主控地址是否为包含主机名的 HTTP 或 HTTPS URL。"""
+
+    try:
+        parsed = urlsplit(server_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise AgentConnectionError(server_url, "", "主控地址格式无效") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise AgentConnectionError(server_url, "", "主控地址格式无效，请以 http:// 或 https:// 开头")
+    if port is not None and not 1 <= port <= 65535:
+        raise AgentConnectionError(server_url, "", "主控地址端口必须在 1 到 65535 之间")
+
+
+def describe_url_error(exc: error.URLError) -> str:
+    """把 urllib 的底层网络异常转换成面向用户的中文原因。"""
+
+    reason = exc.reason
+    if isinstance(reason, socket.gaierror):
+        return "主控域名无法解析"
+    if isinstance(reason, ConnectionRefusedError):
+        return "主控拒绝连接"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "连接主控超时"
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "主控 HTTPS 证书校验失败"
+    detail = str(reason).strip()
+    return f"网络连接失败（{detail}）" if detail else "网络连接失败"
+
+
 class AgentClient:
     """Agent 访问中心 API 的 HTTP 客户端。"""
 
     def __init__(self, config: AgentConfig) -> None:
         """保存配置并创建 HTTP client。"""
 
+        validate_server_url(config.server_url)
         self.config = config
 
     def auth_payload(self) -> dict[str, Any]:
@@ -104,7 +151,11 @@ class AgentClient:
             f"{self.config.server_url}{path}",
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": AGENT_USER_AGENT,
+            },
         )
         try:
             with request.urlopen(http_request, timeout=30) as response:
@@ -118,7 +169,7 @@ class AgentClient:
                     )
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            logger.warning(
+            logger.debug(
                 "Agent API 返回错误 path=%s status=%s duration=%.2fs body=%s",
                 path,
                 exc.code,
@@ -127,13 +178,13 @@ class AgentClient:
             )
             raise AgentHttpError(exc.code, path, body) from exc
         except error.URLError as exc:
-            logger.warning(
-                "Agent API 请求失败 path=%s duration=%.2fs error=%s",
+            logger.debug(
+                "Agent API 连接失败 path=%s duration=%.2fs error=%s",
                 path,
                 time.monotonic() - started_at,
                 exc,
             )
-            raise
+            raise AgentConnectionError(self.config.server_url, path, describe_url_error(exc)) from exc
         if not body:
             return {}
         return json.loads(body)

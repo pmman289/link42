@@ -17,7 +17,7 @@ from typing import Any, Union
 
 from link42_common.version import AGENT_VERSION
 
-from .client import AgentClient, AgentHttpError
+from .client import AgentClient, AgentConnectionError, AgentHttpError
 from .config import AgentConfig
 from .config import load_config_from_env
 from .gre import gre_runtime_supported, openwrt_gre_supported, start_gre_from_config
@@ -499,19 +499,32 @@ def main() -> None:
         config.dry_run,
         config.log_level,
     )
-    client = AgentClient(config)
     log_state = AgentLogState()
     while True:
         try:
+            client = AgentClient(config)
             snapshot = collect_agent_snapshot()
             client.register(get_hostname(), snapshot.capabilities, snapshot.platform)
             log_snapshot_if_changed(snapshot, log_state)
             run_once(client, config, snapshot, log_state)
+        except AgentConnectionError as exc:
+            logger.error(
+                "%s；请检查 LINK42_SERVER_URL、DNS 和网络连接，Agent 将在 %s 秒后重试",
+                exc,
+                config.poll_interval,
+            )
         except AgentHttpError as exc:
             if exc.status_code == 401:
                 logger.error(
                     "agent authentication failed: invalid node id or token; "
                     "rotate/copy a fresh deployment command from the controller"
+                )
+            elif exc.status_code == 403:
+                logger.error(
+                    "主控或前置 CDN/WAF 拒绝了 Agent 请求（HTTP 403）；"
+                    "请检查是否对 /api/agent/* 启用了浏览器质询或访问限制 path=%s response=%s",
+                    exc.path,
+                    exc.body[:200],
                 )
             else:
                 logger.warning("Agent API 请求失败 status=%s path=%s body=%s", exc.status_code, exc.path, exc.body[:500])
