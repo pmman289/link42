@@ -13,7 +13,7 @@
 - Looking Glass 可以请求节点执行受限的 `ping` 和 `traceroute` 网络诊断。
 - 查询结果默认返回原始输出，由 Looking Glass 自行解析和展示。
 - 查询采用异步提交、轮询读取结果的方式，适配 Agent 高延迟、离线、排队和超时场景。
-- 外部接口必须有独立鉴权、权限范围、节点访问白名单和限流能力。
+- 外部接口必须有独立鉴权、权限范围和限流能力。
 - 外部接口不能暴露主控管理能力、内部任务 ID、节点插件能力或任意命令执行能力。
 
 ## 2. 非目标
@@ -62,7 +62,6 @@ integration_api_keys
 - token_hash
 - token_hint
 - scopes
-- allowed_node_ids
 - enabled
 - expires_at
 - last_used_at
@@ -86,7 +85,7 @@ looking_glass.bird.route        # 发起 BIRD route lookup 查询
 
 - API Key 不存在、已禁用或过期，返回 `401`。
 - 缺少对应 scope，返回 `403`。
-- 节点不在 `allowed_node_ids` 中，返回 `404` 或 `403`。为减少节点枚举风险，推荐返回 `404`。
+- 有效 Token 可以访问主控中的全部当前节点和后续新增节点。
 - 每次成功调用更新 `last_used_at`。
 
 ## 5. API Token 生成和管理
@@ -110,7 +109,6 @@ DELETE /api/integrations/looking-glass/tokens/{token_id}
 {
   "name": "public-looking-glass",
   "scopes": ["looking_glass.nodes.read", "looking_glass.bird.route"],
-  "allowed_node_ids": [8, 15],
   "expires_at": "2027-07-10T00:00:00Z"
 }
 ```
@@ -125,7 +123,6 @@ DELETE /api/integrations/looking-glass/tokens/{token_id}
   "token_prefix": "l42lg_01JZEXAMPLE",
   "token_hint": "xxxxxxwxyz",
   "scopes": ["looking_glass.nodes.read", "looking_glass.bird.route"],
-  "allowed_node_ids": [8, 15],
   "enabled": true,
   "expires_at": "2027-07-10T00:00:00Z",
   "created_at": "2026-07-10T09:30:00Z"
@@ -153,7 +150,6 @@ Token 列表响应不返回明文：
       "token_prefix": "l42lg_01JZEXAMPLE",
       "token_hint": "xxxxxxwxyz",
       "scopes": ["looking_glass.nodes.read", "looking_glass.bird.route"],
-      "allowed_node_ids": [8, 15],
       "enabled": true,
       "expires_at": "2027-07-10T00:00:00Z",
       "last_used_at": "2026-07-10T09:35:00Z",
@@ -706,7 +702,7 @@ looking_glass_queries
 400 invalid_request          请求格式错误、IP 非法或目标地址非法
 401 invalid_api_key          API Key 不存在、禁用或过期
 403 permission_denied        缺少 scope
-404 node_not_found           节点不存在或不在白名单
+404 node_not_found           节点不存在
 404 query_not_found          查询不存在或不属于当前 API Key
 409 node_offline             节点离线
 409 capability_missing       节点不支持该查询
@@ -762,10 +758,10 @@ sequenceDiagram
 
 ## 14. 实施顺序
 
-1. 新增集成 API Key 表、Token 生成、Token 轮换、吊销、scope 校验和节点白名单。
+1. 新增集成 API Key 表、Token 生成、Token 轮换、吊销和 scope 校验。
 2. 新增 `/third-party-api/looking-glass/v1/nodes` 和节点详情接口。
 3. 新增 `looking_glass_queries` 表和异步查询提交、轮询接口。
 4. 新增 Agent 受限任务 `looking_glass.bird.route_lookup`。
 5. 将 Agent 任务区分为 `control` 和 `query` 队列，避免查询阻塞部署。
 6. 增加超时、输出限制、短缓存、限流和过期清理。
-7. 增加单元测试，覆盖 Token 鉴权、节点过滤、IP 校验、任务入队、超时、输出截断和查询结果读取。
+7. 增加单元测试，覆盖 Token 鉴权、节点查询、IP 校验、任务入队、超时、输出截断和查询结果读取。

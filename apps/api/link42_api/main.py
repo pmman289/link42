@@ -506,14 +506,6 @@ def require_looking_glass_scope(api_key: models.IntegrationApiKey, scope: str) -
         raise api_error(403, "permission_denied", "API Token 缺少访问权限")
 
 
-def require_looking_glass_node_access(api_key: models.IntegrationApiKey, node_id: int) -> None:
-    """校验第三方 API Token 是否允许访问指定节点。"""
-
-    allowed_node_ids = {int(value) for value in api_key.allowed_node_ids or []}
-    if node_id not in allowed_node_ids:
-        raise api_error(404, "node_not_found", "节点不存在")
-
-
 def parse_node_ref(node_ref: str) -> int:
     """解析第三方 API 使用的节点引用。"""
 
@@ -735,15 +727,6 @@ async def require_api_authentication(request: Request, call_next):
     return response
 
 
-def ensure_allowed_nodes_exist(db: Session, node_ids: list[int]) -> None:
-    """校验 Token 节点白名单中的节点都存在。"""
-
-    existing_ids = set(db.scalars(select(models.Node.id).where(models.Node.id.in_(node_ids))))
-    missing_ids = sorted(set(node_ids) - existing_ids)
-    if missing_ids:
-        raise HTTPException(status_code=400, detail=f"nodes not found: {missing_ids}")
-
-
 def token_read_with_plaintext(api_key: models.IntegrationApiKey, token: str) -> schemas.IntegrationApiTokenCreateResult:
     """生成包含一次性明文 Token 的管理端响应。"""
 
@@ -766,7 +749,6 @@ def create_looking_glass_token(
 ) -> schemas.IntegrationApiTokenCreateResult:
     """创建 Looking Glass 第三方 API Token，并仅本次返回明文。"""
 
-    ensure_allowed_nodes_exist(db, payload.allowed_node_ids)
     token, token_prefix, token_hint = generate_integration_token()
     api_key = models.IntegrationApiKey(
         name=payload.name.strip(),
@@ -774,7 +756,7 @@ def create_looking_glass_token(
         token_hash=hash_token(token),
         token_hint=token_hint,
         scopes=payload.scopes,
-        allowed_node_ids=payload.allowed_node_ids,
+        allowed_node_ids=[],
         enabled=True,
         expires_at=payload.expires_at,
         created_by=admin_username(db),
@@ -797,9 +779,6 @@ def update_looking_glass_token(
     api_key = db.get(models.IntegrationApiKey, token_id)
     if api_key is None:
         raise HTTPException(status_code=404, detail="token not found")
-    if payload.allowed_node_ids is not None:
-        ensure_allowed_nodes_exist(db, payload.allowed_node_ids)
-        api_key.allowed_node_ids = payload.allowed_node_ids
     if payload.name is not None:
         api_key.name = payload.name.strip()
     if payload.scopes is not None:
@@ -882,9 +861,6 @@ def list_looking_glass_nodes(
 
     require_looking_glass_scope(api_key, LOOKING_GLASS_NODE_READ_SCOPE)
     limit = max(1, min(int(limit or 100), 500))
-    allowed_node_ids = sorted({int(value) for value in api_key.allowed_node_ids or []})
-    if not allowed_node_ids:
-        return schemas.LookingGlassNodeList(items=[], next_cursor=None)
     cursor_id = 0
     if cursor:
         try:
@@ -893,7 +869,7 @@ def list_looking_glass_nodes(
             raise api_error(400, "invalid_request", "分页游标无效") from exc
     query = (
         select(models.Node)
-        .where(models.Node.id.in_(allowed_node_ids), models.Node.id > cursor_id)
+        .where(models.Node.id > cursor_id)
         .order_by(models.Node.id)
         .limit(limit + 1)
     )
@@ -925,7 +901,6 @@ def get_looking_glass_node(
 
     require_looking_glass_scope(api_key, LOOKING_GLASS_NODE_READ_SCOPE)
     node_id = parse_node_ref(node_ref_value)
-    require_looking_glass_node_access(api_key, node_id)
     node = db.get(models.Node, node_id)
     if node is None:
         raise api_error(404, "node_not_found", "节点不存在")
@@ -948,7 +923,6 @@ def create_looking_glass_query_task(
     """创建 Looking Glass 异步查询任务，并返回可轮询的 query_id。"""
 
     node_id = parse_node_ref(node_ref_value)
-    require_looking_glass_node_access(api_key, node_id)
     node = db.get(models.Node, node_id)
     if node is None:
         raise api_error(404, "node_not_found", "节点不存在")

@@ -2002,57 +2002,9 @@ textarea {
   grid-column: 1 / -1;
 }
 
-.tokenNodeList,
 .tokenList {
   display: grid;
   gap: 8px;
-}
-
-.tokenNodeList {
-  max-height: 260px;
-  overflow: auto;
-  overscroll-behavior: contain;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-solid);
-  padding: 6px;
-}
-
-.nodeCheckItem {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  padding: 8px 9px;
-}
-
-.nodeCheckItem:hover {
-  background: var(--surface-muted);
-}
-
-.nodeCheckItem input {
-  width: 16px;
-  min-height: 16px;
-  margin: 0;
-}
-
-.nodeCheckItem > span {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
-
-.nodeCheckItem strong,
-.nodeCheckItem small {
-  overflow-wrap: anywhere;
-}
-
-.nodeCheckItem small {
-  color: var(--muted);
 }
 
 .tokenReveal,

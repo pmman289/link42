@@ -53,6 +53,7 @@ from link42_api.main import (
     expire_stale_running_agent_tasks,
     get_controller_settings,
     get_db,
+    get_looking_glass_node,
     list_node_connections,
     get_setting,
     list_node_plugins_for_node,
@@ -61,6 +62,7 @@ from link42_api.main import (
     is_node_online,
     is_api_auth_exempt,
     list_import_candidates,
+    list_looking_glass_nodes,
     list_nodes,
     login,
     mimic_endpoint_payloads,
@@ -2630,14 +2632,11 @@ def test_create_looking_glass_token_returns_plaintext_once() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
-        node = models.Node(name="node-a", agent_token_hash="hash", endpoint_ips=["203.0.113.1"])
-        session.add(node)
-        session.commit()
         result = create_looking_glass_token(
             IntegrationApiTokenCreate(
                 name="public-lg",
                 scopes=["looking_glass.nodes.read", "looking_glass.bird.route"],
-                allowed_node_ids=[node.id],
+                allowed_node_ids=[999],
             ),
             session,
         )
@@ -2648,6 +2647,59 @@ def test_create_looking_glass_token_returns_plaintext_once() -> None:
     assert stored is not None
     assert stored.token_hash != result.token
     assert verify_token(result.token, stored.token_hash)
+    assert stored.allowed_node_ids == []
+    assert "allowed_node_ids" not in result.model_dump()
+
+
+def test_existing_looking_glass_token_accesses_nodes_created_later() -> None:
+    """验证已有 Token 自动访问后续新增节点，不受旧节点白名单字段限制。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        original_node = models.Node(name="node-a", agent_token_hash="hash-a")
+        session.add(original_node)
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="public-lg",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.nodes.read", "looking_glass.bird.route"],
+            allowed_node_ids=[original_node.id],
+            enabled=True,
+        )
+        session.add(api_key)
+        session.commit()
+        original_node_id = original_node.id
+
+        added_node = models.Node(
+            name="node-b",
+            region="华东",
+            agent_token_hash="hash-b",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_capabilities=["looking_glass.ping"],
+        )
+        session.add(added_node)
+        session.commit()
+        added_node_id = added_node.id
+
+        node_list = list_looking_glass_nodes(api_key=api_key, db=session)
+        node_detail = get_looking_glass_node(f"node_{added_node_id}", api_key, session)
+        response = Response()
+        query = submit_looking_glass_ping(
+            f"node_{added_node_id}",
+            LookingGlassPingRequest(target="1.1.1.1"),
+            response,
+            api_key,
+            session,
+        )
+
+    assert [item.node_ref for item in node_list.items] == [f"node_{original_node_id}", f"node_{added_node_id}"]
+    assert node_detail.node_ref == f"node_{added_node_id}"
+    assert response.status_code == 202
+    assert query.node_ref == f"node_{added_node_id}"
 
 
 def test_delete_looking_glass_token_removes_token_and_query_audit() -> None:

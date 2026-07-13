@@ -409,7 +409,6 @@ type LookingGlassApiToken = {
   token_prefix: string;
   token_hint: string;
   scopes: string[];
-  allowed_node_ids: number[];
   enabled: boolean;
   expires_at: string | null;
   last_used_at: string | null;
@@ -2938,16 +2937,11 @@ function App() {
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const scopes = ["looking_glass.nodes.read", "looking_glass.bird.route"];
-    const allowedNodeIds = form.getAll("lg_node_ids").map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0);
-    if (allowedNodeIds.length === 0) {
-      throw new Error("请至少选择一个允许访问的节点");
-    }
     const result = await api<LookingGlassApiTokenCreateResult>("/api/integrations/looking-glass/tokens", {
       method: "POST",
       body: JSON.stringify({
         name: String(form.get("lg_name") || "").trim(),
         scopes,
-        allowed_node_ids: allowedNodeIds,
         expires_at: localDateTimeToIso(form.get("lg_expires_at")),
       }),
     });
@@ -5415,27 +5409,7 @@ function App() {
                 <Field label="过期时间" hint="留空表示不设置固定过期时间。">
                   <input name="lg_expires_at" type="datetime-local" />
                 </Field>
-                <div className="field wideField">
-                  <span className="fieldLabel">
-                    允许访问的节点<span className="requiredMark" aria-label="必填">*</span>
-                  </span>
-                  {nodes.length > 0 ? (
-                    <div className="tokenNodeList">
-                      {nodes.map((node) => (
-                        <label key={node.id} className="nodeCheckItem">
-                          <input type="checkbox" name="lg_node_ids" value={node.id} defaultChecked />
-                          <span>
-                            <strong>{node.name}</strong>
-                            <small>{node.region || "未设置地域"} · {node.status === "online" ? "在线" : "离线"}</small>
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="empty">还没有节点，创建节点后才能生成 Looking Glass API Token。</div>
-                  )}
-                </div>
-                <button type="submit" disabled={nodes.length === 0 || actionPending("lg-token:create")}>
+                <button type="submit" disabled={actionPending("lg-token:create")}>
                   <Plus size={16} /> {actionPending("lg-token:create") ? "生成中" : "生成 Token"}
                 </button>
               </form>
@@ -5450,8 +5424,7 @@ function App() {
                         <span>{token.token_prefix}...{token.token_hint}</span>
                         <small>
                           {token.enabled && !token.revoked_at ? "已启用" : "已停用"}
-                          {" · 节点 "}
-                          {token.allowed_node_ids.length}
+                          {" · 全部节点"}
                           {" · 权限 "}
                           {token.scopes.length}
                           {" · 最后使用 "}

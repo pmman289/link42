@@ -1343,7 +1343,6 @@ class IntegrationApiTokenCreate(BaseModel):
 
     name: str = Field(min_length=1, max_length=120)
     scopes: list[str] = Field(default_factory=list)
-    allowed_node_ids: list[int] = Field(default_factory=list)
     expires_at: datetime | None = None
 
     @field_validator("scopes")
@@ -1360,23 +1359,11 @@ class IntegrationApiTokenCreate(BaseModel):
             raise ValueError("at least one scope is required")
         return cleaned
 
-    @field_validator("allowed_node_ids")
-    @classmethod
-    def validate_allowed_node_ids(cls, values: list[int]) -> list[int]:
-        """校验节点白名单 ID 必须为正整数并去重。"""
-
-        cleaned = sorted({int(value) for value in values if int(value) > 0})
-        if not cleaned:
-            raise ValueError("at least one node is required")
-        return cleaned
-
-
 class IntegrationApiTokenUpdate(BaseModel):
     """更新第三方 Looking Glass API Token 元数据请求。"""
 
     name: str | None = Field(default=None, min_length=1, max_length=120)
     scopes: list[str] | None = None
-    allowed_node_ids: list[int] | None = None
     enabled: bool | None = None
     expires_at: datetime | None = None
 
@@ -1389,16 +1376,6 @@ class IntegrationApiTokenUpdate(BaseModel):
             return None
         return IntegrationApiTokenCreate.validate_scopes(values)
 
-    @field_validator("allowed_node_ids")
-    @classmethod
-    def validate_optional_allowed_node_ids(cls, values: list[int] | None) -> list[int] | None:
-        """校验可选节点白名单，未传时不修改。"""
-
-        if values is None:
-            return None
-        return IntegrationApiTokenCreate.validate_allowed_node_ids(values)
-
-
 class IntegrationApiTokenRead(BaseModel):
     """第三方 Looking Glass API Token 元数据响应，不包含明文 Token。"""
 
@@ -1407,7 +1384,6 @@ class IntegrationApiTokenRead(BaseModel):
     token_prefix: str
     token_hint: str
     scopes: list[str]
-    allowed_node_ids: list[int]
     enabled: bool
     expires_at: datetime | None = None
     last_used_at: datetime | None = None

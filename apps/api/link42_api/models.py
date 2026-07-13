@@ -351,6 +351,7 @@ class IntegrationApiKey(TimestampMixin, Base):
     token_hash: Mapped[str] = mapped_column(String(128))
     token_hint: Mapped[str] = mapped_column(String(16))
     scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # 保留旧列以兼容现有数据库；节点访问已改为始终允许全部节点。
     allowed_node_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -10,6 +10,8 @@
 
 管理端 Token 由 Link42 管理员在主控面板的“系统设置 -> Looking Glass API Token”中生成。Looking Glass 服务只保存生成出的 Token，并通过 Bearer Token 调用第三方 API。
 
+每个有效 Token 均可访问主控中的全部当前节点和后续新增节点，不需要在添加节点后重新生成 Token。
+
 第三方接口里的时间字段统一使用 Unix 秒级时间戳，例如 `1783675800`。判断查询是否超时时，直接比较当前 Unix 时间和 `deadline_at`。
 
 如果 Link42 主控位于反向代理后方，Token 的最后来源 IP 会优先使用 `X-Forwarded-For`、`X-Real-IP`、`CF-Connecting-IP` 或 `Forwarded` 中的合法客户端 IP。
@@ -495,7 +497,7 @@ cancelled    查询被取消
 400 invalid_request          请求格式错误、IP 非法或目标地址非法
 401 invalid_api_key          API Token 不存在、禁用、吊销或过期
 403 permission_denied        Token 缺少所需权限
-404 node_not_found           节点不存在或不在 Token 白名单中
+404 node_not_found           节点不存在
 404 query_not_found          查询不存在或不属于当前 Token
 409 node_offline             节点离线
 409 capability_missing       节点不支持对应查询能力
