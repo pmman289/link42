@@ -14,6 +14,7 @@ SKIP_VERIFY="${SKIP_VERIFY:-0}"
 LOCAL_VERIFY="${LOCAL_VERIFY:-1}"
 TEST_CONTAINER="${TEST_CONTAINER:-link42-publish-test}"
 TEST_VOLUME="${TEST_VOLUME:-link42-publish-test-runtime}"
+LINK42_WEB_BUILD_IMAGE="${LINK42_WEB_BUILD_IMAGE:-node:20-bookworm-slim}"
 
 cd "$ROOT_DIR"
 
@@ -37,7 +38,16 @@ if [[ "$SKIP_VERIFY" != "1" ]]; then
   .venv/bin/python -m compileall apps/api apps/agent packages tests
 
   link42_log "building web"
-  npm run build --prefix apps/web
+  node_major="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || printf '0')"
+  if [[ "$node_major" -ge 20 ]]; then
+    npm run build --prefix apps/web
+  else
+    docker run --rm \
+      -v "$ROOT_DIR:/src" \
+      -w /src \
+      "$LINK42_WEB_BUILD_IMAGE" \
+      npm run build --prefix apps/web
+  fi
 
   link42_log "checking whitespace"
   git diff --check
@@ -79,7 +89,7 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
 
   password="$(
     docker logs "$TEST_CONTAINER" 2>&1 \
-      | sed -n -E 's/.*(Link42 initial login:|Link42 初始登录信息) username=pmman password=//p' \
+      | sed -n -E 's/.*(Link42 initial login:|Link42 初始登录信息) username=pmman password=([^ ]+).*/\2/p' \
       | tail -1
   )"
   if [[ -z "$password" ]]; then
