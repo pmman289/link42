@@ -5177,21 +5177,32 @@ def delete_managed_link(
 ) -> dict[str, str]:
     """同时删除受管连接双方；必须先断开双方接口。"""
 
-    local_interface, peer_interface, _, _ = get_managed_link_bundle(db, interface_id)
+    local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
     require_online_node(db, local_interface.node_id)
     require_online_node(db, peer_interface.node_id)
     if any(interface.runtime_status in ["running", "starting", "stopping"] for interface in [local_interface, peer_interface]):
         raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
     middleware = managed_link_middleware(local_interface)
+    if middleware and delete_node_config:
+        for target_interface, task_type, task_payload in middleware_task_payloads(
+            middleware,
+            local_interface,
+            peer_interface,
+            "delete",
+        ):
+            enqueue_interface_task_once(db, target_interface, task_type, task_payload)
     for interface in [local_interface, peer_interface]:
-        if middleware and delete_node_config:
-            for target_interface, task_type, task_payload in middleware_task_payloads(middleware, local_interface, peer_interface, "delete"):
-                if target_interface.id == interface.id:
-                    enqueue_interface_task_once(db, target_interface, task_type, task_payload)
         mark_import_candidate_available_for_interface(db, interface)
         if delete_node_config and should_delete_node_config_file(interface):
             driver = connection_driver_for_interface(interface)
             enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
+
+    # 双向 Peer 通过 peer_interface_id 交叉引用双方接口。先删除并 flush Peer，
+    # 避免删除首个接口后，加载第二个接口的监测关系触发自动 flush 和外键失败。
+    local_interface.peers.remove(local_peer)
+    peer_interface.peers.remove(peer_peer)
+    db.flush()
+    for interface in [local_interface, peer_interface]:
         db.delete(interface)
     db.commit()
     return {"status": "deleted"}

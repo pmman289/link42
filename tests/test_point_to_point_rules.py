@@ -2575,6 +2575,78 @@ def test_delete_managed_link_removes_node_configs_when_requested() -> None:
     assert [task.type for task in tasks] == ["wireguard.delete_config", "wireguard.delete_config"]
 
 
+def test_delete_managed_link_from_reloaded_peer_side_removes_monitors() -> None:
+    """验证从对端删除重新加载的连接时，不会因双向 Peer 和监测外键触发自动 flush 失败。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        node_b = models.Node(name="node-b", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
+        local = models.WireGuardInterface(node=node_a, name="wg-a", source="managed-node", managed=True, runtime_status="stopped")
+        peer = models.WireGuardInterface(node=node_b, name="wg-b", source="managed-node", managed=True, runtime_status="stopped")
+        session.add_all([node_a, node_b, local, peer])
+        session.flush()
+        session.add_all([
+            models.WireGuardPeer(
+                interface=local,
+                peer_interface_id=peer.id,
+                peer_node_id=node_b.id,
+                source="managed-node",
+                public_key="peer-public",
+            ),
+            models.WireGuardPeer(
+                interface=peer,
+                peer_interface_id=local.id,
+                peer_node_id=node_a.id,
+                source="managed-node",
+                public_key="local-public",
+            ),
+        ])
+        local_monitor = models.LinkMonitor(
+            node_id=node_a.id,
+            interface=local,
+            name="local latency",
+            target_host="10.42.0.2",
+        )
+        peer_monitor = models.LinkMonitor(
+            node_id=node_b.id,
+            interface=peer,
+            name="peer latency",
+            target_host="10.42.0.1",
+        )
+        session.add_all([local_monitor, peer_monitor])
+        session.flush()
+        session.add_all([
+            models.LinkMonitorSample(
+                monitor=local_monitor,
+                checked_at=datetime.utcnow(),
+                success=True,
+                latency_ms=1.0,
+            ),
+            models.LinkMonitorSample(
+                monitor=peer_monitor,
+                checked_at=datetime.utcnow(),
+                success=True,
+                latency_ms=2.0,
+            ),
+        ])
+        session.commit()
+        local_id = local.id
+        peer_id = peer.id
+
+    with Session(engine) as session:
+        result = delete_managed_link(peer_id, db=session)
+
+    with Session(engine) as session:
+        assert result == {"status": "deleted"}
+        assert session.get(models.WireGuardInterface, local_id) is None
+        assert session.get(models.WireGuardInterface, peer_id) is None
+        assert list(session.scalars(select(models.WireGuardPeer))) == []
+        assert list(session.scalars(select(models.LinkMonitor))) == []
+        assert list(session.scalars(select(models.LinkMonitorSample))) == []
+
+
 def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeypatch) -> None:
     """验证主控保存 Agent 版本能力，并不会把不支持的任务交给旧 Agent。"""
 
