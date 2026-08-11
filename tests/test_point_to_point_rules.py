@@ -17,7 +17,7 @@ from link42_common.connection_types import (
     WIREGUARD_TASKS,
 )
 from pydantic import ValidationError
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -1319,20 +1319,73 @@ def test_delete_node_requires_all_wireguard_configs_removed() -> None:
             delete_node(node.id, session)
 
     assert exc_info.value.status_code == 409
-    assert exc_info.value.detail == "node has wireguard configs"
+    assert exc_info.value.detail == "node has connections"
 
 
-def test_delete_node_removes_empty_node_related_tasks_and_candidates() -> None:
-    """验证空节点可删除，并清理历史任务和扫描候选。"""
+def test_delete_node_requires_all_connection_endpoints_removed() -> None:
+    """验证节点仍属于 GRE 等通用连接时不能删除节点。"""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
+        node = models.Node(name="node-a", agent_token_hash="hash", status="offline")
+        connection = models.Connection(protocol_type="gre", name="gre-a-b")
+        endpoint = models.ConnectionEndpoint(
+            connection=connection,
+            node=node,
+            role="local",
+            interface_name="gre-a",
+            tunnel_ips=["10.42.0.1/30"],
+            routes=[],
+            protocol_config={},
+        )
+        session.add_all([node, connection, endpoint])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            delete_node(node.id, session)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "node has connections"
+
+
+def test_delete_node_removes_empty_node_related_tasks_and_candidates() -> None:
+    """验证空节点可删除，并按外键顺序清理 LG 查询、任务及其他历史数据。"""
+
+    engine = create_engine("sqlite:///:memory:")
+
+    def enable_foreign_keys(dbapi_connection, _connection_record) -> None:
+        """为该回归库启用 SQLite 外键约束。"""
+
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    event.listen(engine, "connect", enable_foreign_keys)
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
         node = models.Node(name="node-a", agent_token_hash="hash", status="offline", endpoint_ips=["10.0.0.1"])
         session.add(node)
-        session.commit()
+        session.flush()
         node_id = node.id
-        session.add(models.AgentTask(node_id=node_id, type="wireguard.import_scan", payload={}))
+        task = models.AgentTask(node_id=node_id, type="looking_glass.ping", payload={})
+        api_key = models.IntegrationApiKey(
+            name="LG",
+            token_prefix="l42lg_test",
+            token_hash="hash",
+            token_hint="test",
+        )
+        session.add_all([task, api_key])
+        session.flush()
+        session.add(
+            models.LookingGlassQuery(
+                public_id="lgq_test",
+                api_key_id=api_key.id,
+                node_id=node_id,
+                operation="ping",
+                request={},
+                request_fingerprint="fingerprint",
+                agent_task_id=task.id,
+            )
+        )
         session.add(
             models.ImportCandidate(
                 node_id=node_id,
@@ -1341,17 +1394,50 @@ def test_delete_node_removes_empty_node_related_tasks_and_candidates() -> None:
                 parsed={"name": "wg0"},
             )
         )
+        session.add(models.PortInventorySetting(node_id=node_id, range_start=23000, range_end=23099))
+        session.add(
+            models.PortInventoryEntry(
+                node_id=node_id,
+                protocol="udp",
+                port=23000,
+                purpose="测试",
+            )
+        )
+        monitor = models.LinkMonitor(node_id=node_id, name="历史监测", target_host="10.0.0.2")
+        session.add(monitor)
+        session.flush()
+        session.add(
+            models.LinkMonitorSample(
+                monitor_id=monitor.id,
+                checked_at=datetime.utcnow(),
+                success=True,
+                latency_ms=1.0,
+            )
+        )
         session.commit()
+        api_key_id = api_key.id
 
         result = delete_node(node_id, session)
         node_count = session.scalar(select(models.Node).where(models.Node.id == node_id))
         task_count = session.scalar(select(models.AgentTask).where(models.AgentTask.node_id == node_id))
         candidate_count = session.scalar(select(models.ImportCandidate).where(models.ImportCandidate.node_id == node_id))
+        query_count = session.scalar(select(models.LookingGlassQuery).where(models.LookingGlassQuery.node_id == node_id))
+        monitor_count = session.scalar(select(models.LinkMonitor).where(models.LinkMonitor.node_id == node_id))
+        sample_count = session.scalar(select(models.LinkMonitorSample))
+        entry_count = session.scalar(select(models.PortInventoryEntry).where(models.PortInventoryEntry.node_id == node_id))
+        setting_count = session.scalar(select(models.PortInventorySetting).where(models.PortInventorySetting.node_id == node_id))
+        remaining_api_key = session.get(models.IntegrationApiKey, api_key_id)
 
     assert result == {"status": "deleted"}
     assert node_count is None
     assert task_count is None
     assert candidate_count is None
+    assert query_count is None
+    assert monitor_count is None
+    assert sample_count is None
+    assert entry_count is None
+    assert setting_count is None
+    assert remaining_api_key is not None
 
 
 def test_import_scan_result_removes_stale_unimported_candidates(monkeypatch) -> None:
@@ -2576,7 +2662,7 @@ def test_delete_managed_link_removes_node_configs_when_requested() -> None:
 
 
 def test_delete_managed_link_from_reloaded_peer_side_removes_monitors() -> None:
-    """验证从对端删除重新加载的连接时，不会因双向 Peer 和监测外键触发自动 flush 失败。"""
+    """验证从对端删除连接时，监测历史使用集合 SQL 清理且不会触发外键失败。"""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -2617,26 +2703,37 @@ def test_delete_managed_link_from_reloaded_peer_side_removes_monitors() -> None:
         )
         session.add_all([local_monitor, peer_monitor])
         session.flush()
-        session.add_all([
-            models.LinkMonitorSample(
-                monitor=local_monitor,
-                checked_at=datetime.utcnow(),
-                success=True,
-                latency_ms=1.0,
-            ),
-            models.LinkMonitorSample(
-                monitor=peer_monitor,
-                checked_at=datetime.utcnow(),
-                success=True,
-                latency_ms=2.0,
-            ),
-        ])
+        checked_at = datetime.utcnow()
+        session.add_all(
+            [
+                models.LinkMonitorSample(
+                    monitor=monitor,
+                    checked_at=checked_at,
+                    success=True,
+                    latency_ms=float(index),
+                )
+                for monitor in [local_monitor, peer_monitor]
+                for index in range(250)
+            ]
+        )
         session.commit()
         local_id = local.id
         peer_id = peer.id
 
-    with Session(engine) as session:
-        result = delete_managed_link(peer_id, db=session)
+    sample_delete_statements: list[tuple[str, bool]] = []
+
+    def capture_sample_deletes(_conn, _cursor, statement, _parameters, _context, executemany) -> None:
+        """记录历史样本删除语句及其是否使用逐参数批处理。"""
+
+        if statement.startswith("DELETE FROM link_monitor_samples"):
+            sample_delete_statements.append((statement, executemany))
+
+    event.listen(engine, "before_cursor_execute", capture_sample_deletes)
+    try:
+        with Session(engine) as session:
+            result = delete_managed_link(peer_id, db=session)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sample_deletes)
 
     with Session(engine) as session:
         assert result == {"status": "deleted"}
@@ -2645,6 +2742,8 @@ def test_delete_managed_link_from_reloaded_peer_side_removes_monitors() -> None:
         assert list(session.scalars(select(models.WireGuardPeer))) == []
         assert list(session.scalars(select(models.LinkMonitor))) == []
         assert list(session.scalars(select(models.LinkMonitorSample))) == []
+    assert len(sample_delete_statements) == 1
+    assert sample_delete_statements[0][1] is False
 
 
 def test_agent_register_saves_version_and_poll_filters_unsupported_tasks(monkeypatch) -> None:

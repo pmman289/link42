@@ -2608,6 +2608,27 @@ def parse_monitor_window(value: str | None) -> timedelta:
     return mapping[key]
 
 
+def delete_link_monitors_where(db: Session, *criteria: Any) -> tuple[int, int]:
+    """按条件集合删除链路监测及历史样本，避免 ORM 逐条加载大量样本。"""
+
+    if not criteria:
+        raise ValueError("link monitor deletion criteria must not be empty")
+    monitor_ids = select(models.LinkMonitor.id).where(*criteria)
+    sample_result = db.execute(
+        delete(models.LinkMonitorSample).where(models.LinkMonitorSample.monitor_id.in_(monitor_ids)),
+        execution_options={"synchronize_session": False},
+    )
+    monitor_result = db.execute(
+        delete(models.LinkMonitor).where(*criteria),
+        execution_options={"synchronize_session": False},
+    )
+    sample_count = max(sample_result.rowcount or 0, 0)
+    monitor_count = max(monitor_result.rowcount or 0, 0)
+    if monitor_count or sample_count:
+        logger.info("批量删除链路监测 monitor_count=%d sample_count=%d", monitor_count, sample_count)
+    return monitor_count, sample_count
+
+
 def monitor_status(latency_ms: float | None, packet_loss: float, stability_score: int, sample_count: int) -> str:
     """把监测指标归类为前端颜色状态。"""
 
@@ -3552,6 +3573,7 @@ def queue_replace_interface(db: Session, interface: models.WireGuardInterface) -
     if should_delete_node_config_file(interface):
         enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
     mark_import_candidate_available_for_interface(db, interface)
+    delete_link_monitors_where(db, models.LinkMonitor.interface_id == interface.id)
     db.delete(interface)
 
 
@@ -4274,10 +4296,15 @@ def delete_connection(raw_connection_ref: str, db: Session = Depends(get_db)) ->
         raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
     connection = get_gre_connection_or_404(db, item_id)
     connection_id = connection.id
-    for endpoint in list(connection.endpoints):
+    endpoints = list(connection.endpoints)
+    for endpoint in endpoints:
         require_online_node(db, endpoint.node_id)
         stop_task = create_connection_endpoint_task(db, endpoint, GRE_TASKS.stop)
         create_connection_endpoint_task(db, endpoint, GRE_TASKS.delete_config, {"depends_on_task_id": stop_task.id})
+    delete_link_monitors_where(
+        db,
+        models.LinkMonitor.connection_endpoint_id.in_([endpoint.id for endpoint in endpoints]),
+    )
     db.delete(connection)
     db.commit()
     logger.info("删除 GRE 连接 connection_id=%s", connection_id)
@@ -4554,21 +4581,39 @@ def reset_topology_layout(db: Session = Depends(get_db)) -> schemas.TopologyRead
 
 @app.delete("/api/nodes/{node_id}")
 def delete_node(node_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
-    """删除节点；节点下存在 WireGuard 配置时必须先清空配置。"""
+    """删除空节点及其历史数据；仍参与连接的节点必须先清空连接。"""
 
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
-    interface_count = db.scalar(
+    wireguard_interface = db.scalar(
         select(models.WireGuardInterface).where(models.WireGuardInterface.node_id == node_id).limit(1)
     )
-    if interface_count is not None:
-        raise HTTPException(status_code=409, detail="node has wireguard configs")
+    connection_endpoint = db.scalar(
+        select(models.ConnectionEndpoint).where(models.ConnectionEndpoint.node_id == node_id).limit(1)
+    )
+    peer_reference = db.scalar(
+        select(models.WireGuardPeer).where(models.WireGuardPeer.peer_node_id == node_id).limit(1)
+    )
+    if wireguard_interface is not None or connection_endpoint is not None or peer_reference is not None:
+        raise HTTPException(status_code=409, detail="node has connections")
     node_name = node.name
-    for candidate in db.scalars(select(models.ImportCandidate).where(models.ImportCandidate.node_id == node_id)):
-        db.delete(candidate)
-    for task in db.scalars(select(models.AgentTask).where(models.AgentTask.node_id == node_id)):
-        db.delete(task)
+
+    delete_link_monitors_where(db, models.LinkMonitor.node_id == node_id)
+    db.execute(
+        delete(models.LookingGlassQuery).where(models.LookingGlassQuery.node_id == node_id),
+        execution_options={"synchronize_session": False},
+    )
+    for model in [
+        models.ImportCandidate,
+        models.PortInventoryEntry,
+        models.PortInventorySetting,
+        models.AgentTask,
+    ]:
+        db.execute(
+            delete(model).where(model.node_id == node_id),
+            execution_options={"synchronize_session": False},
+        )
     db.delete(node)
     db.commit()
     logger.info("删除节点 node_id=%s name=%s", node_id, node_name)
@@ -4970,7 +5015,7 @@ def delete_link_monitor(monitor_id: int, db: Session = Depends(get_db)) -> dict[
     monitor = db.get(models.LinkMonitor, monitor_id)
     if monitor is None:
         raise HTTPException(status_code=404, detail="link monitor not found")
-    db.delete(monitor)
+    delete_link_monitors_where(db, models.LinkMonitor.id == monitor_id)
     db.commit()
     return {"status": "deleted"}
 
@@ -5197,6 +5242,11 @@ def delete_managed_link(
             driver = connection_driver_for_interface(interface)
             enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
 
+    delete_link_monitors_where(
+        db,
+        models.LinkMonitor.interface_id.in_([local_interface.id, peer_interface.id]),
+    )
+
     # 双向 Peer 通过 peer_interface_id 交叉引用双方接口。先删除并 flush Peer，
     # 避免删除首个接口后，加载第二个接口的监测关系触发自动 flush 和外键失败。
     local_interface.peers.remove(local_peer)
@@ -5418,6 +5468,7 @@ def delete_interface(
     interface = get_wireguard_config_or_404(interface_id, db)
     if interface.source == "imported" and not interface.managed:
         mark_import_candidate_available_for_interface(db, interface)
+        delete_link_monitors_where(db, models.LinkMonitor.interface_id == interface.id)
         db.delete(interface)
         db.commit()
         return {"status": "deleted"}
@@ -5429,6 +5480,7 @@ def delete_interface(
     if delete_node_config and should_delete_node_config_file(interface):
         driver = connection_driver_for_interface(interface)
         enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
+    delete_link_monitors_where(db, models.LinkMonitor.interface_id == interface.id)
     db.delete(interface)
     db.commit()
     return {"status": "deleted"}

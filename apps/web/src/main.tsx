@@ -648,6 +648,7 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "local imported endpoint does not point to peer node": "本端导入配置的入口地址不指向所选对端节点",
   "peer imported endpoint does not point to local node": "对端导入配置的入口地址不指向当前节点",
   "node has wireguard configs": "节点下仍有 WireGuard 配置，请先删除所有配置",
+  "node has connections": "节点仍有关联连接，请先删除该节点的所有连接",
   "connection not found": "连接不存在",
   "use wireguard API for WireGuard connections": "WireGuard 连接请使用 WireGuard 配置入口操作",
   "gre connection endpoints are incomplete": "GRE 连接端点不完整，请重新创建",
@@ -5649,7 +5650,7 @@ function App() {
             </section>
             <section className="modalSection dangerZone">
               <h3>删除节点</h3>
-              <p className="muted">只有节点下所有 WireGuard 配置都已删除时，才允许删除节点。</p>
+              <p className="muted">只有节点下所有连接配置都已删除时，才允许删除节点。</p>
               <button className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "delete"))} onClick={() => void runAction(deleteEditingNode, nodeActionKey(editingNode.id, "delete"))}>
                 删除节点
               </button>
