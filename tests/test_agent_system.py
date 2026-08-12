@@ -569,14 +569,70 @@ def test_gre_capability_depends_on_iproute2(monkeypatch) -> None:
         "has_mimic": False,
     }
     monkeypatch.setattr(main, "gre_runtime_supported", lambda: True)
+    monkeypatch.setattr(main, "gre_ipv6_runtime_supported", lambda: True)
     monkeypatch.setattr(main, "mimic_installable", lambda platform: False)
     monkeypatch.setattr(main, "mimic_runtime_supported", lambda platform: False)
 
     assert "gre" in main.build_capabilities(platform_info)
     assert "gre.iproute2" in main.build_capabilities(platform_info)
+    assert "gre.ipv6" in main.build_capabilities(platform_info)
 
     monkeypatch.setattr(main, "gre_runtime_supported", lambda: False)
     assert "gre" not in main.build_capabilities(platform_info)
+
+
+def test_gre_ipv6_start_uses_ip6gre_hoplimit_and_ipv6_default_mtu(monkeypatch, tmp_path: Path) -> None:
+    """验证 Linux GRE over IPv6 使用 ip6gre、hoplimit 和 IPv6 推荐 MTU。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """记录 GRE over IPv6 启动命令。"""
+
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    gre.start_gre_interface(
+        {
+            "interface_name": "gre6_ab",
+            "outer_local_ip": "2001:db8:1::1",
+            "outer_remote_ip": "2001:db8:2::1",
+            "tunnel_ips": ["10.42.9.1/30", "fd42:9::1/64"],
+            "routes": [],
+            "key": "42",
+            "ttl": 63,
+            "pmtudisc": False,
+        },
+        str(tmp_path),
+    )
+
+    assert commands == [
+        ["/sbin/ip", "link", "del", "gre6_ab"],
+        [
+            "/sbin/ip",
+            "-6",
+            "tunnel",
+            "add",
+            "gre6_ab",
+            "mode",
+            "ip6gre",
+            "local",
+            "2001:db8:1::1",
+            "remote",
+            "2001:db8:2::1",
+            "key",
+            "42",
+            "hoplimit",
+            "63",
+        ],
+        ["/sbin/ip", "addr", "add", "10.42.9.1/30", "dev", "gre6_ab"],
+        ["/sbin/ip", "addr", "add", "fd42:9::1/64", "dev", "gre6_ab"],
+        ["/sbin/ip", "link", "set", "dev", "gre6_ab", "mtu", "1456", "up"],
+    ]
 
 
 def test_gre_runtime_probe_treats_help_exit_as_expected(monkeypatch) -> None:
@@ -1001,6 +1057,58 @@ def test_openwrt_gre_status_reads_ifstatus_and_generated_device(monkeypatch) -> 
     assert result["runtime_status"] == "running"
     assert result["service_backend"] == "openwrt-uci"
     assert result["link"]["command"] == ["/sbin/ip", "link", "show", "dev", "gre4-gre_ab"]
+
+
+def test_openwrt_gre_ipv6_writes_grev6_fields_and_reads_gre6_device(monkeypatch, tmp_path: Path) -> None:
+    """验证 OpenWrt GRE over IPv6 使用 grev6 字段和 gre6 内核设备。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """模拟 OpenWrt GRE over IPv6 配置和状态命令。"""
+
+        commands.append(command)
+        if command == ["/sbin/uci", "-q", "show", "network"]:
+            return command_result(command, stdout="")
+        if command == ["ifstatus", "gre6_ab"]:
+            return command_result(command, stdout='{"up": true}\n')
+        if command == ["/sbin/ip", "link", "show", "dev", "gre6-gre6_ab"]:
+            return command_result(command, stdout="9: gre6-gre6_ab@NONE: <POINTOPOINT,NOARP,UP> state UNKNOWN\n")
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "openwrt_gre_available", lambda: True)
+    monkeypatch.setattr(gre, "openwrt_gre_ipv6_supported", lambda: True)
+    monkeypatch.setattr(gre, "uci_command", lambda: "/sbin/uci")
+    monkeypatch.setattr(gre, "ifup_command", lambda: "/sbin/ifup")
+    monkeypatch.setattr(gre, "ifdown_command", lambda: "/sbin/ifdown")
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    gre.start_gre_interface(
+        {
+            "interface_name": "gre6_ab",
+            "outer_local_ip": "2001:db8:1::1",
+            "outer_remote_ip": "2001:db8:2::1",
+            "tunnel_ips": ["fd42:9::1/64"],
+            "routes": [],
+            "ttl": 63,
+        },
+        str(tmp_path),
+    )
+    status = gre.gre_status(
+        {
+            "interface_name": "gre6_ab",
+            "outer_local_ip": "2001:db8:1::1",
+            "outer_remote_ip": "2001:db8:2::1",
+        }
+    )
+
+    assert ["/sbin/uci", "set", "network.gre6_ab.proto=grev6"] in commands
+    assert ["/sbin/uci", "set", "network.gre6_ab.ip6addr=2001:db8:1::1"] in commands
+    assert ["/sbin/uci", "set", "network.gre6_ab.peer6addr=2001:db8:2::1"] in commands
+    assert not any(".df=" in item for command in commands for item in command)
+    assert status["runtime_status"] == "running"
+    assert status["link"]["command"] == ["/sbin/ip", "link", "show", "dev", "gre6-gre6_ab"]
 
 
 def test_gre_systemd_start_uses_agent_service_entry(monkeypatch, tmp_path: Path) -> None:

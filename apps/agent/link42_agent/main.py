@@ -20,7 +20,13 @@ from link42_common.version import AGENT_VERSION
 from .client import AgentClient, AgentConnectionError, AgentHttpError
 from .config import AgentConfig
 from .config import load_config_from_env
-from .gre import gre_runtime_supported, openwrt_gre_supported, start_gre_from_config
+from .gre import (
+    gre_ipv6_runtime_supported,
+    gre_runtime_supported,
+    openwrt_gre_ipv6_supported,
+    openwrt_gre_supported,
+    start_gre_from_config,
+)
 from .link_monitor import probe_latency
 from .middleware import mimic_official_release_codename_supported
 from .plugins import node_plugin_capabilities
@@ -93,11 +99,15 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
             "gre",
             "gre.openwrt-uci",
         ])
+        if openwrt_gre_ipv6_supported():
+            capabilities.append("gre.ipv6")
     elif service_manager != "openwrt-uci" and gre_runtime_supported():
         capabilities.extend([
             "gre",
             "gre.iproute2",
         ])
+        if gre_ipv6_runtime_supported():
+            capabilities.append("gre.ipv6")
     if service_manager in ["systemd", "openwrt-uci"]:
         capabilities.extend([
             "middleware",

@@ -31,6 +31,18 @@ def gre_runtime_supported() -> bool:
 
 
 @lru_cache(maxsize=1)
+def gre_ipv6_runtime_supported() -> bool:
+    """判断当前节点的 iproute2 是否支持 IP6GRE。"""
+
+    ip_binary = shutil.which("ip")
+    if not ip_binary:
+        return False
+    result = run_command([ip_binary, "-6", "tunnel", "help"], allow_failure=True, log_failure=False)
+    output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".lower()
+    return "ip6gre" in output
+
+
+@lru_cache(maxsize=1)
 def openwrt_gre_supported() -> bool:
     """判断当前 OpenWrt 节点是否具备 netifd GRE 管理能力。"""
 
@@ -42,10 +54,42 @@ def openwrt_gre_supported() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def openwrt_gre_ipv6_supported() -> bool:
+    """判断 OpenWrt netifd 和内核模块是否支持 GRE over IPv6。"""
+
+    if not openwrt_gre_supported():
+        return False
+    try:
+        script = Path(OPENWRT_GRE_PROTO_PATH).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    module_paths = list(Path("/lib/modules").glob("*/ip6_gre.ko*"))
+    module_available = Path("/sys/module/ip6_gre").exists() or bool(module_paths)
+    return "proto_grev6_setup" in script and module_available
+
+
 def openwrt_gre_available() -> bool:
     """判断当前任务是否应走 OpenWrt UCI GRE 后端。"""
 
     return openwrt_gre_supported()
+
+
+def gre_outer_ip_version(config: dict[str, Any]) -> int:
+    """返回 GRE 外层地址版本，兼容未保存显式版本的旧配置。"""
+
+    if config.get("outer_ip_version"):
+        return int(config["outer_ip_version"])
+    if config.get("outer_local_ip"):
+        return ipaddress.ip_address(config["outer_local_ip"]).version
+    return 4
+
+
+def require_openwrt_gre_family_supported(config: dict[str, Any]) -> None:
+    """拒绝当前 OpenWrt 缺少 netifd 或内核支持的 GRE 地址族。"""
+
+    if gre_outer_ip_version(config) == 6 and not openwrt_gre_ipv6_supported():
+        raise RuntimeError("OpenWrt does not support GRE over IPv6")
 
 
 def gre_config_dir(path: str | None = None) -> Path:
@@ -151,6 +195,15 @@ def install_gre_systemd_unit(config_dir: str | None = None, dry_run: bool = Fals
 def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """清洗 Agent GRE 任务 payload，确保后续渲染字段稳定。"""
 
+    outer_local_ip = str(payload["outer_local_ip"]).strip()
+    outer_remote_ip = str(payload["outer_remote_ip"]).strip()
+    try:
+        local_address = ipaddress.ip_address(outer_local_ip)
+        remote_address = ipaddress.ip_address(outer_remote_ip)
+    except ValueError as exc:
+        raise ValueError("GRE outer addresses must be IP literals") from exc
+    if local_address.version != remote_address.version:
+        raise ValueError("GRE outer addresses must use the same IP version")
     config = {
         "interface_name": validate_interface_name(payload["interface_name"]),
         "previous_interface_name": (
@@ -158,16 +211,17 @@ def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if str(payload.get("previous_interface_name") or "").strip()
             else None
         ),
-        "outer_local_ip": str(payload["outer_local_ip"]).strip(),
-        "outer_remote_ip": str(payload["outer_remote_ip"]).strip(),
+        "outer_local_ip": outer_local_ip,
+        "outer_remote_ip": outer_remote_ip,
+        "outer_ip_version": local_address.version,
         "tunnel_ips": [str(item).strip() for item in payload.get("tunnel_ips") or [] if str(item).strip()],
         "routes": [str(item).strip() for item in payload.get("routes") or [] if str(item).strip()],
-        "mtu": int(payload.get("mtu") or 1476),
+        "mtu": int(payload.get("mtu") or (1456 if local_address.version == 6 else 1476)),
         "key": str(payload.get("key") or "").strip() or None,
         "ttl": int(payload["ttl"]) if payload.get("ttl") is not None else None,
         "pmtudisc": bool(payload.get("pmtudisc", True)),
     }
-    if config["ttl"] is not None and not config["pmtudisc"]:
+    if config["outer_ip_version"] == 4 and config["ttl"] is not None and not config["pmtudisc"]:
         raise ValueError("GRE ttl requires PMTU discovery")
     return config
 
@@ -232,23 +286,27 @@ def ifdown_command() -> str:
 def gre_tunnel_add_command(config: dict[str, Any]) -> list[str]:
     """生成创建 GRE tunnel 的 ip 命令。"""
 
-    command = [
-        ip_command(),
+    outer_ip_version = gre_outer_ip_version(config)
+    command = [ip_command()]
+    if outer_ip_version == 6:
+        command.append("-6")
+    command.extend([
         "tunnel",
         "add",
         config["interface_name"],
         "mode",
-        "gre",
+        "ip6gre" if outer_ip_version == 6 else "gre",
         "local",
         config["outer_local_ip"],
         "remote",
         config["outer_remote_ip"],
-    ]
+    ])
     if config.get("key"):
         command.extend(["key", str(config["key"])])
     if config.get("ttl") is not None:
-        command.extend(["ttl", str(config["ttl"])])
-    command.append("pmtudisc" if config.get("pmtudisc", True) else "nopmtudisc")
+        command.extend(["hoplimit" if outer_ip_version == 6 else "ttl", str(config["ttl"])])
+    if outer_ip_version == 4:
+        command.append("pmtudisc" if config.get("pmtudisc", True) else "nopmtudisc")
     return command
 
 
@@ -286,10 +344,10 @@ def openwrt_gre_addr_section(interface_name: str) -> str:
     return f"{interface_name}_addr"
 
 
-def openwrt_gre_device_name(interface_name: str) -> str:
+def openwrt_gre_device_name(interface_name: str, outer_ip_version: int = 4) -> str:
     """返回 OpenWrt netifd 为 GRE section 生成的内核设备名。"""
 
-    return f"gre4-{interface_name}"
+    return f"gre6-{interface_name}" if outer_ip_version == 6 else f"gre4-{interface_name}"
 
 
 def openwrt_route_section(interface_name: str, version: int, index: int) -> str:
@@ -360,16 +418,19 @@ def openwrt_apply_gre_commands(config: dict[str, Any], *, autostart: bool = True
 
     interface_name = config["interface_name"]
     addr_section = openwrt_gre_addr_section(interface_name)
+    outer_ip_version = gre_outer_ip_version(config)
+    proto = "grev6" if outer_ip_version == 6 else "gre"
+    local_field = "ip6addr" if outer_ip_version == 6 else "ipaddr"
+    remote_field = "peer6addr" if outer_ip_version == 6 else "peeraddr"
     auto_value = "1" if autostart else "0"
     commands = openwrt_delete_gre_config_commands(interface_name)
     commands.extend(
         [
             [uci_command(), "set", f"network.{interface_name}=interface"],
-            [uci_command(), "set", f"network.{interface_name}.proto=gre"],
-            [uci_command(), "set", f"network.{interface_name}.ipaddr={config['outer_local_ip']}"],
-            [uci_command(), "set", f"network.{interface_name}.peeraddr={config['outer_remote_ip']}"],
+            [uci_command(), "set", f"network.{interface_name}.proto={proto}"],
+            [uci_command(), "set", f"network.{interface_name}.{local_field}={config['outer_local_ip']}"],
+            [uci_command(), "set", f"network.{interface_name}.{remote_field}={config['outer_remote_ip']}"],
             [uci_command(), "set", f"network.{interface_name}.mtu={config['mtu']}"],
-            [uci_command(), "set", f"network.{interface_name}.df={'1' if config.get('pmtudisc', True) else '0'}"],
             [uci_command(), "set", f"network.{interface_name}.auto={auto_value}"],
             [uci_command(), "set", f"network.{interface_name}.link42_managed=1"],
             [uci_command(), "set", f"network.{interface_name}.link42_gre_name={interface_name}"],
@@ -381,6 +442,8 @@ def openwrt_apply_gre_commands(config: dict[str, Any], *, autostart: bool = True
             [uci_command(), "set", f"network.{addr_section}.link42_gre_name={interface_name}"],
         ]
     )
+    if outer_ip_version == 4:
+        commands.append([uci_command(), "set", f"network.{interface_name}.df={'1' if config.get('pmtudisc', True) else '0'}"])
     if config.get("ttl") is not None:
         commands.append([uci_command(), "set", f"network.{interface_name}.ttl={config['ttl']}"])
     if config.get("key"):
@@ -411,6 +474,7 @@ def run_openwrt_gre_commands(commands: list[list[str]], allow_delete_failure: bo
 def apply_openwrt_gre_config(config: dict[str, Any], config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
     """写入 OpenWrt GRE UCI 配置，不主动拉起接口。"""
 
+    require_openwrt_gre_family_supported(config)
     path = write_gre_config(config, config_dir)
     commands = openwrt_apply_gre_commands(config, autostart=True)
     if dry_run:
@@ -433,6 +497,7 @@ def apply_openwrt_gre_config(config: dict[str, Any], config_dir: str | None = No
 def start_openwrt_gre_interface(config: dict[str, Any], config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
     """通过 OpenWrt netifd 启动 GRE 隧道和承载地址的 static 接口。"""
 
+    require_openwrt_gre_family_supported(config)
     path = write_gre_config(config, config_dir)
     addr_section = openwrt_gre_addr_section(config["interface_name"])
     commands = openwrt_apply_gre_commands(config, autostart=True)
@@ -737,7 +802,8 @@ def gre_status(payload: dict[str, Any]) -> dict[str, Any]:
                 status_payload = json.loads(str(ifstatus.get("stdout") or "{}"))
             except json.JSONDecodeError:
                 status_payload = {}
-        device_name = openwrt_gre_device_name(interface_name)
+        outer_ip_version = gre_outer_ip_version(payload)
+        device_name = openwrt_gre_device_name(interface_name, outer_ip_version)
         result = run_command([ip_command(), "link", "show", "dev", device_name], allow_failure=True)
         running = bool(status_payload.get("up")) or (
             result["returncode"] == 0 and gre_link_stdout_is_running(str(result.get("stdout") or ""))

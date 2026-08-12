@@ -656,6 +656,8 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "gre risk must be accepted": "创建或修改 GRE 前需要确认风险提示",
   "gre outer addresses must be different": "GRE 双方外层地址不能相同",
   "gre endpoint local and remote addresses must be different": "同一端的 GRE 绑定 IP 和连接对端 IP 不能相同",
+  "gre outer addresses must use the same IP version": "GRE 外层地址必须全部使用相同的 IPv4 或 IPv6 版本",
+  "agent does not support GRE over IPv6": "节点 Agent 尚不支持 GRE over IPv6，请升级 Agent 后重试",
   "gre ttl requires pmtu discovery": "填写 GRE TTL 时必须启用 PMTU discovery",
   "protocol_type must be gre": "连接协议不匹配，请重新选择连接类型",
   "address must be IPv4": "地址必须是 IPv4",
@@ -1075,6 +1077,11 @@ function nodeSupportsGre(node: NodeItem | null): boolean {
   return Boolean(node && isNodeSelectable(node) && (node.agent_capabilities || []).includes("gre"));
 }
 
+// 判断节点 Agent 是否支持使用 IPv6 作为 GRE 外层地址。
+function nodeSupportsGreIpv6(node: NodeItem | null): boolean {
+  return Boolean(node?.agent_capabilities?.includes("gre.ipv6"));
+}
+
 // 生成通用连接 API 路径片段，避免连接引用中的冒号影响 URL。
 function encodedConnectionRef(connectionRef: string): string {
   return encodeURIComponent(connectionRef);
@@ -1383,7 +1390,7 @@ function isValidGreKey(value: string): boolean {
   return Number.isSafeInteger(number) && number >= 0 && number <= 4294967295;
 }
 
-// 校验 GRE 接口名，避免 OpenWrt netifd 生成的 gre4-设备名超过内核限制。
+// 校验 GRE 接口名，避免 OpenWrt netifd 生成的 gre4/gre6 设备名超过内核限制。
 function isValidGreInterfaceName(value: string): boolean {
   return /^[A-Za-z0-9_]{1,10}$/.test(value.trim());
 }
@@ -1477,11 +1484,18 @@ function endpointOptionsFrom(
   ]);
 }
 
-// 从节点地址中提取可作为 GRE 外层地址的 IPv4 选项。
+// 从节点地址中提取可作为 GRE 外层地址的 IPv4/IPv6 选项。
 function greOuterIpOptionsFromNode(node: NodeItem | null, currentHost?: string | null): EndpointOption[] {
-  const nodeHosts = node ? nodeEndpointOptions(node).filter(isValidIpv4Address) : [];
-  const current = currentHost && isValidIpv4Address(currentHost) ? currentHost : null;
+  const nodeHosts = node ? nodeEndpointOptions(node).filter(isProbablyIpAddress) : [];
+  const current = currentHost && isProbablyIpAddress(currentHost) ? currentHost : null;
   return endpointOptionsFrom(null, nodeHosts, current);
+}
+
+// 返回 IP 字面量的地址版本，非 IP 返回 null。
+function ipAddressVersion(value: string): 4 | 6 | null {
+  if (isValidIpv4Address(value)) return 4;
+  if (isValidIpv6Address(value)) return 6;
+  return null;
 }
 
 // 返回 Endpoint 选项来源标签。
@@ -4344,18 +4358,20 @@ function App() {
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
     const localRoutes = splitList(String(form.get("local_routes") || ""));
     const peerRoutes = splitList(String(form.get("peer_routes") || ""));
-    const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1476;
+    const requestedMtu = optionalInt(form.get("mtu"), "MTU");
     const ttl = optionalInt(form.get("ttl"), "TTL");
     const greKey = String(form.get("gre_key") || "").trim();
     if (!isValidGreInterfaceName(localInterfaceName) || !isValidGreInterfaceName(peerInterfaceName)) {
       throw new Error("GRE 接口名称最多 10 个字符，只能包含字母、数字和下划线");
     }
-    if (!isValidIpv4Address(localOuterIp) || !isValidIpv4Address(peerOuterIp)) {
-      throw new Error("GRE 外层地址必须填写 IPv4 字面量，不能使用域名或 IPv6");
+    const outerIpVersion = ipAddressVersion(localOuterIp);
+    if (!outerIpVersion || ipAddressVersion(peerOuterIp) !== outerIpVersion) {
+      throw new Error("GRE 双方外层地址必须是同一版本的 IPv4 或 IPv6 字面量");
     }
+    const mtu = requestedMtu ?? (outerIpVersion === 6 ? 1456 : 1476);
     for (const value of [localBindIp, localRemoteIp, peerBindIp, peerRemoteIp].filter(Boolean)) {
-      if (!isValidIpv4Address(value)) {
-        throw new Error("GRE 高级外层映射地址必须填写 IPv4 字面量");
+      if (ipAddressVersion(value) !== outerIpVersion) {
+        throw new Error("GRE 高级外层映射地址必须与主外层地址使用相同 IP 版本");
       }
     }
     if (localOuterIp === peerOuterIp) {
@@ -4380,7 +4396,7 @@ function App() {
     if (ttl !== null && (!Number.isInteger(ttl) || ttl < 1 || ttl > 255)) {
       throw new Error("TTL 必须是 1-255 之间的整数");
     }
-    if (ttl !== null && form.get("pmtudisc") !== "on") {
+    if (outerIpVersion === 4 && ttl !== null && form.get("pmtudisc") !== "on") {
       throw new Error("填写 GRE TTL 时必须启用 PMTU discovery");
     }
     if (!isValidGreKey(greKey)) {
@@ -4424,10 +4440,15 @@ function App() {
     if (!nodeSupportsGre(peerNode)) {
       throw new Error("对端节点尚未上报 GRE 能力，请确认系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE，并升级 Agent 后重试");
     }
+    const commonPayload = readGreCommonPayload(form);
+    if (ipAddressVersion(commonPayload.local_outer_ip) === 6
+      && (!nodeSupportsGreIpv6(selectedNode) || !nodeSupportsGreIpv6(peerNode))) {
+      throw new Error("GRE over IPv6 需要双方节点升级到支持 IPv6 外层的 Agent");
+    }
     const payload = {
       protocol_type: "gre",
       peer_node_id: peerNodeId,
-      ...readGreCommonPayload(form),
+      ...commonPayload,
     };
     const connection = await api<ConnectionItem>(`/api/nodes/${selectedNodeId}/connections/managed`, {
       method: "POST",
@@ -4453,16 +4474,18 @@ function App() {
     const tunnelIps = splitList(String(form.get("tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
     const routes = splitList(String(form.get("routes") || ""));
-    const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1476;
+    const requestedMtu = optionalInt(form.get("mtu"), "MTU");
     const ttl = optionalInt(form.get("ttl"), "TTL");
     const greKey = String(form.get("gre_key") || "").trim();
     const pmtudisc = form.get("pmtudisc") === "on";
     if (!isValidGreInterfaceName(interfaceName) || (peerInterfaceName && !isValidGreInterfaceName(peerInterfaceName))) {
       throw new Error("GRE 接口名称最多 10 个字符，只能包含字母、数字和下划线");
     }
-    if (!isValidIpv4Address(outerLocalIp) || !isValidIpv4Address(outerRemoteIp)) {
-      throw new Error("GRE 外层地址必须填写 IPv4 字面量，不能使用域名或 IPv6");
+    const outerIpVersion = ipAddressVersion(outerLocalIp);
+    if (!outerIpVersion || ipAddressVersion(outerRemoteIp) !== outerIpVersion) {
+      throw new Error("GRE 本端和对端外层地址必须是同一版本的 IPv4 或 IPv6 字面量");
     }
+    const mtu = requestedMtu ?? (outerIpVersion === 6 ? 1456 : 1476);
     if (outerLocalIp === outerRemoteIp) {
       throw new Error("本端和对端 GRE 外层地址不能相同");
     }
@@ -4475,7 +4498,7 @@ function App() {
     if (ttl !== null && (!Number.isInteger(ttl) || ttl < 1 || ttl > 255)) {
       throw new Error("TTL 必须是 1-255 之间的整数");
     }
-    if (ttl !== null && !pmtudisc) {
+    if (outerIpVersion === 4 && ttl !== null && !pmtudisc) {
       throw new Error("填写 GRE TTL 时必须启用 PMTU discovery");
     }
     if (!isValidGreKey(greKey)) {
@@ -4506,9 +4529,13 @@ function App() {
       throw new Error("当前节点尚未上报 GRE 能力，请确认系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE，并升级 Agent 后重试");
     }
     const formElement = event.currentTarget;
+    const payload = readManualGrePayload(new FormData(formElement));
+    if (ipAddressVersion(payload.outer_local_ip) === 6 && !nodeSupportsGreIpv6(selectedNode)) {
+      throw new Error("GRE over IPv6 需要当前节点升级到支持 IPv6 外层的 Agent");
+    }
     const connection = await api<ConnectionItem>(`/api/nodes/${selectedNodeId}/connections/manual`, {
       method: "POST",
-      body: JSON.stringify(readManualGrePayload(new FormData(formElement))),
+      body: JSON.stringify(payload),
     });
     formElement.reset();
     setCreateDialog(null);
@@ -4528,7 +4555,18 @@ function App() {
       throw new Error("Agent 离线，不能修改 GRE 连接");
     }
     const form = new FormData(event.currentTarget);
-    const payload = selectedGreIsManual ? readManualGrePayload(form) : readGreCommonPayload(form);
+    const manualPayload = selectedGreIsManual ? readManualGrePayload(form) : null;
+    const managedPayload = selectedGreIsManual ? null : readGreCommonPayload(form);
+    const payload = manualPayload || managedPayload;
+    if (!payload) return;
+    const outerIpVersion = ipAddressVersion(manualPayload?.outer_local_ip || managedPayload?.local_outer_ip || "");
+    if (outerIpVersion === 6) {
+      const endpointNodes = selectedGreConnection.endpoints
+        .map((endpoint) => nodes.find((node) => node.id === endpoint.node_id) || null);
+      if (endpointNodes.some((node) => !nodeSupportsGreIpv6(node))) {
+        throw new Error("GRE over IPv6 需要连接中的节点升级到支持 IPv6 外层的 Agent");
+      }
+    }
     const updatePath = selectedGreIsManual
       ? `/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/manual`
       : `/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}`;
@@ -5797,7 +5835,7 @@ function App() {
               >
                 <span className="protocolCardIcon"><Network size={22} /></span>
                 <span className="protocolCardBody">
-                  <span className="protocolCardTitle"><strong>GRE</strong><em>IPv4 外层</em></span>
+                  <span className="protocolCardTitle"><strong>GRE</strong><em>双栈外层</em></span>
                   <small>只在当前节点创建 GRE，适合对端是路由器、云主机或其它非受管设备。</small>
                   <span className="protocolCardMeta">创建后直接部署并启动本端</span>
                 </span>
@@ -5906,7 +5944,7 @@ function App() {
                   <input name="peer_interface_name" placeholder="gre_link42" disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
-              <FormSection title="外层地址" hint="GRE 外层只支持 IPv4；本端地址必须真实存在于本机或符合云 NAT/EIP 的实际绑定方式。">
+              <FormSection title="外层地址" hint="GRE 外层支持 IPv4 或 IPv6，两端必须使用同一地址版本；本端地址必须真实可用于发送外层报文。">
                 <Field label="本端外层地址" hint="写入 ip tunnel local。" requiredMark>
                   <EndpointSelect
                     name="outer_local_ip"
@@ -5916,7 +5954,7 @@ function App() {
                     disabled={!selectedNodeOnline}
                   />
                 </Field>
-                <Field label="对端外层地址" hint="写入 ip tunnel remote，必须是 IPv4 字面量。" requiredMark>
+                <Field label="对端外层地址" hint="写入隧道 remote，必须与本端外层地址使用相同 IP 版本。" requiredMark>
                   <input name="outer_remote_ip" placeholder="198.51.100.20" required disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
@@ -5931,8 +5969,8 @@ function App() {
                   <textarea name="routes" rows={2} placeholder="10.90.0.0/24, fd90::/64" disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
-              <FormSection title="高级" hint="GRE Key 需要与对端一致；填写 TTL 时必须启用 PMTU discovery。">
-                <Field label="MTU"><input name="mtu" defaultValue="1476" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
+              <FormSection title="高级" hint="GRE Key 需要与对端一致；IPv6 外层时 TTL 会作为 hop limit 下发。">
+                <Field label="MTU" hint="留空时 IPv4 使用 1476，IPv6 使用 1456。"><input name="mtu" placeholder="自动" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
                 <Field label="GRE Key"><input name="gre_key" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
                 <Field label="TTL"><input name="ttl" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
                 <label className="checkField">
@@ -5942,7 +5980,7 @@ function App() {
               </FormSection>
               <label className="checkField wideField dangerCheck">
                 <input name="risk_accepted" type="checkbox" required disabled={!selectedNodeOnline} />
-                <span>我已确认 GRE 不加密，且中间网络允许 IP protocol 47；普通 NAT 环境可能无法使用。</span>
+                <span>我已确认 GRE 不加密，底层网络允许 GRE（协议/下一头部 47）；普通 IPv4 NAT 通常不可用，IPv6 需要端到端可达。</span>
               </label>
               <button type="submit" disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNode.id, "create-manual-gre"))}>
                 <Plus size={16} /> {actionPending(nodeActionKey(selectedNode.id, "create-manual-gre")) ? "创建中" : "创建并启动本端 GRE"}
@@ -5991,10 +6029,10 @@ function App() {
                 <span className="protocolCardBody">
                   <span className="protocolCardTitle">
                     <strong>GRE</strong>
-                    <em>IPv4</em>
+                    <em>IPv4 / IPv6</em>
                   </span>
-                  <small>三层隧道，不加密，适合双方网络明确放行 IP protocol 47 的场景。</small>
-                  <span className="protocolCardMeta">可从节点 IPv4 地址选择外层地址</span>
+                  <small>三层隧道，不加密，支持 IPv4 或 IPv6 外层，适合底层网络明确放行 GRE 的场景。</small>
+                  <span className="protocolCardMeta">可从节点 IP 地址选择外层地址</span>
                 </span>
               </button>
             </div>
@@ -6258,7 +6296,7 @@ function App() {
               {!nodeSupportsGre(selectedNode) && (
                 <div className="empty wideField">当前节点尚未上报 GRE 能力，请确认 Agent 已升级且系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE。</div>
               )}
-              <FormSection title="基础" hint="GRE 连接会在两个在线受管节点之间创建 L3 隧道，外层地址使用 IPv4。">
+              <FormSection title="基础" hint="GRE 连接会在两个在线受管节点之间创建 L3 隧道，外层地址可使用 IPv4 或 IPv6。">
                 <Field label="对端节点" hint="只显示已在线并上报 GRE 能力的节点。" requiredMark>
                   <select
                     name="peer_node_id"
@@ -6279,8 +6317,8 @@ function App() {
                   <input name="peer_interface_name" placeholder="gre_b_a" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
-              <FormSection title="外层地址" hint="标准场景只填写两端对外 IPv4；云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
-                <Field label="本端对外地址" hint="对端访问本端时看到或使用的 IPv4；无 NAT 时也是本端实际绑定 IP。" requiredMark>
+              <FormSection title="外层地址" hint="两端对外地址必须使用相同 IP 版本；IPv4 云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
+                <Field label="本端对外地址" hint="对端访问本端时使用的 IPv4 或 IPv6 地址。" requiredMark>
                   <EndpointSelect
                     key={`managed-gre-local-outer-${selectedNode.id}-${managedGreLocalOuterIpDefault}`}
                     name="local_outer_ip"
@@ -6290,7 +6328,7 @@ function App() {
                     disabled={!nodeSupportsGre(selectedNode)}
                   />
                 </Field>
-                <Field label="对端对外地址" hint="本端访问对端时使用的 IPv4；无 NAT 时也是对端实际绑定 IP。" requiredMark>
+                <Field label="对端对外地址" hint="本端访问对端时使用的同版本 IPv4 或 IPv6 地址。" requiredMark>
                   <EndpointSelect
                     key={`managed-gre-peer-outer-${managedPeerNodeId || "none"}-${managedGrePeerOuterIpDefault}`}
                     name="peer_outer_ip"
@@ -6362,7 +6400,7 @@ function App() {
               </FormSection>
               <FormSection title="高级" hint="默认 MTU 1476；GRE Key 可选，填写后双方必须一致。">
                 <Field label="MTU">
-                  <input name="mtu" placeholder="1476" defaultValue="1476" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
+                  <input name="mtu" placeholder="自动：IPv4 1476 / IPv6 1456" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
                 <Field label="GRE Key">
                   <input name="gre_key" placeholder="42" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
@@ -6377,7 +6415,7 @@ function App() {
               </FormSection>
               <label className="checkField wideField dangerCheck">
                 <input name="risk_accepted" type="checkbox" required disabled={!nodeSupportsGre(selectedNode)} />
-                <span>我已确认 GRE 不加密，且双方网络允许 IP protocol 47；普通 NAT 环境可能无法使用。</span>
+                <span>我已确认 GRE 不加密，双方底层网络允许 GRE（协议/下一头部 47）；普通 IPv4 NAT 通常不可用，IPv6 需要端到端可达。</span>
               </label>
               <button
                 type="submit"
@@ -6705,7 +6743,7 @@ function App() {
                       <input name="peer_interface_name" defaultValue={editManualGrePeerInterfaceName} disabled={!selectedGreAllNodesOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="外层地址" hint="本端和对端都必须填写 IPv4 字面量。">
+                  <FormSection title="外层地址" hint="本端和对端必须填写同一版本的 IPv4 或 IPv6 字面量。">
                     <Field label="本端外层地址" hint="写入本端 ip tunnel local。" requiredMark>
                       <EndpointSelect
                         key={`edit-manual-gre-local-${selectedGreConnection.connection_ref}-${editGreLocalOuterIpDefault}`}
@@ -6731,7 +6769,7 @@ function App() {
                       <textarea name="routes" rows={2} defaultValue={selectedGreLocalEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="高级" hint="GRE Key 需要与对端一致；填写 TTL 时必须启用 PMTU discovery。">
+                  <FormSection title="高级" hint="GRE Key 需要与对端一致；IPv6 外层时 TTL 会作为 hop limit 下发。">
                     <Field label="MTU"><input name="mtu" defaultValue={selectedGreLocalEndpoint.mtu || 1476} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
                     <Field label="GRE Key"><input name="gre_key" defaultValue={greProtocolString(selectedGreLocalEndpoint, "key")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
                     <Field label="TTL"><input name="ttl" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "ttl")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
@@ -6742,7 +6780,7 @@ function App() {
                   </FormSection>
                   <label className="checkField wideField dangerCheck">
                     <input name="risk_accepted" type="checkbox" required disabled={!selectedGreAllNodesOnline} />
-                    <span>我已确认 GRE 不加密，且中间网络允许 IP protocol 47；普通 NAT 环境可能无法使用。</span>
+                    <span>我已确认 GRE 不加密，底层网络允许 GRE（协议/下一头部 47）；普通 IPv4 NAT 通常不可用，IPv6 需要端到端可达。</span>
                   </label>
                   <button type="submit" disabled={!selectedGreAllNodesOnline || actionPending(connectionActionKey(selectedGreConnection.connection_ref, "save"))}>
                     <Check size={16} /> {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "save")) ? "下发中" : "保存并下发本端配置"}
@@ -6762,8 +6800,8 @@ function App() {
                     <input name="peer_interface_name" defaultValue={selectedGrePeerEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>
-                <FormSection title="外层地址" hint="标准场景只填写两端对外 IPv4；云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
-                  <Field label="本端对外地址" hint="对端访问本端时看到或使用的 IPv4；无 NAT 时也是本端实际绑定 IP。" requiredMark>
+                <FormSection title="外层地址" hint="两端对外地址必须使用相同 IP 版本；IPv4 云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
+                  <Field label="本端对外地址" hint="对端访问本端时使用的 IPv4 或 IPv6 地址。" requiredMark>
                     <EndpointSelect
                       key={`edit-gre-local-outer-${selectedGreConnection.connection_ref}-${editGreLocalOuterIpDefault}`}
                       name="local_outer_ip"
@@ -6773,7 +6811,7 @@ function App() {
                       disabled={!selectedGreAllNodesOnline}
                     />
                   </Field>
-                  <Field label="对端对外地址" hint="本端访问对端时使用的 IPv4；无 NAT 时也是对端实际绑定 IP。" requiredMark>
+                  <Field label="对端对外地址" hint="本端访问对端时使用的同版本 IPv4 或 IPv6 地址。" requiredMark>
                     <EndpointSelect
                       key={`edit-gre-peer-outer-${selectedGreConnection.connection_ref}-${editGrePeerOuterIpDefault}`}
                       name="peer_outer_ip"
@@ -6860,7 +6898,7 @@ function App() {
                 </FormSection>
                 <label className="checkField wideField dangerCheck">
                   <input name="risk_accepted" type="checkbox" required disabled={!selectedGreAllNodesOnline} />
-                  <span>我已确认 GRE 不加密，且双方网络允许 IP protocol 47；普通 NAT 环境可能无法使用。</span>
+                  <span>我已确认 GRE 不加密，双方底层网络允许 GRE（协议/下一头部 47）；普通 IPv4 NAT 通常不可用，IPv6 需要端到端可达。</span>
                 </label>
                 <button
                   type="submit"

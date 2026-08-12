@@ -2812,7 +2812,7 @@ def gre_connection_read(db: Session, connection: models.Connection) -> schemas.C
         endpoints=[connection_endpoint_read(db, endpoint) for endpoint in endpoints],
         warnings=(["此 GRE 连接仅管理当前节点，对端配置需要在外部设备上自行维护"] if manual_connection else []) + [
             "GRE 不加密，请勿直接承载敏感流量",
-            "GRE 需要中间网络放行 IP protocol 47，普通 NAT 环境通常不可用",
+            "GRE 需要底层网络放行 GRE（协议/下一头部 47）；普通 IPv4 NAT 通常不可用，IPv6 需要端到端可达",
             "OpenWrt 节点创建 GRE 后需要把 GRE 地址接口加入合适的防火墙 zone，否则入向流量可能被防火墙拒绝",
         ] + endpoint_errors,
     )
@@ -2876,10 +2876,27 @@ def wireguard_connection_read(db: Session, interface: models.WireGuardInterface)
     )
 
 
-def require_gre_supported(node: models.Node) -> None:
-    """要求节点 Agent 支持 GRE 连接任务。"""
+def require_gre_supported(node: models.Node, outer_ip_version: int = 4) -> None:
+    """要求节点 Agent 支持指定外层地址族的 GRE 连接任务。"""
 
     require_task_supported(node, GRE_TASKS.apply_config)
+    if outer_ip_version == 6 and "gre.ipv6" not in (node.agent_capabilities or []):
+        raise HTTPException(status_code=409, detail="agent does not support GRE over IPv6")
+
+
+def gre_outer_ip_version(values: list[str | None]) -> int:
+    """校验 GRE 外层地址全部同族并返回地址版本。"""
+
+    versions = {ipaddress.ip_address(value).version for value in values if value}
+    if len(versions) != 1:
+        raise HTTPException(status_code=400, detail="gre outer addresses must use the same IP version")
+    return versions.pop()
+
+
+def gre_effective_mtu(mtu: int | None, outer_ip_version: int) -> int:
+    """返回 GRE 显式 MTU，未填写时按外层地址族使用推荐值。"""
+
+    return mtu if mtu is not None else (1456 if outer_ip_version == 6 else 1476)
 
 
 def validate_gre_payload(payload: schemas.GreManagedConnectionCreate | schemas.GreManagedConnectionUpdate) -> None:
@@ -2890,9 +2907,10 @@ def validate_gre_payload(payload: schemas.GreManagedConnectionCreate | schemas.G
     if payload.local_outer_ip == payload.peer_outer_ip:
         raise HTTPException(status_code=400, detail="gre outer addresses must be different")
     outer = gre_outer_mapping(payload)
+    outer_version = gre_outer_ip_version(list(outer.values()))
     if outer["local_bind_ip"] == outer["local_remote_ip"] or outer["peer_bind_ip"] == outer["peer_remote_ip"]:
         raise HTTPException(status_code=400, detail="gre endpoint local and remote addresses must be different")
-    if payload.ttl is not None and not payload.pmtudisc:
+    if outer_version == 4 and payload.ttl is not None and not payload.pmtudisc:
         raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
 
 
@@ -2905,7 +2923,8 @@ def validate_manual_gre_payload(
         raise HTTPException(status_code=400, detail="gre risk must be accepted")
     if payload.outer_local_ip == payload.outer_remote_ip:
         raise HTTPException(status_code=400, detail="gre endpoint local and remote addresses must be different")
-    if payload.ttl is not None and not payload.pmtudisc:
+    outer_version = gre_outer_ip_version([payload.outer_local_ip, payload.outer_remote_ip])
+    if outer_version == 4 and payload.ttl is not None and not payload.pmtudisc:
         raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
 
 
@@ -4075,11 +4094,11 @@ def list_protocols() -> list[schemas.ConnectionProtocolRead]:
         schemas.ConnectionProtocolRead(
             type=CONNECTION_TYPE_GRE,
             label="GRE",
-            description="IPv4 GRE L3 隧道，不加密，需要中间网络放行 IP protocol 47。",
+            description="GRE L3 隧道，支持 IPv4 或 IPv6 外层，不加密，需要中间网络放行 GRE。",
             managed=True,
             warnings=[
                 "GRE 不加密，请勿直接承载敏感流量",
-                "GRE 需要协议 47 放行，普通 NAT 环境通常不可用",
+                "GRE over IPv4 需要协议 47 放行，普通 NAT 环境通常不可用；GRE over IPv6 需要端到端 IPv6 可达",
                 "OpenWrt 节点创建 GRE 后需要把 GRE 地址接口加入合适的防火墙 zone，否则入向流量可能被防火墙拒绝",
             ],
         ),
@@ -4150,11 +4169,13 @@ def create_managed_connection(
     validate_gre_payload(payload)
     local_node = require_online_node(db, node_id)
     peer_node = require_online_node(db, payload.peer_node_id)
-    require_gre_supported(local_node)
-    require_gre_supported(peer_node)
+    outer = gre_outer_mapping(payload)
+    outer_ip_version = gre_outer_ip_version(list(outer.values()))
+    mtu = gre_effective_mtu(payload.mtu, outer_ip_version)
+    require_gre_supported(local_node, outer_ip_version)
+    require_gre_supported(peer_node, outer_ip_version)
     ensure_unique_interface_name(db, node_id, payload.local_interface_name)
     ensure_unique_interface_name(db, payload.peer_node_id, payload.peer_interface_name)
-    outer = gre_outer_mapping(payload)
     connection = models.Connection(
         protocol_type=CONNECTION_TYPE_GRE,
         name=f"{payload.local_interface_name} <-> {payload.peer_interface_name}",
@@ -4168,7 +4189,7 @@ def create_managed_connection(
         role="local",
         interface_name=payload.local_interface_name,
         tunnel_ips=payload.local_tunnel_ips,
-        mtu=payload.mtu,
+        mtu=mtu,
         routes=payload.local_routes,
         runtime_status="starting",
         protocol_config=gre_protocol_config(outer["local_bind_ip"], outer["local_remote_ip"], payload),
@@ -4179,7 +4200,7 @@ def create_managed_connection(
         role="peer",
         interface_name=payload.peer_interface_name,
         tunnel_ips=payload.peer_tunnel_ips,
-        mtu=payload.mtu,
+        mtu=mtu,
         routes=payload.peer_routes,
         runtime_status="starting",
         protocol_config=gre_protocol_config(outer["peer_bind_ip"], outer["peer_remote_ip"], payload),
@@ -4209,7 +4230,8 @@ def create_manual_connection(
 
     validate_manual_gre_payload(payload)
     node = require_online_node(db, node_id)
-    require_gre_supported(node)
+    outer_ip_version = gre_outer_ip_version([payload.outer_local_ip, payload.outer_remote_ip])
+    require_gre_supported(node, outer_ip_version)
     ensure_unique_interface_name(db, node_id, payload.interface_name)
     connection_name = payload.interface_name
     if payload.peer_interface_name:
@@ -4227,7 +4249,7 @@ def create_manual_connection(
         role="local",
         interface_name=payload.interface_name,
         tunnel_ips=payload.tunnel_ips,
-        mtu=payload.mtu,
+        mtu=gre_effective_mtu(payload.mtu, outer_ip_version),
         routes=payload.routes,
         runtime_status="starting",
         protocol_config=manual_gre_protocol_config(payload),
@@ -4270,8 +4292,11 @@ def update_connection(
     local_endpoint, peer_endpoint = endpoints
     local_node = require_online_node(db, local_endpoint.node_id)
     peer_node = require_online_node(db, peer_endpoint.node_id)
-    require_gre_supported(local_node)
-    require_gre_supported(peer_node)
+    outer = gre_outer_mapping(payload)
+    outer_ip_version = gre_outer_ip_version(list(outer.values()))
+    mtu = gre_effective_mtu(payload.mtu, outer_ip_version)
+    require_gre_supported(local_node, outer_ip_version)
+    require_gre_supported(peer_node, outer_ip_version)
     ensure_unique_interface_name(
         db,
         local_endpoint.node_id,
@@ -4286,15 +4311,14 @@ def update_connection(
     )
     record_endpoint_rename(local_endpoint, payload.local_interface_name)
     record_endpoint_rename(peer_endpoint, payload.peer_interface_name)
-    outer = gre_outer_mapping(payload)
     local_endpoint.interface_name = payload.local_interface_name
     local_endpoint.tunnel_ips = payload.local_tunnel_ips
-    local_endpoint.mtu = payload.mtu
+    local_endpoint.mtu = mtu
     local_endpoint.routes = payload.local_routes
     local_endpoint.protocol_config = gre_protocol_config(outer["local_bind_ip"], outer["local_remote_ip"], payload)
     peer_endpoint.interface_name = payload.peer_interface_name
     peer_endpoint.tunnel_ips = payload.peer_tunnel_ips
-    peer_endpoint.mtu = payload.mtu
+    peer_endpoint.mtu = mtu
     peer_endpoint.routes = payload.peer_routes
     peer_endpoint.protocol_config = gre_protocol_config(outer["peer_bind_ip"], outer["peer_remote_ip"], payload)
     connection.name = f"{payload.local_interface_name} <-> {payload.peer_interface_name}"
@@ -4324,7 +4348,8 @@ def update_manual_connection(
         raise HTTPException(status_code=400, detail="connection is not a manual GRE connection")
     endpoint = endpoints[0]
     node = require_online_node(db, endpoint.node_id)
-    require_gre_supported(node)
+    outer_ip_version = gre_outer_ip_version([payload.outer_local_ip, payload.outer_remote_ip])
+    require_gre_supported(node, outer_ip_version)
     ensure_unique_interface_name(
         db,
         endpoint.node_id,
@@ -4334,7 +4359,7 @@ def update_manual_connection(
     record_endpoint_rename(endpoint, payload.interface_name)
     endpoint.interface_name = payload.interface_name
     endpoint.tunnel_ips = payload.tunnel_ips
-    endpoint.mtu = payload.mtu
+    endpoint.mtu = gre_effective_mtu(payload.mtu, outer_ip_version)
     endpoint.routes = payload.routes
     endpoint.protocol_config = manual_gre_protocol_config(payload)
     connection.name = payload.interface_name

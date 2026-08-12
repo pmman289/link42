@@ -124,6 +124,17 @@ def _validate_ipv4_address(value: str) -> str:
     return cleaned
 
 
+def _validate_ip_address(value: str) -> str:
+    """校验字段必须是 IPv4 或 IPv6 字面量地址。"""
+
+    cleaned = value.strip()
+    try:
+        ipaddress.ip_address(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"invalid IP address: {cleaned}") from exc
+    return cleaned
+
+
 def _validate_optional_ipv4_address(value: str | None) -> str | None:
     """校验可选字段必须是 IPv4 字面量地址，空字符串归一为空。"""
 
@@ -133,6 +144,17 @@ def _validate_optional_ipv4_address(value: str | None) -> str | None:
     if not cleaned:
         return None
     return _validate_ipv4_address(cleaned)
+
+
+def _validate_optional_ip_address(value: str | None) -> str | None:
+    """校验可选字段必须是 IP 字面量地址，空字符串归一为空。"""
+
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return _validate_ip_address(cleaned)
 
 
 def _validate_linux_interface_name(value: str) -> str:
@@ -149,7 +171,7 @@ def _validate_linux_interface_name(value: str) -> str:
 
 
 def _validate_gre_interface_name(value: str) -> str:
-    """校验 GRE 接口名，兼容 OpenWrt netifd 生成的 gre4-设备名长度。"""
+    """校验 GRE 接口名，兼容 OpenWrt netifd 生成的 gre4/gre6 设备名长度。"""
 
     cleaned = value.strip()
     if not cleaned:
@@ -799,7 +821,7 @@ class GreManagedConnectionCreate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_routes: list[str] = Field(default_factory=list)
     peer_routes: list[str] = Field(default_factory=list)
-    mtu: int = 1476
+    mtu: int | None = None
     gre_key: str | None = None
     ttl: int | None = None
     pmtudisc: bool = True
@@ -824,16 +846,16 @@ class GreManagedConnectionCreate(BaseModel):
     @field_validator("local_outer_ip", "peer_outer_ip")
     @classmethod
     def validate_outer_ip(cls, value: str) -> str:
-        """校验 GRE 外层地址为 IPv4 字面量。"""
+        """校验 GRE 外层地址为 IPv4 或 IPv6 字面量。"""
 
-        return _validate_ipv4_address(value)
+        return _validate_ip_address(value)
 
     @field_validator("local_bind_ip", "local_remote_ip", "peer_bind_ip", "peer_remote_ip")
     @classmethod
     def validate_optional_outer_ip(cls, value: str | None) -> str | None:
-        """校验 GRE 高级外层映射地址为可选 IPv4 字面量。"""
+        """校验 GRE 高级外层映射地址为可选 IP 字面量。"""
 
-        return _validate_optional_ipv4_address(value)
+        return _validate_optional_ip_address(value)
 
     @field_validator("local_tunnel_ips", "peer_tunnel_ips", "local_routes", "peer_routes")
     @classmethod
@@ -844,10 +866,10 @@ class GreManagedConnectionCreate(BaseModel):
 
     @field_validator("mtu")
     @classmethod
-    def validate_mtu(cls, value: int) -> int:
+    def validate_mtu(cls, value: int | None) -> int | None:
         """校验 GRE MTU 范围。"""
 
-        if not 576 <= value <= 9000:
+        if value is not None and not 576 <= value <= 9000:
             raise ValueError("MTU must be between 576 and 9000")
         return value
 
@@ -883,7 +905,7 @@ class GreManagedConnectionUpdate(BaseModel):
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_routes: list[str] = Field(default_factory=list)
     peer_routes: list[str] = Field(default_factory=list)
-    mtu: int = 1476
+    mtu: int | None = None
     gre_key: str | None = None
     ttl: int | None = None
     pmtudisc: bool = True
@@ -899,16 +921,16 @@ class GreManagedConnectionUpdate(BaseModel):
     @field_validator("local_outer_ip", "peer_outer_ip")
     @classmethod
     def validate_outer_ip(cls, value: str) -> str:
-        """校验 GRE 外层地址为 IPv4 字面量。"""
+        """校验 GRE 外层地址为 IPv4 或 IPv6 字面量。"""
 
-        return _validate_ipv4_address(value)
+        return _validate_ip_address(value)
 
     @field_validator("local_bind_ip", "local_remote_ip", "peer_bind_ip", "peer_remote_ip")
     @classmethod
     def validate_optional_outer_ip(cls, value: str | None) -> str | None:
-        """校验 GRE 高级外层映射地址为可选 IPv4 字面量。"""
+        """校验 GRE 高级外层映射地址为可选 IP 字面量。"""
 
-        return _validate_optional_ipv4_address(value)
+        return _validate_optional_ip_address(value)
 
     @field_validator("local_tunnel_ips", "peer_tunnel_ips", "local_routes", "peer_routes")
     @classmethod
@@ -919,10 +941,10 @@ class GreManagedConnectionUpdate(BaseModel):
 
     @field_validator("mtu")
     @classmethod
-    def validate_mtu(cls, value: int) -> int:
+    def validate_mtu(cls, value: int | None) -> int | None:
         """校验 GRE MTU 范围。"""
 
-        if not 576 <= value <= 9000:
+        if value is not None and not 576 <= value <= 9000:
             raise ValueError("MTU must be between 576 and 9000")
         return value
 
@@ -954,7 +976,7 @@ class GreManualConnectionCreate(BaseModel):
     tunnel_ips: list[str] = Field(min_length=1)
     peer_tunnel_ips: list[str] = Field(default_factory=list)
     routes: list[str] = Field(default_factory=list)
-    mtu: int = 1476
+    mtu: int | None = None
     gre_key: str | None = None
     ttl: int | None = None
     pmtudisc: bool = True
@@ -988,9 +1010,9 @@ class GreManualConnectionCreate(BaseModel):
     @field_validator("outer_local_ip", "outer_remote_ip")
     @classmethod
     def validate_outer_ip(cls, value: str) -> str:
-        """校验 GRE 外层地址为 IPv4 字面量。"""
+        """校验 GRE 外层地址为 IPv4 或 IPv6 字面量。"""
 
-        return _validate_ipv4_address(value)
+        return _validate_ip_address(value)
 
     @field_validator("tunnel_ips", "peer_tunnel_ips", "routes")
     @classmethod
@@ -1001,10 +1023,10 @@ class GreManualConnectionCreate(BaseModel):
 
     @field_validator("mtu")
     @classmethod
-    def validate_mtu(cls, value: int) -> int:
+    def validate_mtu(cls, value: int | None) -> int | None:
         """校验 GRE MTU 范围。"""
 
-        if not 576 <= value <= 9000:
+        if value is not None and not 576 <= value <= 9000:
             raise ValueError("MTU must be between 576 and 9000")
         return value
 

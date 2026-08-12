@@ -2187,6 +2187,113 @@ def test_create_manual_gre_connection_creates_one_endpoint_and_local_tasks() -> 
     assert all(edge.connection_ref != result.connection_ref for edge in topology.edges)
 
 
+def test_create_manual_gre_over_ipv6_uses_ipv6_default_mtu() -> None:
+    """验证手动 GRE over IPv6 需要能力并使用 IPv6 推荐 MTU。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.10",
+            agent_capabilities=["gre", "gre.ipv6"],
+        )
+        session.add(node)
+        session.commit()
+
+        result = create_manual_connection(
+            node.id,
+            GreManualConnectionCreate(
+                interface_name="gre6_ext",
+                outer_local_ip="2001:db8:1::1",
+                outer_remote_ip="2001:db8:2::1",
+                tunnel_ips=["10.42.9.1/30"],
+                ttl=63,
+                pmtudisc=False,
+                risk_accepted=True,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+
+    assert result.endpoints[0].mtu == 1456
+    assert tasks[0].payload["outer_local_ip"] == "2001:db8:1::1"
+    assert tasks[0].payload["outer_remote_ip"] == "2001:db8:2::1"
+    assert tasks[0].payload["mtu"] == 1456
+
+
+def test_create_managed_gre_over_ipv6_requires_capability_and_rejects_mixed_family() -> None:
+    """验证双端 GRE over IPv6 的能力和外层地址同族校验。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.10",
+            agent_capabilities=["gre", "gre.ipv6"],
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.10",
+            agent_capabilities=["gre"],
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        payload = GreManagedConnectionCreate(
+            peer_node_id=node_b.id,
+            local_interface_name="gre6_a_b",
+            peer_interface_name="gre6_b_a",
+            local_outer_ip="2001:db8:1::1",
+            peer_outer_ip="2001:db8:2::1",
+            local_tunnel_ips=["10.42.10.1/30"],
+            peer_tunnel_ips=["10.42.10.2/30"],
+            risk_accepted=True,
+        )
+        with pytest.raises(HTTPException) as capability_error:
+            create_managed_connection(node_a.id, payload, session)
+
+        node_b.agent_capabilities = ["gre", "gre.ipv6"]
+        session.commit()
+        result = create_managed_connection(node_a.id, payload, session)
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+
+        with pytest.raises(HTTPException) as family_error:
+            create_managed_connection(
+                node_a.id,
+                GreManagedConnectionCreate(
+                    peer_node_id=node_b.id,
+                    local_interface_name="gre6_mix_a",
+                    peer_interface_name="gre6_mix_b",
+                    local_outer_ip="2001:db8:1::1",
+                    peer_outer_ip="198.51.100.20",
+                    local_tunnel_ips=["10.42.11.1/30"],
+                    peer_tunnel_ips=["10.42.11.2/30"],
+                    risk_accepted=True,
+                ),
+                session,
+            )
+
+    assert capability_error.value.status_code == 409
+    assert capability_error.value.detail == "agent does not support GRE over IPv6"
+    assert result.endpoints[0].mtu == 1456
+    assert result.endpoints[1].mtu == 1456
+    assert tasks[0].payload["outer_local_ip"] == "2001:db8:1::1"
+    assert tasks[2].payload["outer_local_ip"] == "2001:db8:2::1"
+    assert family_error.value.status_code == 400
+    assert family_error.value.detail == "gre outer addresses must use the same IP version"
+
+
 def test_update_manual_gre_connection_renames_local_endpoint() -> None:
     """验证手动 GRE 编辑只重发本端任务，并携带旧接口名供 Agent 清理。"""
 
