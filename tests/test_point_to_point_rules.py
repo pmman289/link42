@@ -33,6 +33,7 @@ from link42_api.main import (
     SETTING_ADMIN_USERNAME,
     SETTING_CONTROLLER_URL,
     app,
+    create_manual_connection,
     create_managed_link,
     create_managed_connection,
     gre_connection_read,
@@ -82,6 +83,7 @@ from link42_api.main import (
     stop_managed_link,
     update_controller_settings,
     update_interface,
+    update_manual_connection,
     update_managed_link,
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
@@ -119,6 +121,8 @@ from link42_api.schemas import (
     AgentLinkMonitorResultRequest,
     AgentUpgradeRequest,
     GreManagedConnectionCreate,
+    GreManualConnectionCreate,
+    GreManualConnectionUpdate,
     IntegrationApiTokenCreate,
     LookingGlassPingRequest,
     LookingGlassProtocolDetailRequest,
@@ -2125,6 +2129,117 @@ def test_create_gre_managed_connection_creates_endpoints_and_tasks() -> None:
     assert tasks[3].payload["depends_on_task_id"] == tasks[2].id
     assert any(edge.protocol_type == "gre" and edge.protocol_label == "GRE" for edge in topology.edges)
     assert any(connection.protocol_type == "gre" for connection in node_connections)
+
+
+def test_create_manual_gre_connection_creates_one_endpoint_and_local_tasks() -> None:
+    """验证手动 GRE 只创建当前节点端点，并保存外部对端提示信息。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["203.0.113.10"],
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard", "gre"],
+        )
+        session.add(node)
+        session.commit()
+
+        result = create_manual_connection(
+            node.id,
+            GreManualConnectionCreate(
+                interface_name="gre_ext",
+                peer_interface_name="gre_local",
+                outer_local_ip="203.0.113.10",
+                outer_remote_ip="198.51.100.20",
+                tunnel_ips=["10.42.9.1/30", "fd42:9::1/64"],
+                peer_tunnel_ips=["10.42.9.2/30", "fd42:9::2/64"],
+                routes=["10.90.0.0/24"],
+                mtu=1476,
+                gre_key="99",
+                risk_accepted=True,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+        node_connections = list_node_connections(node.id, session)
+        topology = build_topology(session)
+
+    assert result.name == "gre_ext -> gre_local"
+    assert result.source == "created"
+    assert result.status == "changing"
+    assert len(result.endpoints) == 1
+    endpoint = result.endpoints[0]
+    assert endpoint.interface_name == "gre_ext"
+    assert endpoint.protocol_config["outer_local_ip"] == "203.0.113.10"
+    assert endpoint.protocol_config["outer_remote_ip"] == "198.51.100.20"
+    assert endpoint.protocol_config["peer_interface_name"] == "gre_local"
+    assert endpoint.protocol_config["peer_tunnel_ips"] == ["10.42.9.2/30", "fd42:9::2/64"]
+    assert [task.type for task in tasks] == [GRE_TASKS.apply_config, GRE_TASKS.start]
+    assert {task.node_id for task in tasks} == {node.id}
+    assert tasks[0].payload["interface_name"] == "gre_ext"
+    assert tasks[0].payload["outer_remote_ip"] == "198.51.100.20"
+    assert any(connection.connection_ref == result.connection_ref for connection in node_connections)
+    assert all(edge.connection_ref != result.connection_ref for edge in topology.edges)
+
+
+def test_update_manual_gre_connection_renames_local_endpoint() -> None:
+    """验证手动 GRE 编辑只重发本端任务，并携带旧接口名供 Agent 清理。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["gre"],
+        )
+        session.add(node)
+        session.commit()
+        created = create_manual_connection(
+            node.id,
+            GreManualConnectionCreate(
+                interface_name="gre_old",
+                outer_local_ip="203.0.113.10",
+                outer_remote_ip="198.51.100.20",
+                tunnel_ips=["10.42.9.1/30"],
+                risk_accepted=True,
+            ),
+            session,
+        )
+        for task in session.scalars(select(models.AgentTask)):
+            session.delete(task)
+        session.commit()
+
+        updated = update_manual_connection(
+            created.connection_ref,
+            GreManualConnectionUpdate(
+                interface_name="gre_new",
+                peer_interface_name="gre_peer",
+                outer_local_ip="203.0.113.10",
+                outer_remote_ip="198.51.100.21",
+                tunnel_ips=["10.42.10.1/30"],
+                peer_tunnel_ips=["10.42.10.2/30"],
+                routes=["10.91.0.0/24"],
+                risk_accepted=True,
+            ),
+            session,
+        )
+        tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
+
+    assert updated.name == "gre_new -> gre_peer"
+    assert updated.endpoints[0].interface_name == "gre_new"
+    assert [task.type for task in tasks] == [GRE_TASKS.apply_config, GRE_TASKS.start]
+    assert tasks[0].payload["previous_interface_name"] == "gre_old"
+    assert tasks[0].payload["outer_remote_ip"] == "198.51.100.21"
+    assert tasks[1].payload["depends_on_task_id"] == tasks[0].id
 
 
 def test_create_gre_managed_connection_supports_nat_outer_mapping() -> None:

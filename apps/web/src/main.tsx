@@ -204,6 +204,7 @@ type ManagedLink = {
 };
 
 type ManagedCreateProtocol = "wireguard" | "gre";
+type ManualCreateProtocol = "wireguard" | "gre";
 
 type MiddlewareConfig = Udp2RawMiddleware | MimicMiddleware;
 
@@ -1312,7 +1313,10 @@ function suggestedMonitorTarget(config: ConfigItem, peer: PeerItem | null) {
 
 // 根据通用连接端点推断链路监测目标，优先使用对端隧道 IP。
 function suggestedEndpointMonitorTarget(endpoint: ConnectionEndpointItem | null, peerEndpoint: ConnectionEndpointItem | null) {
-  return firstIpFromCidrs(peerEndpoint?.tunnel_ips || []) || firstIpFromCidrs(endpoint?.routes || []) || "";
+  const manualPeerTunnelIps = Array.isArray(endpoint?.protocol_config?.peer_tunnel_ips)
+    ? (endpoint?.protocol_config.peer_tunnel_ips as unknown[]).map(String)
+    : [];
+  return firstIpFromCidrs(peerEndpoint?.tunnel_ips || []) || firstIpFromCidrs(manualPeerTunnelIps) || firstIpFromCidrs(endpoint?.routes || []) || "";
 }
 
 // 校验可选端口范围。
@@ -2137,7 +2141,8 @@ function App() {
   const [importCandidates, setImportCandidates] = useState<ImportCandidate[]>([]);
   const [plan, setPlan] = useState<ChangePlan | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [createDialog, setCreateDialog] = useState<"external" | "managed-protocol" | "managed" | null>(null);
+  const [createDialog, setCreateDialog] = useState<"external-protocol" | "external" | "managed-protocol" | "managed" | null>(null);
+  const [manualCreateProtocol, setManualCreateProtocol] = useState<ManualCreateProtocol>("wireguard");
   const [managedCreateProtocol, setManagedCreateProtocol] = useState<ManagedCreateProtocol>("wireguard");
   const [nodeCreateOpen, setNodeCreateOpen] = useState(false);
   const [nodeCreateEndpointIps, setNodeCreateEndpointIps] = useState<string[]>([]);
@@ -2342,6 +2347,7 @@ function App() {
         return Boolean(endpointNode && isNodeSelectable(endpointNode));
       })
     : false;
+  const selectedGreIsManual = Boolean(selectedGreConnection && selectedGreConnection.endpoints.length === 1);
   const selectedGreLocalNode = selectedGreLocalEndpoint
     ? nodes.find((node) => node.id === selectedGreLocalEndpoint.node_id) || null
     : null;
@@ -2376,6 +2382,10 @@ function App() {
     selectedGrePeerNode,
     editGrePeerOuterIpDefault,
   );
+  const editManualGrePeerInterfaceName = greProtocolString(selectedGreLocalEndpoint, "peer_interface_name");
+  const editManualGrePeerTunnelIps = Array.isArray(selectedGreLocalEndpoint?.protocol_config?.peer_tunnel_ips)
+    ? (selectedGreLocalEndpoint?.protocol_config.peer_tunnel_ips as unknown[]).map(String)
+    : [];
   const selectedConfigIsManagedLink = selectedConfig?.source === "managed-node";
   const selectedConfigIsUnmanagedImport = selectedConfig?.source === "imported" && !selectedConfig.managed;
   const selectedNodeSupportsWgQuickImport = nodeSupportsWgQuickImport(selectedNode);
@@ -2655,10 +2665,23 @@ function App() {
     setManagedCreateMtu("1420");
   }
 
-  // 关闭创建弹窗并清理受管连接草稿。
+  // 关闭创建弹窗并清理手动与受管连接草稿。
   function closeCreateDialog() {
     setCreateDialog(null);
+    setManualCreateProtocol("wireguard");
     resetManagedLinkDraft();
+  }
+
+  // 打开手动连接协议选择弹窗。
+  function openManualCreateDialog() {
+    setManualCreateProtocol("wireguard");
+    setCreateDialog("external-protocol");
+  }
+
+  // 从协议选择弹窗进入对应的手动连接表单。
+  function selectManualCreateProtocol(protocol: ManualCreateProtocol) {
+    setManualCreateProtocol(protocol);
+    setCreateDialog("external");
   }
 
   // 打开受管连接创建弹窗，并可预置接管本端配置。
@@ -4421,6 +4444,82 @@ function App() {
     notify("success", `GRE 连接 ${connection.name} 已创建，双方部署和启动任务已下发。`);
   }
 
+  // 读取并校验手动单端 GRE 表单。
+  function readManualGrePayload(form: FormData) {
+    const interfaceName = String(form.get("interface_name") || "").trim();
+    const peerInterfaceName = String(form.get("peer_interface_name") || "").trim();
+    const outerLocalIp = String(form.get("outer_local_ip") || "").trim();
+    const outerRemoteIp = String(form.get("outer_remote_ip") || "").trim();
+    const tunnelIps = splitList(String(form.get("tunnel_ips") || ""));
+    const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
+    const routes = splitList(String(form.get("routes") || ""));
+    const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1476;
+    const ttl = optionalInt(form.get("ttl"), "TTL");
+    const greKey = String(form.get("gre_key") || "").trim();
+    const pmtudisc = form.get("pmtudisc") === "on";
+    if (!isValidGreInterfaceName(interfaceName) || (peerInterfaceName && !isValidGreInterfaceName(peerInterfaceName))) {
+      throw new Error("GRE 接口名称最多 10 个字符，只能包含字母、数字和下划线");
+    }
+    if (!isValidIpv4Address(outerLocalIp) || !isValidIpv4Address(outerRemoteIp)) {
+      throw new Error("GRE 外层地址必须填写 IPv4 字面量，不能使用域名或 IPv6");
+    }
+    if (outerLocalIp === outerRemoteIp) {
+      throw new Error("本端和对端 GRE 外层地址不能相同");
+    }
+    if (!isValidCidrs(tunnelIps) || !isValidCidrs(peerTunnelIps) || !isValidCidrs(routes)) {
+      throw new Error("GRE 隧道地址和路由必须使用 IPv4 或 IPv6 CIDR");
+    }
+    if (!isValidMtu(mtu)) {
+      throw new Error("MTU 必须是 576-9000 之间的整数");
+    }
+    if (ttl !== null && (!Number.isInteger(ttl) || ttl < 1 || ttl > 255)) {
+      throw new Error("TTL 必须是 1-255 之间的整数");
+    }
+    if (ttl !== null && !pmtudisc) {
+      throw new Error("填写 GRE TTL 时必须启用 PMTU discovery");
+    }
+    if (!isValidGreKey(greKey)) {
+      throw new Error("GRE Key 必须是 0 到 4294967295 之间的整数");
+    }
+    return {
+      protocol_type: "gre",
+      interface_name: interfaceName,
+      peer_interface_name: peerInterfaceName || null,
+      outer_local_ip: outerLocalIp,
+      outer_remote_ip: outerRemoteIp,
+      tunnel_ips: tunnelIps,
+      peer_tunnel_ips: peerTunnelIps,
+      routes,
+      mtu,
+      gre_key: greKey || null,
+      ttl,
+      pmtudisc,
+      risk_accepted: form.get("risk_accepted") === "on",
+    };
+  }
+
+  // 创建仅由当前节点 Agent 管理的 GRE 连接，对端由用户自行维护。
+  async function createManualGreConnection(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedNodeId || !selectedNode) return;
+    if (!nodeSupportsGre(selectedNode)) {
+      throw new Error("当前节点尚未上报 GRE 能力，请确认系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE，并升级 Agent 后重试");
+    }
+    const formElement = event.currentTarget;
+    const connection = await api<ConnectionItem>(`/api/nodes/${selectedNodeId}/connections/manual`, {
+      method: "POST",
+      body: JSON.stringify(readManualGrePayload(new FormData(formElement))),
+    });
+    formElement.reset();
+    setCreateDialog(null);
+    setManualCreateProtocol("wireguard");
+    selectConfigId(null);
+    selectConnectionRef(connection.connection_ref);
+    void refreshConnections(selectedNodeId).catch((error) => notify("error", formatUserError(error)));
+    scheduleGreConnectionRefresh(selectedNodeId);
+    notify("success", `GRE 连接 ${connection.name} 已创建，本端部署和启动任务已下发。`);
+  }
+
   // 保存 GRE 连接修改，并重新下发双方配置。
   async function saveGreConnection(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -4428,13 +4527,18 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能修改 GRE 连接");
     }
-    await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}`, {
+    const form = new FormData(event.currentTarget);
+    const payload = selectedGreIsManual ? readManualGrePayload(form) : readGreCommonPayload(form);
+    const updatePath = selectedGreIsManual
+      ? `/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/manual`
+      : `/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}`;
+    await api<ConnectionItem>(updatePath, {
       method: "PATCH",
-      body: JSON.stringify(readGreCommonPayload(new FormData(event.currentTarget))),
+      body: JSON.stringify(payload),
     });
     await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
     scheduleGreConnectionRefresh(selectedNodeId);
-    notify("success", "GRE 连接已保存，并已重新下发双方配置。");
+    notify("success", selectedGreIsManual ? "GRE 连接已保存，并已重新下发本端配置。" : "GRE 连接已保存，并已重新下发双方配置。");
   }
 
   // 启动当前选中的 GRE 连接。
@@ -4446,7 +4550,7 @@ function App() {
     await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/start`, { method: "POST" });
     await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
     scheduleGreConnectionRefresh(selectedNodeId);
-    notify("success", "GRE 启动任务已创建，等待双方 Agent 执行。");
+    notify("success", selectedGreIsManual ? "GRE 启动任务已创建，等待本端 Agent 执行。" : "GRE 启动任务已创建，等待双方 Agent 执行。");
   }
 
   // 断开当前选中的 GRE 连接。
@@ -4458,17 +4562,17 @@ function App() {
     await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/stop`, { method: "POST" });
     await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
     scheduleGreConnectionRefresh(selectedNodeId);
-    notify("success", "GRE 断开任务已创建，等待双方 Agent 执行。");
+    notify("success", selectedGreIsManual ? "GRE 断开任务已创建，等待本端 Agent 执行。" : "GRE 断开任务已创建，等待双方 Agent 执行。");
   }
 
   // 删除当前选中的 GRE 连接，并清理双方节点上的 GRE 配置。
   async function deleteSelectedGreConnection() {
     if (!selectedGreConnection || !selectedNodeId) return;
-    if (!window.confirm(`确认删除 GRE 连接 ${selectedGreConnection.name}？系统会下发双方清理任务。`)) return;
+    if (!window.confirm(`确认删除 GRE 连接 ${selectedGreConnection.name}？系统会下发${selectedGreIsManual ? "本端" : "双方"}清理任务。`)) return;
     await api<{ status: string }>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}`, { method: "DELETE" });
     selectConnectionRef(null);
     await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
-    notify("success", "GRE 连接记录已删除，双方清理任务已下发。");
+    notify("success", `GRE 连接记录已删除，${selectedGreIsManual ? "本端" : "双方"}清理任务已下发。`);
   }
 
   // 设置唯一对端后仍需生成并确认 Change Plan 才会部署。
@@ -5659,7 +5763,54 @@ function App() {
         </div>
       )}
 
-      {createDialog === "external" && selectedNode && (
+      {createDialog === "external-protocol" && selectedNode && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel protocolSelectModal" role="dialog" aria-modal="true" aria-labelledby="manual-protocol-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="manual-protocol-title"><Plus size={18} /> 选择连接协议</h2>
+                <p className="muted">手动连接只管理当前节点，对端配置由用户自行维护。</p>
+              </div>
+              <button className="iconButton" onClick={closeCreateDialog}>
+                <X size={18} />
+              </button>
+            </header>
+            <div className="protocolChoice protocolChoiceModal" role="radiogroup" aria-label="连接协议">
+              <button
+                type="button"
+                className="protocolCard"
+                onClick={() => selectManualCreateProtocol("wireguard")}
+                disabled={!selectedNodeOnline}
+              >
+                <span className="protocolCardIcon"><ShieldCheck size={22} /></span>
+                <span className="protocolCardBody">
+                  <span className="protocolCardTitle"><strong>WireGuard</strong><em>加密</em></span>
+                  <small>创建当前节点的 WireGuard 配置和唯一 Peer，对端可以不由 Link42 管理。</small>
+                  <span className="protocolCardMeta">部署前生成并确认变更计划</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                className="protocolCard"
+                onClick={() => selectManualCreateProtocol("gre")}
+                disabled={!nodeSupportsGre(selectedNode)}
+              >
+                <span className="protocolCardIcon"><Network size={22} /></span>
+                <span className="protocolCardBody">
+                  <span className="protocolCardTitle"><strong>GRE</strong><em>IPv4 外层</em></span>
+                  <small>只在当前节点创建 GRE，适合对端是路由器、云主机或其它非受管设备。</small>
+                  <span className="protocolCardMeta">创建后直接部署并启动本端</span>
+                </span>
+              </button>
+            </div>
+            {!nodeSupportsGre(selectedNode) && (
+              <p className="protocolChoiceHint">当前节点 Agent 尚未上报 GRE 能力，暂时只能创建 WireGuard。</p>
+            )}
+          </section>
+        </div>
+      )}
+
+      {createDialog === "external" && manualCreateProtocol === "wireguard" && selectedNode && (
         <div className="modalBackdrop" role="presentation">
           <section className="modalPanel compactModal" role="dialog" aria-modal="true" aria-labelledby="manual-link-title">
             <header className="modalHeader">
@@ -5667,7 +5818,7 @@ function App() {
                 <h2 id="manual-link-title"><Plus size={18} /> 手动创建连接</h2>
                 <p className="muted">{selectedNode.name} 连接到非受管节点。可在创建时直接填写 Peer，随后生成部署计划。</p>
               </div>
-              <button className="iconButton" onClick={() => setCreateDialog(null)}>
+              <button className="iconButton" onClick={closeCreateDialog}>
                 <X size={18} />
               </button>
             </header>
@@ -5725,6 +5876,77 @@ function App() {
                 <textarea name="peer_custom_config" placeholder="自定义对端配置行" disabled={!selectedNodeOnline} />
               </Field>
               <button type="submit" disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNode.id, "create-config"))}><Plus size={16} /> {actionPending(nodeActionKey(selectedNode.id, "create-config")) ? "添加中" : "添加配置"}</button>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {createDialog === "external" && manualCreateProtocol === "gre" && selectedNode && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel" role="dialog" aria-modal="true" aria-labelledby="manual-gre-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="manual-gre-title"><Network size={18} /> 手动创建 GRE</h2>
+                <p className="muted">仅管理 {selectedNode.name} 上的 GRE 接口，对端配置需要自行维护。</p>
+              </div>
+              <button className="iconButton" onClick={closeCreateDialog}>
+                <X size={18} />
+              </button>
+            </header>
+            <form
+              key={`create-manual-gre-${selectedNode.id}`}
+              onSubmit={(event) => void runAction(() => createManualGreConnection(event), nodeActionKey(selectedNode.id, "create-manual-gre"))}
+              className="gridForm describedForm"
+            >
+              <FormSection title="接口" hint="本端接口由 Link42 部署；对端接口名只用于记录和核对。">
+                <Field label="本端接口名称" hint="最多 10 个字符，只能包含字母、数字和下划线。" requiredMark>
+                  <input name="interface_name" placeholder="gre_peer" required disabled={!selectedNodeOnline} />
+                </Field>
+                <Field label="对端接口名称" hint="可选，只作为备注保存。">
+                  <input name="peer_interface_name" placeholder="gre_link42" disabled={!selectedNodeOnline} />
+                </Field>
+              </FormSection>
+              <FormSection title="外层地址" hint="GRE 外层只支持 IPv4；本端地址必须真实存在于本机或符合云 NAT/EIP 的实际绑定方式。">
+                <Field label="本端外层地址" hint="写入 ip tunnel local。" requiredMark>
+                  <EndpointSelect
+                    name="outer_local_ip"
+                    defaultValue={managedGreLocalOuterIpDefault}
+                    placeholder={managedGreLocalOuterIpDefault || "203.0.113.10"}
+                    options={managedGreLocalOuterIpOptions}
+                    disabled={!selectedNodeOnline}
+                  />
+                </Field>
+                <Field label="对端外层地址" hint="写入 ip tunnel remote，必须是 IPv4 字面量。" requiredMark>
+                  <input name="outer_remote_ip" placeholder="198.51.100.20" required disabled={!selectedNodeOnline} />
+                </Field>
+              </FormSection>
+              <FormSection title="隧道地址与路由" hint="隧道地址和经 GRE 到达的网段支持 IPv4/IPv6 CIDR。">
+                <Field label="本端隧道地址" hint="可填写多条，使用逗号或换行分隔。" requiredMark>
+                  <textarea name="tunnel_ips" rows={2} placeholder="10.42.9.1/30, fd42:9::1/64" required disabled={!selectedNodeOnline} />
+                </Field>
+                <Field label="对端隧道地址" hint="可选，用于连接详情展示和监测目标建议。">
+                  <textarea name="peer_tunnel_ips" rows={2} placeholder="10.42.9.2/30, fd42:9::2/64" disabled={!selectedNodeOnline} />
+                </Field>
+                <Field label="经隧道路由" hint="这些网段会在本端通过 GRE 接口路由。" wide>
+                  <textarea name="routes" rows={2} placeholder="10.90.0.0/24, fd90::/64" disabled={!selectedNodeOnline} />
+                </Field>
+              </FormSection>
+              <FormSection title="高级" hint="GRE Key 需要与对端一致；填写 TTL 时必须启用 PMTU discovery。">
+                <Field label="MTU"><input name="mtu" defaultValue="1476" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
+                <Field label="GRE Key"><input name="gre_key" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
+                <Field label="TTL"><input name="ttl" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
+                <label className="checkField">
+                  <input name="pmtudisc" type="checkbox" defaultChecked disabled={!selectedNodeOnline} />
+                  <span>启用 PMTU discovery</span>
+                </label>
+              </FormSection>
+              <label className="checkField wideField dangerCheck">
+                <input name="risk_accepted" type="checkbox" required disabled={!selectedNodeOnline} />
+                <span>我已确认 GRE 不加密，且中间网络允许 IP protocol 47；普通 NAT 环境可能无法使用。</span>
+              </label>
+              <button type="submit" disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNode.id, "create-manual-gre"))}>
+                <Plus size={16} /> {actionPending(nodeActionKey(selectedNode.id, "create-manual-gre")) ? "创建中" : "创建并启动本端 GRE"}
+              </button>
             </form>
           </section>
         </div>
@@ -6282,7 +6504,7 @@ function App() {
                               <button
                                 type="button"
                                 disabled={!selectedNodeOnline}
-                                onClick={() => setCreateDialog("external")}
+                                onClick={openManualCreateDialog}
                               >
                                 <Plus size={16} /> 手动创建连接
                               </button>
@@ -6369,6 +6591,7 @@ function App() {
                                 const nodeEndpoint = connectionEndpointForNode(item, selectedNodeId) || connectionEndpointByRole(item, "local");
                                 const peerEndpoint = connectionPeerEndpointForNode(item, selectedNodeId) || connectionEndpointByRole(item, "peer");
                                 const rowName = nodeEndpoint?.interface_name || item.name;
+                                const externalPeerName = greProtocolString(nodeEndpoint, "peer_interface_name") || "外部对端";
                                 return (
                                   <button
                                     key={item.connection_ref}
@@ -6388,7 +6611,7 @@ function App() {
                                   >
                                     <span>
                                       <strong>{rowName}</strong>
-                                      <small>{protocolLabel(item)} / {nodeEndpoint?.interface_name || "本端"} → {peerEndpoint?.interface_name || "对端"}</small>
+                                      <small>{protocolLabel(item)} / {nodeEndpoint?.interface_name || "本端"} → {peerEndpoint?.interface_name || externalPeerName}</small>
                                     </span>
                                     <span className="configRowMetrics">
                                       <span className="protocolBadge">{protocolLabel(item)}</span>
@@ -6423,7 +6646,7 @@ function App() {
         </div>
       </section>
 
-      {selectedGreConnection && selectedNode && selectedGreLocalEndpoint && selectedGrePeerEndpoint && (
+      {selectedGreConnection && selectedNode && selectedGreLocalEndpoint && (
         <div className="modalBackdrop" role="presentation">
           <section className="modalPanel" role="dialog" aria-modal="true" aria-labelledby="gre-config-title">
             <header className="modalHeader">
@@ -6446,7 +6669,7 @@ function App() {
               </button>
             </header>
 
-            {!selectedGreAllNodesOnline && <div className="empty">双方节点都在线时才能修改、启动或删除 GRE 连接。</div>}
+            {!selectedGreAllNodesOnline && <div className="empty">{selectedGreIsManual ? "当前节点在线时才能修改、启动或删除 GRE 连接。" : "双方节点都在线时才能修改、启动或删除 GRE 连接。"}</div>}
             {selectedGreConnection.warnings.length > 0 && (
               <div className="empty">
                 {selectedGreConnection.warnings.map((warning) => (
@@ -6467,7 +6690,65 @@ function App() {
             )}
 
             <section className="modalSection">
-              <h3>受管 GRE</h3>
+              <h3>{selectedGreIsManual ? "手动 GRE" : "受管 GRE"}</h3>
+              {selectedGreIsManual ? (
+                <form
+                  key={`gre-manual-edit-${selectedGreConnection.connection_ref}`}
+                  onSubmit={(event) => void runAction(() => saveGreConnection(event), connectionActionKey(selectedGreConnection.connection_ref, "save"))}
+                  className="gridForm describedForm"
+                >
+                  <FormSection title="接口" hint="只修改和部署当前节点；对端字段仅作为配置备注保存。">
+                    <Field label="本端接口名称" hint="最多 10 个字符，只能包含字母、数字、下划线。" requiredMark>
+                      <input name="interface_name" defaultValue={selectedGreLocalEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
+                    </Field>
+                    <Field label="对端接口名称" hint="可选，只作为备注保存。">
+                      <input name="peer_interface_name" defaultValue={editManualGrePeerInterfaceName} disabled={!selectedGreAllNodesOnline} />
+                    </Field>
+                  </FormSection>
+                  <FormSection title="外层地址" hint="本端和对端都必须填写 IPv4 字面量。">
+                    <Field label="本端外层地址" hint="写入本端 ip tunnel local。" requiredMark>
+                      <EndpointSelect
+                        key={`edit-manual-gre-local-${selectedGreConnection.connection_ref}-${editGreLocalOuterIpDefault}`}
+                        name="outer_local_ip"
+                        defaultValue={editGreLocalOuterIpDefault}
+                        placeholder={editGreLocalOuterIpOptions[0]?.value || "203.0.113.10"}
+                        options={editGreLocalOuterIpOptions}
+                        disabled={!selectedGreAllNodesOnline}
+                      />
+                    </Field>
+                    <Field label="对端外层地址" hint="写入本端 ip tunnel remote。" requiredMark>
+                      <input name="outer_remote_ip" defaultValue={editGrePeerOuterIpDefault} required disabled={!selectedGreAllNodesOnline} />
+                    </Field>
+                  </FormSection>
+                  <FormSection title="隧道地址与路由" hint="支持 IPv4/IPv6 CIDR；对端隧道地址用于展示和监测建议。">
+                    <Field label="本端隧道地址" requiredMark>
+                      <textarea name="tunnel_ips" rows={2} defaultValue={selectedGreLocalEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
+                    </Field>
+                    <Field label="对端隧道地址">
+                      <textarea name="peer_tunnel_ips" rows={2} defaultValue={editManualGrePeerTunnelIps.join(", ")} disabled={!selectedGreAllNodesOnline} />
+                    </Field>
+                    <Field label="经隧道路由" wide>
+                      <textarea name="routes" rows={2} defaultValue={selectedGreLocalEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
+                    </Field>
+                  </FormSection>
+                  <FormSection title="高级" hint="GRE Key 需要与对端一致；填写 TTL 时必须启用 PMTU discovery。">
+                    <Field label="MTU"><input name="mtu" defaultValue={selectedGreLocalEndpoint.mtu || 1476} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
+                    <Field label="GRE Key"><input name="gre_key" defaultValue={greProtocolString(selectedGreLocalEndpoint, "key")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
+                    <Field label="TTL"><input name="ttl" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "ttl")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
+                    <label className="checkField">
+                      <input name="pmtudisc" type="checkbox" defaultChecked={greProtocolBoolean(selectedGreLocalEndpoint, "pmtudisc", true)} disabled={!selectedGreAllNodesOnline} />
+                      <span>启用 PMTU discovery</span>
+                    </label>
+                  </FormSection>
+                  <label className="checkField wideField dangerCheck">
+                    <input name="risk_accepted" type="checkbox" required disabled={!selectedGreAllNodesOnline} />
+                    <span>我已确认 GRE 不加密，且中间网络允许 IP protocol 47；普通 NAT 环境可能无法使用。</span>
+                  </label>
+                  <button type="submit" disabled={!selectedGreAllNodesOnline || actionPending(connectionActionKey(selectedGreConnection.connection_ref, "save"))}>
+                    <Check size={16} /> {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "save")) ? "下发中" : "保存并下发本端配置"}
+                  </button>
+                </form>
+              ) : selectedGrePeerEndpoint ? (
               <form
                 key={`gre-edit-${selectedGreConnection.connection_ref}`}
                 onSubmit={(event) => void runAction(() => saveGreConnection(event), connectionActionKey(selectedGreConnection.connection_ref, "save"))}
@@ -6588,6 +6869,7 @@ function App() {
                   <Check size={16} /> {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "save")) ? "下发中" : "保存并下发双方配置"}
                 </button>
               </form>
+              ) : null}
             </section>
 
             <section className="modalSection">
@@ -6598,14 +6880,14 @@ function App() {
                   disabled={!selectedGreAllNodesOnline || isGreBusy || isGreRunning || actionPending(connectionActionKey(selectedGreConnection.connection_ref, "start"))}
                   onClick={() => void runAction(startSelectedGreConnection, connectionActionKey(selectedGreConnection.connection_ref, "start"))}
                 >
-                  {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "start")) || selectedGreConnection.status === "starting" ? "启动中" : "启动双方连接"}
+                  {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "start")) || selectedGreConnection.status === "starting" ? "启动中" : selectedGreIsManual ? "启动本端连接" : "启动双方连接"}
                 </button>
                 <button
                   className="secondary"
                   disabled={!selectedGreAllNodesOnline || isGreBusy || isGreStopped || actionPending(connectionActionKey(selectedGreConnection.connection_ref, "stop"))}
                   onClick={() => void runAction(stopSelectedGreConnection, connectionActionKey(selectedGreConnection.connection_ref, "stop"))}
                 >
-                  {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "stop")) || selectedGreConnection.status === "stopping" ? "断开中" : "断开双方连接"}
+                  {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "stop")) || selectedGreConnection.status === "stopping" ? "断开中" : selectedGreIsManual ? "断开本端连接" : "断开双方连接"}
                 </button>
                 <button
                   className="danger"

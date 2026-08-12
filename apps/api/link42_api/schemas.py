@@ -943,6 +943,94 @@ class GreManagedConnectionUpdate(BaseModel):
         return value
 
 
+class GreManualConnectionCreate(BaseModel):
+    """创建仅管理当前节点一端的 GRE 连接请求。"""
+
+    protocol_type: str = "gre"
+    interface_name: str = Field(min_length=1, max_length=10)
+    peer_interface_name: str | None = Field(default=None, max_length=10)
+    outer_local_ip: str
+    outer_remote_ip: str
+    tunnel_ips: list[str] = Field(min_length=1)
+    peer_tunnel_ips: list[str] = Field(default_factory=list)
+    routes: list[str] = Field(default_factory=list)
+    mtu: int = 1476
+    gre_key: str | None = None
+    ttl: int | None = None
+    pmtudisc: bool = True
+    risk_accepted: bool = False
+
+    @field_validator("protocol_type")
+    @classmethod
+    def validate_protocol_type(cls, value: str) -> str:
+        """校验手动连接接口当前只接受 GRE。"""
+
+        if value != "gre":
+            raise ValueError("protocol_type must be gre")
+        return value
+
+    @field_validator("interface_name")
+    @classmethod
+    def validate_interface_name(cls, value: str) -> str:
+        """校验 GRE 接口名符合 OpenWrt 和 Linux 限制。"""
+
+        return _validate_gre_interface_name(value)
+
+    @field_validator("peer_interface_name")
+    @classmethod
+    def validate_peer_interface_name(cls, value: str | None) -> str | None:
+        """校验可选的外部对端 GRE 接口名。"""
+
+        if value is None or not value.strip():
+            return None
+        return _validate_gre_interface_name(value.strip())
+
+    @field_validator("outer_local_ip", "outer_remote_ip")
+    @classmethod
+    def validate_outer_ip(cls, value: str) -> str:
+        """校验 GRE 外层地址为 IPv4 字面量。"""
+
+        return _validate_ipv4_address(value)
+
+    @field_validator("tunnel_ips", "peer_tunnel_ips", "routes")
+    @classmethod
+    def validate_cidr_fields(cls, values: list[str]) -> list[str]:
+        """校验 GRE 隧道地址和路由为合法 CIDR。"""
+
+        return _validate_cidrs(values)
+
+    @field_validator("mtu")
+    @classmethod
+    def validate_mtu(cls, value: int) -> int:
+        """校验 GRE MTU 范围。"""
+
+        if not 576 <= value <= 9000:
+            raise ValueError("MTU must be between 576 and 9000")
+        return value
+
+    @field_validator("gre_key")
+    @classmethod
+    def validate_gre_key(cls, value: str | None) -> str | None:
+        """校验 GRE Key 范围。"""
+
+        return _validate_gre_key(value)
+
+    @field_validator("ttl")
+    @classmethod
+    def validate_ttl(cls, value: int | None) -> int | None:
+        """校验 GRE TTL 范围。"""
+
+        if value is not None and not 1 <= value <= 255:
+            raise ValueError("TTL must be between 1 and 255")
+        return value
+
+
+class GreManualConnectionUpdate(GreManualConnectionCreate):
+    """更新仅管理当前节点一端的 GRE 连接请求。"""
+
+    protocol_type: str = "gre"
+
+
 class InterfaceRead(BaseModel):
     """WireGuard 接口详情响应。"""
 

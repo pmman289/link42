@@ -252,7 +252,7 @@ main() {
   wait_for_api
 
   local password
-  password="$(sed -n 's/.*password=//p' "$RUN_DIR/api.log" | tail -1)"
+  password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/api.log" | tail -1)"
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \
     -d "{\"username\":\"pmman\",\"password\":\"$password\"}" | json_get token)"

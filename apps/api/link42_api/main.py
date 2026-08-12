@@ -2794,6 +2794,7 @@ def gre_connection_read(db: Session, connection: models.Connection) -> schemas.C
     """把 GRE 连接转成通用 API 响应。"""
 
     endpoints = sorted(connection.endpoints, key=lambda endpoint: 0 if endpoint.role == "local" else 1)
+    manual_connection = len(endpoints) == 1
     endpoint_errors = [
         f"{endpoint.node.name if endpoint.node else endpoint.interface_name}: {str((endpoint.extras or {}).get('last_error') or '').strip()}"
         for endpoint in endpoints
@@ -2809,7 +2810,7 @@ def gre_connection_read(db: Session, connection: models.Connection) -> schemas.C
         managed=connection.managed,
         status=gre_connection_status(connection),
         endpoints=[connection_endpoint_read(db, endpoint) for endpoint in endpoints],
-        warnings=[
+        warnings=(["此 GRE 连接仅管理当前节点，对端配置需要在外部设备上自行维护"] if manual_connection else []) + [
             "GRE 不加密，请勿直接承载敏感流量",
             "GRE 需要中间网络放行 IP protocol 47，普通 NAT 环境通常不可用",
             "OpenWrt 节点创建 GRE 后需要把 GRE 地址接口加入合适的防火墙 zone，否则入向流量可能被防火墙拒绝",
@@ -2895,6 +2896,19 @@ def validate_gre_payload(payload: schemas.GreManagedConnectionCreate | schemas.G
         raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
 
 
+def validate_manual_gre_payload(
+    payload: schemas.GreManualConnectionCreate | schemas.GreManualConnectionUpdate,
+) -> None:
+    """执行手动单端 GRE 的跨字段业务校验。"""
+
+    if not payload.risk_accepted:
+        raise HTTPException(status_code=400, detail="gre risk must be accepted")
+    if payload.outer_local_ip == payload.outer_remote_ip:
+        raise HTTPException(status_code=400, detail="gre endpoint local and remote addresses must be different")
+    if payload.ttl is not None and not payload.pmtudisc:
+        raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
+
+
 def gre_outer_mapping(payload: schemas.GreManagedConnectionCreate | schemas.GreManagedConnectionUpdate) -> dict[str, str]:
     """把标准两地址和可选 NAT/EIP 覆盖字段合并成两端实际 GRE local/remote。"""
 
@@ -2915,6 +2929,22 @@ def gre_protocol_config(local_outer_ip: str, remote_outer_ip: str, payload: sche
         "key": payload.gre_key,
         "ttl": payload.ttl,
         "pmtudisc": payload.pmtudisc,
+    }
+
+
+def manual_gre_protocol_config(
+    payload: schemas.GreManualConnectionCreate | schemas.GreManualConnectionUpdate,
+) -> dict[str, Any]:
+    """生成手动单端 GRE 的协议配置和外部对端备注。"""
+
+    return {
+        "outer_local_ip": payload.outer_local_ip,
+        "outer_remote_ip": payload.outer_remote_ip,
+        "key": payload.gre_key,
+        "ttl": payload.ttl,
+        "pmtudisc": payload.pmtudisc,
+        "peer_interface_name": payload.peer_interface_name,
+        "peer_tunnel_ips": payload.peer_tunnel_ips,
     }
 
 
@@ -4169,6 +4199,47 @@ def create_managed_connection(
     return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
 
 
+@app.post("/api/nodes/{node_id}/connections/manual", response_model=schemas.ConnectionRead)
+def create_manual_connection(
+    node_id: int,
+    payload: schemas.GreManualConnectionCreate,
+    db: Session = Depends(get_db),
+) -> schemas.ConnectionRead:
+    """创建仅由当前节点 Agent 管理的单端 GRE 连接。"""
+
+    validate_manual_gre_payload(payload)
+    node = require_online_node(db, node_id)
+    require_gre_supported(node)
+    ensure_unique_interface_name(db, node_id, payload.interface_name)
+    connection_name = payload.interface_name
+    if payload.peer_interface_name:
+        connection_name = f"{payload.interface_name} -> {payload.peer_interface_name}"
+    connection = models.Connection(
+        protocol_type=CONNECTION_TYPE_GRE,
+        name=connection_name,
+        source="created",
+        managed=True,
+        status="starting",
+    )
+    endpoint = models.ConnectionEndpoint(
+        connection=connection,
+        node_id=node_id,
+        role="local",
+        interface_name=payload.interface_name,
+        tunnel_ips=payload.tunnel_ips,
+        mtu=payload.mtu,
+        routes=payload.routes,
+        runtime_status="starting",
+        protocol_config=manual_gre_protocol_config(payload),
+    )
+    db.add_all([connection, endpoint])
+    db.flush()
+    enqueue_gre_apply_and_start(db, endpoint)
+    db.commit()
+    logger.info("创建手动 GRE 连接 connection_id=%s endpoint_id=%s node_id=%s", connection.id, endpoint.id, node_id)
+    return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
+
+
 @app.get("/api/connections/{raw_connection_ref}", response_model=schemas.ConnectionRead)
 def get_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
     """读取通用连接详情。"""
@@ -4186,7 +4257,7 @@ def update_connection(
     payload: schemas.GreManagedConnectionUpdate,
     db: Session = Depends(get_db),
 ) -> schemas.ConnectionRead:
-    """编辑 GRE 连接并重新下发双方配置。"""
+    """编辑双端受管 GRE 连接并重新下发双方配置。"""
 
     protocol_type, item_id = parse_connection_ref(raw_connection_ref)
     if protocol_type != CONNECTION_TYPE_GRE:
@@ -4195,7 +4266,7 @@ def update_connection(
     connection = get_gre_connection_or_404(db, item_id)
     endpoints = sorted(connection.endpoints, key=lambda endpoint: 0 if endpoint.role == "local" else 1)
     if len(endpoints) != 2:
-        raise HTTPException(status_code=400, detail="gre connection endpoints are incomplete")
+        raise HTTPException(status_code=400, detail="use manual GRE API for single-endpoint connections")
     local_endpoint, peer_endpoint = endpoints
     local_node = require_online_node(db, local_endpoint.node_id)
     peer_node = require_online_node(db, peer_endpoint.node_id)
@@ -4235,9 +4306,50 @@ def update_connection(
     return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
 
 
+@app.patch("/api/connections/{raw_connection_ref}/manual", response_model=schemas.ConnectionRead)
+def update_manual_connection(
+    raw_connection_ref: str,
+    payload: schemas.GreManualConnectionUpdate,
+    db: Session = Depends(get_db),
+) -> schemas.ConnectionRead:
+    """编辑单端手动 GRE 连接并重新下发当前节点配置。"""
+
+    protocol_type, item_id = parse_connection_ref(raw_connection_ref)
+    if protocol_type != CONNECTION_TYPE_GRE:
+        raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
+    validate_manual_gre_payload(payload)
+    connection = get_gre_connection_or_404(db, item_id)
+    endpoints = list(connection.endpoints)
+    if len(endpoints) != 1 or connection.source != "created":
+        raise HTTPException(status_code=400, detail="connection is not a manual GRE connection")
+    endpoint = endpoints[0]
+    node = require_online_node(db, endpoint.node_id)
+    require_gre_supported(node)
+    ensure_unique_interface_name(
+        db,
+        endpoint.node_id,
+        payload.interface_name,
+        exclude_connection_endpoint_id=endpoint.id,
+    )
+    record_endpoint_rename(endpoint, payload.interface_name)
+    endpoint.interface_name = payload.interface_name
+    endpoint.tunnel_ips = payload.tunnel_ips
+    endpoint.mtu = payload.mtu
+    endpoint.routes = payload.routes
+    endpoint.protocol_config = manual_gre_protocol_config(payload)
+    connection.name = payload.interface_name
+    if payload.peer_interface_name:
+        connection.name = f"{payload.interface_name} -> {payload.peer_interface_name}"
+    connection.status = "starting"
+    enqueue_gre_apply_and_start(db, endpoint)
+    db.commit()
+    logger.info("更新手动 GRE 连接 connection_id=%s endpoint_id=%s", connection.id, endpoint.id)
+    return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
+
+
 @app.post("/api/connections/{raw_connection_ref}/start", response_model=schemas.ConnectionRead)
 def start_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
-    """启动 GRE 连接双方端点。"""
+    """启动 GRE 连接的全部受管端点。"""
 
     protocol_type, item_id = parse_connection_ref(raw_connection_ref)
     if protocol_type != CONNECTION_TYPE_GRE:
@@ -4255,7 +4367,7 @@ def start_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> 
 
 @app.post("/api/connections/{raw_connection_ref}/stop", response_model=schemas.ConnectionRead)
 def stop_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
-    """停止 GRE 连接双方端点。"""
+    """停止 GRE 连接的全部受管端点。"""
 
     protocol_type, item_id = parse_connection_ref(raw_connection_ref)
     if protocol_type != CONNECTION_TYPE_GRE:
@@ -4273,7 +4385,7 @@ def stop_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> s
 
 @app.post("/api/connections/{raw_connection_ref}/refresh-status", response_model=schemas.ConnectionRead)
 def refresh_connection_status(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
-    """刷新 GRE 连接双方端点运行状态。"""
+    """刷新 GRE 连接全部受管端点的运行状态。"""
 
     protocol_type, item_id = parse_connection_ref(raw_connection_ref)
     if protocol_type != CONNECTION_TYPE_GRE:
@@ -4289,7 +4401,7 @@ def refresh_connection_status(raw_connection_ref: str, db: Session = Depends(get
 
 @app.delete("/api/connections/{raw_connection_ref}")
 def delete_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> dict[str, str]:
-    """删除 GRE 连接记录，并下发双方清理任务。"""
+    """删除 GRE 连接记录，并向全部受管端点下发清理任务。"""
 
     protocol_type, item_id = parse_connection_ref(raw_connection_ref)
     if protocol_type != CONNECTION_TYPE_GRE:

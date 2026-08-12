@@ -128,7 +128,7 @@ main() {
   wait_for_api
 
   local password
-  password="$(sed -n 's/.*password=//p' "$RUN_DIR/controller.log" | tail -1)"
+  password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/controller.log" | tail -1)"
   [[ -n "$password" ]] || fail "initial password not found in controller log"
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \

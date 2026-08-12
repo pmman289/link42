@@ -265,16 +265,18 @@ def gre_start_commands(config: dict[str, Any]) -> list[list[str]]:
     """生成启动 GRE 接口所需的命令序列。"""
 
     interface_name = config["interface_name"]
-    commands = [[ip_command(), "link", "del", interface_name]]
+    commands: list[list[str]] = []
+    previous_interface_name = config.get("previous_interface_name")
+    if previous_interface_name and previous_interface_name != interface_name:
+        # 同一组 local/remote/key 不能同时创建两个 GRE 接口，改名时必须先移除旧接口。
+        commands.append([ip_command(), "link", "del", previous_interface_name])
+    commands.append([ip_command(), "link", "del", interface_name])
     commands.append(gre_tunnel_add_command(config))
     for tunnel_ip in config["tunnel_ips"]:
         commands.append([ip_command(), "addr", "add", tunnel_ip, "dev", interface_name])
     commands.append([ip_command(), "link", "set", "dev", interface_name, "mtu", str(config["mtu"]), "up"])
     for route in config["routes"]:
         commands.append(gre_route_replace_command(route, interface_name))
-    previous_interface_name = config.get("previous_interface_name")
-    if previous_interface_name and previous_interface_name != interface_name:
-        commands.append([ip_command(), "link", "del", previous_interface_name])
     return commands
 
 
@@ -535,6 +537,7 @@ def gre_systemd_start_commands(config: dict[str, Any]) -> list[list[str]]:
         ]
     else:
         cleanup_commands = []
+    commands.extend(cleanup_commands)
     commands.extend(
         [
             [systemctl_command(), "daemon-reload"],
@@ -542,7 +545,6 @@ def gre_systemd_start_commands(config: dict[str, Any]) -> list[list[str]]:
             [systemctl_command(), "restart", gre_systemd_unit_name(interface_name)],
         ]
     )
-    commands.extend(cleanup_commands)
     return commands
 
 

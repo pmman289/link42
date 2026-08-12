@@ -789,7 +789,7 @@ def test_run_gre_service_command_outputs_json(monkeypatch, capsys) -> None:
 
 
 def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) -> None:
-    """验证 GRE 改名启动会先建新接口，成功后再清理旧接口和旧配置。"""
+    """验证 GRE 改名会先移除冲突的旧接口，再创建新接口并清理旧配置。"""
 
     commands: list[list[str]] = []
 
@@ -824,6 +824,7 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
     assert result["previous_config_cleanup"]["config_path"] == str(tmp_path / "gre_old.json")
     assert '"interface_name": "gre_new"' in saved
     assert commands == [
+        ["/sbin/ip", "link", "del", "gre_old"],
         ["/sbin/ip", "link", "del", "gre_new"],
         [
             "/sbin/ip",
@@ -847,7 +848,6 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
         ["/sbin/ip", "link", "set", "dev", "gre_new", "mtu", "1476", "up"],
         ["/sbin/ip", "route", "replace", "10.77.0.0/24", "dev", "gre_new"],
         ["/sbin/ip", "-6", "route", "replace", "fd77::/64", "dev", "gre_new"],
-        ["/sbin/ip", "link", "del", "gre_old"],
     ]
 
 
@@ -1031,6 +1031,37 @@ def test_gre_systemd_start_uses_agent_service_entry(monkeypatch, tmp_path: Path)
         ["/bin/systemctl", "daemon-reload"],
         ["/bin/systemctl", "enable", "link42-gre@gre_a_b.service"],
         ["/bin/systemctl", "restart", "link42-gre@gre_a_b.service"],
+    ]
+
+
+def test_gre_systemd_rename_stops_old_service_before_starting_new_service(monkeypatch, tmp_path: Path) -> None:
+    """验证 systemd GRE 改名会先停止旧实例，避免相同隧道参数创建冲突。"""
+
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: True)
+    monkeypatch.setattr(gre, "systemctl_command", lambda: "/bin/systemctl")
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "agent_binary_path", lambda: "/usr/local/bin/link42-agent")
+    monkeypatch.setattr(gre.shutil, "which", lambda binary: "/usr/local/bin/link42-agent" if binary == "link42-agent" else None)
+
+    result = gre.start_gre_interface(
+        {
+            "interface_name": "gre_new",
+            "previous_interface_name": "gre_old",
+            "outer_local_ip": "203.0.113.10",
+            "outer_remote_ip": "198.51.100.20",
+            "tunnel_ips": ["10.42.8.1/30"],
+            "routes": [],
+        },
+        str(tmp_path),
+        dry_run=True,
+    )
+
+    assert result["commands"] == [
+        ["/bin/systemctl", "disable", "--now", "link42-gre@gre_old.service"],
+        ["/sbin/ip", "link", "del", "gre_old"],
+        ["/bin/systemctl", "daemon-reload"],
+        ["/bin/systemctl", "enable", "link42-gre@gre_new.service"],
+        ["/bin/systemctl", "restart", "link42-gre@gre_new.service"],
     ]
 
 
