@@ -72,6 +72,24 @@ def test_render_wg_quick_supports_table_off_and_multiple_addresses() -> None:
     assert "Table = off" in rendered
 
 
+def test_render_wg_quick_brackets_ipv6_endpoint() -> None:
+    """验证 IPv6 Endpoint 使用 wg-quick 要求的方括号格式。"""
+
+    rendered = render_wg_quick(
+        {"private_key": "private", "tunnel_ips": ["fd42::1/128"]},
+        [
+            {
+                "public_key": "peer-public",
+                "allowed_ips": ["fd42::2/128"],
+                "endpoint_host": "::1",
+                "endpoint_port": 51820,
+            }
+        ],
+    )
+
+    assert "Endpoint = [::1]:51820" in rendered
+
+
 def test_render_wg_quick_inserts_custom_config_after_section_headers() -> None:
     """验证高级自定义配置会插入到对应 section 标题之后。"""
 

@@ -108,6 +108,16 @@ def scrub_text_for_log(value: object, limit: int = 500) -> str:
     return text[:limit]
 
 
+def validate_wireguard_ipv6_mtu(mtu: int | None, *tunnel_ip_groups: list[str]) -> None:
+    """拒绝会让 Linux 注销接口 IPv6 能力的过小 WireGuard MTU。"""
+
+    if mtu is None or mtu >= 1280:
+        return
+    for tunnel_ips in tunnel_ip_groups:
+        if any(ipaddress.ip_interface(value).version == 6 for value in tunnel_ips):
+            raise HTTPException(status_code=400, detail="IPv6 WireGuard MTU must be at least 1280")
+
+
 def summarize_task_payload(payload: dict | None) -> dict[str, object]:
     """生成可安全写入日志的任务 payload 摘要。"""
 
@@ -1867,6 +1877,7 @@ def agent_platform_candidates(node: models.Node) -> list[str]:
     service_manager = str(platform.get("service_manager") or "").lower()
     candidates: list[str] = []
     if service_manager == "openwrt-uci":
+        candidates.append("openwrt-source")
         candidates.append(f"openwrt-{arch}-musl")
     if glibc:
         candidates.append(f"{os_name}-{arch}-glibc{glibc}")
@@ -1906,13 +1917,9 @@ def build_agent_manual_upgrade_command(node: models.Node, target_version: str | 
         "LINK42_AGENT_VERSION": target_version or "latest",
         "LINK42_RES_BASE_URL": settings.agent_res_base_url,
     }
-    controller_url = controller_url_for_agent(db)
-    if controller_url:
-        env_values["LINK42_SERVER_URL"] = controller_url
-    env_values["LINK42_NODE_ID"] = str(node.id)
-    env_values["LINK42_AGENT_TOKEN"] = "<ROTATE_TOKEN_IN_PANEL>"
     env_parts = [f"{key}={shlex.quote(value)}" for key, value in env_values.items()]
-    return f"curl -fsSL {shlex.quote(settings.agent_install_script_url)} | sudo env {' '.join(env_parts)} sh"
+    privilege_prefix = "" if str((node.agent_platform or {}).get("service_manager") or "") == "openwrt-uci" else "sudo "
+    return f"curl -fsSL {shlex.quote(settings.agent_install_script_url)} | {privilege_prefix}env {' '.join(env_parts)} sh"
 
 
 def build_agent_upgrade_plan(
@@ -2041,6 +2048,7 @@ def normalize_udp2raw_config(payload: schemas.Udp2RawMiddlewareConfig | None) ->
         "client_listen_port": payload.client_listen_port,
         "raw_mode": payload.raw_mode,
         "cipher_mode": payload.cipher_mode,
+        "auth_mode": payload.auth_mode,
         "password": payload.password or generate_token("u2r"),
         "auto_rule": payload.auto_rule,
     }
@@ -2078,6 +2086,14 @@ def require_udp2raw_supported(node: models.Node) -> None:
 
     for task_type in ["middleware.install", "middleware.udp2raw.apply"]:
         require_task_supported(node, task_type)
+
+
+def require_udp2raw_mode_supported(node: models.Node, raw_mode: str) -> None:
+    """要求节点 Agent 支持所选 udp2raw 传输模式。"""
+
+    require_udp2raw_supported(node)
+    if raw_mode == "icmp" and "middleware.udp2raw.icmp" not in set(node.agent_capabilities or []):
+        raise HTTPException(status_code=409, detail="agent does not support udp2raw ICMP mode")
 
 
 def normalize_mimic_config(payload: schemas.MimicMiddlewareConfig | None) -> dict | None:
@@ -2265,6 +2281,18 @@ def udp2raw_endpoint_payloads(
         middleware.get("server_connect_host") or server_public_host,
         "udp2raw server connect host",
     )
+    outer_ip_version = ipaddress.ip_address(server_connect_host).version
+    server_listen_host = require_udp2raw_ip(
+        middleware.get("server_listen_host") or ("::" if outer_ip_version == 6 else "0.0.0.0"),
+        "udp2raw server listen host",
+    )
+    listen_ip = ipaddress.ip_address(server_listen_host)
+    if listen_ip.is_unspecified:
+        server_listen_host = server_connect_host if middleware.get("raw_mode") == "icmp" else (
+            "::" if outer_ip_version == 6 else "0.0.0.0"
+        )
+    elif listen_ip.version != outer_ip_version:
+        raise HTTPException(status_code=400, detail="udp2raw server listen address must match outer IP version")
     server_forward_host = require_udp2raw_ip(
         middleware.get("server_forward_host") or "127.0.0.1",
         "udp2raw server forward host",
@@ -2276,13 +2304,14 @@ def udp2raw_endpoint_payloads(
         "instance": instance,
         "raw_mode": middleware["raw_mode"],
         "cipher_mode": middleware["cipher_mode"],
+        "auth_mode": middleware.get("auth_mode") or "md5",
         "password": middleware["password"],
         "auto_rule": middleware["auto_rule"],
     }
     server_payload = {
         **common,
         "mode": "server",
-        "listen_host": middleware["server_listen_host"],
+        "listen_host": server_listen_host,
         "listen_port": middleware["server_listen_port"],
         "remote_host": server_forward_host,
         "remote_port": server_forward_port,
@@ -2316,7 +2345,7 @@ def enqueue_udp2raw_tasks(
     for interface in [local_interface, peer_interface]:
         node = db.get(models.Node, interface.node_id)
         if node is not None:
-            require_udp2raw_supported(node)
+            require_udp2raw_mode_supported(node, str(middleware.get("raw_mode") or "faketcp"))
         enqueue_interface_task_once(db, interface, "middleware.install", {"plugin": "udp2raw"})
     for interface, task_type, payload in udp2raw_endpoint_payloads(
         middleware,
@@ -3991,8 +4020,8 @@ def request_agent_upgrade(
             ),
             "sha256": asset.sha256,
             "size": asset.size,
+            "upgrade_mode": asset.install_mode,
             "binary_args": ["--version"],
-            "service_name": "link42-agent",
             "install_path": "/usr/local/bin/link42-agent",
             "rollback": True,
         },
@@ -4824,6 +4853,7 @@ def create_interface(
     db: Session = Depends(get_db),
 ) -> models.WireGuardInterface:
     """在指定节点上创建 WireGuard 点对点配置期望状态。"""
+    validate_wireguard_ipv6_mtu(payload.mtu, payload.tunnel_ips)
     require_online_node(db, node_id)
 
     ensure_unique_interface_name(db, node_id, payload.name)
@@ -4860,6 +4890,7 @@ def create_managed_link(
 
     if node_id == payload.peer_node_id:
         raise HTTPException(status_code=400, detail="peer node must be different")
+    validate_wireguard_ipv6_mtu(payload.mtu, payload.local_tunnel_ips, payload.peer_tunnel_ips)
 
     local_node = require_online_node(db, node_id)
     peer_node = require_online_node(db, payload.peer_node_id)
@@ -5218,6 +5249,7 @@ def update_managed_link(
 ) -> dict[str, object]:
     """编辑受管节点连接，并直接下发双方配置。"""
 
+    validate_wireguard_ipv6_mtu(payload.mtu, payload.local_tunnel_ips, payload.peer_tunnel_ips)
     local_interface, peer_interface, local_peer, peer_peer = get_managed_link_bundle(db, interface_id)
     old_middleware = managed_link_middleware(local_interface)
     local_node = require_online_node(db, local_interface.node_id)
@@ -5413,6 +5445,7 @@ def update_interface(
 ) -> models.WireGuardInterface:
     """修改已有 WireGuard 点对点配置的期望状态。"""
 
+    validate_wireguard_ipv6_mtu(payload.mtu, payload.tunnel_ips)
     interface = db.get(models.WireGuardInterface, interface_id)
     if interface is None:
         raise HTTPException(status_code=404, detail="interface not found")

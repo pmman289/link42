@@ -113,12 +113,14 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
             "middleware",
             "middleware.install",
             "middleware.udp2raw",
+            "middleware.udp2raw.icmp",
         ])
+    if service_manager in {"systemd", "openwrt-uci"}:
+        capabilities.append("agent.self_upgrade")
     if service_manager == "systemd":
         capabilities.extend([
-            "agent.self_upgrade",
+            "middleware.udp2raw.systemd",
         ])
-        capabilities.append("middleware.udp2raw.systemd")
         if mimic_installable(platform_info):
             capabilities.append("middleware.install.mimic")
         if mimic_runtime_supported(platform_info) and platform_info.get("has_mimic"):

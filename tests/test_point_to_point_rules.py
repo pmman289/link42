@@ -33,6 +33,7 @@ from link42_api.main import (
     SETTING_ADMIN_USERNAME,
     SETTING_CONTROLLER_URL,
     app,
+    create_interface,
     create_manual_connection,
     create_managed_link,
     create_managed_connection,
@@ -4547,8 +4548,9 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
     assert plan.reason == "当前 Agent 不支持自升级"
     assert plan.manual_command is not None
     assert "LINK42_AGENT_VERSION=0.2.0" in plan.manual_command
-    assert "LINK42_NODE_ID=" in plan.manual_command
-    assert "LINK42_AGENT_TOKEN='<ROTATE_TOKEN_IN_PANEL>'" in plan.manual_command
+    assert "LINK42_RES_BASE_URL=https://example.com/res" in plan.manual_command
+    assert "LINK42_NODE_ID=" not in plan.manual_command
+    assert "LINK42_AGENT_TOKEN=" not in plan.manual_command
 
 
 def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) -> None:
@@ -4606,6 +4608,65 @@ def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) 
     assert task.payload["target_version"] == "0.2.1"
     assert task.payload["download_url"] == "http://controller:8000/api/agent/releases/0.2.1/download?platform=linux-x64-glibc2.31"
     assert task.payload["sha256"] == "abc123"
+
+
+def test_openwrt_agent_upgrade_uses_source_asset(monkeypatch, tmp_path) -> None:
+    """验证 OpenWrt 一键升级选择源码包并下发源码替换参数。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main.settings, "agent_release_dir", str(tmp_path))
+    (tmp_path / "agent-source.tar.gz").write_bytes(b"source")
+    (tmp_path / "manifest.json").write_text(
+        """
+        {
+          "latest": "0.6.14",
+          "releases": {
+            "0.6.14": {
+              "assets": {
+                "openwrt-source": {
+                  "path": "agent-source.tar.gz",
+                  "sha256": "source-sha",
+                  "size": 6,
+                  "install_mode": "source"
+                }
+              }
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="openwrt",
+            agent_token_hash="hash",
+            status="online",
+            agent_version="0.6.13",
+            agent_capabilities=["wireguard", "agent.self_upgrade", "service:openwrt-uci"],
+            agent_platform={"os": "linux", "arch": "x86_64", "service_manager": "openwrt-uci", "libc": "musl"},
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        set_setting(session, SETTING_CONTROLLER_URL, "http://controller:8000")
+        session.commit()
+
+        plan = build_agent_upgrade_plan(node, session)
+        result = request_agent_upgrade(node.id, AgentUpgradeRequest(), session)
+        task = session.get(models.AgentTask, result.task_id)
+
+    assert plan.upgrade_mode == "self_upgrade"
+    assert plan.matched_platform == "openwrt-source"
+    assert plan.manual_command is not None and "| env " in plan.manual_command
+    assert "sudo env" not in plan.manual_command
+    assert task is not None
+    assert task.payload["upgrade_mode"] == "source"
+    assert "source_dir" not in task.payload
+    assert "service_name" not in task.payload
+    assert "platform=openwrt-source" in task.payload["download_url"]
 
 
 def test_create_managed_link_with_udp2raw_uses_single_direction(monkeypatch) -> None:
@@ -5112,6 +5173,116 @@ def test_udp2raw_defaults_server_forward_to_wireguard_listen_port() -> None:
     assert server_payload["remote_port"] == 51821
 
 
+def test_udp2raw_icmp_ipv6_payload_binds_server_connect_ip() -> None:
+    """验证 ICMPv6 通配监听会收敛到服务端连接 IP，避免自动规则误伤其它 Echo。"""
+
+    local_interface = models.WireGuardInterface(id=1, node_id=1, name="wg-a", listen_port=None)
+    peer_interface = models.WireGuardInterface(id=2, node_id=2, name="wg-b", listen_port=51821)
+    middleware = {
+        "type": "udp2raw",
+        "enabled": True,
+        "server_side": "peer",
+        "server_listen_host": "0.0.0.0",
+        "server_connect_host": "2001:db8::20",
+        "server_listen_port": 23002,
+        "server_forward_host": "::1",
+        "server_forward_port": 51821,
+        "client_listen_host": "::1",
+        "client_listen_port": 12312,
+        "raw_mode": "icmp",
+        "cipher_mode": "none",
+        "auth_mode": "none",
+        "password": "u2r_secret",
+        "auto_rule": True,
+    }
+
+    payloads = udp2raw_endpoint_payloads(
+        middleware,
+        local_interface,
+        peer_interface,
+        "2001:db8::10",
+        "2001:db8::20",
+    )
+
+    server_payload = payloads[0][2]
+    client_payload = payloads[1][2]
+    assert server_payload["listen_host"] == "2001:db8::20"
+    assert server_payload["remote_host"] == "::1"
+    assert client_payload["remote_host"] == "2001:db8::20"
+    assert client_payload["raw_mode"] == "icmp"
+    assert client_payload["auth_mode"] == "none"
+
+
+def test_udp2raw_icmp_ipv4_payload_binds_server_connect_ip() -> None:
+    """验证 ICMPv4 通配监听会绑定服务端连接 IP，而不是拦截全部入站 Echo Request。"""
+
+    local_interface = models.WireGuardInterface(id=1, node_id=1, name="wg-a", listen_port=None)
+    peer_interface = models.WireGuardInterface(id=2, node_id=2, name="wg-b", listen_port=51821)
+    middleware = {
+        "type": "udp2raw",
+        "enabled": True,
+        "server_side": "peer",
+        "server_listen_host": "0.0.0.0",
+        "server_connect_host": "198.51.100.20",
+        "server_listen_port": 23002,
+        "server_forward_host": "127.0.0.1",
+        "server_forward_port": 51821,
+        "client_listen_host": "127.0.0.1",
+        "client_listen_port": 12312,
+        "raw_mode": "icmp",
+        "cipher_mode": "none",
+        "auth_mode": "none",
+        "password": "u2r_secret",
+        "auto_rule": True,
+    }
+
+    payloads = udp2raw_endpoint_payloads(
+        middleware,
+        local_interface,
+        peer_interface,
+        "198.51.100.10",
+        "198.51.100.20",
+    )
+
+    assert payloads[0][2]["listen_host"] == "198.51.100.20"
+
+
+def test_udp2raw_rejects_non_wildcard_listen_address_family_mismatch() -> None:
+    """验证服务端指定监听地址时不能与 udp2raw 外层连接地址使用不同地址族。"""
+
+    local_interface = models.WireGuardInterface(id=1, node_id=1, name="wg-a", listen_port=None)
+    peer_interface = models.WireGuardInterface(id=2, node_id=2, name="wg-b", listen_port=51821)
+    middleware = {
+        "type": "udp2raw",
+        "enabled": True,
+        "server_side": "peer",
+        "server_listen_host": "192.0.2.20",
+        "server_connect_host": "2001:db8::20",
+        "server_listen_port": 23002,
+        "server_forward_host": "127.0.0.1",
+        "server_forward_port": 51821,
+        "client_listen_host": "127.0.0.1",
+        "client_listen_port": 12312,
+        "raw_mode": "icmp",
+        "cipher_mode": "none",
+        "auth_mode": "none",
+        "password": "u2r_secret",
+        "auto_rule": True,
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        udp2raw_endpoint_payloads(
+            middleware,
+            local_interface,
+            peer_interface,
+            "2001:db8::10",
+            "2001:db8::20",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "udp2raw server listen address must match outer IP version"
+
+
 def test_udp2raw_requires_server_side_wireguard_listen_port() -> None:
     """验证启用 udp2raw 时，运行 server 的 WireGuard 端必须填写 ListenPort。"""
 
@@ -5212,6 +5383,160 @@ def test_udp2raw_rejects_domain_as_server_connect_host(monkeypatch) -> None:
 
     assert exc_info.value.status_code == 400
     assert "must be an IP address" in str(exc_info.value.detail)
+
+
+def test_udp2raw_icmp_requires_new_agent_capability(monkeypatch) -> None:
+    """验证选择 ICMP 时旧 Agent 会被主控拒绝，避免创建后才在节点失败。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: ("private", "public"))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    old_capabilities = [
+        "wireguard",
+        "wg_quick_import",
+        "service:systemd",
+        "middleware",
+        "middleware.install",
+        "middleware.udp2raw",
+    ]
+    with Session(engine) as session:
+        node_a = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.10"],
+            agent_version="0.6.12",
+            agent_capabilities=old_capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        node_b = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["198.51.100.20"],
+            agent_version="0.6.12",
+            agent_capabilities=old_capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([node_a, node_b])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_managed_link(
+                node_a.id,
+                ManagedLinkCreate(
+                    peer_node_id=node_b.id,
+                    local_interface_name="wg-a",
+                    peer_interface_name="wg-b",
+                    local_tunnel_ips=["10.42.0.1/32"],
+                    peer_tunnel_ips=["10.42.0.2/32"],
+                    local_endpoint_host="198.51.100.10",
+                    peer_endpoint_host="198.51.100.20",
+                    peer_listen_port=51821,
+                    udp2raw=Udp2RawMiddlewareConfig(
+                        enabled=True,
+                        server_side="peer",
+                        server_listen_port=23002,
+                        client_listen_port=12312,
+                        raw_mode="icmp",
+                    ),
+                ),
+                session,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "agent does not support udp2raw ICMP mode"
+
+
+def test_managed_link_rejects_ipv6_tunnel_mtu_below_protocol_minimum(monkeypatch) -> None:
+    """验证 IPv6 WireGuard 不接受会让内核移除 IPv6 地址的过小 MTU。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "generate_wireguard_keypair", lambda: ("private", "public"))
+    monkeypatch.setattr(api_main, "generate_preshared_key", lambda: "shared-key")
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    capabilities = [
+        "wireguard",
+        "wg_quick_import",
+        "service:systemd",
+        "middleware",
+        "middleware.install",
+        "middleware.udp2raw",
+        "middleware.udp2raw.icmp",
+    ]
+    with Session(engine) as session:
+        local_node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["2001:db8::1"],
+            agent_version="0.6.13",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        peer_node = models.Node(
+            name="node-b",
+            agent_token_hash="hash",
+            status="online",
+            endpoint_ips=["2001:db8::2"],
+            agent_version="0.6.13",
+            agent_capabilities=capabilities,
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add_all([local_node, peer_node])
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_managed_link(
+                local_node.id,
+                ManagedLinkCreate(
+                    peer_node_id=peer_node.id,
+                    local_interface_name="wg-a",
+                    peer_interface_name="wg-b",
+                    local_tunnel_ips=["fd42::1/126"],
+                    peer_tunnel_ips=["fd42::2/126"],
+                    local_endpoint_host="2001:db8::1",
+                    peer_endpoint_host="2001:db8::2",
+                    peer_listen_port=51820,
+                    mtu=1240,
+                ),
+                session,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "IPv6 WireGuard MTU must be at least 1280"
+
+
+def test_manual_wireguard_rejects_ipv6_tunnel_mtu_below_protocol_minimum() -> None:
+    """验证手动 WireGuard 配置也不能绕过 IPv6 最小 MTU 校验。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            create_interface(
+                node.id,
+                InterfaceCreate(name="wg-v6", tunnel_ips=["fd42::1/64"], mtu=1279),
+                session,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "IPv6 WireGuard MTU must be at least 1280"
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import tarfile
 import threading
 from typing import Any
 from urllib import error
@@ -1897,10 +1898,30 @@ def test_agent_install_script_explicit_env_overrides_existing_env_file() -> None
     script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
 
     assert 'INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"' in script
+    assert 'INPUT_LINK42_WIREGUARD_DIR="${LINK42_WIREGUARD_DIR-}"' in script
+    assert 'INPUT_LINK42_AGENT_DRY_RUN="${LINK42_AGENT_DRY_RUN-}"' in script
+    assert 'INPUT_LINK42_POLL_INTERVAL="${LINK42_POLL_INTERVAL-}"' in script
     assert '. "$ENV_FILE"' in script
     assert 'LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"' in script
+    assert 'WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"' in script
+    assert 'DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"' in script
+    assert 'POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"' in script
     assert script.index('INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"') < script.index('. "$ENV_FILE"')
     assert script.index('. "$ENV_FILE"') < script.index('LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"')
+
+
+def test_agent_install_script_openwrt_stages_and_rolls_back_source() -> None:
+    """验证 OpenWrt 覆盖安装会先校验新源码，并在服务失败时恢复旧版本。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+
+    assert 'SERVICE_NAME="${LINK42_AGENT_SERVICE_NAME:-link42-agent}"' in script
+    assert 'staged_source="$INSTALL_DIR/.src.new"' in script
+    assert 'staged_version="$(PYTHONPATH=' in script
+    assert 'backup_source="$INSTALL_DIR/.src.bak"' in script
+    assert "rollback_source_install()" in script
+    assert '"/etc/init.d/$SERVICE_NAME" status' in script
+    assert 'installed_version="$($BIN_PATH --version)"' in script
 
 
 def test_agent_uninstall_script_removes_link42_middleware() -> None:
@@ -2021,6 +2042,92 @@ def test_udp2raw_apply_uses_openwrt_procd(tmp_path: Path, monkeypatch) -> None:
         [str(init_script), "enable"],
         [str(init_script), "restart"],
     ]
+
+
+def test_udp2raw_openwrt_service_prefix_is_isolated(tmp_path: Path, monkeypatch) -> None:
+    """验证测试环境可使用独立 procd 服务前缀，不覆盖生产实例。"""
+
+    monkeypatch.setattr(middleware, "OPENWRT_INIT_DIR", tmp_path)
+    monkeypatch.setattr(middleware, "UDP2RAW_SERVICE_PREFIX", "link42-test-udp2raw")
+
+    assert middleware.init_path("client", "icmp-openwrt") == (
+        tmp_path / "link42-test-udp2raw-client-icmp-openwrt"
+    )
+    assert middleware.unit_name("server", "icmp-vpstest") == (
+        "link42-test-udp2raw-server@icmp-vpstest.service"
+    )
+
+
+def test_udp2raw_service_prefix_rejects_shell_characters(monkeypatch) -> None:
+    """验证服务前缀不能注入路径分隔符或 shell 字符。"""
+
+    monkeypatch.setattr(middleware, "UDP2RAW_SERVICE_PREFIX", "link42/test;bad")
+
+    with pytest.raises(ValueError, match="service prefix contains unsupported characters"):
+        middleware.init_name("client", "icmp-openwrt")
+
+
+def test_udp2raw_icmp_ipv4_args_are_rendered() -> None:
+    """验证 udp2raw ICMP over IPv4 参数保持标准 IPv4 host:port 格式。"""
+
+    args = middleware.build_udp2raw_args(
+        {
+            "instance": "link42-1-2",
+            "mode": "client",
+            "listen_host": "127.0.0.1",
+            "listen_port": 12312,
+            "remote_host": "198.51.100.20",
+            "remote_port": 23002,
+            "password": "secret",
+            "raw_mode": "icmp",
+            "cipher_mode": "none",
+            "auth_mode": "none",
+            "auto_rule": False,
+        }
+    )
+
+    assert "-l127.0.0.1:12312" in args
+    assert "-r198.51.100.20:23002" in args
+    assert "--raw-mode icmp" in args
+    assert "--cipher-mode none" in args
+    assert "--auth-mode none" in args
+    assert " -a" not in args
+
+
+def test_udp2raw_icmp_ipv6_args_use_brackets() -> None:
+    """验证 udp2raw ICMPv6 的监听和远端参数使用方括号包裹 IPv6 地址。"""
+
+    args = middleware.build_udp2raw_args(
+        {
+            "instance": "link42-1-2",
+            "mode": "server",
+            "listen_host": "::",
+            "listen_port": 23002,
+            "remote_host": "::1",
+            "remote_port": 51820,
+            "password": "secret",
+            "raw_mode": "icmp",
+            "cipher_mode": "xor",
+            "auth_mode": "simple",
+            "auto_rule": True,
+        }
+    )
+
+    assert "-l[::]:23002" in args
+    assert "-r[::1]:51820" in args
+    assert "--raw-mode icmp" in args
+    assert "--auth-mode simple" in args
+    assert args.endswith("-a")
+
+
+def test_udp2raw_capabilities_include_icmp(monkeypatch) -> None:
+    """验证支持 udp2raw 的 Agent 会显式上报 ICMP/ICMPv6 能力。"""
+
+    monkeypatch.setattr(main, "get_service_manager_name", lambda: "systemd")
+    monkeypatch.setattr(main, "get_agent_platform", lambda: {"service_manager": "systemd"})
+    monkeypatch.setattr(main.shutil, "which", lambda binary: None)
+
+    assert "middleware.udp2raw.icmp" in main.build_capabilities()
 
 
 def test_udp2raw_openwrt_result_drops_successful_rc_common_noise() -> None:
@@ -2417,6 +2524,38 @@ def test_stop_interface_uses_systemd_for_managed_service(monkeypatch) -> None:
     assert ["wg-quick", "down", "wg0"] not in commands
 
 
+def test_stop_interface_waits_for_openwrt_netifd(monkeypatch) -> None:
+    """验证 OpenWrt ifdown 异步返回时会等待内核接口真正消失。"""
+
+    commands: list[list[str]] = []
+    status_checks = 0
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """模拟 ifdown 返回后第二次状态检查才删除接口。"""
+
+        nonlocal status_checks
+        commands.append(command)
+        if command == ["wg", "show", "wg0"]:
+            status_checks += 1
+            return command_result(command) if status_checks <= 4 else command_result(command, returncode=1)
+        if command == ["uci", "-q", "show", "network.wg0.proto"]:
+            return command_result(command, stdout="network.wg0.proto='wireguard'\n")
+        if command == ["ifdown", "wg0"]:
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=False, openrc=False, openwrt=True, wg_quick=False)
+    monkeypatch.setattr(service_manager.Path, "exists", lambda self: str(self) == service_manager.OPENWRT_WIREGUARD_PROTO)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    monkeypatch.setattr(system.time, "sleep", lambda _seconds: None)
+
+    result = system.stop_wireguard_interface({"interface_name": "wg0"})
+
+    assert result["runtime"]["runtime_status"] == "stopped"
+    assert status_checks == 6
+    assert ["ifdown", "wg0"] in commands
+
+
 def test_delete_wireguard_config_disables_systemd_service(tmp_path: Path, monkeypatch) -> None:
     """验证删除 WireGuard 配置时会同步禁用残留的 systemd wg-quick 服务。"""
 
@@ -2710,7 +2849,7 @@ def test_openwrt_backend_is_reported_as_agent_capability(monkeypatch, tmp_path: 
     assert "service:openwrt-uci" in seen_capabilities
     assert "wireguard" in seen_capabilities
     assert "wg_quick_import" not in seen_capabilities
-    assert "agent.self_upgrade" not in seen_capabilities
+    assert "agent.self_upgrade" in seen_capabilities
     assert "middleware.install" in seen_capabilities
     assert "middleware.udp2raw" in seen_capabilities
     assert "middleware.udp2raw.openwrt-procd" in seen_capabilities
@@ -2922,9 +3061,10 @@ def test_agent_platform_reports_musl_libc(monkeypatch) -> None:
 
     monkeypatch.setattr(system.shutil, "which", fake_which)
 
-    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
         """模拟 Agent 系统命令执行器。"""
         if command == ["ldd", "--version"]:
+            assert kwargs["log_failure"] is False
             return command_result(command, stdout="musl libc (aarch64)\nVersion 1.2.3\n")
         return command_result(command)
 
@@ -2974,4 +3114,72 @@ def test_self_upgrade_dry_run_stages_when_systemd(monkeypatch) -> None:
         dry_run=True,
     )
 
-    assert result == {"status": "staged", "dry_run": True, "target_version": "0.2.1"}
+    assert result == {
+        "status": "staged",
+        "dry_run": True,
+        "target_version": "0.2.1",
+        "upgrade_mode": "binary",
+    }
+
+
+def test_self_upgrade_dry_run_stages_openwrt_source(monkeypatch) -> None:
+    """验证 OpenWrt 自升级接受源码资产并返回 staged。"""
+
+    config = type("Config", (), {"server_url": "http://controller:8000", "token": "token"})()
+    monkeypatch.setattr(upgrade, "get_service_manager_name", lambda: "openwrt-uci")
+
+    result = upgrade.self_upgrade(
+        {
+            "download_url": "http://controller:8000/api/agent/releases/0.6.14/download?platform=openwrt-source",
+            "target_version": "0.6.14",
+            "sha256": "abc123",
+            "upgrade_mode": "source",
+        },
+        config,
+        dry_run=True,
+    )
+
+    assert result["status"] == "staged"
+    assert result["upgrade_mode"] == "source"
+
+
+def test_extract_source_archive_checks_version_and_paths(tmp_path: Path) -> None:
+    """验证 OpenWrt 源码升级包只接受安全路径和目标版本。"""
+
+    source_root = tmp_path / "source"
+    version_file = source_root / "packages/link42_common/version.py"
+    version_file.parent.mkdir(parents=True)
+    version_file.write_text('AGENT_VERSION = "0.6.14"\n', encoding="utf-8")
+    (source_root / "apps/agent").mkdir(parents=True)
+    archive = tmp_path / "agent.tar.gz"
+    with tarfile.open(archive, "w:gz") as output:
+        output.add(source_root / "apps", arcname="apps")
+        output.add(source_root / "packages", arcname="packages")
+
+    destination = tmp_path / "staged"
+    upgrade.extract_source_archive(archive, destination, "0.6.14")
+
+    assert (destination / "packages/link42_common/version.py").exists()
+
+
+def test_openwrt_upgrade_script_contains_rollback(tmp_path: Path, monkeypatch) -> None:
+    """验证 OpenWrt 后台升级脚本包含 procd 健康检查和源码回滚。"""
+
+    script = tmp_path / "upgrade.sh"
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(upgrade, "UPGRADE_SCRIPT", script)
+    monkeypatch.setattr(upgrade, "STATE_FILE", state_file)
+
+    upgrade.write_openwrt_upgrade_script(
+        "link42-agent",
+        Path("/opt/link42-agent/src"),
+        Path("/opt/link42-agent/.link42-agent-src.new"),
+        "0.6.14",
+    )
+
+    content = script.read_text(encoding="utf-8")
+    assert 'SERVICE=\'/etc/init.d/link42-agent\'' in content
+    assert 'mv "$SOURCE_DIR" "$BACKUP_SOURCE"' in content
+    assert '"$SERVICE" status' in content
+    assert 'TARGET_VERSION=\'0.6.14\'' in content
+    assert "write_state rolled_back" in content

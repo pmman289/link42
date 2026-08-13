@@ -186,7 +186,7 @@ Agent 升级分两层：
 
 1. 节点离线：不能升级，只能展示安装命令。
 2. 节点在线但无 `agent.self_upgrade`：展示手动升级命令。
-3. 节点在线且有 `agent.self_upgrade`：允许点击“一键升级”。
+3. 节点在线且有 `agent.self_upgrade`：允许点击“一键升级”。systemd 使用版本化二进制，OpenWrt 使用版本化源码包。
 4. 目标版本低于或等于当前版本：默认不升级，除非用户选择“强制重装”。
 
 ### 升级来源
@@ -274,12 +274,14 @@ payload：
   "download_url": "https://controller/api/agent/releases/0.2.0/download?platform=linux-x64",
   "sha256": "...",
   "size": 29500000,
+  "upgrade_mode": "binary",
   "binary_args": ["--version"],
-  "service_name": "link42-agent",
   "install_path": "/usr/local/bin/link42-agent",
   "rollback": true
 }
 ```
+
+OpenWrt 节点使用 `openwrt-source` 资产，payload 中的 `upgrade_mode` 为 `source`。服务名、源码目录和升级状态目录由 Agent 节点本地环境决定，主控不会下发这些高权限路径。
 
 任务门禁：
 
@@ -299,16 +301,16 @@ payload：
 
 执行流程：
 
-1. 下载新二进制到临时文件。
+1. 下载新二进制或 OpenWrt 源码包到临时文件。
 2. 校验 SHA256。
-3. 执行 `--version` 或 `version` 自检。
-4. 备份当前二进制为 `.bak`。
-5. 原子替换 Agent 二进制。
+3. systemd 执行 `--version` 自检；OpenWrt 安全解压并校验源码包内版本。
+4. 备份当前二进制或源码目录为 `.bak`。
+5. 原子替换 Agent 二进制或源码目录。
 6. 上报 `upgrade_staged`。
 7. 重启 Agent 服务。
 8. 新 Agent 启动后注册并上报新版本。
 
-如果新 Agent 启动失败，systemd 可以通过 wrapper 或升级脚本回滚 `.bak`。第一版可以先要求用户手动回滚，但任务结果必须保留备份路径。
+如果新 Agent 启动失败，后台升级脚本会恢复 `.bak` 并重新启动旧版本服务。
 
 ### 自升级状态机
 
@@ -385,12 +387,22 @@ write_state '{"status":"rolled_back"}'
 exit 1
 ```
 
-第一版只实现 systemd。OpenRC/OpenWrt 后续按同一状态机补 backend：
+当前支持的自动升级后端：
 
 ```text
-service:openrc      -> rc-service link42-agent stop/start
-service:openwrt-uci -> /etc/init.d/link42-agent stop/start
+service:systemd     -> 下载版本化二进制并通过 systemd-run 原子替换
+service:openwrt-uci -> 下载 openwrt-source 源码包，通过 procd 停止、替换和重启
 ```
+
+OpenWrt 默认使用以下本地路径：
+
+```text
+/opt/link42-agent/src       当前源码目录
+/var/lib/link42/agent       下载资产、升级脚本和状态文件
+/etc/init.d/link42-agent    procd 服务
+```
+
+升级不会改写 `/etc/link42/agent.env`、WireGuard/UCI 配置、GRE 配置或中间层资产。旧 OpenWrt Agent 尚未上报 `agent.self_upgrade` 能力，因此首次升级到支持版本仍需执行一次面板提供的手动覆盖安装命令；后续版本才可直接使用一键升级。
 
 ### 安装脚本覆盖升级
 
@@ -443,9 +455,11 @@ POST /api/nodes/{node_id}/agent/upgrade/manual-command
   "upgrade_mode": "manual",
   "reason": "当前 Agent 不支持自升级",
   "matched_asset": null,
-  "manual_command": "curl -fsSL ... | sudo env LINK42_AGENT_VERSION=0.2.0 sh"
+  "manual_command": "curl -fsSL ... | sudo env LINK42_AGENT_VERSION=0.2.0 LINK42_RES_BASE_URL=https://get.pmman.tech/res/link42 sh"
 }
 ```
+
+手动升级命令面向已经安装过 Agent 的节点，不包含节点 ID 或 token。安装脚本会从现有 `/etc/link42/agent.env` 读取并保留这些凭据；OpenWrt 节点以 root 运行，因此命令不带 `sudo`。
 
 支持自升级时：
 

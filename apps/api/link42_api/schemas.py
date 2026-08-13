@@ -1184,6 +1184,7 @@ class Udp2RawMiddlewareConfig(BaseModel):
     client_listen_port: int | None = None
     raw_mode: str = "faketcp"
     cipher_mode: str = "xor"
+    auth_mode: str = "md5"
     password: str | None = None
     auto_rule: bool = True
 
@@ -1232,6 +1233,15 @@ class Udp2RawMiddlewareConfig(BaseModel):
 
         if value not in ["xor", "aes128cbc", "none"]:
             raise ValueError("cipher_mode must be xor, aes128cbc, or none")
+        return value
+
+    @field_validator("auth_mode")
+    @classmethod
+    def validate_auth_mode(cls, value: str) -> str:
+        """校验 udp2raw auth-mode。"""
+
+        if value not in ["hmac_sha1", "md5", "crc32", "simple", "none"]:
+            raise ValueError("auth_mode must be hmac_sha1, md5, crc32, simple, or none")
         return value
 
 
@@ -1486,6 +1496,7 @@ class AgentReleaseAsset(BaseModel):
     path: str
     sha256: str
     size: int | None = None
+    install_mode: str = "binary"
 
 
 class AgentReleaseInfo(BaseModel):

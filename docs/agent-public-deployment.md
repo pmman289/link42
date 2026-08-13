@@ -227,12 +227,22 @@ curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
 sudo env LINK42_AGENT_VERSION='0.2.0' sh
 ```
 
+OpenWrt 默认以 root 登录，不需要 `sudo`：
+
+```bash
+curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
+env LINK42_AGENT_VERSION='0.2.0' sh
+```
+
 安装脚本会保留已有：
 
 ```text
 LINK42_SERVER_URL
 LINK42_NODE_ID
 LINK42_AGENT_TOKEN
+LINK42_WIREGUARD_DIR
+LINK42_AGENT_DRY_RUN
+LINK42_POLL_INTERVAL
 ```
 
 除非命令行环境变量显式覆盖它们。

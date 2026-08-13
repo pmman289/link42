@@ -342,6 +342,25 @@ OpenWrt 注意事项：
 - 当 OpenWrt 作为 udp2raw server 时，用户仍需要按实际入口区域手动放行 `server_listen_port`。例如入口来自 WAN，就在对应 WAN zone 放行该 TCP 端口；入口来自自定义 DN42 zone，则在该 zone 放行。
 - 如果 client 日志持续出现 `rst==1`，优先检查是否存在错误的 direct DROP/ACCEPT 顺序、udp2raw 自身自动规则、上游 NAT/端口转发和 OpenWrt firewall zone；如果表现为超时或没有入站包，再检查入口区域是否放行。
 
+udp2raw ICMP 模式：
+
+- `raw_mode=icmp` 时，服务端连接地址为 IPv4 会使用 ICMP Echo，为 IPv6 会使用 ICMPv6 Echo。
+- IPv6 地址写入 udp2raw 参数时必须使用 `[addr]:port` 格式，Agent 会自动完成渲染。
+- ICMP 模式的服务端监听地址保留通配值时，主控会自动绑定到服务端连接 IP，避免 udp2raw `-a` 生成的 Echo Request 规则误伤隧道内或其它本机 ICMP 流量。
+- 服务端位于 NAT/EIP 后时，`server_connect_host` 填客户端可达的公网 IP，`server_listen_host` 必须填写机器网卡上的实际本地 IP。
+- ICMP 本身没有传输层端口，但 udp2raw 仍使用服务端会话端口进行本地绑定和会话区分，因此表单中的双方端口仍为必填。
+- ICMP/ICMPv6 模式要求双方 Agent 上报 `middleware.udp2raw.icmp`，旧 Agent 需要先升级。
+- 使用前需要确认主机防火墙、云安全组和中间网络允许 ICMP Echo 或 ICMPv6 Echo。
+- 追求最低处理开销时可选择 `cipher_mode=none`、`auth_mode=none`；隧道内敏感流量应继续由 WireGuard 加密认证。
+
+Agent 测试隔离：
+
+- 正式部署无需设置下列变量，默认路径和服务名保持兼容。
+- `LINK42_UDP2RAW_BIN` 可指定独立的 udp2raw 二进制路径。
+- `LINK42_UDP2RAW_CONFIG_DIR` 可指定独立的实例配置目录。
+- `LINK42_UDP2RAW_SERVICE_PREFIX` 可指定独立的 systemd/procd 服务前缀。
+- systemd 测试环境还可通过 `LINK42_UDP2RAW_LIBEXEC`、`LINK42_UDP2RAW_SERVER_UNIT`、`LINK42_UDP2RAW_CLIENT_UNIT` 隔离包装脚本和 unit 文件。
+
 ## mimic 第一版约定
 
 `mimic` 插件用于 Linux 网卡层透明处理 WireGuard UDP 流量，不修改 WireGuard
@@ -466,6 +485,7 @@ client_listen_host
 client_listen_port
 raw_mode
 cipher_mode
+auth_mode
 password
 ```
 

@@ -8,7 +8,7 @@ INSTALL_DIR="${LINK42_INSTALL_DIR:-/opt/link42-agent}"
 BIN_PATH="${LINK42_AGENT_BIN:-/usr/local/bin/link42-agent}"
 ENV_DIR="${LINK42_ENV_DIR:-/etc/link42}"
 ENV_FILE="$ENV_DIR/agent.env"
-SERVICE_NAME="link42-agent"
+SERVICE_NAME="${LINK42_AGENT_SERVICE_NAME:-link42-agent}"
 MIDDLEWARE_DIR="$ENV_DIR/middleware"
 UDP2RAW_CONFIG_DIR="$MIDDLEWARE_DIR/udp2raw"
 UDP2RAW_BIN="${LINK42_UDP2RAW_BIN:-/usr/local/bin/udp2raw}"
@@ -204,6 +204,9 @@ esac
 INPUT_LINK42_SERVER_URL="${LINK42_SERVER_URL-}"
 INPUT_LINK42_NODE_ID="${LINK42_NODE_ID-}"
 INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"
+INPUT_LINK42_WIREGUARD_DIR="${LINK42_WIREGUARD_DIR-}"
+INPUT_LINK42_AGENT_DRY_RUN="${LINK42_AGENT_DRY_RUN-}"
+INPUT_LINK42_POLL_INTERVAL="${LINK42_POLL_INTERVAL-}"
 
 if [ -f "$ENV_FILE" ]; then
   set -a
@@ -221,6 +224,19 @@ fi
 if [ -n "$INPUT_LINK42_AGENT_TOKEN" ]; then
   LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"
 fi
+if [ -n "$INPUT_LINK42_WIREGUARD_DIR" ]; then
+  LINK42_WIREGUARD_DIR="$INPUT_LINK42_WIREGUARD_DIR"
+fi
+if [ -n "$INPUT_LINK42_AGENT_DRY_RUN" ]; then
+  LINK42_AGENT_DRY_RUN="$INPUT_LINK42_AGENT_DRY_RUN"
+fi
+if [ -n "$INPUT_LINK42_POLL_INTERVAL" ]; then
+  LINK42_POLL_INTERVAL="$INPUT_LINK42_POLL_INTERVAL"
+fi
+
+WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"
+DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"
+POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"
 
 need_env LINK42_SERVER_URL
 need_env LINK42_NODE_ID
@@ -336,9 +352,10 @@ download_agent() {
   [ "$expected" = "$actual" ] || fail "sha256 mismatch for downloaded agent"
 
   if [ "$AGENT_INSTALL_MODE" = "source" ]; then
-    rm -rf "$INSTALL_DIR/src"
-    mkdir -p "$INSTALL_DIR/src"
-    python3 - "$tmp_file" "$INSTALL_DIR/src" <<'PY' || fail "unsafe agent source archive"
+    staged_source="$INSTALL_DIR/.src.new"
+    rm -rf "$staged_source"
+    mkdir -p "$staged_source"
+    python3 - "$tmp_file" "$staged_source" <<'PY' || fail "unsafe agent source archive"
 from pathlib import PurePosixPath
 import os
 from pathlib import Path
@@ -380,6 +397,23 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
         with source, os.fdopen(descriptor, "wb") as output:
             shutil.copyfileobj(source, output)
 PY
+    staged_version="$(PYTHONPATH="$staged_source/apps/agent:$staged_source/packages" python3 -m link42_agent.main --version)"
+    if [ "$AGENT_VERSION" != "latest" ] && [ "$staged_version" != "$AGENT_VERSION" ]; then
+      rm -rf "$staged_source"
+      fail "downloaded agent version mismatch: expected $AGENT_VERSION, got $staged_version"
+    fi
+    stop_existing_service
+    backup_source="$INSTALL_DIR/.src.bak"
+    rm -rf "$backup_source"
+    if [ -d "$INSTALL_DIR/src" ]; then
+      mv "$INSTALL_DIR/src" "$backup_source"
+    fi
+    if ! mv "$staged_source" "$INSTALL_DIR/src"; then
+      if [ -d "$backup_source" ]; then
+        mv "$backup_source" "$INSTALL_DIR/src"
+      fi
+      fail "failed to activate downloaded agent source"
+    fi
     cat > "$BIN_PATH" <<EOF
 #!/bin/sh
 set -eu
@@ -393,10 +427,20 @@ exec python3 -m link42_agent.main "\$@"
 EOF
     chmod 0755 "$BIN_PATH"
   else
+    stop_existing_service
     install -m 0755 "$tmp_file" "$BIN_PATH"
   fi
   rm -f "$tmp_file" "$tmp_sha"
   trap - EXIT HUP INT TERM
+}
+
+rollback_source_install() {
+  # 服务安装或健康检查失败时恢复覆盖前的 OpenWrt 源码。
+  if [ "$AGENT_INSTALL_MODE" != "source" ] || [ ! -d "$INSTALL_DIR/.src.bak" ]; then
+    return
+  fi
+  rm -rf "$INSTALL_DIR/src"
+  mv "$INSTALL_DIR/.src.bak" "$INSTALL_DIR/src"
 }
 
 write_env_file() {
@@ -511,7 +555,22 @@ status_service() {
 EOF
   chmod 0755 "/etc/init.d/$SERVICE_NAME"
   "/etc/init.d/$SERVICE_NAME" enable
-  "/etc/init.d/$SERVICE_NAME" restart
+  if "/etc/init.d/$SERVICE_NAME" status >/dev/null 2>&1; then
+    service_action=restart
+  else
+    service_action=start
+  fi
+  if ! "/etc/init.d/$SERVICE_NAME" "$service_action"; then
+    rollback_source_install
+    "/etc/init.d/$SERVICE_NAME" restart >/dev/null 2>&1 || true
+    fail "failed to restart $SERVICE_NAME after installation"
+  fi
+  sleep 2
+  if ! "/etc/init.d/$SERVICE_NAME" status >/dev/null 2>&1; then
+    rollback_source_install
+    "/etc/init.d/$SERVICE_NAME" restart >/dev/null 2>&1 || true
+    fail "$SERVICE_NAME did not become healthy after installation"
+  fi
 }
 
 log "installing dependencies"
@@ -527,7 +586,6 @@ if ! command -v wg-quick >/dev/null 2>&1; then
   fi
 fi
 
-stop_existing_service
 download_agent
 write_env_file
 
@@ -539,6 +597,17 @@ else
   install_openwrt_service
 fi
 
+installed_version="$($BIN_PATH --version)"
+if [ "$AGENT_VERSION" != "latest" ] && [ "$installed_version" != "$AGENT_VERSION" ]; then
+  rollback_source_install
+  if [ "$SERVICE_BACKEND" = "openwrt-procd" ]; then
+    "/etc/init.d/$SERVICE_NAME" restart >/dev/null 2>&1 || true
+  fi
+  fail "installed agent version mismatch: expected $AGENT_VERSION, got $installed_version"
+fi
+rm -rf "$INSTALL_DIR/.src.bak"
+
 log "installed $SERVICE_NAME using $SERVICE_BACKEND"
 log "binary: $BIN_PATH"
 log "config: $ENV_FILE"
+log "version: $installed_version"

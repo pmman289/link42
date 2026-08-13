@@ -11,6 +11,8 @@ PLATFORM_KEY="${LINK42_AGENT_PLATFORM:-linux-x64-glibc2.31}"
 BUILD_MODE="${LINK42_AGENT_BUILD_MODE:-docker}"
 BUILD_IMAGE="${LINK42_AGENT_BUILD_IMAGE:-python:3.11-slim-bullseye}"
 
+cd "$ROOT_DIR"
+
 # 读取当前 Agent 版本号。
 agent_version() {
   "$PYTHON_BIN" - <<'PY'
@@ -117,7 +119,6 @@ if ! "$PYTHON_BIN" -m PyInstaller --version >/dev/null 2>&1; then
 fi
 
 mkdir -p "$OUT_DIR"
-cd "$ROOT_DIR"
 
 "$PYTHON_BIN" -m PyInstaller \
   --clean \

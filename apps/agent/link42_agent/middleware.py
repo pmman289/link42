@@ -23,11 +23,16 @@ from .validation import (
 )
 
 
-UDP2RAW_BIN = Path("/usr/local/bin/udp2raw")
-UDP2RAW_CONFIG_DIR = Path("/etc/link42/middleware/udp2raw")
-UDP2RAW_LIBEXEC = Path("/usr/local/libexec/link42-udp2raw-systemd")
-UDP2RAW_SERVER_UNIT = Path("/etc/systemd/system/link42-udp2raw-server@.service")
-UDP2RAW_CLIENT_UNIT = Path("/etc/systemd/system/link42-udp2raw-client@.service")
+UDP2RAW_BIN = Path(os.getenv("LINK42_UDP2RAW_BIN", "/usr/local/bin/udp2raw"))
+UDP2RAW_CONFIG_DIR = Path(os.getenv("LINK42_UDP2RAW_CONFIG_DIR", "/etc/link42/middleware/udp2raw"))
+UDP2RAW_LIBEXEC = Path(os.getenv("LINK42_UDP2RAW_LIBEXEC", "/usr/local/libexec/link42-udp2raw-systemd"))
+UDP2RAW_SERVICE_PREFIX = os.getenv("LINK42_UDP2RAW_SERVICE_PREFIX", "link42-udp2raw")
+UDP2RAW_SERVER_UNIT = Path(
+    os.getenv("LINK42_UDP2RAW_SERVER_UNIT", f"/etc/systemd/system/{UDP2RAW_SERVICE_PREFIX}-server@.service")
+)
+UDP2RAW_CLIENT_UNIT = Path(
+    os.getenv("LINK42_UDP2RAW_CLIENT_UNIT", f"/etc/systemd/system/{UDP2RAW_SERVICE_PREFIX}-client@.service")
+)
 OPENWRT_INIT_DIR = Path("/etc/init.d")
 MIMIC_CONFIG_DIR = Path("/etc/link42/middleware/mimic")
 MIMIC_SYSTEM_CONFIG_DIR = Path("/etc/mimic")
@@ -618,25 +623,77 @@ WantedBy=multi-user.target
 def build_udp2raw_args(payload: dict[str, Any]) -> str:
     """把任务 payload 渲染成 udp2raw 命令行参数。"""
 
-    mode = payload["mode"]
-    listen_host = payload["listen_host"]
-    listen_port = int(payload["listen_port"])
-    remote_host = payload["remote_host"]
-    remote_port = int(payload["remote_port"])
+    mode = validate_mode(str(payload["mode"]))
+    listen_host = validate_udp2raw_ip(str(payload["listen_host"]), "udp2raw listen host")
+    listen_port = validate_udp2raw_port(payload["listen_port"], "udp2raw listen port")
+    remote_host = validate_udp2raw_ip(str(payload["remote_host"]), "udp2raw remote host")
+    remote_port = validate_udp2raw_port(payload["remote_port"], "udp2raw remote port")
     password = shell_quote(str(payload["password"]))
-    raw_mode = payload.get("raw_mode") or "faketcp"
-    cipher_mode = payload.get("cipher_mode") or "xor"
+    raw_mode = validate_udp2raw_raw_mode(str(payload.get("raw_mode") or "faketcp"))
+    cipher_mode = validate_udp2raw_cipher_mode(str(payload.get("cipher_mode") or "xor"))
+    auth_mode = validate_udp2raw_auth_mode(str(payload.get("auth_mode") or "md5"))
     args = [
         "-s" if mode == "server" else "-c",
-        f"-l{listen_host}:{listen_port}",
-        f"-r{remote_host}:{remote_port}",
+        f"-l{format_udp2raw_endpoint(listen_host, listen_port)}",
+        f"-r{format_udp2raw_endpoint(remote_host, remote_port)}",
         f"-k {password}",
         f"--raw-mode {raw_mode}",
         f"--cipher-mode {cipher_mode}",
+        f"--auth-mode {auth_mode}",
     ]
     if payload.get("auto_rule", True):
         args.append(auto_rule_arg())
     return " ".join(args)
+
+
+def validate_udp2raw_ip(value: str, field_name: str) -> str:
+    """校验 udp2raw 地址并返回压缩后的 IP 字面量。"""
+
+    try:
+        return ipaddress.ip_address(value.strip()).compressed
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an IPv4 or IPv6 address") from exc
+
+
+def validate_udp2raw_port(value: Any, field_name: str) -> int:
+    """校验 udp2raw 端口；ICMP 模式仍使用端口作为本地绑定和会话标识。"""
+
+    port = int(value)
+    if port < 1 or port > 65535:
+        raise ValueError(f"{field_name} must be between 1 and 65535")
+    return port
+
+
+def validate_udp2raw_raw_mode(value: str) -> str:
+    """限制 udp2raw raw-mode 为 Link42 支持的模式。"""
+
+    if value not in {"faketcp", "udp", "icmp"}:
+        raise ValueError("udp2raw raw mode must be faketcp, udp, or icmp")
+    return value
+
+
+def validate_udp2raw_cipher_mode(value: str) -> str:
+    """限制 udp2raw cipher-mode 为 Link42 表单支持的模式。"""
+
+    if value not in {"xor", "aes128cbc", "none"}:
+        raise ValueError("udp2raw cipher mode must be xor, aes128cbc, or none")
+    return value
+
+
+def validate_udp2raw_auth_mode(value: str) -> str:
+    """限制 udp2raw auth-mode 为 Link42 表单支持的模式。"""
+
+    if value not in {"hmac_sha1", "md5", "crc32", "simple", "none"}:
+        raise ValueError("udp2raw auth mode must be hmac_sha1, md5, crc32, simple, or none")
+    return value
+
+
+def format_udp2raw_endpoint(host: str, port: int) -> str:
+    """渲染 udp2raw 的 host:port 参数，并为 IPv6 地址补方括号。"""
+
+    ip = ipaddress.ip_address(host)
+    host_text = f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
+    return f"{host_text}:{port}"
 
 
 def auto_rule_arg() -> str:
@@ -662,13 +719,21 @@ def config_file_for_mode(mode: str) -> Path:
 def unit_name(mode: str, instance: str) -> str:
     """生成 systemd udp2raw 实例 unit 名称。"""
 
-    return f"link42-udp2raw-{validate_mode(mode)}@{validate_instance_name(instance)}.service"
+    return f"{validate_service_prefix()}-{validate_mode(mode)}@{validate_instance_name(instance)}.service"
 
 
 def init_name(mode: str, instance: str) -> str:
     """生成 OpenWrt procd init 脚本名称。"""
 
-    return f"link42-udp2raw-{validate_mode(mode)}-{validate_instance_name(instance)}"
+    return f"{validate_service_prefix()}-{validate_mode(mode)}-{validate_instance_name(instance)}"
+
+
+def validate_service_prefix() -> str:
+    """校验 udp2raw 服务前缀，允许测试环境与生产实例隔离。"""
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", UDP2RAW_SERVICE_PREFIX):
+        raise ValueError("udp2raw service prefix contains unsupported characters")
+    return UDP2RAW_SERVICE_PREFIX
 
 
 def init_path(mode: str, instance: str) -> Path:
@@ -805,6 +870,12 @@ def parse_udp2raw_args(mode: str, instance: str, args: str) -> dict[str, Any]:
             payload["remote_host"], payload["remote_port"] = split_host_port(token[2:])
         elif token == "--raw-mode" and index + 1 < len(tokens):
             payload["raw_mode"] = tokens[index + 1]
+            index += 1
+        elif token == "--cipher-mode" and index + 1 < len(tokens):
+            payload["cipher_mode"] = tokens[index + 1]
+            index += 1
+        elif token == "--auth-mode" and index + 1 < len(tokens):
+            payload["auth_mode"] = tokens[index + 1]
             index += 1
         index += 1
     return payload

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import ipaddress
 from typing import Optional
 
 
@@ -38,10 +39,23 @@ def render_wg_quick(interface: dict, peers: Iterable[dict]) -> str:
         endpoint_host = peer.get("endpoint_host")
         endpoint_port = peer.get("endpoint_port")
         if endpoint_host and endpoint_port:
-            _append(lines, "Endpoint", f"{endpoint_host}:{endpoint_port}")
+            _append(lines, "Endpoint", _format_endpoint(str(endpoint_host), endpoint_port))
         _append(lines, "PersistentKeepalive", peer.get("persistent_keepalive"))
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_endpoint(host: str, port: object) -> str:
+    """渲染 WireGuard Endpoint，IPv6 字面量必须使用方括号。"""
+
+    host_text = host.strip()
+    try:
+        address = ipaddress.ip_address(host_text)
+    except ValueError:
+        return f"{host_text}:{port}"
+    if address.version == 6:
+        return f"[{address.compressed}]:{port}"
+    return f"{address.compressed}:{port}"
 
 
 def _append(lines: list[str], key: str, value: Optional[object]) -> None:

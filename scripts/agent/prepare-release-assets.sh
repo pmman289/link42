@@ -11,6 +11,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3 || command -v python)"
 fi
 
+cd "$ROOT_DIR"
 mkdir -p "$OUT_DIR"
 
 # 读取当前 Agent 版本号。
@@ -79,6 +80,7 @@ fi
 
 needs_source_rebuild=0
 if [[ "${REBUILD_AGENT_RELEASES:-0}" == "1" \
+  || "$current_manifest_latest" != "$expected_version" \
   || ! -f "$SRC_DIR/link42-agent-source.tar.gz" \
   || ! -f "$SRC_DIR/link42-agent-source.tar.gz.sha256" ]]; then
   needs_source_rebuild=1

@@ -21,6 +21,8 @@ from .validation import atomic_write_text, managed_child_path, validate_interfac
 # wg-quick 默认配置目录；可通过环境变量覆盖，便于测试和非标准系统布局。
 DEFAULT_WIREGUARD_DIR = "/etc/wireguard"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+OPENWRT_INTERFACE_STOP_TIMEOUT_SECONDS = 5.0
+OPENWRT_INTERFACE_STOP_POLL_SECONDS = 0.2
 logger = logging.getLogger("link42.agent.system")
 
 
@@ -81,7 +83,7 @@ def get_agent_platform() -> dict[str, Any]:
     os_release = read_os_release()
     libc_name, libc_version = platform.libc_ver()
     if platform.system().lower() == "linux" and shutil.which("ldd"):
-        result = run_command(["ldd", "--version"], allow_failure=True)
+        result = run_command(["ldd", "--version"], allow_failure=True, log_failure=False)
         output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}".lower()
         if "musl" in output:
             libc_name = "musl"
@@ -454,20 +456,29 @@ def get_wireguard_status(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def assert_wireguard_stopped(interface_name: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
-    """确认接口已经不在内核 WireGuard 状态中。"""
+def assert_wireguard_stopped(
+    interface_name: str,
+    result: dict[str, Any] | None = None,
+    *,
+    wait_seconds: float = 0,
+) -> dict[str, Any]:
+    """确认接口已离开内核 WireGuard 状态，支持等待异步网络管理器完成。"""
 
     interface_name = validate_interface_name(interface_name)
-    current = get_wireguard_status({"interface_name": interface_name})
-    if current["runtime_status"] == "running":
-        detail = ""
-        if result:
-            failed_result = result.get("down") or result.get("stop") or result
-            if isinstance(failed_result, dict):
-                detail = str(failed_result.get("stderr") or failed_result.get("stdout") or "").strip()
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"wireguard interface {interface_name} is still running after stop{suffix}")
-    return current
+    deadline = time.monotonic() + max(wait_seconds, 0)
+    while True:
+        current = get_wireguard_status({"interface_name": interface_name})
+        if current["runtime_status"] != "running":
+            return current
+        if time.monotonic() >= deadline:
+            detail = ""
+            if result:
+                failed_result = result.get("down") or result.get("stop") or result
+                if isinstance(failed_result, dict):
+                    detail = str(failed_result.get("stderr") or failed_result.get("stdout") or "").strip()
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"wireguard interface {interface_name} is still running after stop{suffix}")
+        time.sleep(OPENWRT_INTERFACE_STOP_POLL_SECONDS)
 
 
 def disable_wireguard_service(interface_name: str, manager: Any, service_state: dict[str, Any]) -> dict[str, Any] | None:
@@ -524,7 +535,8 @@ def stop_wireguard_interface(payload: dict[str, Any], dry_run: bool = False) -> 
             "service": service_state,
             "stop": manager.stop(interface_name),
         }
-        result["runtime"] = assert_wireguard_stopped(interface_name, result)
+        wait_seconds = OPENWRT_INTERFACE_STOP_TIMEOUT_SECONDS if isinstance(manager, OpenWrtUciManager) else 0
+        result["runtime"] = assert_wireguard_stopped(interface_name, result, wait_seconds=wait_seconds)
         return result
     result = {"changed": True, "down": run_command(["wg-quick", "down", interface_name], allow_failure=True)}
     result["runtime"] = assert_wireguard_stopped(interface_name, result)

@@ -221,6 +221,7 @@ type Udp2RawMiddleware = {
   client_listen_port: number;
   raw_mode: string;
   cipher_mode: string;
+  auth_mode: string;
   password: string;
   auto_rule: boolean;
 };
@@ -636,6 +637,9 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "udp2raw server listen port is required": "请填写 udp2raw 服务端监听端口",
   "udp2raw client listen port is required": "请填写 udp2raw 客户端本地监听端口",
   "udp2raw server side requires WireGuard listen port": "udp2raw 服务端所在节点必须填写 WireGuard 监听端口",
+  "udp2raw server listen address must match outer IP version": "udp2raw 服务端监听地址必须与连接服务端 IP 使用相同的 IPv4 或 IPv6 地址族",
+  "agent does not support udp2raw ICMP mode": "当前 Agent 版本不支持 udp2raw ICMP/ICMPv6 模式，请升级双方 Agent 后重试",
+  "IPv6 WireGuard MTU must be at least 1280": "使用 IPv6 接口地址时，WireGuard MTU 不能小于 1280",
   "mimic requires endpoint address on both sides": "启用 mimic 时双方入口地址都必须填写",
   "mimic requires WireGuard listen port on both sides": "启用 mimic 时双方 WireGuard 监听端口都必须填写",
   "mimic peer endpoint port is required": "mimic 对端入口需要填写端口，或填写对端监听端口",
@@ -729,6 +733,7 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "udp2raw ip fields must be IPv4 or IPv6 addresses, not domain names": "udp2raw 地址必须填写 IP，不能填写域名",
   "raw_mode must be faketcp, udp, or icmp": "udp2raw 传输模式只能是 faketcp、udp 或 icmp",
   "cipher_mode must be xor, aes128cbc, or none": "udp2raw 加密模式只能是 xor、aes128cbc 或 none",
+  "auth_mode must be hmac_sha1, md5, crc32, simple, or none": "udp2raw 认证模式无效，请重新选择",
   "mimic interface name contains unsupported characters": "mimic 网卡名称包含不支持的字符",
   "xdp_mode must be auto, native, or skb": "XDP 模式只能是 auto、native 或 skb",
   "mimic numeric options must be non-negative": "mimic 数值选项不能为负数",
@@ -1345,6 +1350,14 @@ function isValidMtu(value: number | null): boolean {
   return value === null || (Number.isInteger(value) && value >= 576 && value <= 9000);
 }
 
+// 校验包含 IPv6 地址的 WireGuard 接口遵守 IPv6 最小 MTU。
+function validateWireGuardIpv6Mtu(mtu: number, ...tunnelIpGroups: string[][]): void {
+  const hasIpv6 = tunnelIpGroups.some((values) => values.some((value) => value.split("/")[0]?.includes(":")));
+  if (hasIpv6 && mtu < 1280) {
+    throw new Error("使用 IPv6 接口地址时，MTU 不能小于 1280");
+  }
+}
+
 // 用轻量规则判断输入是否像 IP 地址。
 function isProbablyIpAddress(value: string): boolean {
   const cleaned = value.trim();
@@ -1511,10 +1524,11 @@ function endpointSourceLabel(source: EndpointOption["source"]) {
 // 生成用户在节点上安装 Agent 的 shell 命令。
 function buildAgentCommand(node: NodeItem, token: string, controllerUrl: string = DEFAULT_CONTROLLER_URL): string {
   if (!token) return "";
+  const privilegeCommand = nodeServiceManager(node) === "openwrt-uci" ? "env" : "sudo env";
   return [
     "curl -fsSL https://get.pmman.tech/sh/link42-agent.sh",
     "|",
-    "sudo env",
+    privilegeCommand,
     `LINK42_SERVER_URL=${shellArg(controllerUrl)}`,
     `LINK42_NODE_ID=${shellArg(String(node.id))}`,
     `LINK42_AGENT_TOKEN=${shellArg(token)}`,
@@ -1914,6 +1928,7 @@ function Udp2RawFields({
 }) {
   const serverWireGuardListenPort = serverSide === "local" ? localListenPort : peerListenPort;
   const forwardPortDefault = defaults?.server_forward_port || serverWireGuardListenPort || "";
+  const [rawMode, setRawMode] = useState(defaults?.raw_mode || "faketcp");
   // 切换 udp2raw 启用状态，并在启用时给 MTU 一个更保守的默认值。
   function handleEnabledChange(event: React.ChangeEvent<HTMLInputElement>) {
     const nextEnabled = event.currentTarget.checked;
@@ -1960,10 +1975,15 @@ function Udp2RawFields({
           <Field label="客户端连接服务端 IP" hint="写入客户端的 -r；必须是 IP，不能填域名。">
             <input name="udp2raw_server_connect_host" defaultValue={defaults?.server_connect_host || ""} placeholder="203.0.113.20" disabled={disabled} />
           </Field>
-          <Field label="服务端监听地址" hint="服务端的 -l 地址；通常 0.0.0.0，必须是 IP。">
+          <Field label="服务端监听地址" hint="普通模式通常填 0.0.0.0；ICMP 模式使用通配地址时会自动绑定到服务端连接 IP，NAT 场景请填写机器网卡上的实际本地 IP。">
             <input name="udp2raw_server_listen_host" defaultValue={defaults?.server_listen_host || "0.0.0.0"} disabled={disabled} />
           </Field>
-          <Field label="服务端监听端口" hint="客户端连接的 raw TCP/faketcp/icmp 端口。">
+          <Field
+            label="服务端会话端口"
+            hint={rawMode === "icmp"
+              ? "ICMP 没有传输层端口，但 udp2raw 仍使用该值进行本地绑定和会话区分，两端必须一致。"
+              : "客户端连接的 udp2raw 服务端端口。"}
+          >
             <input name="udp2raw_server_listen_port" defaultValue={defaults?.server_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
           <Field label="服务端转发到 IP" hint="服务端解包后把 UDP 发往这里；通常 127.0.0.1。">
@@ -1984,11 +2004,16 @@ function Udp2RawFields({
           <Field label="客户端本地监听端口" hint="填写本节点 WireGuard 连接对端接口时要使用的本地 udp2raw UDP 端口；本端对端入口会被接管到 127.0.0.1:此端口。">
             <input name="udp2raw_client_listen_port" defaultValue={defaults?.client_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
-          <Field label="传输模式" hint="faketcp 伪装性更强；udp 更直接；icmp 仅在明确需要时使用。">
-            <select name="udp2raw_raw_mode" defaultValue={defaults?.raw_mode || "faketcp"} disabled={disabled}>
-              <option value="faketcp">faketcp</option>
-              <option value="udp">udp</option>
-              <option value="icmp">icmp</option>
+          <Field label="传输模式" hint="ICMP 模式会根据服务端连接 IP 自动选择 ICMPv4 或 ICMPv6。">
+            <select
+              name="udp2raw_raw_mode"
+              value={rawMode}
+              disabled={disabled}
+              onChange={(event) => setRawMode(event.currentTarget.value)}
+            >
+              <option value="faketcp">FakeTCP</option>
+              <option value="udp">UDP</option>
+              <option value="icmp">ICMP（自动 IPv4/IPv6）</option>
             </select>
           </Field>
           <Field label="加密模式" hint="xor 开销低；none 不加密；aes128cbc 兼容 udp2raw 原生模式。">
@@ -1998,6 +2023,15 @@ function Udp2RawFields({
               <option value="none">none</option>
             </select>
           </Field>
+          <Field label="认证模式" hint="md5 兼容现有连接；simple 或 none 开销更低。敏感流量仍应由 WireGuard 保护。">
+            <select name="udp2raw_auth_mode" defaultValue={defaults?.auth_mode || "md5"} disabled={disabled}>
+              <option value="md5">MD5（兼容默认）</option>
+              <option value="simple">Simple（低开销）</option>
+              <option value="none">None（最低开销）</option>
+              <option value="crc32">CRC32</option>
+              <option value="hmac_sha1">HMAC-SHA1</option>
+            </select>
+          </Field>
           <Field label="共享密码" hint="两端必须一致；留空时主控自动生成并保存。">
             <input name="udp2raw_password" defaultValue={defaults?.password || ""} disabled={disabled} />
           </Field>
@@ -2005,6 +2039,11 @@ function Udp2RawFields({
             <input name="udp2raw_auto_rule" type="checkbox" defaultChecked={defaults?.auto_rule ?? true} disabled={disabled} />
             <span>启用 udp2raw 自动规则（-a）</span>
           </label>
+          {rawMode === "icmp" && (
+            <div className="formNotice wideField">
+              服务端连接 IP 填 IPv4 时使用 ICMP Echo，填 IPv6 时使用 ICMPv6 Echo。请确认双方系统和中间网络允许对应报文；服务端监听地址保留通配值时会自动绑定到连接 IP，避免自动防火墙规则误伤其它 ICMP 流量。
+            </div>
+          )}
           <div className="formNotice wideField">
             {serverSide === "peer"
               ? "本端入口会指向本端 udp2raw 客户端；对端服务端解包后转发到对端 WireGuard。OpenWrt 作为服务端时，入口防火墙区域仍需手动放行服务端监听端口。"
@@ -2040,6 +2079,7 @@ function readUdp2RawForm(
     client_listen_port: optionalInt(form.get("udp2raw_client_listen_port"), "udp2raw 客户端本地监听端口"),
     raw_mode: String(form.get("udp2raw_raw_mode") || "faketcp"),
     cipher_mode: String(form.get("udp2raw_cipher_mode") || "xor"),
+    auth_mode: String(form.get("udp2raw_auth_mode") || "md5"),
     password: String(form.get("udp2raw_password") || "").trim() || null,
     auto_rule: form.get("udp2raw_auto_rule") === "on",
   };
@@ -4162,6 +4202,7 @@ function App() {
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
     }
+    validateWireGuardIpv6Mtu(mtu, tunnelIps);
     if (!isProbablyWireGuardKey(form.get("public_key")) || !isProbablyWireGuardKey(form.get("private_key"))) {
       throw new Error("WireGuard 密钥格式应为 44 位 base64 字符串");
     }
@@ -4283,6 +4324,7 @@ function App() {
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
     }
+    validateWireGuardIpv6Mtu(mtu, localTunnelIps, peerTunnelIps);
     if (!localEndpointHost && !peerEndpointHost) {
       throw new Error("本端或对端至少需要填写一个入口地址");
     }
@@ -4720,6 +4762,7 @@ function App() {
     if (!isValidMtu(mtu)) {
       throw new Error("MTU 必须是 576-9000 之间的整数");
     }
+    validateWireGuardIpv6Mtu(mtu, localTunnelIps, peerTunnelIps);
     if (!localEndpointHost && !peerEndpointHost) {
       throw new Error("本端或对端至少需要填写一个入口地址");
     }
