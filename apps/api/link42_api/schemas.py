@@ -825,6 +825,7 @@ class GreManagedConnectionCreate(BaseModel):
     gre_key: str | None = None
     ttl: int | None = None
     pmtudisc: bool = True
+    encaplimit: int | None = None
     risk_accepted: bool = False
 
     @field_validator("protocol_type")
@@ -889,6 +890,15 @@ class GreManagedConnectionCreate(BaseModel):
             raise ValueError("TTL must be between 1 and 255")
         return value
 
+    @field_validator("encaplimit")
+    @classmethod
+    def validate_encaplimit(cls, value: int | None) -> int | None:
+        """校验 IP6GRE 封装限制范围，空值表示显式禁用限制。"""
+
+        if value is not None and not 0 <= value <= 255:
+            raise ValueError("encaplimit must be between 0 and 255")
+        return value
+
 
 class GreManagedConnectionUpdate(BaseModel):
     """更新受管 GRE 连接请求。"""
@@ -909,6 +919,7 @@ class GreManagedConnectionUpdate(BaseModel):
     gre_key: str | None = None
     ttl: int | None = None
     pmtudisc: bool = True
+    encaplimit: int | None = None
     risk_accepted: bool = False
 
     @field_validator("local_interface_name", "peer_interface_name")
@@ -964,6 +975,15 @@ class GreManagedConnectionUpdate(BaseModel):
             raise ValueError("TTL must be between 1 and 255")
         return value
 
+    @field_validator("encaplimit")
+    @classmethod
+    def validate_encaplimit(cls, value: int | None) -> int | None:
+        """校验 IP6GRE 封装限制范围，空值表示显式禁用限制。"""
+
+        if value is not None and not 0 <= value <= 255:
+            raise ValueError("encaplimit must be between 0 and 255")
+        return value
+
 
 class GreManualConnectionCreate(BaseModel):
     """创建仅管理当前节点一端的 GRE 连接请求。"""
@@ -980,6 +1000,7 @@ class GreManualConnectionCreate(BaseModel):
     gre_key: str | None = None
     ttl: int | None = None
     pmtudisc: bool = True
+    encaplimit: int | None = None
     risk_accepted: bool = False
 
     @field_validator("protocol_type")
@@ -1044,6 +1065,15 @@ class GreManualConnectionCreate(BaseModel):
 
         if value is not None and not 1 <= value <= 255:
             raise ValueError("TTL must be between 1 and 255")
+        return value
+
+    @field_validator("encaplimit")
+    @classmethod
+    def validate_encaplimit(cls, value: int | None) -> int | None:
+        """校验 IP6GRE 封装限制范围，空值表示显式禁用限制。"""
+
+        if value is not None and not 0 <= value <= 255:
+            raise ValueError("encaplimit must be between 0 and 255")
         return value
 
 

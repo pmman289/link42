@@ -85,6 +85,7 @@ from link42_api.main import (
     update_interface,
     update_manual_connection,
     update_managed_link,
+    validate_manual_gre_payload,
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
     request_node_plugin_action,
@@ -2199,7 +2200,7 @@ def test_create_manual_gre_over_ipv6_uses_ipv6_default_mtu() -> None:
             status="online",
             last_seen_at=datetime.utcnow(),
             agent_version="0.6.10",
-            agent_capabilities=["gre", "gre.ipv6"],
+            agent_capabilities=["gre", "gre.ipv6", "gre.ipv6.encaplimit"],
         )
         session.add(node)
         session.commit()
@@ -2223,6 +2224,7 @@ def test_create_manual_gre_over_ipv6_uses_ipv6_default_mtu() -> None:
     assert tasks[0].payload["outer_local_ip"] == "2001:db8:1::1"
     assert tasks[0].payload["outer_remote_ip"] == "2001:db8:2::1"
     assert tasks[0].payload["mtu"] == 1456
+    assert tasks[0].payload["encaplimit"] is None
 
 
 def test_create_managed_gre_over_ipv6_requires_capability_and_rejects_mixed_family() -> None:
@@ -2237,7 +2239,7 @@ def test_create_managed_gre_over_ipv6_requires_capability_and_rejects_mixed_fami
             status="online",
             last_seen_at=datetime.utcnow(),
             agent_version="0.6.10",
-            agent_capabilities=["gre", "gre.ipv6"],
+            agent_capabilities=["gre", "gre.ipv6", "gre.ipv6.encaplimit"],
         )
         node_b = models.Node(
             name="node-b",
@@ -2258,12 +2260,13 @@ def test_create_managed_gre_over_ipv6_requires_capability_and_rejects_mixed_fami
             peer_outer_ip="2001:db8:2::1",
             local_tunnel_ips=["10.42.10.1/30"],
             peer_tunnel_ips=["10.42.10.2/30"],
+            encaplimit=4,
             risk_accepted=True,
         )
         with pytest.raises(HTTPException) as capability_error:
             create_managed_connection(node_a.id, payload, session)
 
-        node_b.agent_capabilities = ["gre", "gre.ipv6"]
+        node_b.agent_capabilities = ["gre", "gre.ipv6", "gre.ipv6.encaplimit"]
         session.commit()
         result = create_managed_connection(node_a.id, payload, session)
         tasks = list(session.scalars(select(models.AgentTask).order_by(models.AgentTask.id)))
@@ -2285,13 +2288,34 @@ def test_create_managed_gre_over_ipv6_requires_capability_and_rejects_mixed_fami
             )
 
     assert capability_error.value.status_code == 409
-    assert capability_error.value.detail == "agent does not support GRE over IPv6"
+    assert capability_error.value.detail == "agent does not support GRE over IPv6 encaplimit control"
     assert result.endpoints[0].mtu == 1456
     assert result.endpoints[1].mtu == 1456
     assert tasks[0].payload["outer_local_ip"] == "2001:db8:1::1"
+    assert tasks[0].payload["encaplimit"] == 4
     assert tasks[2].payload["outer_local_ip"] == "2001:db8:2::1"
+    assert tasks[2].payload["encaplimit"] == 4
     assert family_error.value.status_code == 400
     assert family_error.value.detail == "gre outer addresses must use the same IP version"
+
+
+def test_gre_ipv4_rejects_encaplimit() -> None:
+    """验证 IPv4 GRE 不接受仅供 IP6GRE 使用的 encaplimit。"""
+
+    payload = GreManualConnectionCreate(
+        interface_name="gre_v4",
+        outer_local_ip="203.0.113.10",
+        outer_remote_ip="198.51.100.20",
+        tunnel_ips=["10.42.14.1/30"],
+        encaplimit=4,
+        risk_accepted=True,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_manual_gre_payload(payload)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "encaplimit is only supported by GRE over IPv6"
 
 
 def test_update_manual_gre_connection_renames_local_endpoint() -> None:

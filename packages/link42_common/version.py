@@ -1,6 +1,6 @@
 from __future__ import annotations
 
 
-AGENT_VERSION = "0.6.11"
+AGENT_VERSION = "0.6.12"
 AGENT_PROTOCOL_VERSION = 1
-CONTROLLER_VERSION = "0.6.13"
+CONTROLLER_VERSION = "0.6.14"

@@ -2880,8 +2880,8 @@ def require_gre_supported(node: models.Node, outer_ip_version: int = 4) -> None:
     """要求节点 Agent 支持指定外层地址族的 GRE 连接任务。"""
 
     require_task_supported(node, GRE_TASKS.apply_config)
-    if outer_ip_version == 6 and "gre.ipv6" not in (node.agent_capabilities or []):
-        raise HTTPException(status_code=409, detail="agent does not support GRE over IPv6")
+    if outer_ip_version == 6 and "gre.ipv6.encaplimit" not in (node.agent_capabilities or []):
+        raise HTTPException(status_code=409, detail="agent does not support GRE over IPv6 encaplimit control")
 
 
 def gre_outer_ip_version(values: list[str | None]) -> int:
@@ -2912,6 +2912,8 @@ def validate_gre_payload(payload: schemas.GreManagedConnectionCreate | schemas.G
         raise HTTPException(status_code=400, detail="gre endpoint local and remote addresses must be different")
     if outer_version == 4 and payload.ttl is not None and not payload.pmtudisc:
         raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
+    if outer_version == 4 and payload.encaplimit is not None:
+        raise HTTPException(status_code=400, detail="encaplimit is only supported by GRE over IPv6")
 
 
 def validate_manual_gre_payload(
@@ -2926,6 +2928,8 @@ def validate_manual_gre_payload(
     outer_version = gre_outer_ip_version([payload.outer_local_ip, payload.outer_remote_ip])
     if outer_version == 4 and payload.ttl is not None and not payload.pmtudisc:
         raise HTTPException(status_code=400, detail="gre ttl requires pmtu discovery")
+    if outer_version == 4 and payload.encaplimit is not None:
+        raise HTTPException(status_code=400, detail="encaplimit is only supported by GRE over IPv6")
 
 
 def gre_outer_mapping(payload: schemas.GreManagedConnectionCreate | schemas.GreManagedConnectionUpdate) -> dict[str, str]:
@@ -2948,6 +2952,7 @@ def gre_protocol_config(local_outer_ip: str, remote_outer_ip: str, payload: sche
         "key": payload.gre_key,
         "ttl": payload.ttl,
         "pmtudisc": payload.pmtudisc,
+        "encaplimit": payload.encaplimit,
     }
 
 
@@ -2962,6 +2967,7 @@ def manual_gre_protocol_config(
         "key": payload.gre_key,
         "ttl": payload.ttl,
         "pmtudisc": payload.pmtudisc,
+        "encaplimit": payload.encaplimit,
         "peer_interface_name": payload.peer_interface_name,
         "peer_tunnel_ips": payload.peer_tunnel_ips,
     }
@@ -4381,7 +4387,10 @@ def start_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> 
         raise HTTPException(status_code=400, detail="use wireguard API for WireGuard connections")
     connection = get_gre_connection_or_404(db, item_id)
     for endpoint in connection.endpoints:
-        require_online_node(db, endpoint.node_id)
+        node = require_online_node(db, endpoint.node_id)
+        outer_local_ip = str((endpoint.protocol_config or {}).get("outer_local_ip") or "").strip()
+        outer_ip_version = ipaddress.ip_address(outer_local_ip).version if outer_local_ip else 4
+        require_gre_supported(node, outer_ip_version)
         create_connection_endpoint_task(db, endpoint, GRE_TASKS.start)
         endpoint.runtime_status = "starting"
     connection.status = "starting"

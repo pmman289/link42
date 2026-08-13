@@ -576,6 +576,7 @@ def test_gre_capability_depends_on_iproute2(monkeypatch) -> None:
     assert "gre" in main.build_capabilities(platform_info)
     assert "gre.iproute2" in main.build_capabilities(platform_info)
     assert "gre.ipv6" in main.build_capabilities(platform_info)
+    assert "gre.ipv6.encaplimit" in main.build_capabilities(platform_info)
 
     monkeypatch.setattr(main, "gre_runtime_supported", lambda: False)
     assert "gre" not in main.build_capabilities(platform_info)
@@ -628,11 +629,75 @@ def test_gre_ipv6_start_uses_ip6gre_hoplimit_and_ipv6_default_mtu(monkeypatch, t
             "42",
             "hoplimit",
             "63",
+            "encaplimit",
+            "none",
         ],
         ["/sbin/ip", "addr", "add", "10.42.9.1/30", "dev", "gre6_ab"],
         ["/sbin/ip", "addr", "add", "fd42:9::1/64", "dev", "gre6_ab"],
         ["/sbin/ip", "link", "set", "dev", "gre6_ab", "mtu", "1456", "up"],
     ]
+
+
+def test_existing_gre_ipv6_without_encaplimit_restarts_with_none(monkeypatch, tmp_path: Path) -> None:
+    """验证旧 IP6GRE 配置缺少 encaplimit 时，重新连接会显式禁用封装限制。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """记录旧 IP6GRE 配置重新启动时执行的命令。"""
+
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    gre.start_gre_interface(
+        {
+            "interface_name": "gre6_old",
+            "outer_local_ip": "2001:db8:1::1",
+            "outer_remote_ip": "2001:db8:2::1",
+            "tunnel_ips": ["10.42.12.1/30"],
+            "routes": [],
+        },
+        str(tmp_path),
+    )
+
+    tunnel_command = commands[1]
+    assert tunnel_command[-2:] == ["encaplimit", "none"]
+    saved = json.loads((tmp_path / "gre6_old.json").read_text(encoding="utf-8"))
+    assert saved["encaplimit"] is None
+
+
+def test_gre_ipv6_accepts_explicit_encaplimit(monkeypatch, tmp_path: Path) -> None:
+    """验证用户启用封装限制后，IP6GRE 使用指定 encaplimit。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """记录显式 encaplimit 的 IP6GRE 启动命令。"""
+
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    gre.start_gre_interface(
+        {
+            "interface_name": "gre6_limit",
+            "outer_local_ip": "2001:db8:1::1",
+            "outer_remote_ip": "2001:db8:2::1",
+            "tunnel_ips": ["10.42.13.1/30"],
+            "routes": [],
+            "encaplimit": 4,
+        },
+        str(tmp_path),
+    )
+
+    assert commands[1][-2:] == ["encaplimit", "4"]
 
 
 def test_gre_runtime_probe_treats_help_exit_as_expected(monkeypatch) -> None:
@@ -1106,6 +1171,7 @@ def test_openwrt_gre_ipv6_writes_grev6_fields_and_reads_gre6_device(monkeypatch,
     assert ["/sbin/uci", "set", "network.gre6_ab.proto=grev6"] in commands
     assert ["/sbin/uci", "set", "network.gre6_ab.ip6addr=2001:db8:1::1"] in commands
     assert ["/sbin/uci", "set", "network.gre6_ab.peer6addr=2001:db8:2::1"] in commands
+    assert ["/sbin/uci", "set", "network.gre6_ab.encaplimit=none"] in commands
     assert not any(".df=" in item for command in commands for item in command)
     assert status["runtime_status"] == "running"
     assert status["link"]["command"] == ["/sbin/ip", "link", "show", "dev", "gre6-gre6_ab"]

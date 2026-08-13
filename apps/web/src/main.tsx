@@ -658,7 +658,10 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "gre endpoint local and remote addresses must be different": "同一端的 GRE 绑定 IP 和连接对端 IP 不能相同",
   "gre outer addresses must use the same IP version": "GRE 外层地址必须全部使用相同的 IPv4 或 IPv6 版本",
   "agent does not support GRE over IPv6": "节点 Agent 尚不支持 GRE over IPv6，请升级 Agent 后重试",
+  "agent does not support GRE over IPv6 encaplimit control": "节点 Agent 版本过旧，无法控制 GRE over IPv6 封装限制，请升级 Agent 后重试",
   "gre ttl requires pmtu discovery": "填写 GRE TTL 时必须启用 PMTU discovery",
+  "encaplimit is only supported by GRE over IPv6": "IPv6 封装限制仅适用于 GRE over IPv6",
+  "encaplimit must be between 0 and 255": "IPv6 封装限制必须在 0-255 之间",
   "protocol_type must be gre": "连接协议不匹配，请重新选择连接类型",
   "address must be IPv4": "地址必须是 IPv4",
   "CIDR value must be IPv4": "CIDR 必须使用 IPv4 地址",
@@ -1079,7 +1082,7 @@ function nodeSupportsGre(node: NodeItem | null): boolean {
 
 // 判断节点 Agent 是否支持使用 IPv6 作为 GRE 外层地址。
 function nodeSupportsGreIpv6(node: NodeItem | null): boolean {
-  return Boolean(node?.agent_capabilities?.includes("gre.ipv6"));
+  return Boolean(node?.agent_capabilities?.includes("gre.ipv6.encaplimit"));
 }
 
 // 生成通用连接 API 路径片段，避免连接引用中的冒号影响 URL。
@@ -4360,6 +4363,8 @@ function App() {
     const peerRoutes = splitList(String(form.get("peer_routes") || ""));
     const requestedMtu = optionalInt(form.get("mtu"), "MTU");
     const ttl = optionalInt(form.get("ttl"), "TTL");
+    const encaplimitEnabled = form.get("encaplimit_enabled") === "on";
+    const encaplimit = encaplimitEnabled ? (optionalInt(form.get("encaplimit"), "IPv6 封装限制") ?? 4) : null;
     const greKey = String(form.get("gre_key") || "").trim();
     if (!isValidGreInterfaceName(localInterfaceName) || !isValidGreInterfaceName(peerInterfaceName)) {
       throw new Error("GRE 接口名称最多 10 个字符，只能包含字母、数字和下划线");
@@ -4399,6 +4404,12 @@ function App() {
     if (outerIpVersion === 4 && ttl !== null && form.get("pmtudisc") !== "on") {
       throw new Error("填写 GRE TTL 时必须启用 PMTU discovery");
     }
+    if (outerIpVersion === 4 && encaplimitEnabled) {
+      throw new Error("IPv6 封装限制仅适用于 GRE over IPv6");
+    }
+    if (encaplimit !== null && (!Number.isInteger(encaplimit) || encaplimit < 0 || encaplimit > 255)) {
+      throw new Error("IPv6 封装限制必须是 0-255 之间的整数");
+    }
     if (!isValidGreKey(greKey)) {
       throw new Error("GRE Key 必须是 0 到 4294967295 之间的整数");
     }
@@ -4419,6 +4430,7 @@ function App() {
       gre_key: greKey || null,
       ttl,
       pmtudisc: form.get("pmtudisc") === "on",
+      encaplimit,
       risk_accepted: form.get("risk_accepted") === "on",
     };
   }
@@ -4476,6 +4488,8 @@ function App() {
     const routes = splitList(String(form.get("routes") || ""));
     const requestedMtu = optionalInt(form.get("mtu"), "MTU");
     const ttl = optionalInt(form.get("ttl"), "TTL");
+    const encaplimitEnabled = form.get("encaplimit_enabled") === "on";
+    const encaplimit = encaplimitEnabled ? (optionalInt(form.get("encaplimit"), "IPv6 封装限制") ?? 4) : null;
     const greKey = String(form.get("gre_key") || "").trim();
     const pmtudisc = form.get("pmtudisc") === "on";
     if (!isValidGreInterfaceName(interfaceName) || (peerInterfaceName && !isValidGreInterfaceName(peerInterfaceName))) {
@@ -4501,6 +4515,12 @@ function App() {
     if (outerIpVersion === 4 && ttl !== null && !pmtudisc) {
       throw new Error("填写 GRE TTL 时必须启用 PMTU discovery");
     }
+    if (outerIpVersion === 4 && encaplimitEnabled) {
+      throw new Error("IPv6 封装限制仅适用于 GRE over IPv6");
+    }
+    if (encaplimit !== null && (!Number.isInteger(encaplimit) || encaplimit < 0 || encaplimit > 255)) {
+      throw new Error("IPv6 封装限制必须是 0-255 之间的整数");
+    }
     if (!isValidGreKey(greKey)) {
       throw new Error("GRE Key 必须是 0 到 4294967295 之间的整数");
     }
@@ -4517,6 +4537,7 @@ function App() {
       gre_key: greKey || null,
       ttl,
       pmtudisc,
+      encaplimit,
       risk_accepted: form.get("risk_accepted") === "on",
     };
   }
@@ -5977,6 +5998,13 @@ function App() {
                   <input name="pmtudisc" type="checkbox" defaultChecked disabled={!selectedNodeOnline} />
                   <span>启用 PMTU discovery</span>
                 </label>
+                <label className="checkField">
+                  <input name="encaplimit_enabled" type="checkbox" disabled={!selectedNodeOnline} />
+                  <span>启用 IPv6 封装限制</span>
+                </label>
+                <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用；关闭开关时下发 encaplimit none。">
+                  <input name="encaplimit" defaultValue="4" inputMode="numeric" disabled={!selectedNodeOnline} />
+                </Field>
               </FormSection>
               <label className="checkField wideField dangerCheck">
                 <input name="risk_accepted" type="checkbox" required disabled={!selectedNodeOnline} />
@@ -6412,6 +6440,13 @@ function App() {
                   <input name="pmtudisc" type="checkbox" defaultChecked disabled={!nodeSupportsGre(selectedNode)} />
                   <span>启用 PMTU discovery</span>
                 </label>
+                <label className="checkField">
+                  <input name="encaplimit_enabled" type="checkbox" disabled={!nodeSupportsGre(selectedNode)} />
+                  <span>启用 IPv6 封装限制</span>
+                </label>
+                <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用；关闭开关时下发 encaplimit none。">
+                  <input name="encaplimit" defaultValue="4" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
+                </Field>
               </FormSection>
               <label className="checkField wideField dangerCheck">
                 <input name="risk_accepted" type="checkbox" required disabled={!nodeSupportsGre(selectedNode)} />
@@ -6777,6 +6812,13 @@ function App() {
                       <input name="pmtudisc" type="checkbox" defaultChecked={greProtocolBoolean(selectedGreLocalEndpoint, "pmtudisc", true)} disabled={!selectedGreAllNodesOnline} />
                       <span>启用 PMTU discovery</span>
                     </label>
+                    <label className="checkField">
+                      <input name="encaplimit_enabled" type="checkbox" defaultChecked={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") !== ""} disabled={!selectedGreAllNodesOnline} />
+                      <span>启用 IPv6 封装限制</span>
+                    </label>
+                    <Field label="IPv6 封装限制" hint="关闭开关时下发 encaplimit none。">
+                      <input name="encaplimit" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") || "4"} inputMode="numeric" disabled={!selectedGreAllNodesOnline} />
+                    </Field>
                   </FormSection>
                   <label className="checkField wideField dangerCheck">
                     <input name="risk_accepted" type="checkbox" required disabled={!selectedGreAllNodesOnline} />
@@ -6895,6 +6937,13 @@ function App() {
                     <input name="pmtudisc" type="checkbox" defaultChecked={greProtocolBoolean(selectedGreLocalEndpoint, "pmtudisc", true)} disabled={!selectedGreAllNodesOnline} />
                     <span>启用 PMTU discovery</span>
                   </label>
+                  <label className="checkField">
+                    <input name="encaplimit_enabled" type="checkbox" defaultChecked={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") !== ""} disabled={!selectedGreAllNodesOnline} />
+                    <span>启用 IPv6 封装限制</span>
+                  </label>
+                  <Field label="IPv6 封装限制" hint="关闭开关时双方下发 encaplimit none。">
+                    <input name="encaplimit" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") || "4"} inputMode="numeric" disabled={!selectedGreAllNodesOnline} />
+                  </Field>
                 </FormSection>
                 <label className="checkField wideField dangerCheck">
                   <input name="risk_accepted" type="checkbox" required disabled={!selectedGreAllNodesOnline} />

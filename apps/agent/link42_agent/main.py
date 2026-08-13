@@ -100,14 +100,14 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
             "gre.openwrt-uci",
         ])
         if openwrt_gre_ipv6_supported():
-            capabilities.append("gre.ipv6")
+            capabilities.extend(["gre.ipv6", "gre.ipv6.encaplimit"])
     elif service_manager != "openwrt-uci" and gre_runtime_supported():
         capabilities.extend([
             "gre",
             "gre.iproute2",
         ])
         if gre_ipv6_runtime_supported():
-            capabilities.append("gre.ipv6")
+            capabilities.extend(["gre.ipv6", "gre.ipv6.encaplimit"])
     if service_manager in ["systemd", "openwrt-uci"]:
         capabilities.extend([
             "middleware",

@@ -220,9 +220,14 @@ def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "key": str(payload.get("key") or "").strip() or None,
         "ttl": int(payload["ttl"]) if payload.get("ttl") is not None else None,
         "pmtudisc": bool(payload.get("pmtudisc", True)),
+        "encaplimit": int(payload["encaplimit"]) if payload.get("encaplimit") is not None else None,
     }
     if config["outer_ip_version"] == 4 and config["ttl"] is not None and not config["pmtudisc"]:
         raise ValueError("GRE ttl requires PMTU discovery")
+    if config["outer_ip_version"] == 4 and config["encaplimit"] is not None:
+        raise ValueError("encaplimit is only supported by GRE over IPv6")
+    if config["encaplimit"] is not None and not 0 <= config["encaplimit"] <= 255:
+        raise ValueError("encaplimit must be between 0 and 255")
     return config
 
 
@@ -305,6 +310,8 @@ def gre_tunnel_add_command(config: dict[str, Any]) -> list[str]:
         command.extend(["key", str(config["key"])])
     if config.get("ttl") is not None:
         command.extend(["hoplimit" if outer_ip_version == 6 else "ttl", str(config["ttl"])])
+    if outer_ip_version == 6:
+        command.extend(["encaplimit", str(config["encaplimit"]) if config.get("encaplimit") is not None else "none"])
     if outer_ip_version == 4:
         command.append("pmtudisc" if config.get("pmtudisc", True) else "nopmtudisc")
     return command
@@ -446,6 +453,9 @@ def openwrt_apply_gre_commands(config: dict[str, Any], *, autostart: bool = True
         commands.append([uci_command(), "set", f"network.{interface_name}.df={'1' if config.get('pmtudisc', True) else '0'}"])
     if config.get("ttl") is not None:
         commands.append([uci_command(), "set", f"network.{interface_name}.ttl={config['ttl']}"])
+    if outer_ip_version == 6:
+        encaplimit = config.get("encaplimit")
+        commands.append([uci_command(), "set", f"network.{interface_name}.encaplimit={encaplimit if encaplimit is not None else 'none'}"])
     if config.get("key"):
         commands.append([uci_command(), "set", f"network.{interface_name}.ikey={config['key']}"])
         commands.append([uci_command(), "set", f"network.{interface_name}.okey={config['key']}"])
