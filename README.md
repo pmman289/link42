@@ -4,6 +4,20 @@ Link42 是一个用来管理多节点 WireGuard 点对点链路的 Web 面板。
 
 它适合 DN42、家庭网络、实验室网络、小型多机房内网这类场景：你有几台 Linux/OpenWrt 节点，希望少手写配置，能看清链路关系，并且可以安全地导入、接管和下发 WireGuard 配置。
 
+## 界面预览
+
+![Link42 主控首页](docs/assets/nodeseek-intro/link42-dashboard.png)
+
+![Link42 全屏拓扑](docs/assets/nodeseek-intro/link42-topology.png)
+
+受管 WireGuard 连接可以启用 udp2raw，并选择 ICMP/ICMPv6 作为外层传输模式：
+
+![udp2raw ICMP 配置](docs/assets/nodeseek-intro/link42-icmp-link.png)
+
+节点插件中的端口台账可以记录端口范围、扫描结果和实际用途：
+
+![端口台账](docs/assets/nodeseek-intro/link42-port-inventory.png)
+
 ## 主要功能
 
 - 多节点管理：查看节点在线状态、Agent 版本、系统能力和地域分组。
