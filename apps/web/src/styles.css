@@ -641,6 +641,16 @@ textarea {
   font-weight: 800;
 }
 
+.field input[aria-invalid="true"],
+.field select[aria-invalid="true"],
+.field textarea[aria-invalid="true"],
+.gridForm input[aria-invalid="true"],
+.gridForm select[aria-invalid="true"],
+.gridForm textarea[aria-invalid="true"] {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
 .field > small {
   color: var(--muted);
   font-size: 12px;

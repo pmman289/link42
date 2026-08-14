@@ -87,6 +87,7 @@ from link42_api.main import (
     update_manual_connection,
     update_managed_link,
     validate_manual_gre_payload,
+    validate_udp2raw_port_conflicts,
     udp2raw_endpoint_payloads,
     request_agent_upgrade,
     request_node_plugin_action,
@@ -5316,6 +5317,67 @@ def test_udp2raw_requires_server_side_wireguard_listen_port() -> None:
 
     assert exc_info.value.status_code == 400
     assert "requires WireGuard listen port" in str(exc_info.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("server_side", "local_listen_port", "peer_listen_port"),
+    [
+        ("peer", 23001, 51820),
+        ("local", 51820, 23001),
+    ],
+)
+def test_udp2raw_rejects_client_wireguard_port_conflict(
+    server_side: str,
+    local_listen_port: int,
+    peer_listen_port: int,
+) -> None:
+    """验证 udp2raw 客户端监听端口不能与同机 WireGuard ListenPort 相同。"""
+
+    middleware = {
+        "type": "udp2raw",
+        "server_side": server_side,
+        "server_listen_port": 23002,
+        "client_listen_port": 23001,
+        "raw_mode": "faketcp",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_udp2raw_port_conflicts(middleware, local_listen_port, peer_listen_port)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "udp2raw client listen port conflicts with WireGuard listen port on the same node"
+
+
+def test_udp2raw_udp_mode_rejects_server_wireguard_port_conflict() -> None:
+    """验证 UDP 模式服务端会话端口不能与同机 WireGuard ListenPort 相同。"""
+
+    middleware = {
+        "type": "udp2raw",
+        "server_side": "peer",
+        "server_listen_port": 51820,
+        "client_listen_port": 23001,
+        "raw_mode": "udp",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_udp2raw_port_conflicts(middleware, None, 51820)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "udp2raw UDP server port conflicts with WireGuard listen port on the same node"
+
+
+def test_udp2raw_raw_socket_mode_allows_shared_numeric_server_port() -> None:
+    """验证 FakeTCP 使用原始套接字时允许与 WireGuard 使用相同的数字端口。"""
+
+    middleware = {
+        "type": "udp2raw",
+        "server_side": "peer",
+        "server_listen_port": 51820,
+        "client_listen_port": 23001,
+        "raw_mode": "faketcp",
+    }
+
+    validate_udp2raw_port_conflicts(middleware, None, 51820)
 
 
 def test_udp2raw_rejects_domain_as_server_connect_host(monkeypatch) -> None:

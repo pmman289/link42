@@ -2131,6 +2131,32 @@ def normalize_middleware_config(
     return udp2raw or mimic
 
 
+def validate_udp2raw_port_conflicts(
+    middleware: dict | None,
+    local_listen_port: int | None,
+    peer_listen_port: int | None,
+) -> None:
+    """校验 udp2raw 与同机 WireGuard 不会占用冲突的 UDP 端口。"""
+
+    if not middleware or middleware.get("type") != "udp2raw":
+        return
+    server_side = str(middleware.get("server_side") or "peer")
+    server_wireguard_port = local_listen_port if server_side == "local" else peer_listen_port
+    client_wireguard_port = peer_listen_port if server_side == "local" else local_listen_port
+    if server_wireguard_port is None:
+        raise HTTPException(status_code=400, detail="udp2raw server side requires WireGuard listen port")
+    if client_wireguard_port == middleware.get("client_listen_port"):
+        raise HTTPException(
+            status_code=400,
+            detail="udp2raw client listen port conflicts with WireGuard listen port on the same node",
+        )
+    if middleware.get("raw_mode") == "udp" and server_wireguard_port == middleware.get("server_listen_port"):
+        raise HTTPException(
+            status_code=400,
+            detail="udp2raw UDP server port conflicts with WireGuard listen port on the same node",
+        )
+
+
 def parse_kernel_major_minor(value: object) -> tuple[int, int]:
     """从平台上报的内核版本字符串中解析 major/minor。"""
 
@@ -4903,6 +4929,7 @@ def create_managed_link(
     if replace_peer_peer and not endpoint_points_to_node(replace_peer_peer.endpoint_host, local_node) and not payload.force_endpoint_mismatch:
         raise HTTPException(status_code=409, detail="peer imported endpoint does not point to local node")
     middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
+    validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     local_endpoint, peer_endpoint = require_managed_link_endpoints(
         local_node,
         peer_node,
@@ -5255,6 +5282,7 @@ def update_managed_link(
     local_node = require_online_node(db, local_interface.node_id)
     peer_node = require_online_node(db, peer_interface.node_id)
     middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
+    validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     local_endpoint, peer_endpoint = require_managed_link_endpoints(
         local_node,
         peer_node,

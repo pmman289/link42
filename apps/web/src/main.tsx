@@ -12,6 +12,22 @@ import { EditorView, keymap } from "@codemirror/view";
 import { Tree, type NodeRendererProps } from "react-arborist";
 import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
+import { validateForm } from "./formValidation";
+import {
+  linkMonitorFormRule,
+  loginFormRule,
+  lookingGlassTokenFormRule,
+  managedGreCreateFormRule,
+  managedGreFormRule,
+  managedWireGuardFormRule,
+  manualGreFormRule,
+  nodeCreateFormRule,
+  nodeEditFormRule,
+  portInventoryEntryFormRule,
+  settingsFormRule,
+  wireGuardConfigFormRule,
+  wireGuardPeerFormRule,
+} from "./formRules";
 import "./styles.css";
 
 type NodeItem = {
@@ -637,6 +653,8 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "udp2raw server listen port is required": "请填写 udp2raw 服务端监听端口",
   "udp2raw client listen port is required": "请填写 udp2raw 客户端本地监听端口",
   "udp2raw server side requires WireGuard listen port": "udp2raw 服务端所在节点必须填写 WireGuard 监听端口",
+  "udp2raw client listen port conflicts with WireGuard listen port on the same node": "udp2raw 客户端本地监听端口不能与同机 WireGuard 监听端口相同",
+  "udp2raw UDP server port conflicts with WireGuard listen port on the same node": "UDP 模式下，udp2raw 服务端会话端口不能与同机 WireGuard 监听端口相同",
   "udp2raw server listen address must match outer IP version": "udp2raw 服务端监听地址必须与连接服务端 IP 使用相同的 IPv4 或 IPv6 地址族",
   "agent does not support udp2raw ICMP mode": "当前 Agent 版本不支持 udp2raw ICMP/ICMPv6 模式，请升级双方 Agent 后重试",
   "IPv6 WireGuard MTU must be at least 1280": "使用 IPv6 接口地址时，WireGuard MTU 不能小于 1280",
@@ -663,7 +681,7 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "gre outer addresses must use the same IP version": "GRE 外层地址必须全部使用相同的 IPv4 或 IPv6 版本",
   "agent does not support GRE over IPv6": "节点 Agent 尚不支持 GRE over IPv6，请升级 Agent 后重试",
   "agent does not support GRE over IPv6 encaplimit control": "节点 Agent 版本过旧，无法控制 GRE over IPv6 封装限制，请升级 Agent 后重试",
-  "gre ttl requires pmtu discovery": "填写 GRE TTL 时必须启用 PMTU discovery",
+  "gre ttl requires pmtu discovery": "填写 GRE TTL 时必须启用路径 MTU 探测",
   "encaplimit is only supported by GRE over IPv6": "IPv6 封装限制仅适用于 GRE over IPv6",
   "encaplimit must be between 0 and 255": "IPv6 封装限制必须在 0-255 之间",
   "protocol_type must be gre": "连接协议不匹配，请重新选择连接类型",
@@ -1334,12 +1352,6 @@ function suggestedEndpointMonitorTarget(endpoint: ConnectionEndpointItem | null,
   return firstIpFromCidrs(peerEndpoint?.tunnel_ips || []) || firstIpFromCidrs(manualPeerTunnelIps) || firstIpFromCidrs(endpoint?.routes || []) || "";
 }
 
-// 校验可选端口范围。
-function isValidPort(value: number | null): boolean {
-  // UDP 端口范围校验，空值表示不填写。
-  return value === null || (Number.isInteger(value) && value >= 1 && value <= 65535);
-}
-
 // 校验必填端口范围。
 function isRequiredPort(value: number): boolean {
   return Number.isInteger(value) && value >= 1 && value <= 65535;
@@ -1348,14 +1360,6 @@ function isRequiredPort(value: number): boolean {
 // 校验可选 MTU 范围。
 function isValidMtu(value: number | null): boolean {
   return value === null || (Number.isInteger(value) && value >= 576 && value <= 9000);
-}
-
-// 校验包含 IPv6 地址的 WireGuard 接口遵守 IPv6 最小 MTU。
-function validateWireGuardIpv6Mtu(mtu: number, ...tunnelIpGroups: string[][]): void {
-  const hasIpv6 = tunnelIpGroups.some((values) => values.some((value) => value.split("/")[0]?.includes(":")));
-  if (hasIpv6 && mtu < 1280) {
-    throw new Error("使用 IPv6 接口地址时，MTU 不能小于 1280");
-  }
 }
 
 // 用轻量规则判断输入是否像 IP 地址。
@@ -1445,13 +1449,6 @@ function MonitorSummaryButton({
       )}
     </span>
   );
-}
-
-// 粗略校验 WireGuard base64 key 的格式。
-function isProbablyWireGuardKey(value: FormDataEntryValue | null): boolean {
-  // WireGuard key 是 base64 字符串，常见长度 44；留空由调用方决定是否允许。
-  if (!value) return true;
-  return /^[A-Za-z0-9+/]{43}=$/.test(String(value));
 }
 
 // 汇总节点可作为 Endpoint 的地址候选。
@@ -1843,35 +1840,35 @@ function MimicFields({
       </label>
       {enabled && (
         <>
-          <Field label="本端出口网卡" hint="选择承载本端 WireGuard 入口流量的物理或上联网卡。">
+          <Field label="本端出口网卡" hint="选择本端用于收发这条连接外层流量的物理网卡，例如 eth0；不要选择 WireGuard 接口。">
             <select name="mimic_local_bind_interface" defaultValue={defaults?.local_bind_interface || localInterfaces[0] || ""} required disabled={disabled}>
               <option value="">请选择网卡</option>
               {localInterfaces.map((name) => <option key={name} value={name}>{name}</option>)}
             </select>
           </Field>
-          <Field label="对端出口网卡" hint="选择承载对端 WireGuard 入口流量的物理或上联网卡。">
+          <Field label="对端出口网卡" hint="选择对端用于收发这条连接外层流量的物理网卡，例如 eth0；不要选择 WireGuard 接口。">
             <select name="mimic_peer_bind_interface" defaultValue={defaults?.peer_bind_interface || peerInterfaces[0] || ""} required disabled={disabled}>
               <option value="">请选择网卡</option>
               {peerInterfaces.map((name) => <option key={name} value={name}>{name}</option>)}
             </select>
           </Field>
-          <Field label="XDP 模式" hint="默认 skb 兼容性更稳；确认网卡 native XDP 稳定后可切 native。">
+          <Field label="XDP 模式" hint="不确定时选择 skb，兼容性最好；只有确认网卡驱动支持原生 XDP 时才选择 native。">
             <select name="mimic_xdp_mode" defaultValue={defaults?.xdp_mode || "skb"} disabled={disabled}>
               <option value="skb">skb</option>
               <option value="auto">auto</option>
               <option value="native">native</option>
             </select>
           </Field>
-          <Field label="链路类型" hint="大多数以太网环境保持 eth。">
+          <Field label="链路类型" hint="用于告诉 mimic 外层网卡的链路类型；普通以太网和云服务器保持 eth。">
             <input name="mimic_link_type" defaultValue={defaults?.link_type || "eth"} disabled={disabled} />
           </Field>
-          <Field label="握手间隔" hint="对应 mimic 的 handshake interval；留空使用 mimic 默认值。">
+          <Field label="握手间隔" hint="控制 mimic 重新发送握手的间隔；通常留空使用默认值。">
             <input name="mimic_handshake_interval" defaultValue={defaults?.handshake_interval || ""} inputMode="numeric" disabled={disabled} />
           </Field>
-          <Field label="保活时间" hint="对应 mimic 的 keepalive time；留空使用 mimic 默认值。">
+          <Field label="保活时间" hint="控制空闲连接发送保活的间隔；通常留空使用默认值。">
             <input name="mimic_keepalive_interval" defaultValue={defaults?.keepalive_interval || ""} inputMode="numeric" disabled={disabled} />
           </Field>
-          <Field label="填充长度" hint="范围 0-16；留空不额外指定。">
+          <Field label="填充长度" hint="在报文中增加 0-16 字节填充；没有兼容需求时留空。">
             <input name="mimic_padding" defaultValue={defaults?.padding || ""} inputMode="numeric" disabled={disabled} />
           </Field>
           <div className="formNotice wideField">
@@ -1901,7 +1898,7 @@ function RouteModeSelect({
   return (
     <select name="table_name" defaultValue={defaultValue ?? "off"} disabled={disabled}>
       <option value="">自动生成路由（默认）</option>
-      <option value="off">不自动生成路由（Table=off）</option>
+      <option value="off">不自动生成路由（手动或由路由协议维护）</option>
     </select>
   );
 }
@@ -1961,7 +1958,7 @@ function Udp2RawFields({
       </label>
       {enabled && (
         <>
-          <Field label="服务端所在节点" hint="服务端需要有 WireGuard ListenPort；客户端侧 WireGuard 可不写 ListenPort。">
+          <Field label="服务端所在节点" hint="选择哪一端接收中间层连接。服务端侧 WireGuard 必须监听端口，客户端侧通常不需要 WireGuard 监听端口。">
             <select
               name="udp2raw_server_side"
               value={serverSide}
@@ -1972,24 +1969,24 @@ function Udp2RawFields({
               <option value="local">本端运行 udp2raw 服务端，对端运行客户端</option>
             </select>
           </Field>
-          <Field label="客户端连接服务端 IP" hint="写入客户端的 -r；必须是 IP，不能填域名。">
+          <Field label="客户端连接服务端 IP" hint="填写客户端实际能够访问到的服务端地址，例如公网 IP；只支持 IP，不支持域名。">
             <input name="udp2raw_server_connect_host" defaultValue={defaults?.server_connect_host || ""} placeholder="203.0.113.20" disabled={disabled} />
           </Field>
-          <Field label="服务端监听地址" hint="普通模式通常填 0.0.0.0；ICMP 模式使用通配地址时会自动绑定到服务端连接 IP，NAT 场景请填写机器网卡上的实际本地 IP。">
+          <Field label="服务端监听地址" hint="一般保持 0.0.0.0。服务端使用公网 NAT/EIP 时，应填写机器网卡上的实际本地 IP，而不是不在网卡上的公网地址。">
             <input name="udp2raw_server_listen_host" defaultValue={defaults?.server_listen_host || "0.0.0.0"} disabled={disabled} />
           </Field>
           <Field
             label="服务端会话端口"
             hint={rawMode === "icmp"
-              ? "ICMP 没有传输层端口，但 udp2raw 仍使用该值进行本地绑定和会话区分，两端必须一致。"
-              : "客户端连接的 udp2raw 服务端端口。"}
+              ? "ICMP 没有传输层端口；udp2raw 使用该值区分会话，客户端会自动使用相同值连接服务端。"
+              : "客户端会自动使用该值连接服务端；不要与同机 WireGuard UDP 监听端口填写成相同值。"}
           >
             <input name="udp2raw_server_listen_port" defaultValue={defaults?.server_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
-          <Field label="服务端转发到 IP" hint="服务端解包后把 UDP 发往这里；通常 127.0.0.1。">
+          <Field label="服务端转发到 IP" hint="解包后的 WireGuard UDP 报文要发送到的本机地址；WireGuard 运行在同一台机器时使用 127.0.0.1。">
             <input name="udp2raw_server_forward_host" defaultValue={defaults?.server_forward_host || "127.0.0.1"} disabled={disabled} />
           </Field>
-          <Field label="服务端转发到端口" hint="可选；留空则使用服务端侧 WireGuard ListenPort。">
+          <Field label="服务端转发到端口" hint="填写服务端侧 WireGuard 实际监听的 UDP 端口；留空会自动使用服务端 WireGuard 监听端口。">
             <input
               key={`udp2raw-forward-port-${serverSide}-${forwardPortDefault}`}
               name="udp2raw_server_forward_port"
@@ -1998,13 +1995,13 @@ function Udp2RawFields({
               disabled={disabled}
             />
           </Field>
-          <Field label="客户端本地监听地址" hint="WireGuard 入口会被接管到这个本地 UDP 地址。">
+          <Field label="客户端本地监听地址" hint="本机 WireGuard 会把加密报文发送到这里；通常保持 127.0.0.1，避免暴露到外网。">
             <input name="udp2raw_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} />
           </Field>
-          <Field label="客户端本地监听端口" hint="填写本节点 WireGuard 连接对端接口时要使用的本地 udp2raw UDP 端口；本端对端入口会被接管到 127.0.0.1:此端口。">
+          <Field label="客户端本地监听端口" hint="本机 WireGuard 会把报文发送到这个 UDP 端口，再由 udp2raw 转发；不能与同机 WireGuard 监听端口相同。">
             <input name="udp2raw_client_listen_port" defaultValue={defaults?.client_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} />
           </Field>
-          <Field label="传输模式" hint="ICMP 模式会根据服务端连接 IP 自动选择 ICMPv4 或 ICMPv6。">
+          <Field label="传输模式" hint="FakeTCP 兼容性较常见；UDP 开销较低；ICMP 会根据服务端 IP 自动选择 ICMPv4 或 ICMPv6。">
             <select
               name="udp2raw_raw_mode"
               value={rawMode}
@@ -2016,14 +2013,14 @@ function Udp2RawFields({
               <option value="icmp">ICMP（自动 IPv4/IPv6）</option>
             </select>
           </Field>
-          <Field label="加密模式" hint="xor 开销低；none 不加密；aes128cbc 兼容 udp2raw 原生模式。">
+          <Field label="加密模式" hint="这里保护的是中间层报文外观，业务数据仍由 WireGuard 加密；优先使用 xor，追求最低开销可选 none。">
             <select name="udp2raw_cipher_mode" defaultValue={defaults?.cipher_mode || "xor"} disabled={disabled}>
               <option value="xor">xor</option>
               <option value="aes128cbc">aes128cbc</option>
               <option value="none">none</option>
             </select>
           </Field>
-          <Field label="认证模式" hint="md5 兼容现有连接；simple 或 none 开销更低。敏感流量仍应由 WireGuard 保护。">
+          <Field label="认证模式" hint="用于识别合法的 udp2raw 对端；md5 兼容性较好，simple 或 none 开销更低。">
             <select name="udp2raw_auth_mode" defaultValue={defaults?.auth_mode || "md5"} disabled={disabled}>
               <option value="md5">MD5（兼容默认）</option>
               <option value="simple">Simple（低开销）</option>
@@ -2048,6 +2045,9 @@ function Udp2RawFields({
             {serverSide === "peer"
               ? "本端入口会指向本端 udp2raw 客户端；对端服务端解包后转发到对端 WireGuard。OpenWrt 作为服务端时，入口防火墙区域仍需手动放行服务端监听端口。"
               : "对端入口会指向对端 udp2raw 客户端；本端服务端解包后转发到本端 WireGuard。OpenWrt 作为服务端时，入口防火墙区域仍需手动放行服务端监听端口。"}
+          </div>
+          <div className="formNotice wideField">
+            数据流：WireGuard → 本地 udp2raw 客户端 → 中间网络 → udp2raw 服务端 → 服务端 WireGuard。
           </div>
         </>
       )}
@@ -2099,69 +2099,6 @@ function readMimicForm(form: FormData): Record<string, unknown> | null {
     keepalive_interval: optionalInt(form.get("mimic_keepalive_interval"), "mimic 保活间隔"),
     padding: optionalInt(form.get("mimic_padding"), "mimic 填充长度"),
   };
-}
-
-// 校验 mimic 表单和 WireGuard 依赖字段是否满足部署要求。
-function validateMimicForm(
-  mimic: Record<string, unknown> | null,
-  localListenPort: number | null,
-  peerListenPort: number | null,
-  localEndpointHost: string,
-  peerEndpointHost: string,
-) {
-  if (!mimic) return;
-  if (!mimic.local_bind_interface || !mimic.peer_bind_interface) {
-    throw new Error("mimic 需要选择双方出口网卡");
-  }
-  if (!localEndpointHost || !peerEndpointHost) {
-    throw new Error("mimic 需要双方入口地址都填写");
-  }
-  if (!localListenPort || !peerListenPort) {
-    throw new Error("mimic 透明匹配需要双方 WireGuard ListenPort 都填写");
-  }
-  if (!["auto", "native", "skb"].includes(String(mimic.xdp_mode))) {
-    throw new Error("mimic XDP 模式必须是 auto、native 或 skb");
-  }
-  if (mimic.padding !== null && mimic.padding !== undefined) {
-    const padding = Number(mimic.padding);
-    if (!Number.isInteger(padding) || padding < 0 || padding > 16) {
-    throw new Error("mimic 填充长度必须在 0-16 之间");
-    }
-  }
-}
-
-// 校验 udp2raw 表单和 WireGuard 依赖字段是否满足部署要求。
-function validateUdp2RawForm(udp2raw: Record<string, unknown> | null, localListenPort: number | null, peerListenPort: number | null) {
-  if (!udp2raw) return;
-  const serverSide = String(udp2raw.server_side);
-  const serverListenHost = String(udp2raw.server_listen_host || "");
-  const serverConnectHost = String(udp2raw.server_connect_host || "");
-  const serverForwardHost = String(udp2raw.server_forward_host || "");
-  const clientListenHost = String(udp2raw.client_listen_host || "");
-  const serverListenPort = (udp2raw.server_listen_port as number | null | undefined) ?? null;
-  const clientListenPort = (udp2raw.client_listen_port as number | null | undefined) ?? null;
-  const serverForwardPort = (udp2raw.server_forward_port as number | null | undefined) ?? null;
-  if (
-    !isValidPort(serverListenPort) ||
-    !isValidPort(clientListenPort)
-  ) {
-    throw new Error("udp2raw 服务端监听端口和客户端本地 UDP 监听端口必须填写 1-65535 之间的整数");
-  }
-  if (!isValidPort(serverForwardPort)) {
-    throw new Error("udp2raw 服务端转发目的端口必须留空，或填写 1-65535 之间的整数");
-  }
-  if (!isProbablyIpAddress(serverListenHost) || !isProbablyIpAddress(serverForwardHost) || !isProbablyIpAddress(clientListenHost)) {
-    throw new Error("udp2raw 监听地址和转发目的地址必须填写 IP，不能填写域名");
-  }
-  if (!isProbablyIpAddress(serverConnectHost)) {
-    throw new Error("udp2raw 服务端对外地址必须填写 IP，不能填写域名");
-  }
-  if (serverSide === "local" && !localListenPort) {
-    throw new Error("udp2raw 服务端在本端时，本端 WireGuard 监听端口必须填写");
-  }
-  if (serverSide === "peer" && !peerListenPort) {
-    throw new Error("udp2raw 服务端在对端时，对端 WireGuard 监听端口必须填写");
-  }
 }
 
 // 渲染 Link42 主界面并集中管理页面状态。
@@ -2898,7 +2835,7 @@ function App() {
   // 处理登录表单提交。
   async function login(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const form = validateForm(event.currentTarget, loginFormRule);
     setLoginError("");
     let result: LoginResult;
     try {
@@ -2951,11 +2888,8 @@ function App() {
   // 保存主控设置，必要时先上传 logo 文件。
   async function saveSettings(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const form = validateForm(event.currentTarget, settingsFormRule);
     const newPassword = String(form.get("new_password") || "");
-    if (newPassword && newPassword.length < 6) {
-      throw new Error("新密码至少需要 6 个字符");
-    }
     const logoFile = form.get("site_logo_file");
     let uploadedLogoUrl: string | null = null;
     if (logoFile instanceof File && logoFile.size > 0) {
@@ -3013,7 +2947,7 @@ function App() {
   async function createLookingGlassToken(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, lookingGlassTokenFormRule);
     const scopes = ["looking_glass.nodes.read", "looking_glass.bird.route"];
     const result = await api<LookingGlassApiTokenCreateResult>("/api/integrations/looking-glass/tokens", {
       method: "POST",
@@ -3356,13 +3290,10 @@ function App() {
   async function createManualPortInventoryEntry(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, portInventoryEntryFormRule);
     const protocol = String(form.get("protocol") || "TCP") as "TCP" | "UDP";
     const port = Number(form.get("port"));
     const purpose = String(form.get("purpose") || "").trim();
-    if (!isRequiredPort(port)) {
-      throw new Error("端口号必须是 1-65535");
-    }
     await createPortInventoryEntry({ protocol, port, purpose, source: "manual" });
     formElement.reset();
   }
@@ -3618,7 +3549,7 @@ function App() {
     if (!target || !selectedNodeId) return;
     const nodeId = selectedNodeId;
     const currentSamples = activeMonitorDetail?.samples || [];
-    const form = new FormData(event.currentTarget);
+    const form = validateForm(event.currentTarget, linkMonitorFormRule);
     const monitor = await api<LinkMonitor>(target.apiPath, {
       method: "POST",
       body: JSON.stringify({
@@ -3976,12 +3907,9 @@ function App() {
   async function createNode(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, nodeCreateFormRule, { endpointIps: nodeCreateEndpointIps });
     const controllerUrl = String(form.get("controller_url") || DEFAULT_CONTROLLER_URL).trim();
     const endpointIps = uniqueList([...nodeCreateEndpointIps, ...splitList(String(form.get("endpoint_ip_draft") || ""))]);
-    if (endpointIps.length === 0) {
-      throw new Error("请至少填写一个节点入口地址");
-    }
     const result = await api<NodeCreateResult>("/api/nodes", {
       method: "POST",
       body: JSON.stringify({
@@ -4017,11 +3945,8 @@ function App() {
     event.preventDefault();
     if (!editingNode) return;
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, nodeEditFormRule, { endpointIps: editingNodeEndpointIps });
     const endpointIps = uniqueList([...editingNodeEndpointIps, ...splitList(String(form.get("endpoint_ip_draft") || ""))]);
-    if (endpointIps.length === 0) {
-      throw new Error("请至少填写一个节点入口地址");
-    }
     const updated = await api<NodeItem>(`/api/nodes/${editingNode.id}`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -4186,59 +4111,17 @@ function App() {
     event.preventDefault();
     if (!selectedNodeId) return;
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, wireGuardConfigFormRule);
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能修改该节点的 WireGuard 配置");
     }
     const listenPort = optionalInt(form.get("listen_port"), "监听端口");
     const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1420;
     const tunnelIps = splitList(String(form.get("tunnel_ips") || ""));
-    if (!isValidCidrs(tunnelIps)) {
-      throw new Error("接口地址必须使用 CIDR 格式，例如 10.42.0.1/24");
-    }
-    if (!isValidPort(listenPort)) {
-      throw new Error("监听端口必须在 1-65535 之间");
-    }
-    if (!isValidMtu(mtu)) {
-      throw new Error("MTU 必须是 576-9000 之间的整数");
-    }
-    validateWireGuardIpv6Mtu(mtu, tunnelIps);
-    if (!isProbablyWireGuardKey(form.get("public_key")) || !isProbablyWireGuardKey(form.get("private_key"))) {
-      throw new Error("WireGuard 密钥格式应为 44 位 base64 字符串");
-    }
     const createPeerPublicKey = String(form.get("peer_public_key") || "").trim();
     const createPeerAllowedIps = splitList(String(form.get("peer_allowed_ips") || ""));
     const createPeerEndpointPort = optionalInt(form.get("peer_endpoint_port"), "对端入口端口");
     const createPeerKeepalive = optionalInt(form.get("peer_persistent_keepalive"), "对端保活间隔");
-    if (mode === "create") {
-      const hasCreatePeerData = Boolean(
-        createPeerAllowedIps.length ||
-        createPeerEndpointPort !== null ||
-        createPeerKeepalive !== null ||
-        String(form.get("peer_name") || "").trim() ||
-        String(form.get("peer_preshared_key") || "").trim() ||
-        String(form.get("peer_endpoint_host") || "").trim() ||
-        String(form.get("peer_custom_config") || "").trim(),
-      );
-      if (hasCreatePeerData && !createPeerPublicKey) {
-        throw new Error("填写 Peer 信息时必须填写对端公钥");
-      }
-      if (!isProbablyWireGuardKey(createPeerPublicKey)) {
-        throw new Error("对端公钥格式应为 44 位 base64 字符串");
-      }
-      if (!isProbablyWireGuardKey(form.get("peer_preshared_key"))) {
-        throw new Error("预共享密钥格式应为 44 位 base64 字符串");
-      }
-      if (!isValidCidrs(createPeerAllowedIps)) {
-        throw new Error("允许路由必须使用 CIDR 格式，例如 172.20.0.0/14 或 fd00::/8");
-      }
-      if (!isValidPort(createPeerEndpointPort)) {
-        throw new Error("入口端口必须留空，或填写 1-65535 之间的整数");
-      }
-      if (createPeerKeepalive !== null && (!Number.isInteger(createPeerKeepalive) || createPeerKeepalive < 0 || createPeerKeepalive > 65535)) {
-        throw new Error("保活间隔必须是 0-65535 之间的整数");
-      }
-    }
     const payload = {
       name: form.get("name"),
       tunnel_ips: tunnelIps,
@@ -4291,7 +4174,7 @@ function App() {
       throw new Error("Agent 离线，不能创建受管节点连接");
     }
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, managedWireGuardFormRule, { middlewareType, requirePeerNode: true });
     const peerNodeId = Number(form.get("peer_node_id"));
     const localTunnelIps = splitList(String(form.get("local_tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
@@ -4309,27 +4192,6 @@ function App() {
     if (!peerNodeId || peerNodeId === selectedNodeId) {
       throw new Error("请选择另一个在线受管节点");
     }
-    if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
-      throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32");
-    }
-    if (!isValidCidrs(localAllowedIps) || !isValidCidrs(peerAllowedIps)) {
-      throw new Error("允许路由必须使用 CIDR 格式，例如 10.42.0.2/32 或 192.168.10.0/24");
-    }
-    if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
-      throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
-    }
-    if (!isValidPort(localEndpointPort) || !isValidPort(peerEndpointPort)) {
-      throw new Error("双方入口端口必须留空，或填写 1-65535 之间的整数");
-    }
-    if (!isValidMtu(mtu)) {
-      throw new Error("MTU 必须是 576-9000 之间的整数");
-    }
-    validateWireGuardIpv6Mtu(mtu, localTunnelIps, peerTunnelIps);
-    if (!localEndpointHost && !peerEndpointHost) {
-      throw new Error("本端或对端至少需要填写一个入口地址");
-    }
-    validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
-    validateMimicForm(mimic, localListenPort, peerListenPort, localEndpointHost, peerEndpointHost);
     if (replaceLocalConfigId && !replacePeerConfigId) {
       throw new Error("请选择对端的导入配置覆盖项");
     }
@@ -4444,7 +4306,7 @@ function App() {
       throw new Error("TTL 必须是 1-255 之间的整数");
     }
     if (outerIpVersion === 4 && ttl !== null && form.get("pmtudisc") !== "on") {
-      throw new Error("填写 GRE TTL 时必须启用 PMTU discovery");
+      throw new Error("填写 GRE TTL 时必须启用路径 MTU 探测");
     }
     if (outerIpVersion === 4 && encaplimitEnabled) {
       throw new Error("IPv6 封装限制仅适用于 GRE over IPv6");
@@ -4485,7 +4347,7 @@ function App() {
       throw new Error("当前节点尚未上报 GRE 能力，请确认系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE，并升级 Agent 后重试");
     }
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, managedGreCreateFormRule);
     const peerNodeId = Number(form.get("peer_node_id"));
     const peerNode = nodes.find((node) => node.id === peerNodeId) || null;
     if (!peerNode || peerNode.id === selectedNodeId) {
@@ -4555,7 +4417,7 @@ function App() {
       throw new Error("TTL 必须是 1-255 之间的整数");
     }
     if (outerIpVersion === 4 && ttl !== null && !pmtudisc) {
-      throw new Error("填写 GRE TTL 时必须启用 PMTU discovery");
+      throw new Error("填写 GRE TTL 时必须启用路径 MTU 探测");
     }
     if (outerIpVersion === 4 && encaplimitEnabled) {
       throw new Error("IPv6 封装限制仅适用于 GRE over IPv6");
@@ -4592,7 +4454,7 @@ function App() {
       throw new Error("当前节点尚未上报 GRE 能力，请确认系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE，并升级 Agent 后重试");
     }
     const formElement = event.currentTarget;
-    const payload = readManualGrePayload(new FormData(formElement));
+    const payload = readManualGrePayload(validateForm(formElement, manualGreFormRule));
     if (ipAddressVersion(payload.outer_local_ip) === 6 && !nodeSupportsGreIpv6(selectedNode)) {
       throw new Error("GRE over IPv6 需要当前节点升级到支持 IPv6 外层的 Agent");
     }
@@ -4617,7 +4479,10 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能修改 GRE 连接");
     }
-    const form = new FormData(event.currentTarget);
+    const form = validateForm(
+      event.currentTarget,
+      selectedGreIsManual ? manualGreFormRule : managedGreFormRule,
+    );
     const manualPayload = selectedGreIsManual ? readManualGrePayload(form) : null;
     const managedPayload = selectedGreIsManual ? null : readGreCommonPayload(form);
     const payload = manualPayload || managedPayload;
@@ -4684,25 +4549,10 @@ function App() {
       throw new Error("Agent 离线，不能保存或部署对端配置");
     }
     const formElement = event.currentTarget;
-    const form = new FormData(formElement);
+    const form = validateForm(formElement, wireGuardPeerFormRule);
     const allowedIps = splitList(String(form.get("allowed_ips") || ""));
     const endpointPort = optionalInt(form.get("endpoint_port"), "入口端口");
     const keepalive = optionalInt(form.get("persistent_keepalive"), "保活间隔");
-    if (!isProbablyWireGuardKey(form.get("public_key"))) {
-      throw new Error("对端公钥格式应为 44 位 base64 字符串");
-    }
-    if (!isProbablyWireGuardKey(form.get("preshared_key"))) {
-      throw new Error("预共享密钥格式应为 44 位 base64 字符串");
-    }
-    if (!isValidCidrs(allowedIps)) {
-      throw new Error("允许路由必须使用 CIDR 格式，例如 10.42.0.2/32");
-    }
-    if (!isValidPort(endpointPort)) {
-      throw new Error("入口端口必须在 1-65535 之间");
-    }
-    if (keepalive !== null && (!Number.isInteger(keepalive) || keepalive < 0 || keepalive > 65535)) {
-      throw new Error("保活间隔必须是 0-65535 之间的整数");
-    }
     await api<PeerItem>(`/api/wireguard/configs/${selectedConfigId}/peer`, {
       method: "PUT",
       body: JSON.stringify({
@@ -4732,7 +4582,7 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能修改受管连接");
     }
-    const form = new FormData(event.currentTarget);
+    const form = validateForm(event.currentTarget, managedWireGuardFormRule, { middlewareType, requirePeerNode: false });
     const localTunnelIps = splitList(String(form.get("local_tunnel_ips") || ""));
     const peerTunnelIps = splitList(String(form.get("peer_tunnel_ips") || ""));
     const localAllowedIps = splitList(String(form.get("local_allowed_ips") || ""));
@@ -4747,30 +4597,6 @@ function App() {
     const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1420;
     const udp2raw = middlewareType === "udp2raw" ? readUdp2RawForm(form, localListenPort, peerListenPort) : null;
     const mimic = middlewareType === "mimic" ? readMimicForm(form) : null;
-    if (!isValidCidrs(localTunnelIps) || !isValidCidrs(peerTunnelIps)) {
-      throw new Error("双方 IP 必须使用 CIDR 格式，例如 10.42.0.1/32, fd42::1/64");
-    }
-    if (!isValidCidrs(localAllowedIps) || !isValidCidrs(peerAllowedIps)) {
-      throw new Error("允许路由必须使用 CIDR 格式，例如 10.42.0.2/32 或 192.168.10.0/24");
-    }
-    if (!isValidPort(localListenPort) || !isValidPort(peerListenPort)) {
-      throw new Error("双方监听端口必须留空，或填写 1-65535 之间的整数");
-    }
-    if (!isValidPort(localEndpointPort) || !isValidPort(peerEndpointPort)) {
-      throw new Error("双方入口端口必须留空，或填写 1-65535 之间的整数");
-    }
-    if (!isValidMtu(mtu)) {
-      throw new Error("MTU 必须是 576-9000 之间的整数");
-    }
-    validateWireGuardIpv6Mtu(mtu, localTunnelIps, peerTunnelIps);
-    if (!localEndpointHost && !peerEndpointHost) {
-      throw new Error("本端或对端至少需要填写一个入口地址");
-    }
-    if (keepalive !== null && (!Number.isInteger(keepalive) || keepalive < 0 || keepalive > 65535)) {
-      throw new Error("保活间隔必须是 0-65535 之间的整数");
-    }
-    validateUdp2RawForm(udp2raw, localListenPort, peerListenPort);
-    validateMimicForm(mimic, localListenPort, peerListenPort, localEndpointHost, peerEndpointHost);
     const configId = selectedConfigId;
     await api<ManagedLink>(`/api/wireguard/configs/${configId}/managed-link`, {
       method: "PATCH",
@@ -5383,10 +5209,10 @@ function App() {
                     </span>
                   </div>
                   <div className="portInventoryRange">
-                    <Field label="起始端口" requiredMark>
+                    <Field label="起始端口" hint="可用端口范围的第一个端口，取值 1-65535。" requiredMark>
                       <input value={portRangeStart} onChange={(event) => setPortRangeStart(event.currentTarget.value)} placeholder="23000" inputMode="numeric" />
                     </Field>
-                    <Field label="结束端口" requiredMark>
+                    <Field label="结束端口" hint="可用端口范围的最后一个端口，必须大于或等于起始端口。" requiredMark>
                       <input value={portRangeEnd} onChange={(event) => setPortRangeEnd(event.currentTarget.value)} placeholder="23099" inputMode="numeric" />
                     </Field>
                     <div className="portInventoryActions">
@@ -5452,12 +5278,12 @@ function App() {
                     <input className="portInventorySearch" value={portSearch} onChange={(event) => setPortSearch(event.currentTarget.value)} placeholder="搜索端口、用途、来源" />
                   </div>
                   <form className="portInventoryEntryForm" onSubmit={(event) => void runAction(() => createManualPortInventoryEntry(event), "plugin:port-inventory:create")}>
-                    <select name="protocol" defaultValue="TCP">
+                    <select name="protocol" defaultValue="TCP" aria-label="传输协议" title="选择该端口使用 TCP 还是 UDP">
                       <option value="TCP">TCP</option>
                       <option value="UDP">UDP</option>
                     </select>
-                    <input name="port" placeholder="端口" inputMode="numeric" required />
-                    <input name="purpose" placeholder="用途" />
+                    <input name="port" placeholder="端口号（1-65535）" inputMode="numeric" aria-label="端口号" required />
+                    <input name="purpose" placeholder="用途，例如 WireGuard" aria-label="端口用途" />
                     <button type="submit" disabled={actionPending("plugin:port-inventory:create")}><Plus size={16} /> 添加条目</button>
                   </form>
                   <div className="portInventoryList">
@@ -5565,22 +5391,22 @@ function App() {
               </button>
             </header>
             <form className="stack" onSubmit={(event) => void runAction(() => saveSettings(event), "settings:save")}>
-              <Field label="主控访问地址" hint="Agent 节点能访问到的 URL，例如 http://192.168.123.20:8000。">
+              <Field label="主控访问地址" hint="生成 Agent 安装命令时使用。请填写节点实际能够访问的完整地址，例如 https://link42.example.com。">
                 <input name="controller_url" defaultValue={controllerUrl} placeholder={DEFAULT_CONTROLLER_URL} required />
               </Field>
-              <Field label="用户名">
+              <Field label="用户名" hint="用于登录当前管理面板；修改后下次登录生效。">
                 <input name="username" defaultValue={settingsUsername} required />
               </Field>
               <Field label="站点标题" hint="展示在浏览器标题、登录页和顶部栏。">
                 <input name="site_title" defaultValue={siteTitle} required />
               </Field>
-              <Field label="Logo" hint="上传 PNG、JPEG 或 WebP；文件会保存到主控配置目录，Docker 映射后可持久化。">
+              <Field label="Logo" hint="支持 PNG、JPEG、WebP，最大 3 MiB；上传后保存在主控配置目录中。留空保持当前 Logo。">
                 <div className="logoUploadField">
                   <img src={settingsLogoPreviewUrl || siteLogoUrl || DEFAULT_SITE_LOGO_URL} alt="" />
                   <input name="site_logo_file" type="file" accept="image/png,image/jpeg,image/webp" onChange={previewLogoFile} />
                 </div>
               </Field>
-              <Field label="新密码" hint="留空表示不修改密码。">
+              <Field label="新密码" hint="至少 6 个字符；留空保持当前密码。修改密码后需要重新登录。">
                 <input name="new_password" type="password" autoComplete="new-password" minLength={6} />
               </Field>
               <button type="submit" disabled={actionPending("settings:save")}><Check size={16} /> {actionPending("settings:save") ? "保存中" : "保存设置"}</button>
@@ -5613,10 +5439,10 @@ function App() {
                 </div>
               )}
               <form className="tokenCreateGrid" onSubmit={(event) => void runAction(() => createLookingGlassToken(event), "lg-token:create")}>
-                <Field label="Token 名称">
+                <Field label="Token 名称" hint="仅用于在面板中识别调用方，例如 public-looking-glass；不会成为 Token 内容的一部分。">
                   <input name="lg_name" placeholder="public-looking-glass" required />
                 </Field>
-                <Field label="过期时间" hint="留空表示不设置固定过期时间。">
+                <Field label="过期时间" hint="到达该时间后 Token 会自动失效；留空表示长期有效，直到手动删除或轮换。">
                   <input name="lg_expires_at" type="datetime-local" />
                 </Field>
                 <button type="submit" disabled={actionPending("lg-token:create")}>
@@ -5691,13 +5517,13 @@ function App() {
               </button>
             </header>
             <form onSubmit={(event) => void runAction(() => createNode(event), "node:create")} className="gridForm">
-              <Field label="节点名称" hint="用于在控制台识别这个 Agent。">
+              <Field label="节点名称" hint="用于节点列表、拓扑图和连接表单中识别这台机器，例如 guangzhou-01。">
                 <input name="name" placeholder="node-a" required />
               </Field>
-              <Field label="主控地址" hint="Agent 安装时连接的 Link42 API 地址。">
+              <Field label="主控地址" hint="写入该节点的 Agent 安装命令；必须是这台节点能够访问到的完整 HTTP/HTTPS 地址。">
                 <input name="controller_url" placeholder="http://192.168.123.20:8000" defaultValue={controllerUrl} required />
               </Field>
-              <Field label="入口地址" hint="可添加公网 IP、内网 IP 或域名；后续受管连接会从这里选择连接地址。" wide requiredMark>
+              <Field label="入口地址" hint="记录其它节点可用于连接本机的地址，可添加多个公网 IP、内网 IP 或域名。这里不要求地址一定在本机网卡上。" wide requiredMark>
                 <EndpointListInput
                   value={nodeCreateEndpointIps}
                   onChange={setNodeCreateEndpointIps}
@@ -5705,10 +5531,10 @@ function App() {
                   onDuplicate={(endpoint) => notify("info", `已有该入口地址：${endpoint}`)}
                 />
               </Field>
-              <Field label="节点地域" hint="拓扑图展示的地域，例如 广州 / 东京 / HomeLab。">
+              <Field label="节点地域" hint="用于节点筛选和地域分组，例如 广州、东京、家庭网络；不影响连接配置。">
                 <input name="region" placeholder="广州" />
               </Field>
-              <Field label="拓扑展示地址" hint="拓扑图展示的本机地址；留空使用第一个入口地址。">
+              <Field label="拓扑展示地址" hint="只用于拓扑节点卡片上的地址文字，不参与连接；留空显示第一个入口地址。">
                 <input name="topology_endpoint" placeholder="10.10.0.1" />
               </Field>
               <button type="submit" disabled={actionPending("node:create")}><Plus size={16} /> {actionPending("node:create") ? "创建中" : "创建节点"}</button>
@@ -5733,13 +5559,13 @@ function App() {
               </button>
             </header>
             <form key={`node-edit-${editingNode.id}`} onSubmit={(event) => void runAction(() => saveNode(event), nodeActionKey(editingNode.id, "save"))} className="gridForm">
-              <Field label="节点名称" hint="修改后会同步显示在节点列表。">
+              <Field label="节点名称" hint="用于节点列表、拓扑图和连接表单中识别这台机器。">
                 <input name="name" placeholder="node-a" defaultValue={editingNode.name} required />
               </Field>
-              <Field label="节点地域" hint="拓扑图展示的地域，例如 广州 / 东京 / HomeLab。">
+              <Field label="节点地域" hint="用于节点筛选和地域分组，例如 广州、东京、家庭网络；不影响连接配置。">
                 <input name="region" placeholder="广州" defaultValue={editingNode.region || ""} />
               </Field>
-              <Field label="入口地址" hint="可添加公网 IP、内网 IP 或域名；受管连接会校验所选地址属于节点。" wide requiredMark>
+              <Field label="入口地址" hint="记录其它节点可用于连接本机的地址。删除正在被连接使用的地址前，请先修改对应连接。" wide requiredMark>
                 <EndpointListInput
                   value={editingNodeEndpointIps}
                   onChange={setEditingNodeEndpointIps}
@@ -5747,7 +5573,7 @@ function App() {
                   onDuplicate={(endpoint) => notify("info", `已有该入口地址：${endpoint}`)}
                 />
               </Field>
-              <Field label="拓扑展示地址" hint="选择或输入拓扑节点卡片展示的本机地址；留空使用第一个入口地址。" wide>
+              <Field label="拓扑展示地址" hint="只控制拓扑节点卡片显示的地址，不参与连接；留空显示第一个入口地址。" wide>
                 <EndpointSelect
                   name="topology_endpoint"
                   options={endpointOptionsFrom(null, editingNodeEndpointIps, editingNode.topology_endpoint)}
@@ -5755,7 +5581,7 @@ function App() {
                   placeholder="选择或输入展示地址"
                 />
               </Field>
-              <Field label="GitHub 代理 URL" hint="Agent 安装 GitHub 发布资产时使用；留空则直连 GitHub。" wide>
+              <Field label="GitHub 代理 URL" hint="该节点下载 Agent 或插件发布文件时使用，例如 https://gh-proxy.example.com/；留空直接访问 GitHub。" wide>
                 <input name="github_proxy_url" placeholder="https://gh-proxy.example.com/" defaultValue={editingNode.github_proxy_url || ""} />
               </Field>
               <button type="submit" disabled={actionPending(nodeActionKey(editingNode.id, "save"))}><Check size={16} /> {actionPending(nodeActionKey(editingNode.id, "save")) ? "保存中" : "保存节点"}</button>
@@ -5929,52 +5755,52 @@ function App() {
               onSubmit={(event) => void runAction(() => saveConfig(event, "create"), nodeActionKey(selectedNode.id, "create-config"))}
               className="gridForm describedForm"
             >
-              <Field label="接口名称" hint="节点上的 wg-quick 接口名，例如 wg0。">
+              <Field label="接口名称" hint="将在当前节点创建的 WireGuard 接口名，例如 wg0；最多 15 个字符。">
                 <input name="name" placeholder="wg0" required disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="本端隧道地址" hint="CIDR 格式，多个地址用逗号分隔。">
+              <Field label="本端隧道地址" hint="分配给当前 WireGuard 接口的虚拟 IP，例如 10.42.0.1/32 或 fd42::1/64；多个地址用逗号分隔。">
                 <input name="tunnel_ips" placeholder="10.42.0.1/24" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="监听端口" hint="UDP 端口，留空表示不写 ListenPort。">
+              <Field label="监听端口" hint="当前节点接收 WireGuard 报文的本机 UDP 端口；仅主动连接对端时可以留空。">
                 <input name="listen_port" placeholder="51820" inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="MTU" hint="链路 MTU，默认 1420。">
+              <Field label="MTU" hint="WireGuard 接口的最大报文大小；通常使用 1420，使用中间层或特殊网络时再降低。">
                 <input name="mtu" placeholder="1420" defaultValue="1420" inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
+              <Field label="自动路由" hint="默认根据“经对端路由”自动添加系统路由；选择“不自动生成路由”后由用户或路由协议自行维护。">
                 <RouteModeSelect disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="本端公钥" hint="可选；用于记录和展示，44 位 base64。">
+              <Field label="本端公钥" hint="当前接口的 WireGuard 公钥，44 位 base64；填写私钥时通常无需手动填写。">
                 <input name="public_key" placeholder="粘贴本端公钥" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="本端私钥" hint="可选；可信面板会明文保存并渲染到本机配置。" wide>
+              <Field label="本端私钥" hint="当前接口使用的 WireGuard 私钥；主控保存后会下发到该节点。请勿填写其它接口的私钥。" wide>
                 <textarea name="private_key" placeholder="粘贴本端私钥" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="接口高级配置" hint="逐行写入 [Interface] 后，例如 PostUp/PostDown。保存前请确认这些配置行能被 WireGuard 识别。" wide>
+              <Field label="接口高级配置" hint="可选；追加到本端 [Interface] 区块，例如 PostUp、PostDown。内容错误可能导致接口启动失败。" wide>
                 <textarea name="interface_custom_config" placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端名称" hint="可选，仅用于界面识别。">
+              <Field label="对端名称" hint="只用于在面板中识别这个对端，不会写入 WireGuard 配置。">
                 <input name="peer_name" placeholder="对端名称" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端公钥" hint="可选；填写后会同时创建唯一 Peer。">
+              <Field label="对端公钥" hint="对端 WireGuard 接口的公钥。填写任意对端配置时，此项必须填写。">
                 <input name="peer_public_key" placeholder="粘贴对端公钥" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="允许路由" hint="写入 [Peer] 的允许路由字段（AllowedIPs）；dn42 常见为 172.20.0.0/14, fd00::/8。">
+              <Field label="经对端路由" hint="指定哪些目标地址通过这个对端发送（WireGuard AllowedIPs），例如 10.42.0.2/32；多个网段用逗号分隔。">
                 <input name="peer_allowed_ips" placeholder="172.20.0.0/14, fd00::/8" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端入口地址" hint="对端公网 IP、内网 IP 或域名；可留空。">
+              <Field label="对端入口地址" hint="当前节点主动连接对端时使用的 IP 或域名；由对端主动连接本机时可以留空。">
                 <input name="peer_endpoint_host" placeholder="203.0.113.20" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端入口端口" hint="对端 UDP 端口；入口地址留空时通常也留空。">
+              <Field label="对端入口端口" hint="对端 WireGuard 实际监听的 UDP 端口；填写入口地址时必须同时填写。">
                 <input name="peer_endpoint_port" placeholder="51820" inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="保活间隔" hint="NAT 后常用 25；留空表示不写保活字段。">
+              <Field label="保活间隔" hint="当前节点定期向对端发送保活包的秒数；穿越 NAT 时常用 25，直连环境可留空。">
                 <input name="peer_persistent_keepalive" placeholder="25" inputMode="numeric" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="预共享密钥" hint="可选，填写后会渲染 PresharedKey。">
+              <Field label="预共享密钥" hint="双方 Peer 必须填写相同的 44 位密钥；可选，用于在 WireGuard 密钥之外增加一层共享密钥。">
                 <input name="peer_preshared_key" placeholder="粘贴预共享密钥" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端高级配置" hint="逐行写入 [Peer] 后。保存前请确认这些配置行能被 WireGuard 识别。" wide>
+              <Field label="对端高级配置" hint="可选；追加到本端配置的 [Peer] 区块。内容错误可能导致接口启动失败。" wide>
                 <textarea name="peer_custom_config" placeholder="自定义对端配置行" disabled={!selectedNodeOnline} />
               </Field>
               <button type="submit" disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNode.id, "create-config"))}><Plus size={16} /> {actionPending(nodeActionKey(selectedNode.id, "create-config")) ? "添加中" : "添加配置"}</button>
@@ -6000,16 +5826,16 @@ function App() {
               onSubmit={(event) => void runAction(() => createManualGreConnection(event), nodeActionKey(selectedNode.id, "create-manual-gre"))}
               className="gridForm describedForm"
             >
-              <FormSection title="接口" hint="本端接口由 Link42 部署；对端接口名只用于记录和核对。">
+              <FormSection title="接口" hint="Link42 只在当前节点创建接口；对端接口需要由其它系统或人工配置。">
                 <Field label="本端接口名称" hint="最多 10 个字符，只能包含字母、数字和下划线。" requiredMark>
                   <input name="interface_name" placeholder="gre_peer" required disabled={!selectedNodeOnline} />
                 </Field>
-                <Field label="对端接口名称" hint="可选，只作为备注保存。">
+                <Field label="对端接口名称" hint="可选，仅用于在连接详情中记录对端接口名，不会在对端创建接口。">
                   <input name="peer_interface_name" placeholder="gre_link42" disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
-              <FormSection title="外层地址" hint="GRE 外层支持 IPv4 或 IPv6，两端必须使用同一地址版本；本端地址必须真实可用于发送外层报文。">
-                <Field label="本端外层地址" hint="写入 ip tunnel local。" requiredMark>
+              <FormSection title="外层地址" hint="外层地址是 GRE 报文在真实网络中使用的源和目标地址。两端必须同为 IPv4 或同为 IPv6。">
+                <Field label="本端外层地址" hint="当前机器发送 GRE 报文时使用的源 IP，必须存在于本机网卡；使用云公网 EIP/NAT 时通常填写对应的内网 IP。" requiredMark>
                   <EndpointSelect
                     name="outer_local_ip"
                     defaultValue={managedGreLocalOuterIpDefault}
@@ -6018,34 +5844,34 @@ function App() {
                     disabled={!selectedNodeOnline}
                   />
                 </Field>
-                <Field label="对端外层地址" hint="写入隧道 remote，必须与本端外层地址使用相同 IP 版本。" requiredMark>
+                <Field label="对端外层地址" hint="当前机器发送 GRE 报文的目标 IP，应填写能够到达对端的地址，并与本端地址使用相同 IP 版本。" requiredMark>
                   <input name="outer_remote_ip" placeholder="198.51.100.20" required disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
-              <FormSection title="隧道地址与路由" hint="隧道地址和经 GRE 到达的网段支持 IPv4/IPv6 CIDR。">
-                <Field label="本端隧道地址" hint="可填写多条，使用逗号或换行分隔。" requiredMark>
+              <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定哪些目标网段通过该接口发送。">
+                <Field label="本端隧道地址" hint="分配给当前 GRE 接口的虚拟 IP，例如 10.42.8.1/30 或 fd42::1/64；可填写多条。" requiredMark>
                   <textarea name="tunnel_ips" rows={2} placeholder="10.42.9.1/30, fd42:9::1/64" required disabled={!selectedNodeOnline} />
                 </Field>
-                <Field label="对端隧道地址" hint="可选，用于连接详情展示和监测目标建议。">
+                <Field label="对端隧道地址" hint="记录对端 GRE 接口的虚拟 IP，用于状态展示和推荐监测目标；不会在本机添加该地址。">
                   <textarea name="peer_tunnel_ips" rows={2} placeholder="10.42.9.2/30, fd42:9::2/64" disabled={!selectedNodeOnline} />
                 </Field>
-                <Field label="经隧道路由" hint="这些网段会在本端通过 GRE 接口路由。" wide>
+                <Field label="经隧道路由" hint="填写位于对端一侧、需要由当前节点通过 GRE 到达的网段；多个网段用逗号或换行分隔。" wide>
                   <textarea name="routes" rows={2} placeholder="10.90.0.0/24, fd90::/64" disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
-              <FormSection title="高级" hint="GRE Key 需要与对端一致；IPv6 外层时 TTL 会作为 hop limit 下发。">
-                <Field label="MTU" hint="留空时 IPv4 使用 1476，IPv6 使用 1456。"><input name="mtu" placeholder="自动" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
-                <Field label="GRE Key"><input name="gre_key" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
-                <Field label="TTL"><input name="ttl" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
+              <FormSection title="高级" hint="不确定时保持默认。GRE Key 只用于匹配隧道，不提供加密。">
+                <Field label="MTU" hint="GRE 接口最大报文大小；留空时 IPv4 默认 1476，IPv6 默认 1456。"><input name="mtu" placeholder="自动" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
+                <Field label="GRE Key" hint="可选的数字标识，两端必须一致；它不提供加密或身份认证。"><input name="gre_key" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
+                <Field label="TTL" hint="GRE 外层报文允许经过的最大路由跳数；留空使用系统默认值。"><input name="ttl" inputMode="numeric" disabled={!selectedNodeOnline} /></Field>
                 <label className="checkField">
                   <input name="pmtudisc" type="checkbox" defaultChecked disabled={!selectedNodeOnline} />
-                  <span>启用 PMTU discovery</span>
+                  <span>启用路径 MTU 探测（推荐）</span>
                 </label>
                 <label className="checkField">
                   <input name="encaplimit_enabled" type="checkbox" disabled={!selectedNodeOnline} />
-                  <span>启用 IPv6 封装限制</span>
+                  <span>限制 IPv6 嵌套封装层数</span>
                 </label>
-                <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用；关闭开关时下发 encaplimit none。">
+                <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用。关闭后不限制 IPv6 嵌套封装层数，可避免部分网络把报文变为下一头部 60。">
                   <input name="encaplimit" defaultValue="4" inputMode="numeric" disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
@@ -6139,8 +5965,8 @@ function App() {
             >
               {managedCreateProtocol === "wireguard" ? (
                 <>
-              <FormSection title="节点与导入" hint="选择对端节点；需要接管现有 wg-quick 配置时，在这里指定双方要替换的导入配置。">
-              <Field label="对端节点" hint="只能选择当前在线的其它受管节点。">
+              <FormSection title="节点与导入" hint="先选择连接的另一台节点。只有把现有配置转换为受管连接时，才需要选择导入配置。">
+              <Field label="对端节点" hint="选择要与当前节点建立连接的另一台在线节点。">
                 <select
                   name="peer_node_id"
                   required
@@ -6156,7 +5982,7 @@ function App() {
                   ))}
                 </select>
               </Field>
-              <Field label="替换本端导入配置" hint="可选；用于把现有 wg-quick 配置替换为新的受管连接。">
+              <Field label="替换本端导入配置" hint="仅在接管现有连接时选择。部署成功后，所选旧配置会由新的受管配置替代。">
                 <select
                   value={replaceLocalConfigId || ""}
                   disabled={!selectedNodeOnline}
@@ -6170,7 +5996,7 @@ function App() {
               </Field>
               <Field
                 label="替换对端导入配置"
-                hint={replaceLocalConfigId ? "必选；本端导入配置转受管时必须指定对端要覆盖的导入配置。" : "可选；选择后创建时会停用并删除旧配置文件。"}
+                hint={replaceLocalConfigId ? "本端配置转为受管连接时，必须选择与它对应的对端导入配置。" : "仅在双方都已有导入配置并希望由 Link42 接管时选择。"}
               >
                 <select
                   value={replacePeerConfigId || ""}
@@ -6185,28 +6011,46 @@ function App() {
                 </select>
               </Field>
               </FormSection>
-              <FormSection title="接口与隧道地址" hint="接口名写入双方节点；隧道 IP 和允许路由支持多个 CIDR，用逗号分隔。">
-              <Field label="本端接口名称" hint="当前节点上创建的接口名。">
+              <FormSection title="接口与隧道地址" hint="这里填写双方虚拟接口的名称和地址，不是公网或物理网卡地址。">
+              <Field label="本端接口名称" hint="将在当前节点创建的 WireGuard 接口名，例如 wg_gz_hk；最多 15 个字符。">
                 <input name="local_interface_name" placeholder="wg-node-a" defaultValue={replaceLocalConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端接口名称" hint="对端节点上创建的接口名；同机双 Agent 测试时必须不同。">
+              <Field label="对端接口名称" hint="将在对端节点创建的 WireGuard 接口名；如果双方 Agent 在同一台机器上，两个名称必须不同。">
                 <input name="peer_interface_name" placeholder="wg-node-b" defaultValue={replacePeerConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="本端隧道 IP" hint="本端 WireGuard Address；例如 10.42.0.1/32, fd42::1/64。">
+              <Field label="本端隧道地址" hint="分配给当前节点 WireGuard 接口的虚拟 IP，例如 10.42.0.1/32 或 fd42::1/64。">
                 <input name="local_tunnel_ips" placeholder="10.42.0.1/32, fd42::1/64" defaultValue={replaceLocalConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端隧道 IP" hint="对端 WireGuard Address；例如 10.42.0.2/32, fd42::2/64。">
+              <Field label="对端隧道地址" hint="分配给对端节点 WireGuard 接口的虚拟 IP，例如 10.42.0.2/32 或 fd42::2/64。">
                 <input name="peer_tunnel_ips" placeholder="10.42.0.2/32, fd42::2/64" defaultValue={replacePeerConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="本端监听端口" hint="可选；留空表示本端 WireGuard 不写 ListenPort。udp2raw server 在本端时必须填写。">
-                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
+              <Field
+                label="本端监听端口"
+                hint={mimicActive
+                  ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
+                  : udp2rawActive
+                    ? udp2rawServerSide === "peer"
+                      ? "本端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
+                      : "本端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
+                    : "可选；留空表示本端 WireGuard 不固定监听端口。"}
+              >
+                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" required={mimicActive || (udp2rawActive && udp2rawServerSide === "local")} disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端监听端口" hint="可选；留空表示对端 WireGuard 不写 ListenPort。udp2raw server 在对端时必须填写。">
-                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
+              <Field
+                label="对端监听端口"
+                hint={mimicActive
+                  ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
+                  : udp2rawActive
+                    ? udp2rawServerSide === "local"
+                      ? "对端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
+                      : "对端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
+                    : "可选；留空表示对端 WireGuard 不固定监听端口。"}
+              >
+                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" required={mimicActive || (udp2rawActive && udp2rawServerSide === "peer")} disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
-              <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。启用 mimic 时双方入口都必填。">
-              <Field label="本端入口地址" hint="对端连接本节点时使用；本端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
+              <FormSection title="连接地址与路由" hint="入口地址是另一端主动连接时使用的真实网络地址。只需一端主动发起连接时，无法被访问的一侧可以留空。">
+              <Field label="本端入口地址" hint="对端主动连接当前节点时使用，从当前节点的入口地址列表中选择；当前节点不能被主动访问时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
                 <EndpointSelect
                   key={`managed-local-endpoint-${replacePeerConfigId || "none"}-${managedLocalEndpointDefault}`}
                   name="local_endpoint_host"
@@ -6217,7 +6061,7 @@ function App() {
                   locked={udp2rawActive}
                 />
               </Field>
-              <Field label="本端入口端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。udp2raw 启用时由中间层接管。">
+              <Field label="本端入口端口" hint="对端连接当前节点时使用的目标 UDP 端口；留空使用本端监听端口。启用 udp2raw 后由中间层自动接管。">
                 <input
                   name="local_endpoint_port"
                   placeholder="51820"
@@ -6226,7 +6070,7 @@ function App() {
                   disabled={!selectedNodeOnline || udp2rawActive}
                 />
               </Field>
-              <Field label="对端入口地址" hint="本端连接对端节点时使用；对端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
+              <Field label="对端入口地址" hint="当前节点主动连接对端时使用，从对端节点的入口地址列表中选择；对端不能被主动访问时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
                 <EndpointSelect
                   key={`managed-peer-endpoint-${replaceLocalConfigId || "none"}-${managedPeerEndpointDefault}`}
                   name="peer_endpoint_host"
@@ -6237,7 +6081,7 @@ function App() {
                   locked={udp2rawActive}
                 />
               </Field>
-              <Field label="对端入口端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。udp2raw 启用时由中间层接管。">
+              <Field label="对端入口端口" hint="当前节点连接对端时使用的目标 UDP 端口；留空使用对端监听端口。启用 udp2raw 后由中间层自动接管。">
                 <input
                   name="peer_endpoint_port"
                   placeholder="51821"
@@ -6246,7 +6090,7 @@ function App() {
                   disabled={!selectedNodeOnline || udp2rawActive}
                 />
               </Field>
-              <Field label="本端允许路由" hint="写入当前节点 [Peer] 的允许路由字段（AllowedIPs）；留空则使用对端隧道 IP。">
+              <Field label="本端经对端路由" hint="填写当前节点需要通过对端到达的地址或网段（WireGuard AllowedIPs）；留空只路由到对端隧道地址。">
                 <input
                   key={`managed-local-allowed-${replaceLocalConfigId || "none"}-${replacePeerConfigId || "none"}-${managedLocalAllowedIpsDefault}`}
                   name="local_allowed_ips"
@@ -6255,7 +6099,7 @@ function App() {
                   disabled={!selectedNodeOnline}
                 />
               </Field>
-              <Field label="对端允许路由" hint="写入对端节点 [Peer] 的允许路由字段（AllowedIPs）；留空则使用本端隧道 IP。">
+              <Field label="对端经本端路由" hint="填写对端节点需要通过当前节点到达的地址或网段（WireGuard AllowedIPs）；留空只路由到本端隧道地址。">
                 <input
                   key={`managed-peer-allowed-${replaceLocalConfigId || "none"}-${replacePeerConfigId || "none"}-${managedPeerAllowedIpsDefault}`}
                   name="peer_allowed_ips"
@@ -6265,8 +6109,8 @@ function App() {
                 />
               </Field>
               </FormSection>
-              <FormSection title="连接中间层" hint="udp2raw 通过本地代理接管入口地址；mimic 在网卡层透明处理真实入口流量。">
-                <Field label="中间层类型" hint="OpenWrt 当前只支持 udp2raw；mimic 需要非 OpenWrt Linux kernel > 6.1 且已安装 mimic。">
+              <FormSection title="连接中间层" hint="中间层用于改变 WireGuard 报文在公网中的传输方式；普通直连不需要启用。">
+                <Field label="中间层类型" hint="udp2raw 可将 WireGuard UDP 封装为 FakeTCP、UDP 或 ICMP；mimic 仅适用于已安装插件且内核版本高于 6.1 的非 OpenWrt Linux。">
                   <select
                     value={middlewareType}
                     disabled={!selectedNodeOnline}
@@ -6311,7 +6155,7 @@ function App() {
                   }}
                 />
               )}
-              <FormSection title="链路参数" hint="Table=off 是 DN42 常用默认值；启用中间层时 MTU 默认降到 1300，但仍可手动调整。">
+              <FormSection title="链路参数" hint="这些参数会同时应用到双方 WireGuard 接口。没有特殊网络要求时保持默认。">
               <Field label="MTU" hint={udp2rawActive ? "启用 udp2raw 时建议降低 MTU；已自动填入 1300，可手动修改。" : mimicActive ? "启用 mimic 时建议将 IPv6 WireGuard MTU 降到 1408，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                 <input
                   name="mtu"
@@ -6322,21 +6166,21 @@ function App() {
                   disabled={!selectedNodeOnline}
                 />
               </Field>
-              <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
+              <Field label="自动路由" hint="默认根据双方“经对端路由”自动写入系统路由；选择“不自动生成路由”后由路由协议或用户维护。">
                 <RouteModeSelect defaultValue={replaceLocalConfig?.table_name || replacePeerConfig?.table_name || "off"} disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
-              <FormSection title="高级配置" hint="这些内容会原样追加到对应的 [Interface] 或 [Peer] 区块，请只填写 WireGuard 支持的配置行。">
-              <Field label="本端接口高级配置" hint="写入当前节点 [Interface] 后，例如 PostUp。不同节点可不同。" wide>
+              <FormSection title="高级配置" hint="仅供需要 PostUp、PostDown 等自定义 wg-quick 配置的用户使用；内容会原样写入节点配置。">
+              <Field label="本端接口高级配置" hint="追加到当前节点的 [Interface] 区块，例如 PostUp、PostDown。" wide>
                 <textarea name="local_interface_custom_config" defaultValue={replaceLocalConfig?.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="本端对端高级配置" hint="写入当前节点 [Peer] 后。" wide>
+              <Field label="本端 Peer 高级配置" hint="追加到当前节点配置中的 [Peer] 区块。" wide>
                 <textarea name="local_peer_custom_config" placeholder="允许路由之外的自定义对端配置行" disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端接口高级配置" hint="写入对端节点 [Interface] 后，例如不同的 PostUp。" wide>
+              <Field label="对端接口高级配置" hint="追加到对端节点的 [Interface] 区块，可与本端使用不同命令。" wide>
                 <textarea name="peer_interface_custom_config" defaultValue={replacePeerConfig?.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
               </Field>
-              <Field label="对端对端高级配置" hint="写入对端节点 [Peer] 后。" wide>
+              <Field label="对端 Peer 高级配置" hint="追加到对端节点配置中的 [Peer] 区块。" wide>
                 <textarea name="peer_peer_custom_config" placeholder="允许路由之外的自定义对端配置行" disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
@@ -6367,8 +6211,8 @@ function App() {
               {!nodeSupportsGre(selectedNode) && (
                 <div className="empty wideField">当前节点尚未上报 GRE 能力，请确认 Agent 已升级且系统支持 Linux iproute2 GRE 或 OpenWrt UCI GRE。</div>
               )}
-              <FormSection title="基础" hint="GRE 连接会在两个在线受管节点之间创建 L3 隧道，外层地址可使用 IPv4 或 IPv6。">
-                <Field label="对端节点" hint="只显示已在线并上报 GRE 能力的节点。" requiredMark>
+              <FormSection title="基础" hint="Link42 会在双方节点创建并启动 GRE 三层接口；GRE 不加密，也不能像 UDP 一样直接穿越普通 NAT。">
+                <Field label="对端节点" hint="选择要建立 GRE 的另一台节点；列表只显示在线且支持 GRE 的节点。" requiredMark>
                   <select
                     name="peer_node_id"
                     required
@@ -6388,8 +6232,8 @@ function App() {
                   <input name="peer_interface_name" placeholder="gre_b_a" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
-              <FormSection title="外层地址" hint="两端对外地址必须使用相同 IP 版本；IPv4 云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
-                <Field label="本端对外地址" hint="对端访问本端时使用的 IPv4 或 IPv6 地址。" requiredMark>
+              <FormSection title="外层地址" hint="对外地址表示另一端看到并连接的地址。标准直连只填下面两个地址；云公网 EIP/NAT 场景再展开高级映射。">
+                <Field label="本端对外地址" hint="对端发送 GRE 报文时使用的目标地址，可从本端节点地址中选择；可以是公网 EIP。" requiredMark>
                   <EndpointSelect
                     key={`managed-gre-local-outer-${selectedNode.id}-${managedGreLocalOuterIpDefault}`}
                     name="local_outer_ip"
@@ -6399,7 +6243,7 @@ function App() {
                     disabled={!nodeSupportsGre(selectedNode)}
                   />
                 </Field>
-                <Field label="对端对外地址" hint="本端访问对端时使用的同版本 IPv4 或 IPv6 地址。" requiredMark>
+                <Field label="对端对外地址" hint="本端发送 GRE 报文时使用的目标地址，可从对端节点地址中选择；必须与本端地址使用相同 IP 版本。" requiredMark>
                   <EndpointSelect
                     key={`managed-gre-peer-outer-${managedPeerNodeId || "none"}-${managedGrePeerOuterIpDefault}`}
                     name="peer_outer_ip"
@@ -6412,7 +6256,7 @@ function App() {
                 <details className="advancedDetails wideField">
                   <summary>云 NAT/EIP 高级映射</summary>
                   <div className="advancedGrid">
-                    <Field label="本端实际绑定 IP" hint="写入本端 ip tunnel local；留空使用本端对外地址。">
+                    <Field label="本端实际绑定 IP" hint="本端机器网卡上真实存在的源 IP。公网 EIP 不在网卡上时填写对应内网 IP；留空使用本端对外地址。">
                       <EndpointSelect
                         key={`managed-gre-local-bind-${selectedNode.id}`}
                         name="local_bind_ip"
@@ -6422,7 +6266,7 @@ function App() {
                         disabled={!nodeSupportsGre(selectedNode)}
                       />
                     </Field>
-                    <Field label="本端连接对端 IP" hint="写入本端 ip tunnel remote；留空使用对端对外地址。">
+                    <Field label="本端实际连接 IP" hint="本端发包时使用的实际目标 IP；通常与对端对外地址相同，留空即可。">
                       <EndpointSelect
                         key={`managed-gre-local-remote-${managedPeerNodeId || "none"}`}
                         name="local_remote_ip"
@@ -6432,7 +6276,7 @@ function App() {
                         disabled={!nodeSupportsGre(selectedNode) || !managedPeerNodeId}
                       />
                     </Field>
-                    <Field label="对端实际绑定 IP" hint="写入对端 ip tunnel local；留空使用对端对外地址。">
+                    <Field label="对端实际绑定 IP" hint="对端机器网卡上真实存在的源 IP。公网 EIP 不在网卡上时填写对应内网 IP；留空使用对端对外地址。">
                       <EndpointSelect
                         key={`managed-gre-peer-bind-${managedPeerNodeId || "none"}`}
                         name="peer_bind_ip"
@@ -6442,7 +6286,7 @@ function App() {
                         disabled={!nodeSupportsGre(selectedNode) || !managedPeerNodeId}
                       />
                     </Field>
-                    <Field label="对端连接本端 IP" hint="写入对端 ip tunnel remote；留空使用本端对外地址。">
+                    <Field label="对端实际连接 IP" hint="对端发包时使用的实际目标 IP；通常与本端对外地址相同，留空即可。">
                       <EndpointSelect
                         key={`managed-gre-peer-remote-${selectedNode.id}`}
                         name="peer_remote_ip"
@@ -6455,39 +6299,39 @@ function App() {
                   </div>
                 </details>
               </FormSection>
-              <FormSection title="隧道地址与路由" hint="路由字段表示经 GRE 到达的远端网段，不是 WireGuard AllowedIPs。">
-                <Field label="本端隧道地址" hint="IPv4/IPv6 CIDR，可填写多条，使用逗号或换行分隔。" requiredMark>
+              <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定每一端有哪些目标网段通过 GRE 发送。">
+                <Field label="本端隧道地址" hint="分配给本端 GRE 接口的虚拟 IP，例如 10.42.8.1/30 或 fd42::1/64；可填写多条。" requiredMark>
                   <textarea name="local_tunnel_ips" rows={2} placeholder="10.42.8.1/30, fd42::1/64" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="对端隧道地址" hint="IPv4/IPv6 CIDR，可填写多条，使用逗号或换行分隔。" requiredMark>
+                <Field label="对端隧道地址" hint="分配给对端 GRE 接口的虚拟 IP，例如 10.42.8.2/30 或 fd42::2/64；可填写多条。" requiredMark>
                   <textarea name="peer_tunnel_ips" rows={2} placeholder="10.42.8.2/30, fd42::2/64" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="本端经隧道路由" hint="当前节点经 GRE 到达的对端网段，多个用逗号或换行分隔。">
+                <Field label="本端经隧道路由" hint="填写位于对端一侧、需要由本端通过 GRE 到达的网段。">
                   <textarea name="local_routes" rows={2} placeholder="10.77.0.0/24, fd77::/64" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="对端经隧道路由" hint="对端节点经 GRE 到达的本网段，多个用逗号或换行分隔。">
+                <Field label="对端经隧道路由" hint="填写位于本端一侧、需要由对端通过 GRE 到达的网段。">
                   <textarea name="peer_routes" rows={2} placeholder="10.88.0.0/24, fd88::/64" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
-              <FormSection title="高级" hint="默认 MTU 1476；GRE Key 可选，填写后双方必须一致。">
-                <Field label="MTU">
+              <FormSection title="高级" hint="不确定时保持默认。GRE Key 只用于匹配隧道，不提供加密。">
+                <Field label="MTU" hint="GRE 接口最大报文大小；IPv4 外层默认 1476，IPv6 外层默认 1456。">
                   <input name="mtu" placeholder="自动：IPv4 1476 / IPv6 1456" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="GRE Key">
+                <Field label="GRE Key" hint="可选的数字标识，会同时配置到双方；不提供加密或身份认证。">
                   <input name="gre_key" placeholder="42" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="TTL">
+                <Field label="TTL" hint="GRE 外层报文允许经过的最大路由跳数；留空使用系统默认值。">
                   <input name="ttl" placeholder="255" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
                 <label className="checkField">
                   <input name="pmtudisc" type="checkbox" defaultChecked disabled={!nodeSupportsGre(selectedNode)} />
-                  <span>启用 PMTU discovery</span>
+                  <span>启用路径 MTU 探测（推荐）</span>
                 </label>
                 <label className="checkField">
                   <input name="encaplimit_enabled" type="checkbox" disabled={!nodeSupportsGre(selectedNode)} />
-                  <span>启用 IPv6 封装限制</span>
+                  <span>限制 IPv6 嵌套封装层数</span>
                 </label>
-                <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用；关闭开关时下发 encaplimit none。">
+                <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用。关闭后不限制 IPv6 嵌套封装层数，可避免部分网络无法处理下一头部 60。">
                   <input name="encaplimit" defaultValue="4" inputMode="numeric" disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
@@ -6813,16 +6657,16 @@ function App() {
                   onSubmit={(event) => void runAction(() => saveGreConnection(event), connectionActionKey(selectedGreConnection.connection_ref, "save"))}
                   className="gridForm describedForm"
                 >
-                  <FormSection title="接口" hint="只修改和部署当前节点；对端字段仅作为配置备注保存。">
+                  <FormSection title="接口" hint="只修改当前节点上的 GRE 接口；对端接口名称仅作为记录，不会修改对端机器。">
                     <Field label="本端接口名称" hint="最多 10 个字符，只能包含字母、数字、下划线。" requiredMark>
                       <input name="interface_name" defaultValue={selectedGreLocalEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                     </Field>
-                    <Field label="对端接口名称" hint="可选，只作为备注保存。">
+                    <Field label="对端接口名称" hint="可选，仅用于在连接详情中记录对端接口名。">
                       <input name="peer_interface_name" defaultValue={editManualGrePeerInterfaceName} disabled={!selectedGreAllNodesOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="外层地址" hint="本端和对端必须填写同一版本的 IPv4 或 IPv6 字面量。">
-                    <Field label="本端外层地址" hint="写入本端 ip tunnel local。" requiredMark>
+                  <FormSection title="外层地址" hint="外层地址是 GRE 报文在真实网络中使用的源和目标地址，双方必须同为 IPv4 或同为 IPv6。">
+                    <Field label="本端外层地址" hint="当前机器发送 GRE 报文时使用的源 IP，必须存在于本机网卡；云公网 EIP/NAT 场景通常填写对应内网 IP。" requiredMark>
                       <EndpointSelect
                         key={`edit-manual-gre-local-${selectedGreConnection.connection_ref}-${editGreLocalOuterIpDefault}`}
                         name="outer_local_ip"
@@ -6832,34 +6676,34 @@ function App() {
                         disabled={!selectedGreAllNodesOnline}
                       />
                     </Field>
-                    <Field label="对端外层地址" hint="写入本端 ip tunnel remote。" requiredMark>
+                    <Field label="对端外层地址" hint="当前机器发送 GRE 报文时使用的目标 IP，应填写能够到达对端的地址。" requiredMark>
                       <input name="outer_remote_ip" defaultValue={editGrePeerOuterIpDefault} required disabled={!selectedGreAllNodesOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="隧道地址与路由" hint="支持 IPv4/IPv6 CIDR；对端隧道地址用于展示和监测建议。">
-                    <Field label="本端隧道地址" requiredMark>
+                  <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定哪些目标网段通过该接口发送。">
+                    <Field label="本端隧道地址" hint="分配给当前 GRE 接口的虚拟 IP，可填写多个 IPv4/IPv6 CIDR。" requiredMark>
                       <textarea name="tunnel_ips" rows={2} defaultValue={selectedGreLocalEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
                     </Field>
-                    <Field label="对端隧道地址">
+                    <Field label="对端隧道地址" hint="用于记录对端 GRE 接口地址、展示连接信息和推荐监测目标，不会在本机添加该地址。">
                       <textarea name="peer_tunnel_ips" rows={2} defaultValue={editManualGrePeerTunnelIps.join(", ")} disabled={!selectedGreAllNodesOnline} />
                     </Field>
-                    <Field label="经隧道路由" wide>
+                    <Field label="经隧道路由" hint="填写位于对端一侧、需要由当前节点通过 GRE 到达的网段。" wide>
                       <textarea name="routes" rows={2} defaultValue={selectedGreLocalEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="高级" hint="GRE Key 需要与对端一致；IPv6 外层时 TTL 会作为 hop limit 下发。">
-                    <Field label="MTU"><input name="mtu" defaultValue={selectedGreLocalEndpoint.mtu || 1476} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
-                    <Field label="GRE Key"><input name="gre_key" defaultValue={greProtocolString(selectedGreLocalEndpoint, "key")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
-                    <Field label="TTL"><input name="ttl" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "ttl")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
+                  <FormSection title="高级" hint="不确定时保持默认。GRE Key 只用于匹配隧道，不提供加密。">
+                    <Field label="MTU" hint="GRE 接口最大报文大小；IPv4 外层通常 1476，IPv6 外层通常 1456。"><input name="mtu" defaultValue={selectedGreLocalEndpoint.mtu || 1476} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
+                    <Field label="GRE Key" hint="可选的数字标识，必须与对端配置一致；不提供加密或身份认证。"><input name="gre_key" defaultValue={greProtocolString(selectedGreLocalEndpoint, "key")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
+                    <Field label="TTL" hint="GRE 外层报文允许经过的最大路由跳数；留空使用系统默认值。"><input name="ttl" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "ttl")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} /></Field>
                     <label className="checkField">
                       <input name="pmtudisc" type="checkbox" defaultChecked={greProtocolBoolean(selectedGreLocalEndpoint, "pmtudisc", true)} disabled={!selectedGreAllNodesOnline} />
-                      <span>启用 PMTU discovery</span>
+                      <span>启用路径 MTU 探测（推荐）</span>
                     </label>
                     <label className="checkField">
                       <input name="encaplimit_enabled" type="checkbox" defaultChecked={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") !== ""} disabled={!selectedGreAllNodesOnline} />
-                      <span>启用 IPv6 封装限制</span>
+                      <span>限制 IPv6 嵌套封装层数</span>
                     </label>
-                    <Field label="IPv6 封装限制" hint="关闭开关时下发 encaplimit none。">
+                    <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用。关闭后不限制嵌套封装层数，可避免部分网络无法处理下一头部 60。">
                       <input name="encaplimit" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") || "4"} inputMode="numeric" disabled={!selectedGreAllNodesOnline} />
                     </Field>
                   </FormSection>
@@ -6877,7 +6721,7 @@ function App() {
                 onSubmit={(event) => void runAction(() => saveGreConnection(event), connectionActionKey(selectedGreConnection.connection_ref, "save"))}
                 className="gridForm describedForm"
               >
-                <FormSection title="基础" hint="接口名会写入双方节点，保存后会重新下发并启动双方 GRE。">
+                <FormSection title="基础" hint="接口名称会分别写入对应节点；保存后 Link42 会重新部署并启动双方 GRE。">
                   <Field label="本端接口名称" hint={`节点：${selectedGreLocalEndpoint.node_name || selectedGreLocalEndpoint.node_id}；最多 10 个字符，只能包含字母、数字、下划线。`} requiredMark>
                     <input name="local_interface_name" defaultValue={selectedGreLocalEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
@@ -6885,8 +6729,8 @@ function App() {
                     <input name="peer_interface_name" defaultValue={selectedGrePeerEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>
-                <FormSection title="外层地址" hint="两端对外地址必须使用相同 IP 版本；IPv4 云 EIP/NAT 场景可展开高级映射覆盖实际绑定地址。">
-                  <Field label="本端对外地址" hint="对端访问本端时使用的 IPv4 或 IPv6 地址。" requiredMark>
+                <FormSection title="外层地址" hint="标准直连只需填写双方对外地址；公网 EIP 不在机器网卡上时，再展开高级映射填写实际绑定地址。">
+                  <Field label="本端对外地址" hint="对端发送 GRE 报文时使用的目标地址，可以是本端公网 EIP。" requiredMark>
                     <EndpointSelect
                       key={`edit-gre-local-outer-${selectedGreConnection.connection_ref}-${editGreLocalOuterIpDefault}`}
                       name="local_outer_ip"
@@ -6896,7 +6740,7 @@ function App() {
                       disabled={!selectedGreAllNodesOnline}
                     />
                   </Field>
-                  <Field label="对端对外地址" hint="本端访问对端时使用的同版本 IPv4 或 IPv6 地址。" requiredMark>
+                  <Field label="对端对外地址" hint="本端发送 GRE 报文时使用的目标地址，必须与本端地址使用相同 IP 版本。" requiredMark>
                     <EndpointSelect
                       key={`edit-gre-peer-outer-${selectedGreConnection.connection_ref}-${editGrePeerOuterIpDefault}`}
                       name="peer_outer_ip"
@@ -6909,7 +6753,7 @@ function App() {
                   <details className="advancedDetails wideField" open={Boolean(editGreLocalBindIpDefault || editGreLocalRemoteIpDefault || editGrePeerBindIpDefault || editGrePeerRemoteIpDefault)}>
                     <summary>云 NAT/EIP 高级映射</summary>
                     <div className="advancedGrid">
-                      <Field label="本端实际绑定 IP" hint="写入本端 ip tunnel local；留空使用本端对外地址。">
+                      <Field label="本端实际绑定 IP" hint="本端机器网卡上真实存在的源 IP。公网 EIP 不在网卡上时填写对应内网 IP；留空使用本端对外地址。">
                         <EndpointSelect
                           key={`edit-gre-local-bind-${selectedGreConnection.connection_ref}-${editGreLocalBindIpDefault}`}
                           name="local_bind_ip"
@@ -6919,7 +6763,7 @@ function App() {
                           disabled={!selectedGreAllNodesOnline}
                         />
                       </Field>
-                      <Field label="本端连接对端 IP" hint="写入本端 ip tunnel remote；留空使用对端对外地址。">
+                      <Field label="本端实际连接 IP" hint="本端发包时使用的实际目标 IP；通常与对端对外地址相同，留空即可。">
                         <EndpointSelect
                           key={`edit-gre-local-remote-${selectedGreConnection.connection_ref}-${editGreLocalRemoteIpDefault}`}
                           name="local_remote_ip"
@@ -6929,7 +6773,7 @@ function App() {
                           disabled={!selectedGreAllNodesOnline}
                         />
                       </Field>
-                      <Field label="对端实际绑定 IP" hint="写入对端 ip tunnel local；留空使用对端对外地址。">
+                      <Field label="对端实际绑定 IP" hint="对端机器网卡上真实存在的源 IP。公网 EIP 不在网卡上时填写对应内网 IP；留空使用对端对外地址。">
                         <EndpointSelect
                           key={`edit-gre-peer-bind-${selectedGreConnection.connection_ref}-${editGrePeerBindIpDefault}`}
                           name="peer_bind_ip"
@@ -6939,7 +6783,7 @@ function App() {
                           disabled={!selectedGreAllNodesOnline}
                         />
                       </Field>
-                      <Field label="对端连接本端 IP" hint="写入对端 ip tunnel remote；留空使用本端对外地址。">
+                      <Field label="对端实际连接 IP" hint="对端发包时使用的实际目标 IP；通常与本端对外地址相同，留空即可。">
                         <EndpointSelect
                           key={`edit-gre-peer-remote-${selectedGreConnection.connection_ref}-${editGrePeerRemoteIpDefault}`}
                           name="peer_remote_ip"
@@ -6952,39 +6796,39 @@ function App() {
                     </div>
                   </details>
                 </FormSection>
-                <FormSection title="隧道地址与路由" hint="路由字段表示经 GRE 到达的远端网段，支持 IPv4/IPv6 CIDR。">
-                  <Field label="本端隧道地址" hint="可填写多条，使用逗号或换行分隔。" requiredMark>
+                <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定每一端有哪些目标网段通过 GRE 发送。">
+                  <Field label="本端隧道地址" hint="分配给本端 GRE 接口的虚拟 IP，可填写多个 IPv4/IPv6 CIDR。" requiredMark>
                     <textarea name="local_tunnel_ips" rows={2} defaultValue={selectedGreLocalEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="对端隧道地址" hint="可填写多条，使用逗号或换行分隔。" requiredMark>
+                  <Field label="对端隧道地址" hint="分配给对端 GRE 接口的虚拟 IP，可填写多个 IPv4/IPv6 CIDR。" requiredMark>
                     <textarea name="peer_tunnel_ips" rows={2} defaultValue={selectedGrePeerEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="本端经隧道路由" hint="多个网段用逗号或换行分隔。">
+                  <Field label="本端经隧道路由" hint="填写位于对端一侧、需要由本端通过 GRE 到达的网段。">
                     <textarea name="local_routes" rows={2} defaultValue={selectedGreLocalEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="对端经隧道路由" hint="多个网段用逗号或换行分隔。">
+                  <Field label="对端经隧道路由" hint="填写位于本端一侧、需要由对端通过 GRE 到达的网段。">
                     <textarea name="peer_routes" rows={2} defaultValue={selectedGrePeerEndpoint.routes.join(", ")} disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>
-                <FormSection title="高级" hint="GRE Key、TTL 和 PMTU discovery 会同时下发到双方。">
-                  <Field label="MTU">
+                <FormSection title="高级" hint="不确定时保持默认。这里的参数会同时下发到双方节点。">
+                  <Field label="MTU" hint="GRE 接口最大报文大小；IPv4 外层通常 1476，IPv6 外层通常 1456。">
                     <input name="mtu" defaultValue={selectedGreLocalEndpoint.mtu || 1476} inputMode="numeric" disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="GRE Key">
+                  <Field label="GRE Key" hint="可选的数字标识，会同时配置到双方；不提供加密或身份认证。">
                     <input name="gre_key" defaultValue={greProtocolString(selectedGreLocalEndpoint, "key")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="TTL">
+                  <Field label="TTL" hint="GRE 外层报文允许经过的最大路由跳数；留空使用系统默认值。">
                     <input name="ttl" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "ttl")} inputMode="numeric" disabled={!selectedGreAllNodesOnline} />
                   </Field>
                   <label className="checkField">
                     <input name="pmtudisc" type="checkbox" defaultChecked={greProtocolBoolean(selectedGreLocalEndpoint, "pmtudisc", true)} disabled={!selectedGreAllNodesOnline} />
-                    <span>启用 PMTU discovery</span>
+                    <span>启用路径 MTU 探测（推荐）</span>
                   </label>
                   <label className="checkField">
                     <input name="encaplimit_enabled" type="checkbox" defaultChecked={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") !== ""} disabled={!selectedGreAllNodesOnline} />
-                    <span>启用 IPv6 封装限制</span>
+                    <span>限制 IPv6 嵌套封装层数</span>
                   </label>
-                  <Field label="IPv6 封装限制" hint="关闭开关时双方下发 encaplimit none。">
+                  <Field label="IPv6 封装限制" hint="仅 GRE over IPv6 使用。关闭后双方不限制嵌套封装层数，可避免部分网络无法处理下一头部 60。">
                     <input name="encaplimit" defaultValue={greProtocolNumber(selectedGreLocalEndpoint, "encaplimit") || "4"} inputMode="numeric" disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>
@@ -7066,28 +6910,46 @@ function App() {
                   onSubmit={(event) => void runAction(() => saveManagedLink(event), configActionKey(selectedConfig.id, "save-managed-link"))}
                   className="gridForm describedForm"
                 >
-                  <FormSection title="接口与隧道地址" hint="这里决定双方 WireGuard 接口本身的名称、Address 和可选监听端口。">
-                    <Field label="本端接口名称" hint={`当前节点：${selectedNode.name}`}>
+                  <FormSection title="接口与隧道地址" hint="这里填写双方虚拟接口的名称和地址，不是公网或物理网卡地址。">
+                    <Field label="本端接口名称" hint={`当前节点 ${selectedNode.name} 上的 WireGuard 接口名，最多 15 个字符。`}>
                       <input name="local_interface_name" defaultValue={managedLink.local_interface.name} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端接口名称" hint={`对端节点：${selectedManagedLinkPeerNode?.name || managedLink.peer_interface.node_id}`}>
+                    <Field label="对端接口名称" hint={`对端节点 ${selectedManagedLinkPeerNode?.name || managedLink.peer_interface.node_id} 上的 WireGuard 接口名，最多 15 个字符。`}>
                       <input name="peer_interface_name" defaultValue={managedLink.peer_interface.name} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="本端隧道地址" hint="本端 WireGuard Address；支持多个 CIDR，用逗号分隔。">
+                    <Field label="本端隧道地址" hint="分配给本端 WireGuard 接口的虚拟 IP；支持多个 IPv4/IPv6 CIDR。">
                       <input name="local_tunnel_ips" defaultValue={managedLink.local_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端隧道地址" hint="对端 WireGuard Address；支持多个 CIDR，用逗号分隔。">
+                    <Field label="对端隧道地址" hint="分配给对端 WireGuard 接口的虚拟 IP；支持多个 IPv4/IPv6 CIDR。">
                       <input name="peer_tunnel_ips" defaultValue={managedLink.peer_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="本端监听端口" hint="可选；留空表示本端 WireGuard 不写 ListenPort。udp2raw server 在本端时必须填写。">
-                      <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
+                    <Field
+                      label="本端监听端口"
+                      hint={mimicActive
+                        ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
+                        : udp2rawActive
+                          ? udp2rawServerSide === "peer"
+                            ? "本端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
+                            : "本端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
+                          : "可选；留空表示本端 WireGuard 不固定监听端口。"}
+                    >
+                      <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} inputMode="numeric" required={mimicActive || (udp2rawActive && udp2rawServerSide === "local")} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端监听端口" hint="可选；留空表示对端 WireGuard 不写 ListenPort。udp2raw server 在对端时必须填写。">
-                      <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" required={mimicActive} disabled={!selectedNodeOnline} />
+                    <Field
+                      label="对端监听端口"
+                      hint={mimicActive
+                        ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
+                        : udp2rawActive
+                          ? udp2rawServerSide === "local"
+                            ? "对端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
+                            : "对端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
+                          : "可选；留空表示对端 WireGuard 不固定监听端口。"}
+                    >
+                      <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" required={mimicActive || (udp2rawActive && udp2rawServerSide === "peer")} disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="直连入口与路由" hint="本端或对端至少填写一个入口地址；NAT 或出入口不对称的一侧可以留空。启用 mimic 时双方入口都必填。">
-                    <Field label="本端入口地址" hint="对端连接本节点时使用；本端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
+                  <FormSection title="连接地址与路由" hint="入口地址是另一端主动连接时使用的真实网络地址。只需一端主动发起连接时，无法被访问的一侧可以留空。">
+                    <Field label="本端入口地址" hint="对端主动连接本节点时使用；本端不能被主动访问时可以留空。" requiredMark={mimicActive && selectedNodeOnline}>
                       <EndpointSelect
                         key={`edit-local-endpoint-${editLocalEndpointDefault}`}
                         name="local_endpoint_host"
@@ -7098,7 +6960,7 @@ function App() {
                         locked={udp2rawActive}
                       />
                     </Field>
-                    <Field label="本端入口端口" hint="对端直连本节点时使用；留空则使用本端 ListenPort。">
+                    <Field label="本端入口端口" hint="对端连接本节点时使用的目标 UDP 端口；留空使用本端监听端口。">
                       <input
                         name="local_endpoint_port"
                         defaultValue={managedLink.peer_peer.endpoint_port || managedLink.local_interface.listen_port || ""}
@@ -7106,7 +6968,7 @@ function App() {
                         disabled={!selectedNodeOnline || udp2rawActive}
                       />
                     </Field>
-                    <Field label="对端入口地址" hint="本端连接对端节点时使用；对端不可被拨入时可留空。" requiredMark={mimicActive && selectedNodeOnline}>
+                    <Field label="对端入口地址" hint="本端主动连接对端时使用；对端不能被主动访问时可以留空。" requiredMark={mimicActive && selectedNodeOnline}>
                       <EndpointSelect
                         key={`edit-peer-endpoint-${editPeerEndpointDefault}`}
                         name="peer_endpoint_host"
@@ -7117,7 +6979,7 @@ function App() {
                         locked={udp2rawActive}
                       />
                     </Field>
-                    <Field label="对端入口端口" hint="本端直连对端节点时使用；留空则使用对端 ListenPort。">
+                    <Field label="对端入口端口" hint="本端连接对端时使用的目标 UDP 端口；留空使用对端监听端口。">
                       <input
                         name="peer_endpoint_port"
                         defaultValue={managedLink.local_peer.endpoint_port || managedLink.peer_interface.listen_port || ""}
@@ -7125,15 +6987,15 @@ function App() {
                         disabled={!selectedNodeOnline || udp2rawActive}
                       />
                     </Field>
-                    <Field label="本端允许路由" hint="写入当前节点 [Peer] 的允许路由字段（AllowedIPs）；声明经对端到达的地址段。">
+                    <Field label="本端经对端路由" hint="填写本端需要通过对端到达的地址或网段（WireGuard AllowedIPs）。">
                       <input name="local_allowed_ips" defaultValue={managedLink.local_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端允许路由" hint="写入对端节点 [Peer] 的允许路由字段（AllowedIPs）；声明经本端到达的地址段。">
+                    <Field label="对端经本端路由" hint="填写对端需要通过本端到达的地址或网段（WireGuard AllowedIPs）。">
                       <input name="peer_allowed_ips" defaultValue={managedLink.peer_peer.allowed_ips.join(", ")} required disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="连接中间层" hint="udp2raw 通过本地代理接管入口地址；mimic 在网卡层透明处理真实入口流量。">
-                    <Field label="中间层类型" hint="mimic 需要双方节点为非 OpenWrt Linux kernel > 6.1 且已安装 mimic。">
+                  <FormSection title="连接中间层" hint="中间层用于改变 WireGuard 报文在公网中的传输方式；普通直连不需要启用。">
+                    <Field label="中间层类型" hint="udp2raw 可封装为 FakeTCP、UDP 或 ICMP；mimic 仅适用于已安装插件且内核版本高于 6.1 的非 OpenWrt Linux。">
                       <select
                         value={middlewareType}
                         disabled={!selectedNodeOnline}
@@ -7172,28 +7034,28 @@ function App() {
                       onEnabledChange={setMimicEnabled}
                     />
                   )}
-                  <FormSection title="链路参数" hint="Table=off 是 DN42 常用默认值；保活间隔会写入双方 [Peer]。">
+                  <FormSection title="链路参数" hint="这些参数会同时应用到双方 WireGuard 接口和 Peer。没有特殊网络要求时保持默认。">
                     <Field label="MTU" hint={udp2rawActive ? "启用 udp2raw 时建议降低 MTU；可手动修改。" : mimicActive ? "启用 mimic 时建议将 IPv6 WireGuard MTU 降到 1408，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                       <input name="mtu" defaultValue={managedLink.local_interface.mtu || managedLink.peer_interface.mtu || 1420} inputMode="numeric" disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
+                    <Field label="自动路由" hint="默认根据双方“经对端路由”自动写入系统路由；关闭后由路由协议或用户维护。">
                       <RouteModeSelect defaultValue={managedLink.local_interface.table_name || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="保活间隔" hint="可选；NAT 场景常用 25。">
+                    <Field label="保活间隔" hint="双方定期发送保活包的秒数；穿越 NAT 时常用 25，直连环境可留空。">
                       <input name="persistent_keepalive" placeholder="25" defaultValue={managedLink.local_peer.persistent_keepalive || ""} inputMode="numeric" disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="高级配置" hint="这些内容会原样追加到对应的 [Interface] 或 [Peer] 区块，请只填写 WireGuard 支持的配置行。">
-                    <Field label="本端接口高级配置" hint="写入当前节点 [Interface] 后，例如 PostUp。不同节点可不同。" wide>
+                  <FormSection title="高级配置" hint="仅供需要 PostUp、PostDown 等自定义 wg-quick 配置的用户使用；内容会原样写入节点配置。">
+                    <Field label="本端接口高级配置" hint="追加到本端 [Interface] 区块，例如 PostUp、PostDown。" wide>
                       <textarea name="local_interface_custom_config" defaultValue={managedLink.local_interface.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="本端对端高级配置" hint="写入当前节点 [Peer] 后。" wide>
+                    <Field label="本端 Peer 高级配置" hint="追加到本端配置中的 [Peer] 区块。" wide>
                       <textarea name="local_peer_custom_config" defaultValue={managedLink.local_peer.peer_custom_config || ""} placeholder="允许路由之外的自定义对端配置行" disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端接口高级配置" hint="写入对端节点 [Interface] 后，例如不同的 PostUp。" wide>
+                    <Field label="对端接口高级配置" hint="追加到对端 [Interface] 区块，可与本端使用不同命令。" wide>
                       <textarea name="peer_interface_custom_config" defaultValue={managedLink.peer_interface.interface_custom_config || ""} placeholder="PostUp = ..." disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端对端高级配置" hint="写入对端节点 [Peer] 后。" wide>
+                    <Field label="对端 Peer 高级配置" hint="追加到对端配置中的 [Peer] 区块。" wide>
                       <textarea name="peer_peer_custom_config" defaultValue={managedLink.peer_peer.peer_custom_config || ""} placeholder="允许路由之外的自定义对端配置行" disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
@@ -7211,32 +7073,32 @@ function App() {
                     onSubmit={(event) => void runAction(() => saveConfig(event, "update"), configActionKey(selectedConfig.id, "save-config"))}
                     className="gridForm describedForm"
                   >
-                    <Field label="接口名称" hint="节点上的 wg-quick 接口名，例如 wg0。">
+                    <Field label="接口名称" hint="当前节点上的 WireGuard 接口名，例如 wg0；修改名称后会在下次部署时清理旧接口。">
                       <input name="name" placeholder="wg0" defaultValue={selectedConfig.name} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="本端隧道地址" hint="CIDR 格式，多个地址用逗号分隔。">
+                    <Field label="本端隧道地址" hint="分配给当前 WireGuard 接口的虚拟 IP，例如 10.42.0.1/32 或 fd42::1/64；多个地址用逗号分隔。">
                       <input name="tunnel_ips" placeholder="10.42.0.1/24" defaultValue={selectedConfig.tunnel_ips.join(", ")} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="监听端口" hint="UDP 端口，留空表示不写 ListenPort。">
+                    <Field label="监听端口" hint="当前节点接收 WireGuard 报文的本机 UDP 端口；仅主动连接对端时可以留空。">
                       <input name="listen_port" placeholder="51820" defaultValue={selectedConfig.listen_port || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="MTU" hint="链路 MTU，默认 1420。">
+                    <Field label="MTU" hint="WireGuard 接口的最大报文大小；通常使用 1420，出现分片或使用中间层时再降低。">
                       <input name="mtu" placeholder="1420" defaultValue={selectedConfig.mtu || 1420} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="自动路由" hint="Table=off 表示 wg-quick 不自动添加路由。">
+                    <Field label="自动路由" hint="默认根据“经对端路由”自动添加系统路由；关闭后由用户或路由协议维护。">
                       <RouteModeSelect defaultValue={selectedConfig.table_name || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="本端公钥" hint="44 位 base64；受管连接会自动生成。">
+                    <Field label="本端公钥" hint="当前接口的 WireGuard 公钥，44 位 base64；通常由私钥计算，不要填写对端公钥。">
                       <input name="public_key" placeholder="粘贴本端公钥" defaultValue={selectedConfig.public_key || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="本端私钥" hint={selectedConfig.has_private_key ? "私钥已加密保存；留空保持不变。" : "尚未保存私钥。"} wide>
+                    <Field label="本端私钥" hint={selectedConfig.has_private_key ? "当前私钥已保存；留空保持不变，填写新值会替换原私钥。" : "当前尚未保存私钥；接口启动前需要提供有效私钥。"} wide>
                       <textarea name="private_key" placeholder={selectedConfig.has_private_key ? "留空保持现有私钥" : "粘贴本端私钥"} disabled={!selectedNodeOnline} />
                     </Field>
                     <label className="checkField wideField">
                       <input name="clear_private_key" type="checkbox" disabled={!selectedNodeOnline || !selectedConfig.has_private_key} />
                       <span>清除已保存的本端私钥</span>
                     </label>
-                    <Field label="接口高级配置" hint="逐行写入 [Interface] 后，例如 PostUp/PostDown。保存前请确认这些配置行能被 WireGuard 识别。" wide>
+                    <Field label="接口高级配置" hint="可选；追加到本端 [Interface] 区块，例如 PostUp、PostDown。内容错误可能导致接口启动失败。" wide>
                       <textarea name="interface_custom_config" placeholder="PostUp = ..." defaultValue={selectedConfig.interface_custom_config || ""} disabled={!selectedNodeOnline} />
                     </Field>
                     <button type="submit" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfig.id, "save-config"))}>
@@ -7252,32 +7114,32 @@ function App() {
                     onSubmit={(event) => void runAction(() => savePeer(event), configActionKey(selectedConfig.id, "save-peer"))}
                     className="gridForm describedForm"
                   >
-                    <Field label="对端名称" hint="可选，仅用于界面识别。">
+                    <Field label="对端名称" hint="只用于在面板中识别这个对端，不会写入 WireGuard 配置。">
                       <input name="name" placeholder="对端名称" defaultValue={peer?.name || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端公钥" hint="必填，44 位 base64。">
+                    <Field label="对端公钥" hint="对端 WireGuard 接口的公钥，44 位 base64；每个配置只能有一个对端。">
                       <input name="public_key" placeholder="粘贴对端公钥" defaultValue={peer?.public_key || ""} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="预共享密钥" hint={peer?.has_preshared_key ? "密钥已加密保存；留空保持不变。" : "可选，填写后会渲染 PresharedKey。"}>
+                    <Field label="预共享密钥" hint={peer?.has_preshared_key ? "当前密钥已保存；留空保持不变，填写新值会替换原密钥。" : "可选；双方 Peer 必须填写相同的 44 位预共享密钥。"}>
                       <input name="preshared_key" placeholder={peer?.has_preshared_key ? "留空保持现有密钥" : "粘贴预共享密钥"} disabled={!selectedNodeOnline} />
                     </Field>
                     <label className="checkField wideField">
                       <input name="clear_preshared_key" type="checkbox" disabled={!selectedNodeOnline || !peer?.has_preshared_key} />
                       <span>清除已保存的预共享密钥</span>
                     </label>
-                    <Field label="允许路由" hint="写入 [Peer] 的允许路由字段（AllowedIPs）；CIDR 格式，多个值用逗号分隔。">
+                    <Field label="经对端路由" hint="指定哪些目标地址通过这个对端发送（WireGuard AllowedIPs）；多个 CIDR 用逗号分隔。">
                       <input name="allowed_ips" placeholder="10.42.0.2/32" defaultValue={peer?.allowed_ips.join(", ") || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端入口地址" hint="对端公网 IP、内网 IP 或域名；可留空。">
+                    <Field label="对端入口地址" hint="当前节点主动连接对端时使用的 IP 或域名；由对端主动连接本机时可以留空。">
                       <input name="endpoint_host" placeholder="203.0.113.20" defaultValue={peer?.endpoint_host || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端入口端口" hint="对端 UDP 端口；入口地址留空时通常也留空。">
+                    <Field label="对端入口端口" hint="对端 WireGuard 实际监听的 UDP 端口；填写入口地址时必须同时填写。">
                       <input name="endpoint_port" placeholder="51820" defaultValue={peer?.endpoint_port || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="保活间隔" hint="常用 25；留空表示不写保活字段。">
+                    <Field label="保活间隔" hint="当前节点定期向对端发送保活包的秒数；穿越 NAT 时常用 25，直连环境可留空。">
                       <input name="persistent_keepalive" placeholder="25" defaultValue={peer?.persistent_keepalive || ""} disabled={!selectedNodeOnline} />
                     </Field>
-                    <Field label="对端高级配置" hint="逐行写入 [Peer] 后。保存前请确认这些配置行能被 WireGuard 识别。" wide>
+                    <Field label="对端高级配置" hint="可选；追加到本端配置的 [Peer] 区块。内容错误可能导致接口启动失败。" wide>
                       <textarea name="peer_custom_config" placeholder="自定义对端配置行" defaultValue={peer?.peer_custom_config || ""} disabled={!selectedNodeOnline} />
                     </Field>
                     <button type="submit" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfig.id, "save-peer"))}>
@@ -7392,7 +7254,7 @@ function App() {
               className="gridForm describedForm"
               onSubmit={(event) => void runAction(() => saveLinkMonitor(event), monitorActionKey(monitorDialogActionTarget, "save"))}
             >
-              <Field label="目标 IP" hint="从当前节点 Agent 发起 ping；建议填写对端隧道 IP。">
+              <Field label="目标 IP" hint="当前节点会定期 ping 这个地址。建议填写连接对端的隧道 IP，不要填写会被负载均衡或 CDN 代理的地址。">
                 <input
                   name="target_host"
                   placeholder="10.42.0.2"
@@ -7400,10 +7262,10 @@ function App() {
                   required
                 />
               </Field>
-              <Field label="刷新频率" hint="1-300 秒，默认 10 秒。">
+              <Field label="检测间隔" hint="两次检测之间的秒数，范围 1-300；间隔越短，节点和数据库负载越高。">
                 <input name="interval_seconds" inputMode="numeric" defaultValue={activeMonitorDetail?.monitor.interval_seconds || 10} required />
               </Field>
-              <Field label="保留时间" hint="历史样本保留天数，例如 1、7、30。">
+              <Field label="保留时间" hint="超过所选天数的历史检测样本会自动清理；不会影响当前监测配置。">
                 <select name="retention_days" defaultValue={activeMonitorDetail?.monitor.retention_days || 7}>
                   <option value="1">1 天</option>
                   <option value="7">7 天</option>
