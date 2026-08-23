@@ -639,6 +639,37 @@ def test_gre_ipv6_start_uses_ip6gre_hoplimit_and_ipv6_default_mtu(monkeypatch, t
     ]
 
 
+def test_gre_ipv6_link_local_zone_is_preserved_in_ip_command(monkeypatch, tmp_path: Path) -> None:
+    """验证 GRE over IPv6 的链路本地 zone 会转换为 iproute2 的 dev 参数。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        """记录带 zone 的 GRE 启动命令。"""
+
+        commands.append(command)
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    gre.start_gre_interface(
+        {
+            "interface_name": "gre-prod-a-b",
+            "outer_local_ip": "fe80::1%ens19",
+            "outer_remote_ip": "fe80::2%br-lan",
+            "tunnel_ips": ["fd42:9::1/64"],
+            "routes": [],
+        },
+        str(tmp_path),
+    )
+
+    assert commands[1][commands[1].index("local") + 1] == "fe80::1"
+    assert commands[1][commands[1].index("remote") + 1] == "fe80::2"
+    assert commands[1][commands[1].index("dev") + 1] == "ens19"
+
+
 def test_existing_gre_ipv6_without_encaplimit_restarts_with_none(monkeypatch, tmp_path: Path) -> None:
     """验证旧 IP6GRE 配置缺少 encaplimit 时，重新连接会显式禁用封装限制。"""
 

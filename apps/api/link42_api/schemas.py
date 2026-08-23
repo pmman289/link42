@@ -171,15 +171,30 @@ def _validate_linux_interface_name(value: str) -> str:
 
 
 def _validate_gre_interface_name(value: str) -> str:
-    """校验 GRE 接口名，兼容 OpenWrt netifd 生成的 gre4/gre6 设备名长度。"""
+    """校验 GRE 接口名，遵循 Linux 上限并兼容 OpenWrt UCI 标识符。"""
 
     cleaned = value.strip()
     if not cleaned:
         raise ValueError("interface name is required")
-    if len(cleaned) > 10:
-        raise ValueError("GRE interface name must be 10 characters or fewer")
-    if not all(char.isalnum() or char == "_" for char in cleaned):
-        raise ValueError("GRE interface name can only contain letters, numbers, and underscores")
+    if len(cleaned) > 15:
+        raise ValueError("interface name must be 15 characters or fewer")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", cleaned, flags=re.ASCII):
+        raise ValueError("interface name contains unsupported characters")
+    return cleaned
+
+
+def _validate_gre_outer_address(value: str) -> str:
+    """校验 GRE 外层地址，并支持 IPv6 链路本地地址的 zone 标识。"""
+
+    cleaned = value.strip()
+    try:
+        address = ipaddress.ip_address(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"invalid GRE outer address: {cleaned}") from exc
+    scope_id = getattr(address, "scope_id", None)
+    if scope_id is not None:
+        if address.version != 6 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", scope_id, flags=re.ASCII):
+            raise ValueError("GRE IPv6 zone must be a valid interface name")
     return cleaned
 
 
@@ -809,8 +824,8 @@ class GreManagedConnectionCreate(BaseModel):
 
     protocol_type: str = "gre"
     peer_node_id: int
-    local_interface_name: str = Field(min_length=1, max_length=10)
-    peer_interface_name: str = Field(min_length=1, max_length=10)
+    local_interface_name: str = Field(min_length=1, max_length=15)
+    peer_interface_name: str = Field(min_length=1, max_length=15)
     local_outer_ip: str
     peer_outer_ip: str
     local_bind_ip: str | None = None
@@ -849,14 +864,16 @@ class GreManagedConnectionCreate(BaseModel):
     def validate_outer_ip(cls, value: str) -> str:
         """校验 GRE 外层地址为 IPv4 或 IPv6 字面量。"""
 
-        return _validate_ip_address(value)
+        return _validate_gre_outer_address(value)
 
     @field_validator("local_bind_ip", "local_remote_ip", "peer_bind_ip", "peer_remote_ip")
     @classmethod
     def validate_optional_outer_ip(cls, value: str | None) -> str | None:
-        """校验 GRE 高级外层映射地址为可选 IP 字面量。"""
+        """校验 GRE 高级外层映射地址，并支持 IPv6 链路本地 zone。"""
 
-        return _validate_optional_ip_address(value)
+        if value is None or not value.strip():
+            return None
+        return _validate_gre_outer_address(value)
 
     @field_validator("local_tunnel_ips", "peer_tunnel_ips", "local_routes", "peer_routes")
     @classmethod
@@ -903,8 +920,8 @@ class GreManagedConnectionCreate(BaseModel):
 class GreManagedConnectionUpdate(BaseModel):
     """更新受管 GRE 连接请求。"""
 
-    local_interface_name: str = Field(min_length=1, max_length=10)
-    peer_interface_name: str = Field(min_length=1, max_length=10)
+    local_interface_name: str = Field(min_length=1, max_length=15)
+    peer_interface_name: str = Field(min_length=1, max_length=15)
     local_outer_ip: str
     peer_outer_ip: str
     local_bind_ip: str | None = None
@@ -934,14 +951,16 @@ class GreManagedConnectionUpdate(BaseModel):
     def validate_outer_ip(cls, value: str) -> str:
         """校验 GRE 外层地址为 IPv4 或 IPv6 字面量。"""
 
-        return _validate_ip_address(value)
+        return _validate_gre_outer_address(value)
 
     @field_validator("local_bind_ip", "local_remote_ip", "peer_bind_ip", "peer_remote_ip")
     @classmethod
     def validate_optional_outer_ip(cls, value: str | None) -> str | None:
-        """校验 GRE 高级外层映射地址为可选 IP 字面量。"""
+        """校验 GRE 高级外层映射地址，并支持 IPv6 链路本地 zone。"""
 
-        return _validate_optional_ip_address(value)
+        if value is None or not value.strip():
+            return None
+        return _validate_gre_outer_address(value)
 
     @field_validator("local_tunnel_ips", "peer_tunnel_ips", "local_routes", "peer_routes")
     @classmethod
@@ -989,8 +1008,8 @@ class GreManualConnectionCreate(BaseModel):
     """创建仅管理当前节点一端的 GRE 连接请求。"""
 
     protocol_type: str = "gre"
-    interface_name: str = Field(min_length=1, max_length=10)
-    peer_interface_name: str | None = Field(default=None, max_length=10)
+    interface_name: str = Field(min_length=1, max_length=15)
+    peer_interface_name: str | None = Field(default=None, max_length=15)
     outer_local_ip: str
     outer_remote_ip: str
     tunnel_ips: list[str] = Field(min_length=1)
@@ -1033,7 +1052,7 @@ class GreManualConnectionCreate(BaseModel):
     def validate_outer_ip(cls, value: str) -> str:
         """校验 GRE 外层地址为 IPv4 或 IPv6 字面量。"""
 
-        return _validate_ip_address(value)
+        return _validate_gre_outer_address(value)
 
     @field_validator("tunnel_ips", "peer_tunnel_ips", "routes")
     @classmethod

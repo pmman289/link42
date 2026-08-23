@@ -76,8 +76,10 @@ function isIpv4Address(value: string): boolean {
 /** 校验 IPv6 字面量。 */
 function isIpv6Address(value: string): boolean {
   if (!value.includes(":")) return false;
+  const [address, zone, ...rest] = value.split("%");
+  if (rest.length || (zone !== undefined && !/^[A-Za-z0-9_.-]{1,15}$/.test(zone))) return false;
   try {
-    new URL(`http://[${value}]/`);
+    new URL(`http://[${address}]/`);
     return true;
   } catch {
     return false;
@@ -102,7 +104,7 @@ export function isCidrList(value: string): boolean {
   const items = value.split(/[,\n]+/).map((item) => item.trim()).filter(Boolean);
   return items.every((item) => {
     const [address, prefix, ...rest] = item.split("/");
-    if (!address || !prefix || rest.length || !/^\d+$/.test(prefix)) return false;
+    if (!address || !prefix || rest.length || address.includes("%") || !/^\d+$/.test(prefix)) return false;
     const version = ipVersion(address);
     const number = Number(prefix);
     return version === 4 ? number <= 32 : version === 6 ? number <= 128 : false;
@@ -152,9 +154,9 @@ function siteLogoRule(value: FormDataEntryValue | FormDataEntryValue[] | undefin
 
 /** 校验 GRE 接口名。 */
 function greInterfaceRule(label: string): FieldValidator {
-  return (value) => /^[A-Za-z0-9_]{1,10}$/.test(stringValue(value))
+  return (value) => /^[A-Za-z0-9_-]{1,15}$/.test(stringValue(value))
     ? null
-    : `${label}最多 10 个字符，只能包含字母、数字和下划线`;
+    : `${label}最多 15 个字符，只能包含字母、数字、下划线和连字符`;
 }
 
 /** 校验 GRE Key。 */

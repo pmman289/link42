@@ -690,8 +690,8 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "interface name is required": "接口名称不能为空",
   "interface name must be 15 characters or fewer": "接口名称不能超过 15 个字符",
   "interface name contains unsupported characters": "接口名称只能包含字母、数字、下划线、点和短横线",
-  "GRE interface name must be 10 characters or fewer": "GRE 接口名称不能超过 10 个字符",
-  "GRE interface name can only contain letters, numbers, and underscores": "GRE 接口名称只能包含字母、数字和下划线",
+  "GRE interface name must be 10 characters or fewer": "GRE 接口名称不能超过 15 个字符",
+  "GRE interface name can only contain letters, numbers, and underscores": "GRE 接口名称只能包含字母、数字、下划线和短横线",
   "GRE key must be a number": "GRE Key 必须是数字",
   "GRE key must be between 0 and 4294967295": "GRE Key 必须在 0 到 4294967295 之间",
   "MTU must be between 576 and 9000": "MTU 必须在 576-9000 之间",
@@ -1206,7 +1206,8 @@ function localDateTimeToIso(value: FormDataEntryValue | null): string | null {
 }
 
 // 计算单条拓扑链路的健康状态。
-function topologySingleEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "unknown" {
+function topologySingleEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "inactive" | "unknown" {
+  if ([edge.local_status, edge.peer_status].every((status) => status === "stopped" || status === "stopping")) return "inactive";
   if (edge.local_status !== "running" || edge.peer_status !== "running") return "critical";
   const statuses = [edge.local_monitor?.status, edge.peer_monitor?.status].filter(Boolean);
   if (statuses.includes("critical")) return "critical";
@@ -1215,9 +1216,17 @@ function topologySingleEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "cr
   return "unknown";
 }
 
+// 返回应参与拓扑状态和监测摘要的链路，主动关闭链路只在没有其它链路时保留。
+function topologyOperationalLinks(edge: TopologyDisplayEdge): TopologyEdge[] {
+  const links = edge.links.filter((link) => topologySingleEdgeTone(link) !== "inactive");
+  return links.length > 0 ? links : edge.links;
+}
+
 // 汇总多条合并链路后的拓扑健康状态。
-function topologyEdgeTone(edge: TopologyDisplayEdge): "healthy" | "warning" | "critical" | "unknown" {
-  const tones = edge.links.map(topologySingleEdgeTone);
+function topologyEdgeTone(edge: TopologyDisplayEdge): "healthy" | "warning" | "critical" | "inactive" | "unknown" {
+  // 主动关闭的链路不参与其它链路的聚合状态；只有全部链路都关闭时才显示灰色。
+  const tones = edge.links.map(topologySingleEdgeTone).filter((tone) => tone !== "inactive");
+  if (tones.length === 0) return "inactive";
   if (tones.includes("critical")) return "critical";
   if (tones.includes("warning")) return "warning";
   if (tones.includes("unknown")) return "unknown";
@@ -1232,7 +1241,10 @@ function average(values: number[]) {
 
 // 生成拓扑边标签中的延迟和丢包摘要；拓扑只关心节点间连接关系，不突出具体协议。
 function topologyEdgeSummary(edge: TopologyDisplayEdge) {
-  const summaries = edge.links.flatMap((link) => [link.local_monitor, link.peer_monitor]).filter(Boolean) as LinkMonitorSummary[];
+  if (topologyEdgeTone(edge) === "inactive") return `${edge.link_count > 1 ? `${edge.link_count}条链路 · ` : ""}-- / --`;
+  const summaries = topologyOperationalLinks(edge)
+    .flatMap((link) => [link.local_monitor, link.peer_monitor])
+    .filter(Boolean) as LinkMonitorSummary[];
   const prefix = edge.link_count > 1 ? `${edge.link_count}条链路 · ` : "";
   if (summaries.length === 0) return `${prefix}-- / --`;
   const latencies = summaries
@@ -1374,8 +1386,10 @@ function isProbablyIpAddress(value: string): boolean {
 function isValidIpv6Address(value: string): boolean {
   const cleaned = value.trim();
   if (!cleaned.includes(":") || cleaned.includes("[") || cleaned.includes("]")) return false;
+  const [address, zone, ...rest] = cleaned.split("%");
+  if (rest.length || (zone !== undefined && !/^[A-Za-z0-9_.-]{1,15}$/.test(zone))) return false;
   try {
-    new URL(`http://[${cleaned}]/`);
+    new URL(`http://[${address}]/`);
     return true;
   } catch {
     return false;
@@ -1387,6 +1401,7 @@ function isValidCidrs(values: string[]): boolean {
   return values.every((value) => {
     const [address, prefixText, ...rest] = value.trim().split("/");
     if (!address || !prefixText || rest.length) return false;
+    if (address.includes("%")) return false;
     if (!/^\d+$/.test(prefixText)) return false;
     const prefix = Number(prefixText);
     if (!isProbablyIpAddress(address)) return false;
@@ -1412,7 +1427,7 @@ function isValidGreKey(value: string): boolean {
 
 // 校验 GRE 接口名，避免 OpenWrt netifd 生成的 gre4/gre6 设备名超过内核限制。
 function isValidGreInterfaceName(value: string): boolean {
-  return /^[A-Za-z0-9_]{1,10}$/.test(value.trim());
+  return /^[A-Za-z0-9_-]{1,15}$/.test(value.trim());
 }
 
 // 渲染链路监测摘要按钮。
@@ -2542,7 +2557,7 @@ function App() {
   const topologyFlowEdges = useMemo<FlowEdge[]>(() =>
     topologyDisplayEdges.map((edge) => {
       const tone = topologyEdgeTone(edge);
-      const disconnected = edge.links.some((link) => link.local_status !== "running" || link.peer_status !== "running");
+      const disconnected = tone === "critical";
       return {
         id: edge.id,
         source: String(edge.local_node_id),
@@ -4271,7 +4286,7 @@ function App() {
     const encaplimit = encaplimitEnabled ? (optionalInt(form.get("encaplimit"), "IPv6 封装限制") ?? 4) : null;
     const greKey = String(form.get("gre_key") || "").trim();
     if (!isValidGreInterfaceName(localInterfaceName) || !isValidGreInterfaceName(peerInterfaceName)) {
-      throw new Error("GRE 接口名称最多 10 个字符，只能包含字母、数字和下划线");
+      throw new Error("GRE 接口名称最多 15 个字符，只能包含字母、数字、下划线和连字符");
     }
     const outerIpVersion = ipAddressVersion(localOuterIp);
     if (!outerIpVersion || ipAddressVersion(peerOuterIp) !== outerIpVersion) {
@@ -4397,7 +4412,7 @@ function App() {
     const greKey = String(form.get("gre_key") || "").trim();
     const pmtudisc = form.get("pmtudisc") === "on";
     if (!isValidGreInterfaceName(interfaceName) || (peerInterfaceName && !isValidGreInterfaceName(peerInterfaceName))) {
-      throw new Error("GRE 接口名称最多 10 个字符，只能包含字母、数字和下划线");
+      throw new Error("GRE 接口名称最多 15 个字符，只能包含字母、数字、下划线和连字符");
     }
     const outerIpVersion = ipAddressVersion(outerLocalIp);
     if (!outerIpVersion || ipAddressVersion(outerRemoteIp) !== outerIpVersion) {
@@ -5827,15 +5842,15 @@ function App() {
               className="gridForm describedForm"
             >
               <FormSection title="接口" hint="Link42 只在当前节点创建接口；对端接口需要由其它系统或人工配置。">
-                <Field label="本端接口名称" hint="最多 10 个字符，只能包含字母、数字和下划线。" requiredMark>
+                <Field label="本端接口名称" hint="最多 15 个字符，可使用字母、数字、下划线和连字符。" requiredMark>
                   <input name="interface_name" placeholder="gre_peer" required disabled={!selectedNodeOnline} />
                 </Field>
                 <Field label="对端接口名称" hint="可选，仅用于在连接详情中记录对端接口名，不会在对端创建接口。">
                   <input name="peer_interface_name" placeholder="gre_link42" disabled={!selectedNodeOnline} />
                 </Field>
               </FormSection>
-              <FormSection title="外层地址" hint="外层地址是 GRE 报文在真实网络中使用的源和目标地址。两端必须同为 IPv4 或同为 IPv6。">
-                <Field label="本端外层地址" hint="当前机器发送 GRE 报文时使用的源 IP，必须存在于本机网卡；使用云公网 EIP/NAT 时通常填写对应的内网 IP。" requiredMark>
+              <FormSection title="外层地址" hint="外层地址是 GRE 报文在真实网络中使用的源和目标地址。两端必须同为 IPv4 或同为 IPv6；IPv6 链路本地地址可填写 fe80::1%ens19。">
+                <Field label="本端外层地址" hint="当前机器发送 GRE 报文时使用的源 IP，必须存在于本机网卡；使用云公网 EIP/NAT 时通常填写对应的内网 IP。链路本地 IPv6 请带上出口网卡，例如 fe80::1%ens19。" requiredMark>
                   <EndpointSelect
                     name="outer_local_ip"
                     defaultValue={managedGreLocalOuterIpDefault}
@@ -6225,10 +6240,10 @@ function App() {
                     ))}
                   </select>
                 </Field>
-                <Field label="本端接口名称" hint="GRE 接口名最多 10 个字符，只能包含字母、数字、下划线。" requiredMark>
+                <Field label="本端接口名称" hint="GRE 接口名最多 15 个字符，可使用字母、数字、下划线和连字符。" requiredMark>
                   <input name="local_interface_name" placeholder="gre_a_b" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
-                <Field label="对端接口名称" hint="GRE 接口名最多 10 个字符，只能包含字母、数字、下划线。" requiredMark>
+                <Field label="对端接口名称" hint="GRE 接口名最多 15 个字符，可使用字母、数字、下划线和连字符。" requiredMark>
                   <input name="peer_interface_name" placeholder="gre_b_a" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
               </FormSection>
@@ -6658,15 +6673,15 @@ function App() {
                   className="gridForm describedForm"
                 >
                   <FormSection title="接口" hint="只修改当前节点上的 GRE 接口；对端接口名称仅作为记录，不会修改对端机器。">
-                    <Field label="本端接口名称" hint="最多 10 个字符，只能包含字母、数字、下划线。" requiredMark>
+                    <Field label="本端接口名称" hint="最多 15 个字符，可使用字母、数字、下划线和连字符。" requiredMark>
                       <input name="interface_name" defaultValue={selectedGreLocalEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                     </Field>
                     <Field label="对端接口名称" hint="可选，仅用于在连接详情中记录对端接口名。">
                       <input name="peer_interface_name" defaultValue={editManualGrePeerInterfaceName} disabled={!selectedGreAllNodesOnline} />
                     </Field>
                   </FormSection>
-                  <FormSection title="外层地址" hint="外层地址是 GRE 报文在真实网络中使用的源和目标地址，双方必须同为 IPv4 或同为 IPv6。">
-                    <Field label="本端外层地址" hint="当前机器发送 GRE 报文时使用的源 IP，必须存在于本机网卡；云公网 EIP/NAT 场景通常填写对应内网 IP。" requiredMark>
+                  <FormSection title="外层地址" hint="外层地址是 GRE 报文在真实网络中使用的源和目标地址，双方必须同为 IPv4 或同为 IPv6；IPv6 链路本地地址可填写 fe80::1%ens19。">
+                    <Field label="本端外层地址" hint="当前机器发送 GRE 报文时使用的源 IP，必须存在于本机网卡；云公网 EIP/NAT 场景通常填写对应内网 IP。链路本地 IPv6 请带上出口网卡，例如 fe80::1%ens19。" requiredMark>
                       <EndpointSelect
                         key={`edit-manual-gre-local-${selectedGreConnection.connection_ref}-${editGreLocalOuterIpDefault}`}
                         name="outer_local_ip"
@@ -6722,10 +6737,10 @@ function App() {
                 className="gridForm describedForm"
               >
                 <FormSection title="基础" hint="接口名称会分别写入对应节点；保存后 Link42 会重新部署并启动双方 GRE。">
-                  <Field label="本端接口名称" hint={`节点：${selectedGreLocalEndpoint.node_name || selectedGreLocalEndpoint.node_id}；最多 10 个字符，只能包含字母、数字、下划线。`} requiredMark>
+                  <Field label="本端接口名称" hint={`节点：${selectedGreLocalEndpoint.node_name || selectedGreLocalEndpoint.node_id}；最多 15 个字符，可使用字母、数字、下划线和连字符。`} requiredMark>
                     <input name="local_interface_name" defaultValue={selectedGreLocalEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
-                  <Field label="对端接口名称" hint={`节点：${selectedGrePeerEndpoint.node_name || selectedGrePeerEndpoint.node_id}；最多 10 个字符，只能包含字母、数字、下划线。`} requiredMark>
+                  <Field label="对端接口名称" hint={`节点：${selectedGrePeerEndpoint.node_name || selectedGrePeerEndpoint.node_id}；最多 15 个字符，可使用字母、数字、下划线和连字符。`} requiredMark>
                     <input name="peer_interface_name" defaultValue={selectedGrePeerEndpoint.interface_name} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
                 </FormSection>

@@ -557,6 +557,11 @@ textarea {
   stroke-opacity: 0.36;
 }
 
+.topologyEdge.inactive .react-flow__edge-path {
+  stroke: #9aa7ad;
+  stroke-opacity: 0.9;
+}
+
 .topologyEdgeInteraction {
   stroke: transparent;
   stroke-width: 18;
@@ -2139,6 +2144,11 @@ textarea {
 [data-theme="dark"] .topologyEdge.critical .react-flow__edge-path {
   stroke: var(--danger);
   stroke-opacity: 0.42;
+}
+
+[data-theme="dark"] .topologyEdge.inactive .react-flow__edge-path {
+  stroke: #71818a;
+  stroke-opacity: 0.9;
 }
 
 [data-theme="dark"] .topologyEdgeLabel {

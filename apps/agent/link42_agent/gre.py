@@ -4,6 +4,7 @@ from functools import lru_cache
 import ipaddress
 import json
 from pathlib import Path
+import re
 import shlex
 import shutil
 import sys
@@ -81,8 +82,40 @@ def gre_outer_ip_version(config: dict[str, Any]) -> int:
     if config.get("outer_ip_version"):
         return int(config["outer_ip_version"])
     if config.get("outer_local_ip"):
-        return ipaddress.ip_address(config["outer_local_ip"]).version
+        return validate_gre_outer_address(config["outer_local_ip"], "GRE outer local address").version
     return 4
+
+
+def validate_gre_outer_address(value: object, label: str = "GRE outer address") -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """校验 GRE 外层地址，并限制 IPv6 zone 只能引用安全的本地接口名。"""
+
+    cleaned = str(value or "").strip()
+    try:
+        address = ipaddress.ip_address(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an IPv4 or IPv6 address") from exc
+    scope_id = getattr(address, "scope_id", None)
+    if scope_id is not None and (
+        address.version != 6 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", scope_id, flags=re.ASCII)
+    ):
+        raise ValueError(f"{label} has an invalid IPv6 zone")
+    return address
+
+
+def gre_outer_address_parts(config: dict[str, Any]) -> tuple[str, str, str | None]:
+    """拆分 GRE 外层地址和 IPv6 zone，返回 iproute2/UCI 可用地址及出口设备。"""
+
+    local_address = validate_gre_outer_address(config["outer_local_ip"], "GRE outer local address")
+    remote_address = validate_gre_outer_address(config["outer_remote_ip"], "GRE outer remote address")
+    if local_address.version != remote_address.version:
+        raise ValueError("GRE outer addresses must use the same IP version")
+    local_scope = getattr(local_address, "scope_id", None)
+    remote_scope = getattr(remote_address, "scope_id", None)
+    return (
+        str(local_address).split("%", 1)[0],
+        str(remote_address).split("%", 1)[0],
+        local_scope or remote_scope,
+    )
 
 
 def require_openwrt_gre_family_supported(config: dict[str, Any]) -> None:
@@ -197,11 +230,8 @@ def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     outer_local_ip = str(payload["outer_local_ip"]).strip()
     outer_remote_ip = str(payload["outer_remote_ip"]).strip()
-    try:
-        local_address = ipaddress.ip_address(outer_local_ip)
-        remote_address = ipaddress.ip_address(outer_remote_ip)
-    except ValueError as exc:
-        raise ValueError("GRE outer addresses must be IP literals") from exc
+    local_address = validate_gre_outer_address(outer_local_ip, "GRE outer local address")
+    remote_address = validate_gre_outer_address(outer_remote_ip, "GRE outer remote address")
     if local_address.version != remote_address.version:
         raise ValueError("GRE outer addresses must use the same IP version")
     config = {
@@ -292,6 +322,7 @@ def gre_tunnel_add_command(config: dict[str, Any]) -> list[str]:
     """生成创建 GRE tunnel 的 ip 命令。"""
 
     outer_ip_version = gre_outer_ip_version(config)
+    local_text, remote_text, tunnel_device = gre_outer_address_parts(config)
     command = [ip_command()]
     if outer_ip_version == 6:
         command.append("-6")
@@ -302,10 +333,12 @@ def gre_tunnel_add_command(config: dict[str, Any]) -> list[str]:
         "mode",
         "ip6gre" if outer_ip_version == 6 else "gre",
         "local",
-        config["outer_local_ip"],
+        local_text,
         "remote",
-        config["outer_remote_ip"],
+        remote_text,
     ])
+    if tunnel_device:
+        command.extend(["dev", tunnel_device])
     if config.get("key"):
         command.extend(["key", str(config["key"])])
     if config.get("ttl") is not None:
@@ -426,6 +459,7 @@ def openwrt_apply_gre_commands(config: dict[str, Any], *, autostart: bool = True
     interface_name = config["interface_name"]
     addr_section = openwrt_gre_addr_section(interface_name)
     outer_ip_version = gre_outer_ip_version(config)
+    local_outer_ip, remote_outer_ip, tunnel_device = gre_outer_address_parts(config)
     proto = "grev6" if outer_ip_version == 6 else "gre"
     local_field = "ip6addr" if outer_ip_version == 6 else "ipaddr"
     remote_field = "peer6addr" if outer_ip_version == 6 else "peeraddr"
@@ -435,8 +469,8 @@ def openwrt_apply_gre_commands(config: dict[str, Any], *, autostart: bool = True
         [
             [uci_command(), "set", f"network.{interface_name}=interface"],
             [uci_command(), "set", f"network.{interface_name}.proto={proto}"],
-            [uci_command(), "set", f"network.{interface_name}.{local_field}={config['outer_local_ip']}"],
-            [uci_command(), "set", f"network.{interface_name}.{remote_field}={config['outer_remote_ip']}"],
+            [uci_command(), "set", f"network.{interface_name}.{local_field}={local_outer_ip}"],
+            [uci_command(), "set", f"network.{interface_name}.{remote_field}={remote_outer_ip}"],
             [uci_command(), "set", f"network.{interface_name}.mtu={config['mtu']}"],
             [uci_command(), "set", f"network.{interface_name}.auto={auto_value}"],
             [uci_command(), "set", f"network.{interface_name}.link42_managed=1"],
@@ -449,6 +483,8 @@ def openwrt_apply_gre_commands(config: dict[str, Any], *, autostart: bool = True
             [uci_command(), "set", f"network.{addr_section}.link42_gre_name={interface_name}"],
         ]
     )
+    if tunnel_device:
+        commands.append([uci_command(), "set", f"network.{interface_name}.tunlink={tunnel_device}"])
     if outer_ip_version == 4:
         commands.append([uci_command(), "set", f"network.{interface_name}.df={'1' if config.get('pmtudisc', True) else '0'}"])
     if config.get("ttl") is not None:

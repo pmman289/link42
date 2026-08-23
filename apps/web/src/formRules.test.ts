@@ -110,6 +110,21 @@ describe("统一表单规则", () => {
 
     expect(issues).toContainEqual({ field: "pmtudisc", message: "填写 GRE TTL 时必须启用路径 MTU 探测" });
   });
+
+  it("GRE 允许 Linux 接口名和带 zone 的 IPv6 链路本地地址", () => {
+    const data = formData({
+      local_interface_name: "gre-prod-a-b",
+      peer_interface_name: "gre-prod-b-a",
+      local_outer_ip: "fe80::1%ens19",
+      peer_outer_ip: "fe80::2%ens19",
+      local_tunnel_ips: "fd42::1/64",
+      peer_tunnel_ips: "fd42::2/64",
+      mtu: "1456",
+      risk_accepted: "on",
+    });
+
+    expect(validateFormData(data, managedGreFormRule, undefined)).toEqual([]);
+  });
 });
 
 /** 构造一份默认合法的受管 WireGuard + udp2raw 表单。 */

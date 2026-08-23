@@ -2427,24 +2427,26 @@ def test_create_gre_managed_connection_supports_nat_outer_mapping() -> None:
     assert tasks[2].payload["outer_remote_ip"] == "1.14.226.49"
 
 
-def test_gre_interface_name_rejects_openwrt_unsafe_values() -> None:
-    """验证 GRE 接口名只允许 OpenWrt 兼容的短下划线名称。"""
+def test_gre_interface_name_uses_linux_limit_and_supports_ipv6_zone() -> None:
+    """验证 GRE 接口名允许连字符和 15 字符上限，并保留 IPv6 zone。"""
 
-    with pytest.raises(ValidationError) as hyphen_error:
-        GreManagedConnectionCreate(
-            peer_node_id=2,
-            local_interface_name="gre-a-b",
-            peer_interface_name="gre_b_a",
-            local_outer_ip="203.0.113.10",
-            peer_outer_ip="198.51.100.20",
-            local_tunnel_ips=["10.42.8.1/30"],
-            peer_tunnel_ips=["10.42.8.2/30"],
-            risk_accepted=True,
-        )
+    payload = GreManagedConnectionCreate(
+        peer_node_id=2,
+        local_interface_name="gre-prod-a-b",
+        peer_interface_name="gre-prod-b-a",
+        local_outer_ip="fe80::1%ens19",
+        peer_outer_ip="fe80::2%ens19",
+        local_tunnel_ips=["fd42::1/64"],
+        peer_tunnel_ips=["fd42::2/64"],
+        risk_accepted=True,
+    )
+    assert payload.local_interface_name == "gre-prod-a-b"
+    assert payload.local_outer_ip == "fe80::1%ens19"
+
     with pytest.raises(ValidationError) as length_error:
         GreManagedConnectionCreate(
             peer_node_id=2,
-            local_interface_name="gre_name_123",
+            local_interface_name="gre-interface-16",
             peer_interface_name="gre_b_a",
             local_outer_ip="203.0.113.10",
             peer_outer_ip="198.51.100.20",
@@ -2453,8 +2455,19 @@ def test_gre_interface_name_rejects_openwrt_unsafe_values() -> None:
             risk_accepted=True,
         )
 
-    assert "GRE interface name can only contain letters, numbers, and underscores" in str(hyphen_error.value)
-    assert "String should have at most 10 characters" in str(length_error.value)
+    assert "String should have at most 15 characters" in str(length_error.value)
+
+    with pytest.raises(ValidationError, match="GRE IPv6 zone must be a valid interface name"):
+        GreManagedConnectionCreate(
+            peer_node_id=2,
+            local_interface_name="gre_a",
+            peer_interface_name="gre_b",
+            local_outer_ip="fe80::1%ens@19",
+            peer_outer_ip="fe80::2%ens19",
+            local_tunnel_ips=["fd42::1/64"],
+            peer_tunnel_ips=["fd42::2/64"],
+            risk_accepted=True,
+        )
 
 
 def test_create_gre_managed_connection_rejects_same_endpoint_outer_mapping() -> None:
