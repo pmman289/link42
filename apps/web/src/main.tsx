@@ -1208,12 +1208,13 @@ function localDateTimeToIso(value: FormDataEntryValue | null): string | null {
 // 计算单条拓扑链路的健康状态。
 function topologySingleEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "inactive" | "unknown" {
   if ([edge.local_status, edge.peer_status].every((status) => status === "stopped" || status === "stopping")) return "inactive";
-  if (edge.local_status !== "running" || edge.peer_status !== "running") return "critical";
-  const statuses = [edge.local_monitor?.status, edge.peer_monitor?.status].filter(Boolean);
-  if (statuses.includes("critical")) return "critical";
-  if (statuses.includes("warning")) return "warning";
-  if (statuses.includes("healthy")) return "healthy";
-  return "unknown";
+  const summaries = [edge.local_monitor, edge.peer_monitor].filter(Boolean) as LinkMonitorSummary[];
+  if (summaries.length === 0) return "unknown";
+
+  // 拓扑线路只根据实际监测数值着色，避免 Agent 状态或过期监测状态误显示为断线。
+  if (summaries.some((summary) => summary.packet_loss > 0)) return "critical";
+  if (summaries.some((summary) => typeof summary.last_latency_ms === "number" && summary.last_latency_ms > 300)) return "warning";
+  return "healthy";
 }
 
 // 返回应参与拓扑状态和监测摘要的链路，主动关闭链路只在没有其它链路时保留。
