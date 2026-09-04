@@ -52,6 +52,8 @@ agent_inputs_newer_than() {
       "$ROOT_DIR/packages/link42_common" \
       "$ROOT_DIR/packages/link42_wireguard" \
       -type f \
+      ! -path '*/__pycache__/*' \
+      ! -name '*.pyc' \
       -newer "$target" \
       -print \
       -quit
