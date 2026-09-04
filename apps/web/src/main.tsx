@@ -13,6 +13,7 @@ import { Tree, type NodeRendererProps } from "react-arborist";
 import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
 import { validateForm } from "./formValidation";
+import { topologyEdgeSummary, topologyEdgeTone } from "./topologyState";
 import {
   linkMonitorFormRule,
   loginFormRule,
@@ -1203,56 +1204,6 @@ function localDateTimeToIso(value: FormDataEntryValue | null): string | null {
     throw new Error("过期时间格式无效");
   }
   return date.toISOString();
-}
-
-// 计算单条拓扑链路的健康状态。
-function topologySingleEdgeTone(edge: TopologyEdge): "healthy" | "warning" | "critical" | "inactive" | "unknown" {
-  if ([edge.local_status, edge.peer_status].every((status) => status === "stopped" || status === "stopping")) return "inactive";
-  const summaries = [edge.local_monitor, edge.peer_monitor].filter(Boolean) as LinkMonitorSummary[];
-  if (summaries.length === 0) return "unknown";
-
-  // 拓扑线路只根据实际监测数值着色，避免 Agent 状态或过期监测状态误显示为断线。
-  if (summaries.some((summary) => summary.packet_loss > 0)) return "critical";
-  if (summaries.some((summary) => typeof summary.last_latency_ms === "number" && summary.last_latency_ms > 300)) return "warning";
-  return "healthy";
-}
-
-// 返回应参与拓扑状态和监测摘要的链路，主动关闭链路只在没有其它链路时保留。
-function topologyOperationalLinks(edge: TopologyDisplayEdge): TopologyEdge[] {
-  const links = edge.links.filter((link) => topologySingleEdgeTone(link) !== "inactive");
-  return links.length > 0 ? links : edge.links;
-}
-
-// 汇总多条合并链路后的拓扑健康状态。
-function topologyEdgeTone(edge: TopologyDisplayEdge): "healthy" | "warning" | "critical" | "inactive" | "unknown" {
-  // 主动关闭的链路不参与其它链路的聚合状态；只有全部链路都关闭时才显示灰色。
-  const tones = edge.links.map(topologySingleEdgeTone).filter((tone) => tone !== "inactive");
-  if (tones.length === 0) return "inactive";
-  if (tones.includes("critical")) return "critical";
-  if (tones.includes("warning")) return "warning";
-  if (tones.includes("unknown")) return "unknown";
-  return "healthy";
-}
-
-// 计算数值列表平均值，空列表返回 null。
-function average(values: number[]) {
-  if (values.length === 0) return null;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-// 生成拓扑边标签中的延迟和丢包摘要；拓扑只关心节点间连接关系，不突出具体协议。
-function topologyEdgeSummary(edge: TopologyDisplayEdge) {
-  if (topologyEdgeTone(edge) === "inactive") return `${edge.link_count > 1 ? `${edge.link_count}条链路 · ` : ""}-- / --`;
-  const summaries = topologyOperationalLinks(edge)
-    .flatMap((link) => [link.local_monitor, link.peer_monitor])
-    .filter(Boolean) as LinkMonitorSummary[];
-  const prefix = edge.link_count > 1 ? `${edge.link_count}条链路 · ` : "";
-  if (summaries.length === 0) return `${prefix}-- / --`;
-  const latencies = summaries
-    .map((summary) => summary.last_latency_ms)
-    .filter((value): value is number => typeof value === "number");
-  const losses = summaries.map((summary) => summary.packet_loss);
-  return `${prefix}${formatLatency(average(latencies))} / ${formatLoss(average(losses))}`;
 }
 
 // 选择拓扑节点展示的首选地址。
