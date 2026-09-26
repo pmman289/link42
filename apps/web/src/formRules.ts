@@ -376,6 +376,7 @@ export const managedWireGuardFormRule: FormRule<ManagedWireGuardFormContext> = {
     field({ name: "udpspeeder_fec_mtu", label: "FEC MTU", validate: integerRule("FEC MTU", 100, 2000) }),
     field({ name: "udpspeeder_fec_queue_len", label: "FEC 队列", validate: integerRule("FEC 队列", 1, 10000) }),
     field({ name: "udpspeeder_decode_buffer", label: "解码缓存", validate: integerRule("解码缓存", 300, 20000) }),
+    field({ name: "udpspeeder_socket_buffer_kib", label: "UDP 接收缓冲", validate: integerRule("UDP 接收缓冲", 10, 10240) }),
   ],
   validate: (values, context) => {
     const issues = validateWireGuardMtu(values, ["local_tunnel_ips", "peer_tunnel_ips"]);

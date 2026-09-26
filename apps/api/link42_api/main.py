@@ -2158,6 +2158,7 @@ def normalize_udpspeeder_config(payload: schemas.UdpSpeederMiddlewareConfig | No
         "fec_mtu": payload.fec_mtu,
         "fec_queue_len": payload.fec_queue_len,
         "decode_buffer": payload.decode_buffer,
+        "socket_buffer_kib": payload.socket_buffer_kib,
     }
 
 
@@ -2531,7 +2532,10 @@ def udpspeeder_endpoint_payloads(
     server_host = middleware.get("server_connect_host") or server_host
     if not server_host or server_interface.listen_port is None:
         raise HTTPException(status_code=400, detail="udpspeeder server requires endpoint address and WireGuard listen port")
-    common = {key: middleware.get(key) for key in ["fec_data", "fec_redundancy", "fec_timeout_ms", "fec_mode", "fec_mtu", "fec_queue_len", "decode_buffer"]}
+    common = {
+        key: middleware.get(key, 4096 if key == "socket_buffer_kib" else None)
+        for key in ["fec_data", "fec_redundancy", "fec_timeout_ms", "fec_mode", "fec_mtu", "fec_queue_len", "decode_buffer", "socket_buffer_kib"]
+    }
     server = {"plugin": "udpspeeder", "instance": instance, "mode": "server", "listen_host": middleware["server_listen_host"], "listen_port": middleware["server_listen_port"], "remote_host": middleware["server_forward_host"], "remote_port": middleware.get("server_forward_port") or server_interface.listen_port, **common}
     client = {"plugin": "udpspeeder", "instance": instance, "mode": "client", "listen_host": middleware["client_listen_host"], "listen_port": middleware["client_listen_port"], "remote_host": server_host, "remote_port": middleware["server_listen_port"], **common}
     return [(server_interface, "middleware.udpspeeder.apply", server), (client_interface, "middleware.udpspeeder.apply", client)]

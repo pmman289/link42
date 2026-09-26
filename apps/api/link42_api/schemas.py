@@ -1337,6 +1337,8 @@ class UdpSpeederMiddlewareConfig(BaseModel):
     fec_mtu: int = Field(default=1400, ge=100, le=2000)
     fec_queue_len: int = Field(default=200, ge=1, le=10000)
     decode_buffer: int = Field(default=2000, ge=300, le=20000)
+    # 高流量时避免 UDP 接收缓冲溢出，单位 KiB。
+    socket_buffer_kib: int = Field(default=4096, ge=10, le=10240)
 
     @model_validator(mode="after")
     def validate_fec_packet_count(self) -> "UdpSpeederMiddlewareConfig":

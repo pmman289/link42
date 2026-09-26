@@ -132,6 +132,7 @@
 | `fec_mtu` | 100-2000，用于承载 MTU 1280 的 IPv6 WireGuard 加密报文 | `1400` |
 | `fec_queue_len` | 1-10000；mode 0 下设置为 1 可尽快发送 | `200` |
 | `decode_buffer` | 300-20000 | `2000` |
+| `socket_buffer_kib` | 10-10240；UDP socket 接收/发送缓冲目标，单位 KiB | `4096` |
 | `delay_capacity` | 0-20000，0 表示由 UDPspeeder 默认处理 | `0` |
 | `socket_buffer_kib` | 64-10240 | `1024` |
 | `disable_obscure` | 是否关闭非安全性的报文混淆 | `false` |

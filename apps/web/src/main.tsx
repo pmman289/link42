@@ -243,6 +243,7 @@ type UdpSpeederMiddleware = {
   fec_mtu: number;
   fec_queue_len: number;
   decode_buffer: number;
+  socket_buffer_kib: number;
 };
 
 type Udp2RawMiddleware = {
@@ -2124,6 +2125,7 @@ function UdpSpeederFields({
       <Field label="FEC MTU" hint="允许 100-2000；默认 1400，用于承载 IPv6 WireGuard 报文。"><input name="udpspeeder_fec_mtu" defaultValue={defaults?.fec_mtu ?? 1400} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="发送队列长度" hint="允许 1-10000；设置为 1 可让 mode 0 尽快发送。"><input name="udpspeeder_fec_queue_len" defaultValue={defaults?.fec_queue_len ?? 200} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="解码缓存大小" hint="允许 300-20000。"><input name="udpspeeder_decode_buffer" defaultValue={defaults?.decode_buffer ?? 2000} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="UDP 接收缓冲（KiB）" hint="允许 10-10240；高流量链路建议 4096，启动时会自动提升系统缓冲上限。"><input name="udpspeeder_socket_buffer_kib" defaultValue={defaults?.socket_buffer_kib ?? 4096} inputMode="numeric" disabled={disabled} /></Field>
       <div className="formNotice wideField">数据流：WireGuard → 本地 UDPspeeder client → 网络 → UDPspeeder server → 服务端 WireGuard。</div>
     </FormSection>
     </div>
@@ -2137,7 +2139,7 @@ function readUdpSpeederForm(form: FormData, localListenPort?: number | null, pee
   const serverWireGuardPort = side === "local" ? localListenPort : peerListenPort;
   const fec = String(form.get("udpspeeder_fec") || "10:5").split(":");
   if (fec.length !== 2) throw new Error("FEC 数据:冗余必须使用 data:redundancy 格式");
-  return { enabled: true, server_side: side, server_listen_host: String(form.get("udpspeeder_server_listen_host") || "0.0.0.0").trim(), server_connect_host: String(form.get("udpspeeder_server_connect_host") || "").trim() || null, server_listen_port: optionalInt(form.get("udpspeeder_server_listen_port"), "UDPspeeder 服务端口"), server_forward_host: String(form.get("udpspeeder_server_forward_host") || "127.0.0.1").trim(), server_forward_port: optionalInt(form.get("udpspeeder_server_forward_port"), "UDPspeeder 转发端口") ?? serverWireGuardPort, client_listen_host: String(form.get("udpspeeder_client_listen_host") || "127.0.0.1").trim(), client_listen_port: optionalInt(form.get("udpspeeder_client_listen_port"), "UDPspeeder 客户端端口") ?? serverWireGuardPort ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT, fec_data: Number(fec[0]), fec_redundancy: Number(fec[1]), fec_timeout_ms: optionalInt(form.get("udpspeeder_fec_timeout_ms"), "FEC 超时") ?? 8, fec_mode: Number(form.get("udpspeeder_fec_mode") || 0), fec_mtu: optionalInt(form.get("udpspeeder_fec_mtu"), "FEC MTU") ?? 1400, fec_queue_len: optionalInt(form.get("udpspeeder_fec_queue_len"), "FEC 队列") ?? 200, decode_buffer: optionalInt(form.get("udpspeeder_decode_buffer"), "解码缓存") ?? 2000 };
+  return { enabled: true, server_side: side, server_listen_host: String(form.get("udpspeeder_server_listen_host") || "0.0.0.0").trim(), server_connect_host: String(form.get("udpspeeder_server_connect_host") || "").trim() || null, server_listen_port: optionalInt(form.get("udpspeeder_server_listen_port"), "UDPspeeder 服务端口"), server_forward_host: String(form.get("udpspeeder_server_forward_host") || "127.0.0.1").trim(), server_forward_port: optionalInt(form.get("udpspeeder_server_forward_port"), "UDPspeeder 转发端口") ?? serverWireGuardPort, client_listen_host: String(form.get("udpspeeder_client_listen_host") || "127.0.0.1").trim(), client_listen_port: optionalInt(form.get("udpspeeder_client_listen_port"), "UDPspeeder 客户端口") ?? serverWireGuardPort ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT, fec_data: Number(fec[0]), fec_redundancy: Number(fec[1]), fec_timeout_ms: optionalInt(form.get("udpspeeder_fec_timeout_ms"), "FEC 超时") ?? 8, fec_mode: Number(form.get("udpspeeder_fec_mode") || 0), fec_mtu: optionalInt(form.get("udpspeeder_fec_mtu"), "FEC MTU") ?? 1400, fec_queue_len: optionalInt(form.get("udpspeeder_fec_queue_len"), "FEC 队列") ?? 200, decode_buffer: optionalInt(form.get("udpspeeder_decode_buffer"), "解码缓存") ?? 2000, socket_buffer_kib: optionalInt(form.get("udpspeeder_socket_buffer_kib"), "UDP 接收缓冲") ?? 4096 };
 }
 
 // 从表单中读取并组装 udp2raw 配置。

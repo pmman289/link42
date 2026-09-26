@@ -34,6 +34,7 @@ def test_udpspeeder_renders_ipv6_client_arguments() -> None:
             "fec_mtu": 1250,
             "fec_queue_len": 200,
             "decode_buffer": 2000,
+            "socket_buffer_kib": 4096,
         }
     )
     assert args[:6] == ["-c", "-l", "127.0.0.1:24002", "-r", "[2001:db8::20]:24000", "-f"]
@@ -57,6 +58,7 @@ def test_udpspeeder_rejects_domain_and_invalid_fec() -> None:
         "fec_mtu": 1250,
         "fec_queue_len": 200,
         "decode_buffer": 2000,
+        "socket_buffer_kib": 4096,
     }
     with pytest.raises(ValueError):
         udpspeeder.render_udpspeeder_args(payload)
@@ -83,12 +85,13 @@ def test_udpspeeder_accepts_upstream_parameter_boundaries() -> None:
         "fec_mtu": 100,
         "fec_queue_len": 1,
         "decode_buffer": 300,
+        "socket_buffer_kib": 10,
     }
 
     config = udpspeeder.validate_udpspeeder_payload(payload)
 
     assert config["fec_timeout_ms"] == 0
-    assert udpspeeder.render_udpspeeder_args(payload)[-4:] == ["-q", "1", "--decode-buf", "300"]
+    assert udpspeeder.render_udpspeeder_args(payload)[-6:] == ["-q", "1", "--decode-buf", "300", "--sock-buf", "10"]
 
 
 def test_udpspeeder_rejects_fec_packet_count_above_upstream_limit() -> None:
@@ -108,6 +111,7 @@ def test_udpspeeder_rejects_fec_packet_count_above_upstream_limit() -> None:
         "fec_mtu": 100,
         "fec_queue_len": 1,
         "decode_buffer": 300,
+        "socket_buffer_kib": 10,
     }
 
     with pytest.raises(ValueError, match="less than or equal to 255"):
@@ -124,6 +128,7 @@ def test_udpspeeder_schema_accepts_upstream_parameter_boundaries() -> None:
         fec_mtu=100,
         fec_queue_len=1,
         decode_buffer=300,
+        socket_buffer_kib=10,
     )
 
     assert config.fec_timeout_ms == 0
@@ -164,12 +169,15 @@ def test_udpspeeder_endpoint_payloads_create_server_and_client_roles() -> None:
         "fec_mtu": 1250,
         "fec_queue_len": 200,
         "decode_buffer": 2000,
+        "socket_buffer_kib": 4096,
     }
     payloads = udpspeeder_endpoint_payloads(middleware, local, peer, None, "198.51.100.20")
     assert [item[0].id for item in payloads] == [12, 11]
     assert [item[1] for item in payloads] == ["middleware.udpspeeder.apply"] * 2
     assert [item[2]["mode"] for item in payloads] == ["server", "client"]
     assert payloads[1][2]["remote_host"] == "198.51.100.20"
+    assert payloads[0][2]["socket_buffer_kib"] == 4096
+    assert payloads[1][2]["socket_buffer_kib"] == 4096
 
 
 def test_udpspeeder_allows_client_wireguard_without_listen_port() -> None:
@@ -237,6 +245,7 @@ def test_udpspeeder_client_defaults_to_server_wireguard_port() -> None:
     )
     assert middleware is not None
     assert middleware["client_listen_port"] == 51820
+    assert middleware["socket_buffer_kib"] == 4096
 
 
 def test_udpspeeder_systemd_unit_loads_agent_environment(tmp_path, monkeypatch) -> None:
@@ -266,3 +275,25 @@ def test_udpspeeder_start_and_stop_return_task_result_objects(monkeypatch) -> No
         "changed": True,
         "commands": [{"command": ["systemctl"]}],
     }
+
+
+def test_udpspeeder_service_rebuilds_args_for_legacy_config(tmp_path, monkeypatch) -> None:
+    """验证旧版实例重启时会补上新的 socket 缓冲参数。"""
+
+    config_dir = tmp_path / "udpspeeder"
+    config_dir.mkdir()
+    (config_dir / "legacy.json").write_text(
+        '{"instance":"legacy","mode":"client","listen_host":"127.0.0.1",'
+        '"listen_port":24002,"remote_host":"198.51.100.20","remote_port":24000,'
+        '"fec_data":10,"fec_redundancy":5,"fec_timeout_ms":8,"fec_mode":0,'
+        '"fec_mtu":1400,"fec_queue_len":200,"decode_buffer":2000,"args":[]}',
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(udpspeeder, "UDPSPEEDER_DIR", config_dir)
+    monkeypatch.setattr(udpspeeder, "ensure_udpspeeder_socket_buffer_limit", lambda value: captured.update(buffer=value))
+    monkeypatch.setattr(udpspeeder.os, "execv", lambda path, args: captured.update(path=path, args=args))
+
+    assert udpspeeder.run_udpspeeder_service_command(["agent", "udpspeeder-client-start", "legacy"])
+    assert captured["buffer"] == 4096
+    assert captured["args"][-2:] == ["--sock-buf", "4096"]

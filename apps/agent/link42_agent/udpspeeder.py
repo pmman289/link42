@@ -20,6 +20,9 @@ UDPSPEEDER_BIN = Path(os.getenv("LINK42_UDPSPEEDER_BIN", "/usr/local/bin/udpspee
 UDPSPEEDER_DIR = Path(os.getenv("LINK42_UDPSPEEDER_CONFIG_DIR", "/etc/link42/middleware/udpspeeder"))
 UDPSPEEDER_PREFIX = os.getenv("LINK42_UDPSPEEDER_SERVICE_PREFIX", "link42-udpspeeder")
 MAX_FEC_PACKET_COUNT = 255
+DEFAULT_SOCKET_BUFFER_KIB = 4096
+MIN_SOCKET_BUFFER_KIB = 10
+MAX_SOCKET_BUFFER_KIB = 10240
 
 
 def validate_udpspeeder_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -31,8 +34,8 @@ def validate_udpspeeder_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("udpspeeder mode must be client or server")
     listen = _endpoint(payload.get("listen_host"), payload.get("listen_port"), "listen")
     remote = _endpoint(payload.get("remote_host"), payload.get("remote_port"), "remote")
-    for name, minimum, maximum in [("fec_data", 1, 255), ("fec_redundancy", 0, 254), ("fec_timeout_ms", 0, 1000), ("fec_mode", 0, 1), ("fec_mtu", 100, 2000), ("fec_queue_len", 1, 10000), ("decode_buffer", 300, 20000)]:
-        value = int(payload.get(name))
+    for name, minimum, maximum in [("fec_data", 1, 255), ("fec_redundancy", 0, 254), ("fec_timeout_ms", 0, 1000), ("fec_mode", 0, 1), ("fec_mtu", 100, 2000), ("fec_queue_len", 1, 10000), ("decode_buffer", 300, 20000), ("socket_buffer_kib", MIN_SOCKET_BUFFER_KIB, MAX_SOCKET_BUFFER_KIB)]:
+        value = int(payload.get(name, DEFAULT_SOCKET_BUFFER_KIB if name == "socket_buffer_kib" else None))
         if not minimum <= value <= maximum:
             raise ValueError(f"{name} must be between {minimum} and {maximum}")
     if int(payload.get("fec_data")) + int(payload.get("fec_redundancy")) > MAX_FEC_PACKET_COUNT:
@@ -51,6 +54,7 @@ def validate_udpspeeder_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "fec_mtu": int(payload.get("fec_mtu")),
         "fec_queue_len": int(payload.get("fec_queue_len")),
         "decode_buffer": int(payload.get("decode_buffer")),
+        "socket_buffer_kib": int(payload.get("socket_buffer_kib", DEFAULT_SOCKET_BUFFER_KIB)),
     }
 
 
@@ -90,6 +94,8 @@ def render_udpspeeder_args(payload: dict[str, Any]) -> list[str]:
         str(config["fec_queue_len"]),
         "--decode-buf",
         str(config["decode_buffer"]),
+        "--sock-buf",
+        str(config["socket_buffer_kib"]),
     ]
 
 
@@ -295,8 +301,31 @@ def run_udpspeeder_service_command(argv: list[str]) -> bool:
     instance = validate_instance_name(argv[2], "udpspeeder instance")
     mode = "server" if argv[1] == "udpspeeder-server-start" else "client"
     path = managed_child_path(UDPSPEEDER_DIR, f"{instance}.json")
-    config = json.loads(path.read_text(encoding="utf-8"))
-    if config.get("mode") != mode:
+    stored_config = json.loads(path.read_text(encoding="utf-8"))
+    if stored_config.get("mode") != mode:
         raise ValueError("udpspeeder service mode does not match configuration")
-    os.execv(str(UDPSPEEDER_BIN), [str(UDPSPEEDER_BIN), *config["args"]])
+    # 启动时重新渲染参数，确保旧版本保存的配置也获得新的缓冲参数。
+    config = validate_udpspeeder_payload(stored_config)
+    ensure_udpspeeder_socket_buffer_limit(config["socket_buffer_kib"])
+    os.execv(str(UDPSPEEDER_BIN), [str(UDPSPEEDER_BIN), *render_udpspeeder_args(config)])
     return True
+
+
+def ensure_udpspeeder_socket_buffer_limit(socket_buffer_kib: int) -> None:
+    """确保 UDP 接收缓冲上限足以支持 UDPspeeder 的配置。"""
+
+    if not MIN_SOCKET_BUFFER_KIB <= socket_buffer_kib <= MAX_SOCKET_BUFFER_KIB:
+        raise ValueError("socket_buffer_kib is outside the supported range")
+    target = socket_buffer_kib * 1024
+    for name in ("rmem_max", "wmem_max"):
+        path = Path(f"/proc/sys/net/core/{name}")
+        try:
+            current = int(path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            continue
+        if current >= target:
+            continue
+        result = run_command(["sysctl", "-w", f"net.core.{name}={target}"], allow_failure=True)
+        if result.get("returncode") != 0:
+            # 不能修改系统上限时仍允许服务启动，避免破坏原有连接。
+            continue
