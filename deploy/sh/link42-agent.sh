@@ -1,8 +1,15 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_URL="https://get.pmman.tech/sh/link42-agent.sh"
-RES_BASE_URL="${LINK42_RES_BASE_URL:-https://get.pmman.tech/res/link42}"
+SCRIPT_URL="${LINK42_INSTALL_SCRIPT_URL:-}"
+SERVER_URL="${LINK42_SERVER_URL:-}"
+if [ -z "$SERVER_URL" ] && [ -n "$SCRIPT_URL" ]; then
+  SERVER_URL="$(printf '%s' "$SCRIPT_URL" | sed -E 's#(https?://[^/]+).*#\1#')"
+fi
+if [ -z "$SCRIPT_URL" ] && [ -n "$SERVER_URL" ]; then
+  SCRIPT_URL="${SERVER_URL%/}/api/agent/install.sh"
+fi
+RES_BASE_URL="${LINK42_RES_BASE_URL:-}"
 AGENT_VERSION="${LINK42_AGENT_VERSION:-latest}"
 INSTALL_DIR="${LINK42_INSTALL_DIR:-/opt/link42-agent}"
 BIN_PATH="${LINK42_AGENT_BIN:-/usr/local/bin/link42-agent}"
@@ -52,7 +59,7 @@ is_musl_system() {
 run_as_root_hint() {
   cat >&2 <<EOF
 Usage:
-  curl -fsSL $SCRIPT_URL | sudo env \\
+  curl -fsSL "${SCRIPT_URL:-<主控地址>/api/agent/install.sh}" | sudo env \\
     LINK42_SERVER_URL=http://controller:8000 \\
     LINK42_NODE_ID=1 \\
     LINK42_AGENT_TOKEN=token \\
@@ -321,10 +328,29 @@ download_agent() {
   tmp_sha="$(mktemp "${TMPDIR:-/tmp}/link42-agent.sha256.XXXXXX")"
   trap 'rm -f "$tmp_file" "$tmp_sha"' EXIT HUP INT TERM
 
-  if [ "$AGENT_VERSION" = "latest" ]; then
-    url="$RES_BASE_URL/$AGENT_FILE"
+  platform="linux-x64"
+  [ "$AGENT_INSTALL_MODE" = "source" ] && platform="openwrt-source"
+  if [ -n "$RES_BASE_URL" ]; then
+    if [ "$AGENT_VERSION" = "latest" ]; then
+      url="$RES_BASE_URL/$AGENT_FILE"
+    else
+      url="$RES_BASE_URL/$AGENT_VERSION/$AGENT_FILE"
+    fi
+    sha_url="$url.sha256"
   else
-    url="$RES_BASE_URL/$AGENT_VERSION/$AGENT_FILE"
+    need_env LINK42_SERVER_URL
+    release_version="$AGENT_VERSION"
+    if [ "$release_version" = "latest" ]; then
+      manifest_url="${LINK42_SERVER_URL%/}/api/agent/releases"
+      if command -v curl >/dev/null 2>&1; then
+        release_version="$(curl -fsSL "$manifest_url" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("latest") or "")')"
+      else
+        release_version="$(wget -qO- "$manifest_url" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("latest") or "")')"
+      fi
+      [ -n "$release_version" ] || fail "主控没有可用的 Agent release"
+    fi
+    url="${LINK42_SERVER_URL%/}/api/agent/releases/$release_version/download?platform=$platform"
+    sha_url="${LINK42_SERVER_URL%/}/api/agent/releases/$release_version/sha256?platform=$platform"
   fi
 
   log "downloading $url"
@@ -336,14 +362,16 @@ download_agent() {
     fail "curl or wget is required to download the agent"
   fi
 
-  sha_url="$url.sha256"
   command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required to verify the downloaded agent"
   if command -v curl >/dev/null 2>&1; then
     curl -fsL "$sha_url" -o "$tmp_sha" || fail "failed to download agent checksum: $sha_url"
   elif command -v wget >/dev/null 2>&1; then
     wget -q -O "$tmp_sha" "$sha_url" || fail "failed to download agent checksum: $sha_url"
   fi
-  expected="$(awk 'NR == 1 {print $1}' "$tmp_sha")"
+  case "$sha_url" in
+    */sha256\?*) expected="$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([0-9A-Fa-f]*\)".*/\1/p' "$tmp_sha" | head -n 1)" ;;
+    *) expected="$(awk 'NR == 1 {print $1}' "$tmp_sha")" ;;
+  esac
   case "$expected" in
     *[!0-9a-fA-F]*|'') fail "invalid sha256 file for downloaded agent" ;;
   esac

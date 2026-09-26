@@ -545,10 +545,12 @@ def machine_endian() -> str:
     return "le" if os.sys.byteorder == "little" else "be"
 
 
-def download_asset(config: AgentConfig, asset: str, target: Path) -> None:
-    """从主控下载中间层内置二进制资产并原子替换目标文件。"""
+def download_asset(config: AgentConfig, asset: str, target: Path, plugin: str = "udp2raw") -> None:
+    """从主控下载指定中间层资产并原子替换目标文件。"""
 
-    url = f"/api/agent/plugins/udp2raw/assets/{asset}"
+    if plugin not in {"udp2raw", "udpspeeder"}:
+        raise ValueError("unsupported middleware asset plugin")
+    url = f"/api/agent/plugins/{plugin}/assets/{asset}"
     fd, tmp_name = tempfile.mkstemp(prefix="udp2raw-", dir=str(target.parent))
     try:
         with request.urlopen(f"{config.server_url}{url}", timeout=60) as response:

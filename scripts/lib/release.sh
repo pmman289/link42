@@ -11,9 +11,6 @@ link42_load_release_env() {
   [[ -f "$env_file" ]] || return 0
 
   local vars=(
-    LINK42_PUBLIC_HOST
-    LINK42_PUBLIC_ROOT
-    LINK42_PUBLIC_BASE_URL
     IMAGE_REPO
     IMAGE_TAG
     IMAGE_NAME
@@ -22,8 +19,6 @@ link42_load_release_env() {
     LOCAL_VERIFY
     TEST_CONTAINER
     TEST_VOLUME
-    SKIP_AGENT_PUBLIC
-    SKIP_CONTROLLER
     SKIP_BUILD
     SKIP_PREPARE_AGENT_RELEASES
     REBUILD_AGENT_RELEASES

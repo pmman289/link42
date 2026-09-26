@@ -85,8 +85,8 @@
   - Alpine/OpenRC 使用 `rc-service`、`rc-update`。
   - OpenWrt 路径偏向 UCI/network 配置、`ifup/ifdown`。
 - 已添加 x64 Agent 单文件二进制构建脚本 `scripts/agent/build-x64.sh`。
-- 已添加 Agent 一键安装脚本 `deploy/sh/link42-agent.sh`，预期发布到 `https://get.pmman.tech/sh/link42-agent.sh`。
-- 前端节点安装命令已经改为使用上述安装脚本，并从 `https://get.pmman.tech/res/link42/` 下载二进制资源。
+- 已添加 Agent 一键安装脚本 `deploy/sh/link42-agent.sh`，由主控 `/api/agent/install.sh` 分发。
+- 前端节点安装命令使用当前主控的 `/api/agent/releases/` 下载二进制资源。
 - Git 仓库已初始化并推送过 first commit；远端为 `git@github.com:pmman289/link42.git`，提交身份为 `pmman <me@pmman.tech>`。
 
 ## 当前未完成或刚提出的需求
@@ -140,7 +140,7 @@ scripts/agent/build-x64.sh
 Agent 安装脚本发布后，前端展示的命令形如：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_SERVER_URL='http://controller:8000' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo env LINK42_SERVER_URL='https://your-link42-controller.example.com' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh
 ```
 
 ## 注意事项

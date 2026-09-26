@@ -1,10 +1,10 @@
 # Link42 全流程构建与 DockerHub 推送
 
-本文面向专门负责构建发布的 Agent。目标是完成：
+本文面向负责构建发布的人员。目标是完成：
 
 1. 构建兼容旧系统的 `link42-agent` 二进制。
 2. 生成 Agent release manifest 和校验文件。
-3. 构建内置 Web、API、udp2raw 资产、Agent release manifest 的主控镜像。
+3. 构建内置 Web、API、udp2raw/UDPspeeder 资产、Agent release manifest 的主控镜像。
 4. 推送到 DockerHub：`pmman/link42:tagname` 和 `pmman/link42:latest`。
 5. 必要时导出镜像给其它机器离线运行。
 
@@ -107,9 +107,7 @@ find dist/controller-agent-releases -maxdepth 1 -type f -print
 cat dist/controller-agent-releases/manifest.json
 ```
 
-如果第 2 步已经构建 Agent，`dist/controller-agent-releases` 会包含二进制、源码包、sha256 和 manifest。
-
-如果没有构建 Agent，该目录只会生成空 release manifest。主控仍可构建和运行，但前端升级计划会回退为手动升级命令，不能一键自升级。
+该脚本会检查当前 Agent 源码和已有产物；缺少产物或产物过期时会自动执行 x64 二进制和 OpenWrt 源码包构建，随后将它们复制到 `dist/controller-agent-releases`。
 
 ## 4. 构建主控 Docker 镜像
 
@@ -129,6 +127,8 @@ pmman/link42:<IMAGE_TAG>
 - React Web 构建产物。
 - `wireguard-tools`。
 - `udp2raw_sh/udp2raw_bin`，用于 Agent 安装 udp2raw 中间层。
+- `plugins/udpspeeder/assets`，用于 Agent 安装 UDPspeeder 中间层。
+- `deploy/sh/link42-agent.sh`，用于主控提供 Agent 安装脚本。
 - `dist/controller-agent-releases`，用于 Agent 自升级资产。
 
 镜像内重要目录：
@@ -136,6 +136,8 @@ pmman/link42:<IMAGE_TAG>
 ```text
 /opt/link42/web
 /opt/link42/plugins/udp2raw/assets
+/opt/link42/plugins/udpspeeder/assets
+/opt/link42/deploy/sh/link42-agent.sh
 /opt/link42/releases/agent
 /link42/data
 /link42/config
@@ -199,65 +201,37 @@ docker run -d \
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-## 7. 发布 Agent 安装脚本和外部二进制资源
+## 7. 验证主控提供的 Agent 资源
 
 前端节点安装命令默认使用：
 
 ```text
-https://get.pmman.tech/sh/link42-agent.sh
-https://get.pmman.tech/res/link42
+https://your-link42-controller.example.com/api/agent/install.sh
+https://your-link42-controller.example.com/api/agent/releases
 ```
 
-详细的静态站点发布、验证、节点安装、卸载和回滚流程见：
+节点安装、卸载和回滚流程见：
 
 ```text
 docs/agent-public-deployment.md
 ```
 
-需要同步发布：
+安装脚本和 release 资源已经随主控镜像发布。OpenWrt 安装脚本会从主控下载：
 
 ```text
-deploy/sh/link42-agent.sh
-dist/agent/link42-agent-linux-x64
-dist/agent/link42-agent-linux-x64.sha256
-dist/agent/link42-agent-source.tar.gz
-dist/agent/link42-agent-source.tar.gz.sha256
-dist/agent/<agent_version>/link42-agent-linux-x64
-dist/agent/<agent_version>/link42-agent-linux-x64.sha256
-dist/agent/<agent_version>/link42-agent-source.tar.gz
-dist/agent/<agent_version>/link42-agent-source.tar.gz.sha256
+https://your-link42-controller.example.com/api/agent/releases/<version>/download?platform=openwrt-source
 ```
 
-OpenWrt 安装脚本会固定下载：
-
-```text
-https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
-```
-
-如果该文件缺失，OpenWrt 节点安装会在下载阶段报 404。
+如果主控镜像内没有对应资源，OpenWrt 节点安装会在下载阶段报 404。
 
 当前安装脚本下载规则：
 
 - `LINK42_AGENT_VERSION=latest`：
-  - `$LINK42_RES_BASE_URL/link42-agent-linux-x64`
-  - `$LINK42_RES_BASE_URL/link42-agent-source.tar.gz`
+  - `/api/agent/releases/<version>/download?platform=linux-x64`
+  - `/api/agent/releases/<version>/download?platform=openwrt-source`
 - `LINK42_AGENT_VERSION=0.2.0`：
-  - `$LINK42_RES_BASE_URL/0.2.0/link42-agent-linux-x64`
-  - `$LINK42_RES_BASE_URL/0.2.0/link42-agent-source.tar.gz`
-
-发布到对象存储或静态站点时，目录结构应保持一致：
-
-```text
-res/link42/link42-agent-linux-x64
-res/link42/link42-agent-linux-x64.sha256
-res/link42/link42-agent-source.tar.gz
-res/link42/link42-agent-source.tar.gz.sha256
-res/link42/0.2.0/link42-agent-linux-x64
-res/link42/0.2.0/link42-agent-linux-x64.sha256
-res/link42/0.2.0/link42-agent-source.tar.gz
-res/link42/0.2.0/link42-agent-source.tar.gz.sha256
-sh/link42-agent.sh
-```
+  - `/api/agent/releases/0.2.0/download?platform=linux-x64`
+  - `/api/agent/releases/0.2.0/download?platform=openwrt-source`
 
 ## 8. 发布后验证
 
@@ -285,15 +259,16 @@ curl -fsS http://127.0.0.1:8000/api/agent/releases
 
 `/api/auth/me` 未登录时返回 401 属于正常现象。`/api/agent/releases` 应返回 manifest。
 
-检查公网 Agent 资产，尤其是 OpenWrt 源码包：
+检查主控提供的 Agent 资源，尤其是 OpenWrt 源码包和中间层资产：
 
 ```bash
-curl -fsSI https://get.pmman.tech/res/link42/link42-agent-linux-x64
-curl -fsSI https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
-curl -fsS https://get.pmman.tech/res/link42/link42-agent-source.tar.gz.sha256
+curl -fsS https://your-link42-controller.example.com/api/agent/releases
+curl -fsS -o /dev/null https://your-link42-controller.example.com/api/agent/install.sh
+curl -fsS -o /dev/null https://your-link42-controller.example.com/api/agent/plugins/udp2raw/assets/udp2raw_amd64
+curl -fsS -o /dev/null https://your-link42-controller.example.com/api/agent/plugins/udpspeeder/assets/udpspeeder-x64-static
 ```
 
-以上任一命令返回 404 都说明静态站点发布不完整。
+以上任一命令返回 404 都说明主控镜像资源不完整或 `LINK42_AGENT_RELEASE_DIR` 覆盖目录缺少文件。
 
 清理测试容器：
 

@@ -556,6 +556,12 @@ def test_agent_task_registry_keeps_wireguard_handlers() -> None:
         assert task_type in TASK_HANDLERS
 
 
+def test_summarize_task_result_accepts_command_result_lists() -> None:
+    """验证 stop/start 返回的命令结果列表不会阻断任务上报。"""
+
+    assert main.summarize_task_result([{"returncode": 0}]) == {"type": "list", "items": 1}
+
+
 def test_gre_capability_depends_on_iproute2(monkeypatch) -> None:
     """验证 Agent 只有检测到 iproute2 GRE 能力时才上报 GRE。"""
 
@@ -1910,6 +1916,26 @@ def test_agent_install_script_openwrt_init_defines_rc_common_hooks() -> None:
     assert "stop_service()" in script
     assert "reload_service()" in script
     assert "status_service()" in script
+
+
+def test_agent_install_script_uses_controller_release_api_by_default() -> None:
+    """验证安装脚本默认从当前主控获取 release，不依赖外部资源站。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+    assert "api/agent/releases" in script
+    assert "LINK42_SERVER_URL" in script
+    assert "get.pmman.tech" not in script
+    assert 'sed -n \'s/.*"sha256"' in script
+
+
+def test_udp2raw_installer_uses_controller_asset_endpoint() -> None:
+    """验证 udp2raw 安装脚本默认使用主控资产接口并拒绝空下载地址。"""
+
+    script = Path("udp2raw_sh/udp2raw.sh").read_text(encoding="utf-8")
+    assert "/api/agent/plugins/udp2raw/assets" in script
+    assert "LINK42_SERVER_URL" in script
+    assert "UDP2RAW_BIN_DIR_URL" in script
+    assert "请设置 LINK42_SERVER_URL 或 UDP2RAW_BIN_DIR_URL" in script
 
 
 def test_agent_install_script_openwrt_checks_split_python_https_packages() -> None:

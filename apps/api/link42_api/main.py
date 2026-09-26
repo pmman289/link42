@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import hashlib
@@ -20,7 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from link42_common.connection_types import (
@@ -482,12 +483,15 @@ def is_api_auth_exempt(path: str) -> bool:
         "/api/agent/tasks/poll",
         "/api/agent/link-monitors/poll",
         "/api/agent/link-monitors/result",
+        "/api/agent/install.sh",
+        "/api/agent/releases",
     }:
         return True
     return (
         re.fullmatch(r"/api/agent/tasks/\d+/result", path) is not None
         or path.startswith("/api/agent/releases/")
         or path.startswith("/api/agent/plugins/udp2raw/assets/")
+        or path.startswith("/api/agent/plugins/udpspeeder/assets/")
     )
 
 
@@ -1913,13 +1917,15 @@ def controller_url_for_agent(db: Session) -> str:
 def build_agent_manual_upgrade_command(node: models.Node, target_version: str | None, db: Session) -> str:
     """生成旧 Agent 可执行的覆盖安装命令。"""
 
+    controller_url = controller_url_for_agent(db)
+    install_script_url = settings.agent_install_script_url or f"{controller_url}/api/agent/install.sh"
     env_values = {
+        "LINK42_SERVER_URL": controller_url,
         "LINK42_AGENT_VERSION": target_version or "latest",
-        "LINK42_RES_BASE_URL": settings.agent_res_base_url,
     }
     env_parts = [f"{key}={shlex.quote(value)}" for key, value in env_values.items()]
     privilege_prefix = "" if str((node.agent_platform or {}).get("service_manager") or "") == "openwrt-uci" else "sudo "
-    return f"curl -fsSL {shlex.quote(settings.agent_install_script_url)} | {privilege_prefix}env {' '.join(env_parts)} sh"
+    return f"curl -fsSL {shlex.quote(install_script_url)} | {privilege_prefix}env {' '.join(env_parts)} sh"
 
 
 def build_agent_upgrade_plan(
@@ -2088,6 +2094,12 @@ def require_udp2raw_supported(node: models.Node) -> None:
         require_task_supported(node, task_type)
 
 
+def require_udpspeeder_supported(node: models.Node) -> None:
+    """要求节点 Agent 支持 UDPspeeder 中间层。"""
+
+    require_task_supported(node, "middleware.install")
+
+
 def require_udp2raw_mode_supported(node: models.Node, raw_mode: str) -> None:
     """要求节点 Agent 支持所选 udp2raw 传输模式。"""
 
@@ -2118,17 +2130,59 @@ def normalize_mimic_config(payload: schemas.MimicMiddlewareConfig | None) -> dic
     }
 
 
+def normalize_udpspeeder_config(payload: schemas.UdpSpeederMiddlewareConfig | None) -> dict | None:
+    """清洗 UDPspeeder 配置，未启用时返回 None。"""
+
+    if payload is None or not payload.enabled:
+        return None
+    if payload.server_listen_port is None or payload.client_listen_port is None:
+        raise HTTPException(status_code=400, detail="udpspeeder server and client listen ports are required")
+    if payload.server_side == "peer" and payload.server_connect_host is None:
+        raise HTTPException(status_code=400, detail="udpspeeder server endpoint address is required")
+    return {
+        "type": "udpspeeder",
+        "enabled": True,
+        "server_side": payload.server_side,
+        "server_listen_host": payload.server_listen_host,
+        "server_connect_host": payload.server_connect_host,
+        "server_listen_port": payload.server_listen_port,
+        "server_forward_host": payload.server_forward_host,
+        "server_forward_port": payload.server_forward_port,
+        "client_listen_host": payload.client_listen_host,
+        "client_listen_port": payload.client_listen_port,
+        "fec_data": payload.fec_data,
+        "fec_redundancy": payload.fec_redundancy,
+        "fec_timeout_ms": payload.fec_timeout_ms,
+        "fec_mode": payload.fec_mode,
+        "fec_mtu": payload.fec_mtu,
+        "fec_queue_len": payload.fec_queue_len,
+        "decode_buffer": payload.decode_buffer,
+    }
+
+
+def udpspeeder_effective_wireguard_mtu(middleware: dict | None, mtu: int | None) -> int | None:
+    """返回兼容 IPv4/IPv6 WireGuard 流量的 UDPspeeder 有效 MTU。"""
+
+    if not middleware or middleware.get("type") != "udpspeeder":
+        return mtu
+    # WireGuard IPv6 不能低于 1280；取 1280 可让 IPv6 正常工作，同时为外层
+    # IPv6/UDP、WireGuard 加密头和 UDPspeeder 封装保留空间。
+    return 1280
+
+
 def normalize_middleware_config(
     udp2raw_payload: schemas.Udp2RawMiddlewareConfig | None,
     mimic_payload: schemas.MimicMiddlewareConfig | None,
+    udpspeeder_payload: schemas.UdpSpeederMiddlewareConfig | None = None,
 ) -> dict | None:
     """统一清洗连接中间层配置；一次只能启用一种中间层。"""
 
     udp2raw = normalize_udp2raw_config(udp2raw_payload)
+    udpspeeder = normalize_udpspeeder_config(udpspeeder_payload)
     mimic = normalize_mimic_config(mimic_payload)
-    if udp2raw and mimic:
+    if sum(bool(item) for item in [udp2raw, udpspeeder, mimic]) > 1:
         raise HTTPException(status_code=400, detail="only one middleware can be enabled")
-    return udp2raw or mimic
+    return udp2raw or udpspeeder or mimic
 
 
 def validate_udp2raw_port_conflicts(
@@ -2229,6 +2283,9 @@ def apply_middleware_to_peers(
             peer_endpoint_port,
         )
         return
+    if middleware and middleware.get("type") == "udpspeeder":
+        apply_udpspeeder_to_peers(middleware, local_interface, peer_interface, local_peer, peer_peer)
+        return
     local_peer.endpoint_host = peer_endpoint
     local_peer.endpoint_port = (peer_endpoint_port or peer_interface.listen_port) if peer_endpoint else None
     peer_peer.endpoint_host = local_endpoint
@@ -2266,6 +2323,27 @@ def apply_udp2raw_to_peers(
     else:
         if local_interface.listen_port is None:
             raise HTTPException(status_code=400, detail="udp2raw server side requires WireGuard listen port")
+        local_peer.endpoint_host = None
+        local_peer.endpoint_port = None
+        peer_peer.endpoint_host = middleware["client_listen_host"]
+        peer_peer.endpoint_port = middleware["client_listen_port"]
+
+
+def apply_udpspeeder_to_peers(
+    middleware: dict,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_peer: models.WireGuardPeer,
+    peer_peer: models.WireGuardPeer,
+) -> None:
+    """根据 UDPspeeder 单向 server/client 角色接管 WireGuard Endpoint。"""
+
+    if middleware["server_side"] == "peer":
+        local_peer.endpoint_host = middleware["client_listen_host"]
+        local_peer.endpoint_port = middleware["client_listen_port"]
+        peer_peer.endpoint_host = None
+        peer_peer.endpoint_port = None
+    else:
         local_peer.endpoint_host = None
         local_peer.endpoint_port = None
         peer_peer.endpoint_host = middleware["client_listen_host"]
@@ -2390,6 +2468,49 @@ def enqueue_udp2raw_tasks(
         )
 
 
+def udpspeeder_endpoint_payloads(
+    middleware: dict,
+    local_interface: models.WireGuardInterface,
+    peer_interface: models.WireGuardInterface,
+    local_endpoint: str | None,
+    peer_endpoint: str | None,
+) -> list[tuple[models.WireGuardInterface, str, dict]]:
+    """生成 UDPspeeder 双端 server/client 配置任务。"""
+
+    instance = middleware_instance_name(local_interface, peer_interface)
+    server_side = middleware["server_side"]
+    server_interface = peer_interface if server_side == "peer" else local_interface
+    client_interface = local_interface if server_side == "peer" else peer_interface
+    server_host = peer_endpoint if server_side == "peer" else local_endpoint
+    server_host = middleware.get("server_connect_host") or server_host
+    if not server_host or server_interface.listen_port is None:
+        raise HTTPException(status_code=400, detail="udpspeeder server requires endpoint address and WireGuard listen port")
+    common = {key: middleware.get(key) for key in ["fec_data", "fec_redundancy", "fec_timeout_ms", "fec_mode", "fec_mtu", "fec_queue_len", "decode_buffer"]}
+    server = {"plugin": "udpspeeder", "instance": instance, "mode": "server", "listen_host": middleware["server_listen_host"], "listen_port": middleware["server_listen_port"], "remote_host": middleware["server_forward_host"], "remote_port": middleware.get("server_forward_port") or server_interface.listen_port, **common}
+    client = {"plugin": "udpspeeder", "instance": instance, "mode": "client", "listen_host": middleware["client_listen_host"], "listen_port": middleware["client_listen_port"], "remote_host": server_host, "remote_port": middleware["server_listen_port"], **common}
+    return [(server_interface, "middleware.udpspeeder.apply", server), (client_interface, "middleware.udpspeeder.apply", client)]
+
+
+def enqueue_udpspeeder_tasks(db: Session, middleware: dict, local_interface: models.WireGuardInterface, peer_interface: models.WireGuardInterface, local_endpoint: str | None, peer_endpoint: str | None) -> None:
+    """为 UDPspeeder 受管连接下发安装和配置任务。"""
+
+    for interface in [local_interface, peer_interface]:
+        node = db.get(models.Node, interface.node_id)
+        if node is not None:
+            require_udpspeeder_supported(node)
+        enqueue_interface_task_once(db, interface, "middleware.install", {"plugin": "udpspeeder"})
+    for interface, task_type, payload in udpspeeder_endpoint_payloads(middleware, local_interface, peer_interface, local_endpoint, peer_endpoint):
+        enqueue_interface_task_once_with_task(
+            db,
+            interface,
+            task_type,
+            payload,
+            update_pending_payload=True,
+            queue_after_running=True,
+            check_support=False,
+        )
+
+
 def middleware_instance_name(local_interface: models.WireGuardInterface, peer_interface: models.WireGuardInterface) -> str:
     """生成中间层实例名，当前复用 udp2raw 的双端稳定命名规则。"""
 
@@ -2504,6 +2625,9 @@ def enqueue_middleware_tasks(
     if middleware.get("type") == "udp2raw":
         enqueue_udp2raw_tasks(db, middleware, local_interface, peer_interface, local_endpoint, peer_endpoint)
         return
+    if middleware.get("type") == "udpspeeder":
+        enqueue_udpspeeder_tasks(db, middleware, local_interface, peer_interface, local_endpoint, peer_endpoint)
+        return
     if middleware.get("type") == "mimic":
         enqueue_mimic_tasks(
             db,
@@ -2567,6 +2691,11 @@ def middleware_task_payloads(
                 {"plugin": "udp2raw", "instance": instance, "mode": peer_mode},
             ),
         ]
+    if middleware.get("type") == "udpspeeder":
+        server_side = middleware.get("server_side") or "peer"
+        local_mode = "server" if server_side == "local" else "client"
+        peer_mode = "client" if server_side == "local" else "server"
+        return [(local_interface, f"middleware.udpspeeder.{action}", {"plugin": "udpspeeder", "instance": instance, "mode": local_mode}), (peer_interface, f"middleware.udpspeeder.{action}", {"plugin": "udpspeeder", "instance": instance, "mode": peer_mode})]
     if middleware.get("type") == "mimic":
         return [
             (
@@ -3452,6 +3581,7 @@ def enqueue_interface_task_once_with_task(
     payload_extra: dict | None = None,
     update_pending_payload: bool = False,
     queue_after_running: bool = False,
+    check_support: bool = True,
 ) -> tuple[bool, models.AgentTask | None]:
     """幂等创建接口任务，并返回参与排队的任务对象。"""
 
@@ -3469,7 +3599,7 @@ def enqueue_interface_task_once_with_task(
         logger.debug("接口已有运行中任务，跳过重复入队 task=%s", summarize_agent_task(running_task))
         return False, running_task
     node = db.get(models.Node, interface.node_id)
-    if node is not None:
+    if node is not None and check_support:
         require_task_supported(node, task_type)
     task = create_interface_task(interface, task_type, payload_extra=payload_extra)
     db.add(task)
@@ -3762,10 +3892,48 @@ def run_wg_text(args: list[str], input_text: str | None = None) -> str:
             capture_output=True,
         )
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail="wireguard tool is not installed") from exc
+        fallback = generate_wireguard_material_without_tool(args, input_text)
+        if fallback is not None:
+            return fallback
+        raise HTTPException(
+            status_code=503,
+            detail="主控未安装 WireGuard 工具，无法生成密钥；请安装 wireguard-tools 后重试",
+        ) from exc
     if completed.returncode != 0:
         raise HTTPException(status_code=500, detail=f"wireguard tool failed: {completed.stderr.strip()}")
     return completed.stdout.strip()
+
+
+def generate_wireguard_material_without_tool(args: list[str], input_text: str | None) -> str | None:
+    """在主控没有 wg 工具时生成 WireGuard 所需的标准 Base64 密钥材料。"""
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    except ImportError:
+        return None
+    if args == ["genkey"] and input_text is None:
+        private_key = X25519PrivateKey.generate()
+        raw_private = private_key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        return base64.b64encode(raw_private).decode("ascii")
+    if args == ["pubkey"] and input_text:
+        try:
+            raw_private = base64.b64decode(input_text.strip(), validate=True)
+            private_key = X25519PrivateKey.from_private_bytes(raw_private)
+        except (ValueError, TypeError):
+            return None
+        raw_public = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        return base64.b64encode(raw_public).decode("ascii")
+    if args == ["genpsk"] and input_text is None:
+        return base64.b64encode(os.urandom(32)).decode("ascii")
+    return None
 
 
 def generate_wireguard_keypair() -> tuple[str, str]:
@@ -3953,6 +4121,20 @@ def list_agent_releases() -> schemas.AgentReleaseManifest:
     """返回主控内置的 Agent release manifest。"""
 
     return schemas.AgentReleaseManifest.model_validate(load_agent_release_manifest())
+
+
+@app.get("/api/agent/install.sh", response_class=PlainTextResponse)
+def download_agent_installer() -> PlainTextResponse:
+    """返回主控内置的 Agent 安装脚本，供新节点直接执行。"""
+
+    candidates = [
+        Path("/opt/link42/deploy/sh/link42-agent.sh"),
+        Path(__file__).resolve().parents[3] / "deploy" / "sh" / "link42-agent.sh",
+    ]
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return PlainTextResponse(path.read_text(encoding="utf-8"), media_type="text/plain")
+    raise HTTPException(status_code=404, detail="agent installer not found")
 
 
 @app.get("/api/agent/releases/{version}/download")
@@ -4928,8 +5110,9 @@ def create_managed_link(
         raise HTTPException(status_code=409, detail="local imported endpoint does not point to peer node")
     if replace_peer_peer and not endpoint_points_to_node(replace_peer_peer.endpoint_host, local_node) and not payload.force_endpoint_mismatch:
         raise HTTPException(status_code=409, detail="peer imported endpoint does not point to local node")
-    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
+    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic, payload.udpspeeder)
     validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
+    effective_mtu = udpspeeder_effective_wireguard_mtu(middleware, payload.mtu)
     local_endpoint, peer_endpoint = require_managed_link_endpoints(
         local_node,
         peer_node,
@@ -4963,7 +5146,7 @@ def create_managed_link(
         private_key_ref="local-db",
         private_key_value=local_private_key,
         public_key=local_public_key,
-        mtu=payload.mtu,
+        mtu=effective_mtu,
         table_name=payload.table_name,
         source="managed-node",
         managed=True,
@@ -4977,7 +5160,7 @@ def create_managed_link(
         private_key_ref="local-db",
         private_key_value=peer_private_key,
         public_key=peer_public_key,
-        mtu=payload.mtu,
+        mtu=effective_mtu,
         table_name=payload.table_name,
         source="managed-node",
         managed=True,
@@ -5281,8 +5464,9 @@ def update_managed_link(
     old_middleware = managed_link_middleware(local_interface)
     local_node = require_online_node(db, local_interface.node_id)
     peer_node = require_online_node(db, peer_interface.node_id)
-    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic)
+    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic, payload.udpspeeder)
     validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
+    effective_mtu = udpspeeder_effective_wireguard_mtu(middleware, payload.mtu)
     local_endpoint, peer_endpoint = require_managed_link_endpoints(
         local_node,
         peer_node,
@@ -5297,14 +5481,14 @@ def update_managed_link(
     local_interface.name = payload.local_interface_name
     local_interface.tunnel_ips = payload.local_tunnel_ips
     local_interface.listen_port = payload.local_listen_port
-    local_interface.mtu = payload.mtu
+    local_interface.mtu = effective_mtu
     local_interface.table_name = payload.table_name
     local_interface.managed = True
     local_interface.source = "managed-node"
     peer_interface.name = payload.peer_interface_name
     peer_interface.tunnel_ips = payload.peer_tunnel_ips
     peer_interface.listen_port = payload.peer_listen_port
-    peer_interface.mtu = payload.mtu
+    peer_interface.mtu = effective_mtu
     peer_interface.table_name = payload.table_name
     peer_interface.managed = True
     peer_interface.source = "managed-node"
@@ -5870,6 +6054,19 @@ def get_udp2raw_asset(asset_name: str) -> FileResponse:
         if path.exists():
             return FileResponse(path)
     raise HTTPException(status_code=404, detail="udp2raw asset not found")
+
+
+@app.get("/api/agent/plugins/udpspeeder/assets/{asset_name}")
+def get_udpspeeder_asset(asset_name: str) -> FileResponse:
+    """为 Agent 提供固定白名单内的 UDPspeeder 二进制资产。"""
+
+    allowed = {"udpspeeder-x64-static", "udpspeeder-arm64-musl", "udpspeeder-arm-musl", "udpspeeder-mips24kc-le-musl", "udpspeeder-mips24kc-be-musl"}
+    if asset_name not in allowed:
+        raise HTTPException(status_code=404, detail="udpspeeder asset not found")
+    for path in [Path("/opt/link42/plugins/udpspeeder/assets") / asset_name, Path(__file__).resolve().parents[3] / "plugins" / "udpspeeder" / "assets" / asset_name]:
+        if path.exists():
+            return FileResponse(path, media_type="application/octet-stream")
+    raise HTTPException(status_code=404, detail="udpspeeder asset not found")
 
 
 @app.get("/api/nodes/{node_id}/wireguard/import-candidates", response_model=list[schemas.ImportCandidateRead])

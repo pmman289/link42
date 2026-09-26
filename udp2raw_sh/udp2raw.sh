@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-BASE_URL="${UDP2RAW_BASE_URL:-https://get.pmman.tech/sh}"
-BIN_DIR_URL="${UDP2RAW_BIN_DIR_URL:-$BASE_URL/udp2raw_bin}"
+BASE_URL="${UDP2RAW_BASE_URL:-${LINK42_SERVER_URL:+${LINK42_SERVER_URL%/}/api/agent/plugins/udp2raw/assets}}"
+BIN_DIR_URL="${UDP2RAW_BIN_DIR_URL:-$BASE_URL}"
 INSTALL_BIN="/usr/local/bin/udp2raw"
 LIBEXEC_DIR="/usr/local/libexec"
 CONFIG_DIR="/etc/udp2raw"
@@ -13,6 +13,10 @@ die() {
     echo "错误：$*" >&2
     exit 1
 }
+
+if [ -z "$BIN_DIR_URL" ]; then
+    die "请设置 LINK42_SERVER_URL 或 UDP2RAW_BIN_DIR_URL"
+fi
 
 info() {
     echo "==> $*"

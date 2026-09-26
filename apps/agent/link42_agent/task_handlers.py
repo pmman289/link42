@@ -43,6 +43,14 @@ from .middleware import (
     stop_mimic,
     stop_udp2raw,
 )
+from .udpspeeder import (
+    apply_udpspeeder,
+    delete_udpspeeder,
+    install_udpspeeder,
+    start_udpspeeder,
+    status_udpspeeder,
+    stop_udpspeeder,
+)
 from .plugins import execute_node_plugin_task
 from .system import (
     apply_wireguard_config,
@@ -86,6 +94,8 @@ def wireguard_read_config(payload: dict[str, Any], config: AgentConfig) -> dict[
 def middleware_install(payload: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
     """安装任务中指定的连接中间层组件。"""
 
+    if payload.get("plugin") == "udpspeeder":
+        return install_udpspeeder(config, dry_run=_dry_run(config))
     return install_middleware(payload, config, dry_run=_dry_run(config))
 
 
@@ -196,6 +206,11 @@ TASK_HANDLERS: dict[str, TaskHandler] = {
     "middleware.mimic.stop": lambda payload, config: stop_mimic(payload, dry_run=_dry_run(config)),
     "middleware.mimic.delete": lambda payload, config: delete_mimic(payload, dry_run=_dry_run(config)),
     "middleware.mimic.status": lambda payload, config: status_mimic(payload),
+    "middleware.udpspeeder.apply": lambda payload, config: apply_udpspeeder(payload, dry_run=_dry_run(config)),
+    "middleware.udpspeeder.start": lambda payload, config: start_udpspeeder(payload, dry_run=_dry_run(config)),
+    "middleware.udpspeeder.stop": lambda payload, config: stop_udpspeeder(payload, dry_run=_dry_run(config)),
+    "middleware.udpspeeder.delete": lambda payload, config: delete_udpspeeder(payload, dry_run=_dry_run(config)),
+    "middleware.udpspeeder.status": lambda payload, config: status_udpspeeder(payload),
     "agent.self_upgrade": lambda payload, config: self_upgrade(payload, config, dry_run=_dry_run(config)),
 }
 

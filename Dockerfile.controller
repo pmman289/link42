@@ -24,7 +24,9 @@ COPY pyproject.toml README.md ./
 COPY apps/api ./apps/api
 COPY apps/agent ./apps/agent
 COPY packages ./packages
+COPY deploy/sh/link42-agent.sh ./deploy/sh/link42-agent.sh
 COPY udp2raw_sh/udp2raw_bin ./plugins/udp2raw/assets
+COPY plugins/udpspeeder/assets ./plugins/udpspeeder/assets
 COPY dist/controller-agent-releases ./releases/agent
 RUN for attempt in 1 2 3; do \
       pip install --no-cache-dir --timeout 120 --retries 10 . && break; \

@@ -116,8 +116,8 @@
 
 - Agent x64 单文件二进制由 `scripts/agent/build-x64.sh` 构建。
 - Agent 一键安装脚本位于 `deploy/sh/link42-agent.sh`。
-- Agent 安装脚本预期发布到 `https://get.pmman.tech/sh/link42-agent.sh`。
-- Agent 二进制资源预期发布到 `https://get.pmman.tech/res/link42/link42-agent-linux-x64`。
+- Agent 安装脚本由主控 `/api/agent/install.sh` 分发。
+- Agent 二进制资源由主控 `/api/agent/releases/{version}/download` 分发。
 - 前端展示的 Agent 安装命令应使用安装脚本，并通过环境变量传入主控地址、节点 ID、节点 token。
 - Agent 支持 systemd、OpenRC 和 OpenWrt UCI/ifup 模式；OpenWrt/家庭路由器测试必须保持低风险，不能破坏用户现有网络。
 - 主控 Docker 镜像是下一步需求：应预留 `/data` 存数据库、`/config` 存配置文件，并提供简单构建脚本。

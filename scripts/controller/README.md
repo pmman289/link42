@@ -62,7 +62,11 @@ scripts/controller/publish-dockerhub.sh 20260630-120000
 
 本地容器验证会按当前认证流程登录后检查 `/api/agent/releases`，并确认镜像内置的 Agent latest 可读取。日志里的密码、token 和 secret 会自动打码。
 
+验证还应检查 `/api/agent/install.sh`、udp2raw 和 UDPspeeder 资产接口，确保镜像内置资源完整。
+
 `build-image.sh`、`push-image.sh` 和 `export-image.sh` 也会读取 `scripts/release.env`，并从仓库根目录执行；命令行环境变量优先级高于配置文件。
+
+Agent 二进制和 OpenWrt 源码包会在构建镜像前自动生成，并随主控镜像发布，不需要再上传到独立资源服务器。
 
 ## 导出镜像
 

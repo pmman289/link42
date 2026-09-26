@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException, Response
@@ -4536,8 +4537,6 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
     import link42_api.main as api_main
 
     monkeypatch.setattr(api_main.settings, "agent_release_dir", str(tmp_path))
-    monkeypatch.setattr(api_main.settings, "agent_install_script_url", "https://example.com/link42-agent.sh")
-    monkeypatch.setattr(api_main.settings, "agent_res_base_url", "https://example.com/res")
     (tmp_path / "manifest.json").write_text('{"latest":"0.2.0","releases":{}}', encoding="utf-8")
 
     engine = create_engine("sqlite:///:memory:")
@@ -4562,9 +4561,83 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
     assert plan.reason == "当前 Agent 不支持自升级"
     assert plan.manual_command is not None
     assert "LINK42_AGENT_VERSION=0.2.0" in plan.manual_command
-    assert "LINK42_RES_BASE_URL=https://example.com/res" in plan.manual_command
+    assert "LINK42_SERVER_URL=http://controller:8000" in plan.manual_command
     assert "LINK42_NODE_ID=" not in plan.manual_command
     assert "LINK42_AGENT_TOKEN=" not in plan.manual_command
+
+
+def test_agent_install_script_is_public_controller_asset() -> None:
+    """验证主控安装脚本接口无需 Web 登录且返回可执行脚本文本。"""
+
+    import link42_api.main as api_main
+
+    assert api_main.is_api_auth_exempt("/api/agent/install.sh")
+    response = api_main.download_agent_installer()
+    assert response.status_code == 200
+    assert b"LINK42_SERVER_URL" in response.body
+    assert b"api/agent/releases" in response.body
+
+
+def test_agent_distribution_endpoints_work_over_http(monkeypatch, tmp_path) -> None:
+    """验证安装脚本、manifest、下载和 SHA 接口可通过真实 HTTP 请求串联使用。"""
+
+    import hashlib
+    import link42_api.main as api_main
+
+    asset = tmp_path / "link42-agent-linux-x64"
+    content = b"test-agent-binary"
+    asset.write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    monkeypatch.setattr(api_main.settings, "agent_release_dir", str(tmp_path))
+    (tmp_path / "manifest.json").write_text(
+        __import__("json").dumps(
+            {
+                "latest": "9.9.9",
+                "releases": {
+                    "9.9.9": {
+                        "assets": {
+                            "linux-x64": {"path": asset.name, "sha256": digest, "size": len(content)}
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+
+    def override_db():
+        """为分发接口测试提供临时数据库会话。"""
+
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_db
+    original_get_db = api_main.get_db
+    api_main.get_db = override_db
+    try:
+        client = TestClient(app)
+        assert client.get("/api/agent/install.sh").status_code == 200
+        assert client.get("/api/agent/releases").json()["latest"] == "9.9.9"
+        download = client.get("/api/agent/releases/9.9.9/download?platform=linux-x64")
+        assert download.status_code == 200
+        assert download.content == content
+        checksum = client.get("/api/agent/releases/9.9.9/sha256?platform=linux-x64")
+        assert checksum.status_code == 200
+        assert checksum.json() == {"sha256": digest}
+    finally:
+        api_main.get_db = original_get_db
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_controller_image_includes_udpspeeder_assets() -> None:
+    """验证主控镜像会打包由主控分发的 UDPspeeder 资产。"""
+
+    dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile.controller"
+    content = dockerfile.read_text(encoding="utf-8")
+
+    assert "COPY plugins/udpspeeder/assets ./plugins/udpspeeder/assets" in content
 
 
 def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) -> None:

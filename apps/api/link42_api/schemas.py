@@ -529,6 +529,7 @@ class ManagedLinkCreate(BaseModel):
     replace_peer_interface_id: int | None = None
     force_endpoint_mismatch: bool = False
     udp2raw: Udp2RawMiddlewareConfig | None = None
+    udpspeeder: UdpSpeederMiddlewareConfig | None = None
     mimic: MimicMiddlewareConfig | None = None
 
     @field_validator("local_endpoint_port", "peer_endpoint_port", "local_listen_port", "peer_listen_port")
@@ -1316,6 +1317,56 @@ class MimicMiddlewareConfig(BaseModel):
         return value
 
 
+class UdpSpeederMiddlewareConfig(BaseModel):
+    """UDPspeeder FEC 中间层配置。"""
+
+    enabled: bool = False
+    server_side: str = "peer"
+    server_listen_host: str = "0.0.0.0"
+    server_connect_host: str | None = None
+    server_listen_port: int | None = None
+    server_forward_host: str = "127.0.0.1"
+    server_forward_port: int | None = None
+    client_listen_host: str = "127.0.0.1"
+    client_listen_port: int | None = None
+    fec_data: int = Field(default=10, ge=1, le=1000)
+    fec_redundancy: int = Field(default=5, ge=0, le=1000)
+    fec_timeout_ms: int = Field(default=8, ge=1, le=1000)
+    fec_mode: int = Field(default=0, ge=0, le=1)
+    # 1400 可容纳 MTU 1280 的 IPv6 WireGuard 加密 UDP 报文。
+    fec_mtu: int = Field(default=1400, ge=500, le=1400)
+    fec_queue_len: int = Field(default=200, ge=10, le=10000)
+    decode_buffer: int = Field(default=2000, ge=1, le=100000)
+
+    @field_validator("server_side")
+    @classmethod
+    def validate_server_side(cls, value: str) -> str:
+        """校验 UDPspeeder server 所在端。"""
+
+        if value not in {"local", "peer"}:
+            raise ValueError("server_side must be local or peer")
+        return value
+
+    @field_validator("server_listen_port", "server_forward_port", "client_listen_port")
+    @classmethod
+    def validate_ports(cls, value: int | None) -> int | None:
+        """校验 UDPspeeder 端口范围。"""
+
+        return _validate_port(value)
+
+    @field_validator("server_listen_host", "server_connect_host", "server_forward_host", "client_listen_host")
+    @classmethod
+    def validate_ips(cls, value: str | None) -> str | None:
+        """校验 UDPspeeder 地址只能使用 IP 字面量。"""
+
+        if value is None or not value.strip():
+            return value
+        try:
+            return ipaddress.ip_address(value.strip()).compressed
+        except ValueError as exc:
+            raise ValueError("udpspeeder address must be an IP address") from exc
+
+
 class ManagedLinkCreateResult(BaseModel):
     """创建受管连接响应。"""
 
@@ -1360,6 +1411,7 @@ class ManagedLinkUpdate(BaseModel):
     peer_interface_custom_config: str | None = None
     peer_peer_custom_config: str | None = None
     udp2raw: Udp2RawMiddlewareConfig | None = None
+    udpspeeder: UdpSpeederMiddlewareConfig | None = None
     mimic: MimicMiddlewareConfig | None = None
 
     @field_validator("local_endpoint_port", "peer_endpoint_port", "local_listen_port", "peer_listen_port")

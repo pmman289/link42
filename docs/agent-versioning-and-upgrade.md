@@ -419,14 +419,14 @@ OpenWrt 默认使用以下本地路径：
 命令示例：
 
 ```sh
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh |
 sudo env LINK42_AGENT_VERSION=0.2.0 sh
 ```
 
 如果是新节点或需要重写配置，则带完整环境变量：
 
 ```sh
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh |
 sudo env \
   LINK42_AGENT_VERSION=0.2.0 \
   LINK42_SERVER_URL=http://controller:8000 \
@@ -455,7 +455,7 @@ POST /api/nodes/{node_id}/agent/upgrade/manual-command
   "upgrade_mode": "manual",
   "reason": "当前 Agent 不支持自升级",
   "matched_asset": null,
-  "manual_command": "curl -fsSL ... | sudo env LINK42_AGENT_VERSION=0.2.0 LINK42_RES_BASE_URL=https://get.pmman.tech/res/link42 sh"
+  "manual_command": "curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo env LINK42_SERVER_URL=https://your-link42-controller.example.com LINK42_AGENT_VERSION=0.2.0 sh"
 }
 ```
 
@@ -573,7 +573,7 @@ GET /api/agent/releases/latest
 前端生成安装命令时可以固定版本，也可以用 `latest`：
 
 ```sh
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh |
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh |
 sudo env LINK42_AGENT_VERSION=0.2.0 LINK42_SERVER_URL=... LINK42_NODE_ID=... LINK42_AGENT_TOKEN=... sh
 ```
 

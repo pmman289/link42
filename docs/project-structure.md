@@ -25,7 +25,7 @@ Link42 以“应用代码 / 部署脚本 / 文档 / 构建产物”四层来组�
 - `docs/architecture.md`：设计和架构说明。
 - `docs/connection-middleware-plugins.md`：连接中间层插件规范和注册流程。
 - `docs/agent-versioning-and-upgrade.md`：Agent 版本、能力协商和升级设计。
-- `docs/agent-public-deployment.md`：Agent 安装脚本和二进制发布到 get.pmman.tech 的部署方案。
+- `docs/agent-public-deployment.md`：Agent 安装脚本和二进制由主控统一分发的部署方案。
 - `docs/project-decisions.md`：产品和技术决策。
 - `docs/operations-notes.md`：运维、部署和踩坑记录。
 - `docs/agent-binary-build.md`：Agent 二进制构建说明。

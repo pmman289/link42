@@ -70,13 +70,13 @@
 - 一键安装脚本：
   - `deploy/sh/link42-agent.sh`
 - 预期安装脚本 URL：
-  - `https://get.pmman.tech/sh/link42-agent.sh`
+  - `https://your-link42-controller.example.com/api/agent/install.sh`
 - 预期二进制资源 URL：
-  - `https://get.pmman.tech/res/link42/link42-agent-linux-x64`
+  - `https://your-link42-controller.example.com/api/agent/releases/<version>/download?platform=linux-x64`
 - 前端展示命令形如：
-  - `curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_SERVER_URL='http://controller:8000' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh`
+  - `curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo env LINK42_SERVER_URL='https://your-link42-controller.example.com' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh`
 - 一键卸载命令：
-  - `curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall`
+  - `curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo sh -s -- uninstall`
 - 安装脚本会尝试安装 `wireguard-tools`，下载 Agent 二进制，并按 systemd 或 OpenRC 注册服务。
 - 卸载脚本会删除 Agent 服务、二进制和 `/etc/link42/agent.env`，不会删除 `/etc/wireguard` 下的配置。
 - OpenWrt/OpenRC 支持仍要谨慎测试；用户提供过 `ssh mrouter` 的家庭路由器环境，但不能破坏上面的现有网络。

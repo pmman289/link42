@@ -223,7 +223,27 @@ type ManagedLink = {
 type ManagedCreateProtocol = "wireguard" | "gre";
 type ManualCreateProtocol = "wireguard" | "gre";
 
-type MiddlewareConfig = Udp2RawMiddleware | MimicMiddleware;
+type MiddlewareConfig = Udp2RawMiddleware | UdpSpeederMiddleware | MimicMiddleware;
+
+type UdpSpeederMiddleware = {
+  type: "udpspeeder";
+  enabled: boolean;
+  server_side: "local" | "peer";
+  server_listen_host: string;
+  server_connect_host: string | null;
+  server_listen_port: number;
+  server_forward_host: string;
+  server_forward_port: number | null;
+  client_listen_host: string;
+  client_listen_port: number;
+  fec_data: number;
+  fec_redundancy: number;
+  fec_timeout_ms: number;
+  fec_mode: number;
+  fec_mtu: number;
+  fec_queue_len: number;
+  decode_buffer: number;
+};
 
 type Udp2RawMiddleware = {
   type: "udp2raw";
@@ -1490,7 +1510,7 @@ function buildAgentCommand(node: NodeItem, token: string, controllerUrl: string 
   if (!token) return "";
   const privilegeCommand = nodeServiceManager(node) === "openwrt-uci" ? "env" : "sudo env";
   return [
-    "curl -fsSL https://get.pmman.tech/sh/link42-agent.sh",
+    `curl -fsSL ${shellArg(`${controllerUrl.replace(/\/$/, "")}/api/agent/install.sh`)}`,
     "|",
     privilegeCommand,
     `LINK42_SERVER_URL=${shellArg(controllerUrl)}`,
@@ -2023,6 +2043,65 @@ function Udp2RawFields({
 }
 
 // 从表单中读取并组装 udp2raw 配置。
+function UdpSpeederFields({
+  enabled,
+  serverSide,
+  localListenPort,
+  peerListenPort,
+  defaults,
+  disabled,
+  onEnabledChange,
+  onServerSideChange,
+}: {
+  enabled: boolean;
+  serverSide: "local" | "peer";
+  localListenPort?: number | null;
+  peerListenPort?: number | null;
+  defaults?: Partial<UdpSpeederMiddleware> | null;
+  disabled: boolean;
+  onEnabledChange: (enabled: boolean) => void;
+  onServerSideChange: (side: "local" | "peer") => void;
+}) {
+  // 渲染 UDPspeeder 的角色、端口和 FEC 参数表单。
+  const forwardPort = serverSide === "local" ? localListenPort : peerListenPort;
+  return (
+    <FormSection title="UDPspeeder 中间层" hint="通过 FEC 为 WireGuard UDP 报文增加抗随机丢包能力；一端运行 server，另一端运行 client。">
+      <label className="checkField wideField"><input name="udpspeeder_enabled" type="checkbox" checked={enabled} onChange={(event) => onEnabledChange(event.currentTarget.checked)} disabled={disabled} /><span>启用 UDPspeeder</span></label>
+      <Field label="服务端位置" hint="服务端必须位于有可达入口地址且填写 WireGuard 监听端口的一端。">
+        <select name="udpspeeder_server_side" value={serverSide} onChange={(event) => onServerSideChange(event.currentTarget.value as "local" | "peer")} disabled={disabled}>
+          <option value="peer">对端运行服务端，本端运行客户端</option><option value="local">本端运行服务端，对端运行客户端</option>
+        </select>
+      </Field>
+      <Field label="服务端连接地址" hint="客户端访问服务端的 IP 地址；NAT 场景填写公网映射地址，服务端监听地址另行填写。">
+        <input name="udpspeeder_server_connect_host" defaultValue={defaults?.server_connect_host || ""} placeholder="203.0.113.20" disabled={disabled} />
+      </Field>
+      <Field label="服务端监听地址" hint="通常填写 0.0.0.0 或 ::；如果使用 NAT/EIP，不要把不在网卡上的公网地址填在这里。"><input name="udpspeeder_server_listen_host" defaultValue={defaults?.server_listen_host || "0.0.0.0"} disabled={disabled} /></Field>
+      <Field label="服务端端口"><input name="udpspeeder_server_listen_port" defaultValue={defaults?.server_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} /></Field>
+      <Field label="服务端转发地址"><input name="udpspeeder_server_forward_host" defaultValue={defaults?.server_forward_host || "127.0.0.1"} disabled={disabled} /></Field>
+      <Field label="服务端转发端口" hint="留空时使用服务端 WireGuard 监听端口。"><input name="udpspeeder_server_forward_port" defaultValue={defaults?.server_forward_port || forwardPort || ""} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="客户端监听地址"><input name="udpspeeder_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} /></Field>
+      <Field label="客户端监听端口"><input name="udpspeeder_client_listen_port" defaultValue={defaults?.client_listen_port || ""} inputMode="numeric" required={enabled} disabled={disabled} /></Field>
+      <Field label="FEC 数据:冗余" hint="例如 10:5 表示每 10 个数据包增加 5 个冗余包。"><input name="udpspeeder_fec" defaultValue={`${defaults?.fec_data || 10}:${defaults?.fec_redundancy ?? 5}`} disabled={disabled} /></Field>
+      <Field label="FEC 超时（毫秒）"><input name="udpspeeder_fec_timeout_ms" defaultValue={defaults?.fec_timeout_ms || 8} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="FEC 模式"><select name="udpspeeder_fec_mode" defaultValue={defaults?.fec_mode ?? 0} disabled={disabled}><option value="0">标准模式</option><option value="1">低延迟模式</option></select></Field>
+      <Field label="FEC MTU" hint="默认 1400，用于承载 IPv6 WireGuard 报文；启用后 WireGuard MTU 会保持不低于 IPv6 要求的 1280。"><input name="udpspeeder_fec_mtu" defaultValue={defaults?.fec_mtu || 1400} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="发送队列长度"><input name="udpspeeder_fec_queue_len" defaultValue={defaults?.fec_queue_len || 200} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="解码缓存大小"><input name="udpspeeder_decode_buffer" defaultValue={defaults?.decode_buffer || 2000} inputMode="numeric" disabled={disabled} /></Field>
+      <div className="formNotice wideField">数据流：WireGuard → 本地 UDPspeeder client → 网络 → UDPspeeder server → 服务端 WireGuard。</div>
+    </FormSection>
+  );
+}
+
+function readUdpSpeederForm(form: FormData, localListenPort?: number | null, peerListenPort?: number | null): Record<string, unknown> | null {
+  // 从表单读取并组装 UDPspeeder 配置。
+  if (form.get("udpspeeder_enabled") !== "on") return null;
+  const side = String(form.get("udpspeeder_server_side") || "peer");
+  const fec = String(form.get("udpspeeder_fec") || "10:5").split(":");
+  if (fec.length !== 2) throw new Error("FEC 数据:冗余必须使用 data:redundancy 格式");
+  return { enabled: true, server_side: side, server_listen_host: String(form.get("udpspeeder_server_listen_host") || "0.0.0.0").trim(), server_connect_host: String(form.get("udpspeeder_server_connect_host") || "").trim() || null, server_listen_port: optionalInt(form.get("udpspeeder_server_listen_port"), "UDPspeeder 服务端口"), server_forward_host: String(form.get("udpspeeder_server_forward_host") || "127.0.0.1").trim(), server_forward_port: optionalInt(form.get("udpspeeder_server_forward_port"), "UDPspeeder 转发端口") ?? (side === "local" ? localListenPort : peerListenPort), client_listen_host: String(form.get("udpspeeder_client_listen_host") || "127.0.0.1").trim(), client_listen_port: optionalInt(form.get("udpspeeder_client_listen_port"), "UDPspeeder 客户端端口"), fec_data: Number(fec[0]), fec_redundancy: Number(fec[1]), fec_timeout_ms: optionalInt(form.get("udpspeeder_fec_timeout_ms"), "FEC 超时") ?? 8, fec_mode: Number(form.get("udpspeeder_fec_mode") || 0), fec_mtu: optionalInt(form.get("udpspeeder_fec_mtu"), "FEC MTU") ?? 1400, fec_queue_len: optionalInt(form.get("udpspeeder_fec_queue_len"), "FEC 队列") ?? 200, decode_buffer: optionalInt(form.get("udpspeeder_decode_buffer"), "解码缓存") ?? 2000 };
+}
+
+// 从表单中读取并组装 udp2raw 配置。
 function readUdp2RawForm(
   form: FormData,
   localListenPort?: number | null,
@@ -2114,9 +2193,11 @@ function App() {
   const [replaceLocalConfigId, setReplaceLocalConfigId] = useState<number | null>(null);
   const [replacePeerConfigId, setReplacePeerConfigId] = useState<number | null>(null);
   const [forceEndpointMismatch, setForceEndpointMismatch] = useState(false);
-  const [middlewareType, setMiddlewareType] = useState<"none" | "udp2raw" | "mimic">("none");
+  const [middlewareType, setMiddlewareType] = useState<"none" | "udp2raw" | "udpspeeder" | "mimic">("none");
   const [udp2rawEnabled, setUdp2rawEnabled] = useState(false);
   const [mimicEnabled, setMimicEnabled] = useState(false);
+  const [udpspeederEnabled, setUdpspeederEnabled] = useState(false);
+  const [udpspeederServerSide, setUdpspeederServerSide] = useState<"local" | "peer">("peer");
   const [udp2rawServerSide, setUdp2rawServerSide] = useState<"local" | "peer">("peer");
   const initializedManagedLinkDraftConfigIdRef = useRef<number | null>(null);
   const [managedCreateMtu, setManagedCreateMtu] = useState("1420");
@@ -2361,6 +2442,7 @@ function App() {
   const selectedManagedPeerNode = nodes.find((item) => item.id === managedPeerNodeId) || null;
   const udp2rawActive = middlewareType === "udp2raw" && udp2rawEnabled;
   const mimicActive = middlewareType === "mimic" && mimicEnabled;
+  const udpspeederActive = middlewareType === "udpspeeder" && udpspeederEnabled;
   const selectedLocalEndpoints = selectedNode ? nodeEndpointOptions(selectedNode) : [];
   const selectedPeerEndpoints = selectedManagedPeerNode ? nodeEndpointOptions(selectedManagedPeerNode) : [];
   const managedGreLocalOuterIpOptions = greOuterIpOptionsFromNode(selectedNode);
@@ -3795,6 +3877,7 @@ function App() {
       setMiddlewareType("none");
       setUdp2rawEnabled(false);
       setMimicEnabled(false);
+      setUdpspeederEnabled(false);
       setUdp2rawServerSide("peer");
       return;
     }
@@ -3803,6 +3886,12 @@ function App() {
       setUdp2rawEnabled(Boolean(managedLink.middleware.enabled));
       setMimicEnabled(false);
       setUdp2rawServerSide(managedLink.middleware.server_side || "peer");
+    } else if (managedLink.middleware.type === "udpspeeder") {
+      setMiddlewareType("udpspeeder");
+      setUdpspeederEnabled(Boolean(managedLink.middleware.enabled));
+      setUdp2rawEnabled(false);
+      setMimicEnabled(false);
+      setUdpspeederServerSide(managedLink.middleware.server_side || "peer");
     } else if (managedLink.middleware.type === "mimic") {
       setMiddlewareType("mimic");
       setUdp2rawEnabled(false);
@@ -3821,9 +3910,21 @@ function App() {
   }, [monitorDialogActionTarget, monitorWindow]);
 
   useEffect(() => {
-    if (createDialog !== "managed" || managedCreateProtocol !== "wireguard" || udp2rawActive || mimicActive) return;
+    if (createDialog !== "managed" || managedCreateProtocol !== "wireguard") return;
+    if (udp2rawActive) {
+      setManagedCreateMtu("1300");
+      return;
+    }
+    if (mimicActive) {
+      setManagedCreateMtu("1408");
+      return;
+    }
+    if (udpspeederActive) {
+      setManagedCreateMtu("1280");
+      return;
+    }
     setManagedCreateMtu(String(replaceLocalConfig?.mtu || replacePeerConfig?.mtu || 1420));
-  }, [createDialog, managedCreateProtocol, replaceLocalConfig?.mtu, replacePeerConfig?.mtu, udp2rawActive, mimicActive]);
+  }, [createDialog, managedCreateProtocol, replaceLocalConfig?.mtu, replacePeerConfig?.mtu, udp2rawActive, udpspeederActive, mimicActive]);
 
   useEffect(() => {
     if (!selectedNodeId || !selectedConfigId || !selectedNodeOnline) return;
@@ -4155,6 +4256,7 @@ function App() {
     const peerListenPort = optionalInt(form.get("peer_listen_port"), "对端监听端口");
     const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1420;
     const udp2raw = middlewareType === "udp2raw" ? readUdp2RawForm(form, localListenPort, peerListenPort) : null;
+    const udpspeeder = middlewareType === "udpspeeder" ? readUdpSpeederForm(form, localListenPort, peerListenPort) : null;
     const mimic = middlewareType === "mimic" ? readMimicForm(form) : null;
     if (!peerNodeId || peerNodeId === selectedNodeId) {
       throw new Error("请选择另一个在线受管节点");
@@ -4189,8 +4291,9 @@ function App() {
           replace_local_interface_id: replaceLocalConfigId,
           replace_peer_interface_id: replacePeerConfigId,
           force_endpoint_mismatch: forceEndpointMismatch,
-          udp2raw,
-          mimic,
+        udp2raw,
+        udpspeeder,
+        mimic,
         }),
       },
     );
@@ -4563,6 +4666,7 @@ function App() {
     const keepalive = optionalInt(form.get("persistent_keepalive"), "保活间隔");
     const mtu = optionalInt(form.get("mtu"), "MTU") ?? 1420;
     const udp2raw = middlewareType === "udp2raw" ? readUdp2RawForm(form, localListenPort, peerListenPort) : null;
+    const udpspeeder = middlewareType === "udpspeeder" ? readUdpSpeederForm(form, localListenPort, peerListenPort) : null;
     const mimic = middlewareType === "mimic" ? readMimicForm(form) : null;
     const configId = selectedConfigId;
     await api<ManagedLink>(`/api/wireguard/configs/${configId}/managed-link`, {
@@ -4588,6 +4692,7 @@ function App() {
         peer_interface_custom_config: form.get("peer_interface_custom_config") || null,
         peer_peer_custom_config: form.get("peer_peer_custom_config") || null,
         udp2raw,
+        udpspeeder,
         mimic,
       }),
     });
@@ -6082,16 +6187,19 @@ function App() {
                     value={middlewareType}
                     disabled={!selectedNodeOnline}
                     onChange={(event) => {
-                      const next = event.currentTarget.value as "none" | "udp2raw" | "mimic";
+                      const next = event.currentTarget.value as "none" | "udp2raw" | "udpspeeder" | "mimic";
                       setMiddlewareType(next);
                       setUdp2rawEnabled(next === "udp2raw");
                       setMimicEnabled(next === "mimic");
+                      setUdpspeederEnabled(next === "udpspeeder");
                       if (next === "udp2raw") setManagedCreateMtu("1300");
+                      if (next === "udpspeeder") setManagedCreateMtu("1280");
                       if (next === "mimic") setManagedCreateMtu("1408");
                     }}
                   >
                     <option value="none">不使用中间层</option>
                     <option value="udp2raw">udp2raw</option>
+                    <option value="udpspeeder">UDPspeeder</option>
                     <option value="mimic">mimic</option>
                   </select>
                 </Field>
@@ -6110,6 +6218,17 @@ function App() {
                   onServerSideChange={setUdp2rawServerSide}
                 />
               )}
+              {middlewareType === "udpspeeder" && (
+                <UdpSpeederFields
+                  enabled={udpspeederEnabled}
+                  serverSide={udpspeederServerSide}
+                  localListenPort={replaceLocalConfig?.listen_port}
+                  peerListenPort={replacePeerConfig?.listen_port}
+                  disabled={!selectedNodeOnline}
+                  onEnabledChange={setUdpspeederEnabled}
+                  onServerSideChange={setUdpspeederServerSide}
+                />
+              )}
               {middlewareType === "mimic" && (
                 <MimicFields
                   enabled={mimicEnabled}
@@ -6123,7 +6242,7 @@ function App() {
                 />
               )}
               <FormSection title="链路参数" hint="这些参数会同时应用到双方 WireGuard 接口。没有特殊网络要求时保持默认。">
-              <Field label="MTU" hint={udp2rawActive ? "启用 udp2raw 时建议降低 MTU；已自动填入 1300，可手动修改。" : mimicActive ? "启用 mimic 时建议将 IPv6 WireGuard MTU 降到 1408，可手动修改。" : "双方链路 MTU，默认 1420。"}>
+              <Field label="MTU" hint={udp2rawActive ? "启用 udp2raw 时建议降低 MTU；已自动填入 1300，可手动修改。" : udpspeederActive ? "UDPspeeder 需要为 IPv4/IPv6 WireGuard 报文预留封装空间，默认使用 1280，可手动修改。" : mimicActive ? "启用 mimic 时建议将 IPv6 WireGuard MTU 降到 1408，可手动修改。" : "双方链路 MTU，默认 1420。"}>
                 <input
                   name="mtu"
                   placeholder="1420"
@@ -6967,14 +7086,17 @@ function App() {
                         value={middlewareType}
                         disabled={!selectedNodeOnline}
                         onChange={(event) => {
-                          const next = event.currentTarget.value as "none" | "udp2raw" | "mimic";
+                          const next = event.currentTarget.value as "none" | "udp2raw" | "udpspeeder" | "mimic";
                           setMiddlewareType(next);
                           setUdp2rawEnabled(next === "udp2raw");
                           setMimicEnabled(next === "mimic");
+                          setUdpspeederEnabled(next === "udpspeeder");
+                          setUdpspeederServerSide("peer");
                         }}
                       >
                         <option value="none">不使用中间层</option>
                         <option value="udp2raw">udp2raw</option>
+                        <option value="udpspeeder">UDPspeeder</option>
                         <option value="mimic">mimic</option>
                       </select>
                     </Field>
@@ -6989,6 +7111,18 @@ function App() {
                       disabled={!selectedNodeOnline}
                       onEnabledChange={setUdp2rawEnabled}
                       onServerSideChange={setUdp2rawServerSide}
+                    />
+                  )}
+                  {middlewareType === "udpspeeder" && (
+                    <UdpSpeederFields
+                      enabled={udpspeederEnabled}
+                      serverSide={udpspeederServerSide}
+                      localListenPort={managedLink.local_interface.listen_port}
+                      peerListenPort={managedLink.peer_interface.listen_port}
+                      disabled={!selectedNodeOnline}
+                      defaults={managedLink.middleware?.type === "udpspeeder" ? managedLink.middleware : null}
+                      onEnabledChange={setUdpspeederEnabled}
+                      onServerSideChange={setUdpspeederServerSide}
                     />
                   )}
                   {middlewareType === "mimic" && (

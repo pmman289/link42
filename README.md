@@ -80,7 +80,8 @@ http://192.168.1.10:8000
 安装命令大致长这样，实际请以面板生成的为准：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env \
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo env \
+  LINK42_SERVER_URL=https://your-link42-controller.example.com \
   LINK42_SERVER_URL='http://主控地址:8000' \
   LINK42_NODE_ID='1' \
   LINK42_AGENT_TOKEN='l42agent_xxx' \
@@ -90,7 +91,7 @@ curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env \
 Agent 会安装依赖、写入 `/etc/link42/agent.env`，并注册为系统服务。卸载 Agent：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo sh -s -- uninstall
 ```
 
 卸载 Agent 不会删除已有 WireGuard 配置。

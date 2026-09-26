@@ -1,99 +1,37 @@
-# Agent 构建发布
+# Agent 构建与发布
 
-## 构建产物
+Agent 资源由 Link42 主控统一分发，不再依赖独立的静态资源站点。
 
-构建 Linux x64 单文件二进制：
+## 构建
 
 ```bash
 scripts/agent/build-x64.sh
-```
-
-构建 OpenWrt 源码包：
-
-```bash
 scripts/agent/build-source.sh
+scripts/agent/prepare-release-assets.sh
 ```
 
-主要产物：
+主控镜像默认将 `manifest.json` 和各版本资源放在
+`/opt/link42/releases/agent`。构建主控镜像时会自动生成这些资源，不需要上传到独立资源服务器。
+只有在需要使用外部构建产物时，才通过 `LINK42_AGENT_RELEASE_DIR` 指向一个已准备好的本地目录；不要把空目录挂载到默认路径，否则会覆盖镜像内置资源。
 
-```text
-dist/agent/link42-agent-linux-x64
-dist/agent/link42-agent-linux-x64.sha256
-dist/agent/link42-agent-linux-x64-<version>
-dist/agent/link42-agent-linux-x64-<version>.sha256
-dist/agent/link42-agent-linux-x64-glibc2.31-<version>
-dist/agent/link42-agent-linux-x64-glibc2.31-<version>.sha256
-dist/agent/link42-agent-source.tar.gz
-dist/agent/link42-agent-source.tar.gz.sha256
-dist/agent/manifest.json
-```
+## 新节点安装
 
-## 发布到 get.pmman.tech
-
-完整构建、上传、修权限、公网校验：
+在主控节点管理页面复制安装命令，或使用下面的形式：
 
 ```bash
-scripts/agent/publish-public-assets.sh
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | \
+  sudo env LINK42_SERVER_URL=https://your-link42-controller.example.com \
+  LINK42_NODE_ID=1 LINK42_AGENT_TOKEN=token sh
 ```
 
-如果已经构建好，只上传和验证：
+安装脚本从主控的 `/api/agent/releases` 接口选择平台资源，并通过版本化下载和
+SHA256 接口校验文件。OpenWrt 和 musl 系统会选择 `openwrt-source` 源码包。
 
-```bash
-SKIP_BUILD=1 scripts/agent/publish-public-assets.sh
-```
-
-可配置项：
-
-```bash
-LINK42_PUBLIC_HOST=aligz
-LINK42_PUBLIC_ROOT=/opt/1panel/www/sites/get.pmman.tech/index
-LINK42_PUBLIC_BASE_URL=https://get.pmman.tech
-```
-
-推荐写入统一配置文件：
-
-```bash
-cp scripts/release.env.example scripts/release.env
-```
-
-脚本会自动读取 `scripts/release.env`，命令行环境变量仍可临时覆盖。
-
-校验说明：
-
-```text
-*.sha256 文件只记录文件名，不记录构建机绝对路径。
-发布脚本会重新计算公网下载到的文件 hash，避免误校验本地 dist 目录。
-```
-
-发布后应能访问：
-
-```text
-https://get.pmman.tech/sh/link42-agent.sh
-https://get.pmman.tech/res/link42/link42-agent-linux-x64
-https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
-https://get.pmman.tech/res/link42/<version>/link42-agent-linux-x64
-https://get.pmman.tech/res/link42/<version>/link42-agent-source.tar.gz
-```
-
-## 主控内置 release
-
-主控镜像构建前会自动准备内置 Agent release，也可以手动执行：
+## 准备主控镜像资源
 
 ```bash
 scripts/agent/prepare-release-assets.sh
 ```
 
-输出目录：
-
-```text
-dist/controller-agent-releases
-```
-
-`prepare-release-assets.sh` 会根据当前源码、`dist/agent/manifest.json` 和产物时间自动判断是否需要重建：
-
-```bash
-scripts/agent/prepare-release-assets.sh
-REBUILD_AGENT_RELEASES=1 scripts/agent/prepare-release-assets.sh
-```
-
-当只发布主控镜像时，这个检查可以避免镜像内置旧 Agent。
+主控镜像构建和发布脚本会自动执行该步骤。准备完成后，使用
+`scripts/controller/publish-dockerhub.sh` 构建并推送包含这些资源的主控镜像。

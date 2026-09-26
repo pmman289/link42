@@ -29,6 +29,8 @@ from .gre import (
 )
 from .link_monitor import probe_latency
 from .middleware import mimic_official_release_codename_supported
+from .udpspeeder import UDPSPEEDER_BIN, service_backend as udpspeeder_service_backend
+from .udpspeeder import run_udpspeeder_service_command
 from .plugins import node_plugin_capabilities
 from .system import (
     get_agent_platform,
@@ -115,6 +117,10 @@ def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]
             "middleware.udp2raw",
             "middleware.udp2raw.icmp",
         ])
+        if udpspeeder_service_backend() in {"systemd", "openwrt-procd"}:
+            capabilities.append("middleware.install.udpspeeder")
+            if UDPSPEEDER_BIN.is_file() and os.access(UDPSPEEDER_BIN, os.X_OK):
+                capabilities.extend(["middleware.udpspeeder", "middleware.udpspeeder.fec"])
     if service_manager in {"systemd", "openwrt-uci"}:
         capabilities.append("agent.self_upgrade")
     if service_manager == "systemd":
@@ -244,9 +250,11 @@ def scrub_text_for_log(value: object, limit: int = 500) -> str:
     return text[:limit]
 
 
-def summarize_task_result(result: dict[str, Any]) -> dict[str, Any]:
-    """生成任务结果日志摘要，避免输出完整配置内容。"""
+def summarize_task_result(result: object) -> dict[str, Any]:
+    """生成任务结果日志摘要，避免列表型命令结果打断任务上报。"""
 
+    if not isinstance(result, dict):
+        return {"type": type(result).__name__, "items": len(result) if isinstance(result, list) else None}
     summary: dict[str, Any] = {"keys": sorted(result.keys())}
     if "error" in result:
         summary["error"] = scrub_text_for_log(result.get("error"))
@@ -494,6 +502,8 @@ def main() -> None:
     """Agent 命令行入口，持续轮询中心 API。"""
 
     if run_gre_service_command(sys.argv):
+        return
+    if run_udpspeeder_service_command(sys.argv):
         return
 
     if "--version" in sys.argv or "version" in sys.argv[1:]:

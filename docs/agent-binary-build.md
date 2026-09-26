@@ -64,28 +64,28 @@ LINK42_POLL_INTERVAL=2 \
 deploy/sh/link42-agent.sh
 ```
 
-预期发布 URL：
+主控安装脚本 URL：
 
 ```bash
-https://get.pmman.tech/sh/link42-agent.sh
+https://your-link42-controller.example.com/api/agent/install.sh
 ```
 
 脚本默认从下面的资源目录下载 x64 Agent 二进制：
 
 ```bash
-https://get.pmman.tech/res/link42/link42-agent-linux-x64
+https://your-link42-controller.example.com/api/agent/releases/<version>/download?platform=linux-x64
 ```
 
 前端展示的安装命令形如：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_SERVER_URL='http://controller:8000' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo env LINK42_SERVER_URL='https://your-link42-controller.example.com' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh
 ```
 
 一键卸载：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo sh -s -- uninstall
 ```
 
 卸载会停止并删除 Agent 服务、二进制、`/etc/link42/agent.env`，并默认清理
@@ -95,7 +95,7 @@ Link42 管理的 udp2raw 中间层服务、配置和资产。卸载不会删除 
 如需保留 udp2raw 中间层资产：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_KEEP_MIDDLEWARE=1 sh -s -- uninstall
+curl -fsSL https://your-link42-controller.example.com/api/agent/install.sh | sudo env LINK42_KEEP_MIDDLEWARE=1 sh -s -- uninstall
 ```
 
 ## Alpine/musl 和 OpenWrt ARM
@@ -106,7 +106,7 @@ Alpine 使用 musl libc，不能直接运行当前 glibc PyInstaller 二进制�
 安装脚本会在检测到 Alpine/musl 或 OpenWrt UCI/procd 后下载源码包：
 
 ```text
-https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
+https://your-link42-controller.example.com/api/agent/releases/<version>/download?platform=openwrt-source
 ```
 
 源码包由下面命令生成：
