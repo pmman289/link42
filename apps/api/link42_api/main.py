@@ -2161,6 +2161,17 @@ def normalize_udpspeeder_config(payload: schemas.UdpSpeederMiddlewareConfig | No
     }
 
 
+def udpspeeder_client_default_port(
+    server_side: str,
+    local_listen_port: int | None,
+    peer_listen_port: int | None,
+) -> int:
+    """返回 UDPspeeder 客户端默认端口，复用服务端 WireGuard 的监听端口。"""
+
+    server_wireguard_port = local_listen_port if server_side == "local" else peer_listen_port
+    return server_wireguard_port or DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT
+
+
 def udpspeeder_effective_wireguard_mtu(middleware: dict | None, mtu: int | None) -> int | None:
     """返回兼容 IPv4/IPv6 WireGuard 流量的 UDPspeeder 有效 MTU。"""
 
@@ -2175,11 +2186,19 @@ def normalize_middleware_config(
     udp2raw_payload: schemas.Udp2RawMiddlewareConfig | None,
     mimic_payload: schemas.MimicMiddlewareConfig | None,
     udpspeeder_payload: schemas.UdpSpeederMiddlewareConfig | None = None,
+    local_listen_port: int | None = None,
+    peer_listen_port: int | None = None,
 ) -> dict | None:
     """统一清洗连接中间层配置；一次只能启用一种中间层。"""
 
     udp2raw = normalize_udp2raw_config(udp2raw_payload)
     udpspeeder = normalize_udpspeeder_config(udpspeeder_payload)
+    if udpspeeder and udpspeeder_payload and udpspeeder_payload.client_listen_port is None:
+        udpspeeder["client_listen_port"] = udpspeeder_client_default_port(
+            str(udpspeeder["server_side"]),
+            local_listen_port,
+            peer_listen_port,
+        )
     mimic = normalize_mimic_config(mimic_payload)
     if sum(bool(item) for item in [udp2raw, udpspeeder, mimic]) > 1:
         raise HTTPException(status_code=400, detail="only one middleware can be enabled")
@@ -5137,7 +5156,13 @@ def create_managed_link(
         raise HTTPException(status_code=409, detail="local imported endpoint does not point to peer node")
     if replace_peer_peer and not endpoint_points_to_node(replace_peer_peer.endpoint_host, local_node) and not payload.force_endpoint_mismatch:
         raise HTTPException(status_code=409, detail="peer imported endpoint does not point to local node")
-    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic, payload.udpspeeder)
+    middleware = normalize_middleware_config(
+        payload.udp2raw,
+        payload.mimic,
+        payload.udpspeeder,
+        payload.local_listen_port,
+        payload.peer_listen_port,
+    )
     validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     validate_udpspeeder_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     effective_mtu = udpspeeder_effective_wireguard_mtu(middleware, payload.mtu)
@@ -5492,7 +5517,13 @@ def update_managed_link(
     old_middleware = managed_link_middleware(local_interface)
     local_node = require_online_node(db, local_interface.node_id)
     peer_node = require_online_node(db, peer_interface.node_id)
-    middleware = normalize_middleware_config(payload.udp2raw, payload.mimic, payload.udpspeeder)
+    middleware = normalize_middleware_config(
+        payload.udp2raw,
+        payload.mimic,
+        payload.udpspeeder,
+        payload.local_listen_port,
+        payload.peer_listen_port,
+    )
     validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     validate_udpspeeder_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     effective_mtu = udpspeeder_effective_wireguard_mtu(middleware, payload.mtu)

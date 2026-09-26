@@ -9,6 +9,7 @@ from link42_agent import udpspeeder
 from link42_api import schemas
 from link42_api.main import (
     normalize_middleware_config,
+    udpspeeder_client_default_port,
     udpspeeder_effective_wireguard_mtu,
     udpspeeder_endpoint_payloads,
     validate_udpspeeder_port_conflicts,
@@ -150,6 +151,27 @@ def test_udpspeeder_defaults_leave_room_for_ipv4_and_ipv6_wireguard() -> None:
     assert middleware["fec_mtu"] == 1400
     assert udpspeeder_effective_wireguard_mtu(middleware, 1420) == 1280
     assert udpspeeder_effective_wireguard_mtu(middleware, 1280) == 1280
+
+
+def test_udpspeeder_client_defaults_to_server_wireguard_port() -> None:
+    """验证未填写客户端端口时复用服务端 WireGuard 监听端口。"""
+
+    assert udpspeeder_client_default_port("peer", 51821, 51820) == 51820
+    assert udpspeeder_client_default_port("local", 51821, None) == 51821
+    middleware = normalize_middleware_config(
+        None,
+        None,
+        schemas.UdpSpeederMiddlewareConfig(
+            enabled=True,
+            server_side="peer",
+            server_listen_port=24000,
+            server_connect_host="198.51.100.20",
+        ),
+        local_listen_port=None,
+        peer_listen_port=51820,
+    )
+    assert middleware is not None
+    assert middleware["client_listen_port"] == 51820
 
 
 def test_udpspeeder_systemd_unit_loads_agent_environment(tmp_path, monkeypatch) -> None:

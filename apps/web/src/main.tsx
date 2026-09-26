@@ -2099,9 +2099,9 @@ function UdpSpeederFields({
   }, [localListenPort, peerListenPort]);
 
   const serverForwardPort = serverSide === "local" ? wireGuardPorts.local : wireGuardPorts.peer;
-  const clientListenPort = defaults?.client_listen_port ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT;
+  const clientListenPort = defaults?.client_listen_port ?? serverForwardPort ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT;
   return (
-    <div ref={containerRef}>
+    <div ref={containerRef} className="wideField">
     <FormSection title="UDPspeeder 中间层" hint="通过 FEC 为 WireGuard UDP 报文增加抗随机丢包能力；一端运行 server，另一端运行 client。">
       <label className="checkField wideField"><input name="udpspeeder_enabled" type="checkbox" checked={enabled} onChange={(event) => onEnabledChange(event.currentTarget.checked)} disabled={disabled} /><span>启用 UDPspeeder</span></label>
       <Field label="服务端位置" hint="服务端必须位于有可达入口地址且填写 WireGuard 监听端口的一端。">
@@ -2117,7 +2117,7 @@ function UdpSpeederFields({
       <Field label="服务端转发地址"><input name="udpspeeder_server_forward_host" defaultValue={defaults?.server_forward_host || "127.0.0.1"} disabled={disabled} /></Field>
       <Field label="服务端转发端口" hint="自动使用上方服务端 WireGuard 的监听端口。"><input key={`udpspeeder-forward-port-${serverSide}-${serverForwardPort || "empty"}`} name="udpspeeder_server_forward_port" defaultValue={serverForwardPort || ""} inputMode="numeric" readOnly disabled={disabled} /></Field>
       <Field label="客户端监听地址"><input name="udpspeeder_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} /></Field>
-      <Field label="客户端监听端口" hint={`客户端 UDPspeeder 的本地端口，WireGuard 客户端无需监听；默认使用 ${DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT}，如有冲突可以修改。`}><input name="udpspeeder_client_listen_port" defaultValue={clientListenPort} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="客户端监听端口" hint={`客户端 UDPspeeder 的本地端口，默认复用服务端 WireGuard 监听端口 ${clientListenPort || DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT}；如本机端口冲突可以修改。`}><input key={`udpspeeder-client-port-${serverSide}-${clientListenPort || "empty"}`} name="udpspeeder_client_listen_port" defaultValue={clientListenPort} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="FEC 数据:冗余" hint="例如 10:5 表示每 10 个数据包增加 5 个冗余包。"><input name="udpspeeder_fec" defaultValue={`${defaults?.fec_data || 10}:${defaults?.fec_redundancy ?? 5}`} disabled={disabled} /></Field>
       <Field label="FEC 超时（毫秒）"><input name="udpspeeder_fec_timeout_ms" defaultValue={defaults?.fec_timeout_ms || 8} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="FEC 模式"><select name="udpspeeder_fec_mode" defaultValue={defaults?.fec_mode ?? 0} disabled={disabled}><option value="0">标准模式</option><option value="1">低延迟模式</option></select></Field>
@@ -2134,9 +2134,10 @@ function readUdpSpeederForm(form: FormData, localListenPort?: number | null, pee
   // 从表单读取并组装 UDPspeeder 配置。
   if (form.get("udpspeeder_enabled") !== "on") return null;
   const side = String(form.get("udpspeeder_server_side") || "peer");
+  const serverWireGuardPort = side === "local" ? localListenPort : peerListenPort;
   const fec = String(form.get("udpspeeder_fec") || "10:5").split(":");
   if (fec.length !== 2) throw new Error("FEC 数据:冗余必须使用 data:redundancy 格式");
-  return { enabled: true, server_side: side, server_listen_host: String(form.get("udpspeeder_server_listen_host") || "0.0.0.0").trim(), server_connect_host: String(form.get("udpspeeder_server_connect_host") || "").trim() || null, server_listen_port: optionalInt(form.get("udpspeeder_server_listen_port"), "UDPspeeder 服务端口"), server_forward_host: String(form.get("udpspeeder_server_forward_host") || "127.0.0.1").trim(), server_forward_port: optionalInt(form.get("udpspeeder_server_forward_port"), "UDPspeeder 转发端口") ?? (side === "local" ? localListenPort : peerListenPort), client_listen_host: String(form.get("udpspeeder_client_listen_host") || "127.0.0.1").trim(), client_listen_port: optionalInt(form.get("udpspeeder_client_listen_port"), "UDPspeeder 客户端端口") ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT, fec_data: Number(fec[0]), fec_redundancy: Number(fec[1]), fec_timeout_ms: optionalInt(form.get("udpspeeder_fec_timeout_ms"), "FEC 超时") ?? 8, fec_mode: Number(form.get("udpspeeder_fec_mode") || 0), fec_mtu: optionalInt(form.get("udpspeeder_fec_mtu"), "FEC MTU") ?? 1400, fec_queue_len: optionalInt(form.get("udpspeeder_fec_queue_len"), "FEC 队列") ?? 200, decode_buffer: optionalInt(form.get("udpspeeder_decode_buffer"), "解码缓存") ?? 2000 };
+  return { enabled: true, server_side: side, server_listen_host: String(form.get("udpspeeder_server_listen_host") || "0.0.0.0").trim(), server_connect_host: String(form.get("udpspeeder_server_connect_host") || "").trim() || null, server_listen_port: optionalInt(form.get("udpspeeder_server_listen_port"), "UDPspeeder 服务端口"), server_forward_host: String(form.get("udpspeeder_server_forward_host") || "127.0.0.1").trim(), server_forward_port: optionalInt(form.get("udpspeeder_server_forward_port"), "UDPspeeder 转发端口") ?? serverWireGuardPort, client_listen_host: String(form.get("udpspeeder_client_listen_host") || "127.0.0.1").trim(), client_listen_port: optionalInt(form.get("udpspeeder_client_listen_port"), "UDPspeeder 客户端端口") ?? serverWireGuardPort ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT, fec_data: Number(fec[0]), fec_redundancy: Number(fec[1]), fec_timeout_ms: optionalInt(form.get("udpspeeder_fec_timeout_ms"), "FEC 超时") ?? 8, fec_mode: Number(form.get("udpspeeder_fec_mode") || 0), fec_mtu: optionalInt(form.get("udpspeeder_fec_mtu"), "FEC MTU") ?? 1400, fec_queue_len: optionalInt(form.get("udpspeeder_fec_queue_len"), "FEC 队列") ?? 200, decode_buffer: optionalInt(form.get("udpspeeder_decode_buffer"), "解码缓存") ?? 2000 };
 }
 
 // 从表单中读取并组装 udp2raw 配置。
