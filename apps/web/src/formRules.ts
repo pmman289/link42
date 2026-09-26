@@ -334,7 +334,7 @@ export const managedWireGuardFormRule: FormRule<ManagedWireGuardFormContext> = {
       name: "local_listen_port",
       label: "本端监听端口",
       required: (values, context) => context.middlewareType === "mimic"
-        || context.middlewareType === "udpspeeder"
+        || (context.middlewareType === "udpspeeder" && (fieldString(values, "udpspeeder_server_side") || "peer") === "local")
         || (context.middlewareType === "udp2raw" && (fieldString(values, "udp2raw_server_side") || "peer") === "local"),
       validate: portRule("本端监听端口"),
     }),
@@ -342,7 +342,7 @@ export const managedWireGuardFormRule: FormRule<ManagedWireGuardFormContext> = {
       name: "peer_listen_port",
       label: "对端监听端口",
       required: (values, context) => context.middlewareType === "mimic"
-        || context.middlewareType === "udpspeeder"
+        || (context.middlewareType === "udpspeeder" && (fieldString(values, "udpspeeder_server_side") || "peer") === "peer")
         || (context.middlewareType === "udp2raw" && (fieldString(values, "udp2raw_server_side") || "peer") === "peer"),
       validate: portRule("对端监听端口"),
     }),

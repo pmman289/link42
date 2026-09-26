@@ -63,12 +63,39 @@ describe("统一表单规则", () => {
     });
   });
 
-  it("UDPspeeder 要求双方填写 WireGuard 监听端口", () => {
-    const data = managedWireGuardData({ local_listen_port: "", peer_listen_port: "" });
+  it("UDPspeeder 客户端可以不填写 WireGuard 监听端口", () => {
+    const data = managedWireGuardData({
+      local_listen_port: "",
+      peer_listen_port: "51821",
+      udpspeeder_server_side: "peer",
+      udpspeeder_server_connect_host: "198.51.100.20",
+      udpspeeder_server_listen_host: "0.0.0.0",
+      udpspeeder_server_listen_port: "23000",
+      udpspeeder_server_forward_host: "127.0.0.1",
+      udpspeeder_server_forward_port: "51821",
+      udpspeeder_client_listen_host: "127.0.0.1",
+      udpspeeder_client_listen_port: "23001",
+      udpspeeder_fec: "10:5",
+      udpspeeder_fec_timeout_ms: "8",
+      udpspeeder_fec_mtu: "1400",
+      udpspeeder_fec_queue_len: "200",
+      udpspeeder_decode_buffer: "2000",
+    });
 
     const issues = validateFormData(data, managedWireGuardFormRule, { middlewareType: "udpspeeder", requirePeerNode: true });
 
-    expect(issues).toContainEqual({ field: "local_listen_port", message: "本端监听端口为必填项" });
+    expect(issues.filter((issue) => issue.field === "local_listen_port" || issue.field === "peer_listen_port")).toEqual([]);
+  });
+
+  it("UDPspeeder 服务端必须填写所在节点的 WireGuard 监听端口", () => {
+    const data = managedWireGuardData({
+      local_listen_port: "",
+      peer_listen_port: "",
+      udpspeeder_server_side: "peer",
+    });
+
+    const issues = validateFormData(data, managedWireGuardFormRule, { middlewareType: "udpspeeder", requirePeerNode: true });
+
     expect(issues).toContainEqual({ field: "peer_listen_port", message: "对端监听端口为必填项" });
   });
 

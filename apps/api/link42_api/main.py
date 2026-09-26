@@ -78,6 +78,7 @@ from .wireguard_service import (
 
 LOGGER_NAME = "link42.api"
 logger = logging.getLogger(LOGGER_NAME)
+DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT = 23001
 
 
 def configure_logging(level_name: str) -> None:
@@ -2135,8 +2136,8 @@ def normalize_udpspeeder_config(payload: schemas.UdpSpeederMiddlewareConfig | No
 
     if payload is None or not payload.enabled:
         return None
-    if payload.server_listen_port is None or payload.client_listen_port is None:
-        raise HTTPException(status_code=400, detail="udpspeeder server and client listen ports are required")
+    if payload.server_listen_port is None:
+        raise HTTPException(status_code=400, detail="udpspeeder server listen port is required")
     if payload.server_side == "peer" and payload.server_connect_host is None:
         raise HTTPException(status_code=400, detail="udpspeeder server endpoint address is required")
     return {
@@ -2149,7 +2150,7 @@ def normalize_udpspeeder_config(payload: schemas.UdpSpeederMiddlewareConfig | No
         "server_forward_host": payload.server_forward_host,
         "server_forward_port": payload.server_forward_port,
         "client_listen_host": payload.client_listen_host,
-        "client_listen_port": payload.client_listen_port,
+        "client_listen_port": payload.client_listen_port or DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT,
         "fec_data": payload.fec_data,
         "fec_redundancy": payload.fec_redundancy,
         "fec_timeout_ms": payload.fec_timeout_ms,
@@ -2208,6 +2209,32 @@ def validate_udp2raw_port_conflicts(
         raise HTTPException(
             status_code=400,
             detail="udp2raw UDP server port conflicts with WireGuard listen port on the same node",
+        )
+
+
+def validate_udpspeeder_port_conflicts(
+    middleware: dict | None,
+    local_listen_port: int | None,
+    peer_listen_port: int | None,
+) -> None:
+    """校验 UDPspeeder 的服务端端口和客户端本地端口不会与 WireGuard 冲突。"""
+
+    if not middleware or middleware.get("type") != "udpspeeder":
+        return
+    server_side = str(middleware.get("server_side") or "peer")
+    server_wireguard_port = local_listen_port if server_side == "local" else peer_listen_port
+    client_wireguard_port = peer_listen_port if server_side == "local" else local_listen_port
+    if server_wireguard_port is None:
+        raise HTTPException(status_code=400, detail="udpspeeder server side requires WireGuard listen port")
+    if middleware.get("server_listen_port") == server_wireguard_port:
+        raise HTTPException(
+            status_code=400,
+            detail="udpspeeder server port conflicts with WireGuard listen port on the same node",
+        )
+    if client_wireguard_port is not None and client_wireguard_port == middleware.get("client_listen_port"):
+        raise HTTPException(
+            status_code=400,
+            detail="udpspeeder client listen port conflicts with WireGuard listen port on the same node",
         )
 
 
@@ -5112,6 +5139,7 @@ def create_managed_link(
         raise HTTPException(status_code=409, detail="peer imported endpoint does not point to local node")
     middleware = normalize_middleware_config(payload.udp2raw, payload.mimic, payload.udpspeeder)
     validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
+    validate_udpspeeder_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     effective_mtu = udpspeeder_effective_wireguard_mtu(middleware, payload.mtu)
     local_endpoint, peer_endpoint = require_managed_link_endpoints(
         local_node,
@@ -5466,6 +5494,7 @@ def update_managed_link(
     peer_node = require_online_node(db, peer_interface.node_id)
     middleware = normalize_middleware_config(payload.udp2raw, payload.mimic, payload.udpspeeder)
     validate_udp2raw_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
+    validate_udpspeeder_port_conflicts(middleware, payload.local_listen_port, payload.peer_listen_port)
     effective_mtu = udpspeeder_effective_wireguard_mtu(middleware, payload.mtu)
     local_endpoint, peer_endpoint = require_managed_link_endpoints(
         local_node,

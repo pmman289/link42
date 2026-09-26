@@ -493,6 +493,7 @@ const TASK_POLL_INTERVAL_MS = 2000;
 const AGENT_TASK_POLL_LIMIT = 90;
 const SHORT_TASK_POLL_LIMIT = 30;
 const PORT_INVENTORY_PAGE_SIZE = 10;
+const DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT = 23001;
 
 // 读取本地保存的主题，未设置时跟随系统偏好。
 function initialTheme(): "light" | "dark" {
@@ -2098,7 +2099,7 @@ function UdpSpeederFields({
   }, [localListenPort, peerListenPort]);
 
   const serverForwardPort = serverSide === "local" ? wireGuardPorts.local : wireGuardPorts.peer;
-  const clientListenPort = serverSide === "local" ? wireGuardPorts.peer : wireGuardPorts.local;
+  const clientListenPort = defaults?.client_listen_port ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT;
   return (
     <div ref={containerRef}>
     <FormSection title="UDPspeeder 中间层" hint="通过 FEC 为 WireGuard UDP 报文增加抗随机丢包能力；一端运行 server，另一端运行 client。">
@@ -2116,7 +2117,7 @@ function UdpSpeederFields({
       <Field label="服务端转发地址"><input name="udpspeeder_server_forward_host" defaultValue={defaults?.server_forward_host || "127.0.0.1"} disabled={disabled} /></Field>
       <Field label="服务端转发端口" hint="自动使用上方服务端 WireGuard 的监听端口。"><input key={`udpspeeder-forward-port-${serverSide}-${serverForwardPort || "empty"}`} name="udpspeeder_server_forward_port" defaultValue={serverForwardPort || ""} inputMode="numeric" readOnly disabled={disabled} /></Field>
       <Field label="客户端监听地址"><input name="udpspeeder_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} /></Field>
-      <Field label="客户端监听端口" hint="自动使用上方客户端 WireGuard 的监听端口。"><input key={`udpspeeder-client-port-${serverSide}-${clientListenPort || "empty"}`} name="udpspeeder_client_listen_port" defaultValue={clientListenPort || ""} inputMode="numeric" readOnly disabled={disabled} /></Field>
+      <Field label="客户端监听端口" hint={`客户端 UDPspeeder 的本地端口，WireGuard 客户端无需监听；默认使用 ${DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT}，如有冲突可以修改。`}><input name="udpspeeder_client_listen_port" defaultValue={clientListenPort} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="FEC 数据:冗余" hint="例如 10:5 表示每 10 个数据包增加 5 个冗余包。"><input name="udpspeeder_fec" defaultValue={`${defaults?.fec_data || 10}:${defaults?.fec_redundancy ?? 5}`} disabled={disabled} /></Field>
       <Field label="FEC 超时（毫秒）"><input name="udpspeeder_fec_timeout_ms" defaultValue={defaults?.fec_timeout_ms || 8} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="FEC 模式"><select name="udpspeeder_fec_mode" defaultValue={defaults?.fec_mode ?? 0} disabled={disabled}><option value="0">标准模式</option><option value="1">低延迟模式</option></select></Field>
@@ -2135,7 +2136,7 @@ function readUdpSpeederForm(form: FormData, localListenPort?: number | null, pee
   const side = String(form.get("udpspeeder_server_side") || "peer");
   const fec = String(form.get("udpspeeder_fec") || "10:5").split(":");
   if (fec.length !== 2) throw new Error("FEC 数据:冗余必须使用 data:redundancy 格式");
-  return { enabled: true, server_side: side, server_listen_host: String(form.get("udpspeeder_server_listen_host") || "0.0.0.0").trim(), server_connect_host: String(form.get("udpspeeder_server_connect_host") || "").trim() || null, server_listen_port: optionalInt(form.get("udpspeeder_server_listen_port"), "UDPspeeder 服务端口"), server_forward_host: String(form.get("udpspeeder_server_forward_host") || "127.0.0.1").trim(), server_forward_port: optionalInt(form.get("udpspeeder_server_forward_port"), "UDPspeeder 转发端口") ?? (side === "local" ? localListenPort : peerListenPort), client_listen_host: String(form.get("udpspeeder_client_listen_host") || "127.0.0.1").trim(), client_listen_port: optionalInt(form.get("udpspeeder_client_listen_port"), "UDPspeeder 客户端端口"), fec_data: Number(fec[0]), fec_redundancy: Number(fec[1]), fec_timeout_ms: optionalInt(form.get("udpspeeder_fec_timeout_ms"), "FEC 超时") ?? 8, fec_mode: Number(form.get("udpspeeder_fec_mode") || 0), fec_mtu: optionalInt(form.get("udpspeeder_fec_mtu"), "FEC MTU") ?? 1400, fec_queue_len: optionalInt(form.get("udpspeeder_fec_queue_len"), "FEC 队列") ?? 200, decode_buffer: optionalInt(form.get("udpspeeder_decode_buffer"), "解码缓存") ?? 2000 };
+  return { enabled: true, server_side: side, server_listen_host: String(form.get("udpspeeder_server_listen_host") || "0.0.0.0").trim(), server_connect_host: String(form.get("udpspeeder_server_connect_host") || "").trim() || null, server_listen_port: optionalInt(form.get("udpspeeder_server_listen_port"), "UDPspeeder 服务端口"), server_forward_host: String(form.get("udpspeeder_server_forward_host") || "127.0.0.1").trim(), server_forward_port: optionalInt(form.get("udpspeeder_server_forward_port"), "UDPspeeder 转发端口") ?? (side === "local" ? localListenPort : peerListenPort), client_listen_host: String(form.get("udpspeeder_client_listen_host") || "127.0.0.1").trim(), client_listen_port: optionalInt(form.get("udpspeeder_client_listen_port"), "UDPspeeder 客户端端口") ?? DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT, fec_data: Number(fec[0]), fec_redundancy: Number(fec[1]), fec_timeout_ms: optionalInt(form.get("udpspeeder_fec_timeout_ms"), "FEC 超时") ?? 8, fec_mode: Number(form.get("udpspeeder_fec_mode") || 0), fec_mtu: optionalInt(form.get("udpspeeder_fec_mtu"), "FEC MTU") ?? 1400, fec_queue_len: optionalInt(form.get("udpspeeder_fec_queue_len"), "FEC 队列") ?? 200, decode_buffer: optionalInt(form.get("udpspeeder_decode_buffer"), "解码缓存") ?? 2000 };
 }
 
 // 从表单中读取并组装 udp2raw 配置。
@@ -6137,25 +6138,33 @@ function App() {
                 label="本端监听端口"
                 hint={mimicActive
                   ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
-                  : udp2rawActive
+                  : udpspeederActive
+                    ? udpspeederServerSide === "local"
+                      ? "本端运行 UDPspeeder 服务端，WireGuard 必须填写监听端口。"
+                      : "本端运行 UDPspeeder 客户端，WireGuard 监听端口可以留空。"
+                    : udp2rawActive
                     ? udp2rawServerSide === "peer"
                       ? "本端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
                       : "本端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
                     : "可选；留空表示本端 WireGuard 不固定监听端口。"}
               >
-                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" required={mimicActive || udpspeederActive || (udp2rawActive && udp2rawServerSide === "local")} disabled={!selectedNodeOnline} />
+                <input name="local_listen_port" placeholder="51820" defaultValue={replaceLocalConfig?.listen_port || ""} inputMode="numeric" required={mimicActive || (udpspeederActive && udpspeederServerSide === "local") || (udp2rawActive && udp2rawServerSide === "local")} disabled={!selectedNodeOnline} />
               </Field>
               <Field
                 label="对端监听端口"
                 hint={mimicActive
                   ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
-                  : udp2rawActive
+                  : udpspeederActive
+                    ? udpspeederServerSide === "peer"
+                      ? "对端运行 UDPspeeder 服务端，WireGuard 必须填写监听端口。"
+                      : "对端运行 UDPspeeder 客户端，WireGuard 监听端口可以留空。"
+                    : udp2rawActive
                     ? udp2rawServerSide === "local"
                       ? "对端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
                       : "对端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
                     : "可选；留空表示对端 WireGuard 不固定监听端口。"}
               >
-                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" required={mimicActive || udpspeederActive || (udp2rawActive && udp2rawServerSide === "peer")} disabled={!selectedNodeOnline} />
+                <input name="peer_listen_port" placeholder="51821" defaultValue={replacePeerConfig?.listen_port || ""} inputMode="numeric" required={mimicActive || (udpspeederActive && udpspeederServerSide === "peer") || (udp2rawActive && udp2rawServerSide === "peer")} disabled={!selectedNodeOnline} />
               </Field>
               </FormSection>
               <FormSection title="连接地址与路由" hint="入口地址是另一端主动连接时使用的真实网络地址。只需一端主动发起连接时，无法被访问的一侧可以留空。">
@@ -7052,25 +7061,33 @@ function App() {
                       label="本端监听端口"
                       hint={mimicActive
                         ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
-                        : udp2rawActive
+                        : udpspeederActive
+                          ? udpspeederServerSide === "local"
+                            ? "本端运行 UDPspeeder 服务端，WireGuard 必须填写监听端口。"
+                            : "本端运行 UDPspeeder 客户端，WireGuard 监听端口可以留空。"
+                          : udp2rawActive
                           ? udp2rawServerSide === "peer"
                             ? "本端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
                             : "本端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
                           : "可选；留空表示本端 WireGuard 不固定监听端口。"}
                     >
-                      <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} inputMode="numeric" required={mimicActive || udpspeederActive || (udp2rawActive && udp2rawServerSide === "local")} disabled={!selectedNodeOnline} />
+                      <input name="local_listen_port" defaultValue={managedLink.local_interface.listen_port || ""} inputMode="numeric" required={mimicActive || (udpspeederActive && udpspeederServerSide === "local") || (udp2rawActive && udp2rawServerSide === "local")} disabled={!selectedNodeOnline} />
                     </Field>
                     <Field
                       label="对端监听端口"
                       hint={mimicActive
                         ? "mimic 透明匹配需要双方 WireGuard 都填写监听端口。"
-                        : udp2rawActive
+                        : udpspeederActive
+                          ? udpspeederServerSide === "peer"
+                            ? "对端运行 UDPspeeder 服务端，WireGuard 必须填写监听端口。"
+                            : "对端运行 UDPspeeder 客户端，WireGuard 监听端口可以留空。"
+                          : udp2rawActive
                           ? udp2rawServerSide === "local"
                             ? "对端运行 udp2raw 客户端，通常不需要 WireGuard 监听端口，建议留空。"
                             : "对端运行 udp2raw 服务端时必须填写；UDP 模式下不能与服务端会话端口相同。"
                           : "可选；留空表示对端 WireGuard 不固定监听端口。"}
                     >
-                      <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" required={mimicActive || udpspeederActive || (udp2rawActive && udp2rawServerSide === "peer")} disabled={!selectedNodeOnline} />
+                      <input name="peer_listen_port" defaultValue={managedLink.peer_interface.listen_port || ""} inputMode="numeric" required={mimicActive || (udpspeederActive && udpspeederServerSide === "peer") || (udp2rawActive && udp2rawServerSide === "peer")} disabled={!selectedNodeOnline} />
                     </Field>
                   </FormSection>
                   <FormSection title="连接地址与路由" hint="入口地址是另一端主动连接时使用的真实网络地址。只需一端主动发起连接时，无法被访问的一侧可以留空。">

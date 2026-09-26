@@ -7,7 +7,12 @@ import pytest
 
 from link42_agent import udpspeeder
 from link42_api import schemas
-from link42_api.main import normalize_middleware_config, udpspeeder_effective_wireguard_mtu, udpspeeder_endpoint_payloads
+from link42_api.main import (
+    normalize_middleware_config,
+    udpspeeder_effective_wireguard_mtu,
+    udpspeeder_endpoint_payloads,
+    validate_udpspeeder_port_conflicts,
+)
 
 
 def test_udpspeeder_renders_ipv6_client_arguments() -> None:
@@ -101,6 +106,33 @@ def test_udpspeeder_endpoint_payloads_create_server_and_client_roles() -> None:
     assert payloads[1][2]["remote_host"] == "198.51.100.20"
 
 
+def test_udpspeeder_allows_client_wireguard_without_listen_port() -> None:
+    """验证 UDPspeeder 客户端侧 WireGuard 可以使用临时源端口。"""
+
+    middleware = {
+        "type": "udpspeeder",
+        "server_side": "peer",
+        "server_listen_port": 24000,
+        "client_listen_port": 24002,
+    }
+
+    validate_udpspeeder_port_conflicts(middleware, None, 51820)
+
+
+def test_udpspeeder_requires_server_wireguard_listen_port() -> None:
+    """验证 UDPspeeder 服务端所在节点必须有 WireGuard ListenPort。"""
+
+    middleware = {
+        "type": "udpspeeder",
+        "server_side": "peer",
+        "server_listen_port": 24000,
+        "client_listen_port": 24002,
+    }
+
+    with pytest.raises(Exception, match="server side requires WireGuard listen port"):
+        validate_udpspeeder_port_conflicts(middleware, 51820, None)
+
+
 def test_udpspeeder_defaults_leave_room_for_ipv4_and_ipv6_wireguard() -> None:
     """验证 UDPspeeder 默认组合会把 WireGuard MTU 限制到 IPv4/IPv6 都可承载的范围。"""
 
@@ -110,11 +142,11 @@ def test_udpspeeder_defaults_leave_room_for_ipv4_and_ipv6_wireguard() -> None:
         schemas.UdpSpeederMiddlewareConfig(
             enabled=True,
             server_listen_port=24000,
-            client_listen_port=24002,
             server_connect_host="198.51.100.20",
         ),
     )
     assert middleware is not None
+    assert middleware["client_listen_port"] == 23001
     assert middleware["fec_mtu"] == 1400
     assert udpspeeder_effective_wireguard_mtu(middleware, 1420) == 1280
     assert udpspeeder_effective_wireguard_mtu(middleware, 1280) == 1280
