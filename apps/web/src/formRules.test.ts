@@ -63,6 +63,15 @@ describe("统一表单规则", () => {
     });
   });
 
+  it("UDPspeeder 要求双方填写 WireGuard 监听端口", () => {
+    const data = managedWireGuardData({ local_listen_port: "", peer_listen_port: "" });
+
+    const issues = validateFormData(data, managedWireGuardFormRule, { middlewareType: "udpspeeder", requirePeerNode: true });
+
+    expect(issues).toContainEqual({ field: "local_listen_port", message: "本端监听端口为必填项" });
+    expect(issues).toContainEqual({ field: "peer_listen_port", message: "对端监听端口为必填项" });
+  });
+
   it("udp2raw 客户端监听端口不能与同机 WireGuard 端口相同", () => {
     const data = managedWireGuardData({ local_listen_port: "23001" });
 
