@@ -2119,11 +2119,11 @@ function UdpSpeederFields({
       <Field label="客户端监听地址"><input name="udpspeeder_client_listen_host" defaultValue={defaults?.client_listen_host || "127.0.0.1"} disabled={disabled} /></Field>
       <Field label="客户端监听端口" hint={`客户端 UDPspeeder 的本地端口，默认复用服务端 WireGuard 监听端口 ${clientListenPort || DEFAULT_UDPSPEEDER_CLIENT_LISTEN_PORT}；如本机端口冲突可以修改。`}><input key={`udpspeeder-client-port-${serverSide}-${clientListenPort || "empty"}`} name="udpspeeder_client_listen_port" defaultValue={clientListenPort} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="FEC 数据:冗余" hint="例如 10:5 表示每 10 个数据包增加 5 个冗余包。"><input name="udpspeeder_fec" defaultValue={`${defaults?.fec_data || 10}:${defaults?.fec_redundancy ?? 5}`} disabled={disabled} /></Field>
-      <Field label="FEC 超时（毫秒）"><input name="udpspeeder_fec_timeout_ms" defaultValue={defaults?.fec_timeout_ms || 8} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="FEC 超时（毫秒）" hint="允许 0-1000；设置为 0 表示不额外等待 FEC 超时。"><input name="udpspeeder_fec_timeout_ms" defaultValue={defaults?.fec_timeout_ms ?? 8} inputMode="numeric" disabled={disabled} /></Field>
       <Field label="FEC 模式"><select name="udpspeeder_fec_mode" defaultValue={defaults?.fec_mode ?? 0} disabled={disabled}><option value="0">标准模式</option><option value="1">低延迟模式</option></select></Field>
-      <Field label="FEC MTU" hint="默认 1400，用于承载 IPv6 WireGuard 报文；启用后 WireGuard MTU 会保持不低于 IPv6 要求的 1280。"><input name="udpspeeder_fec_mtu" defaultValue={defaults?.fec_mtu || 1400} inputMode="numeric" disabled={disabled} /></Field>
-      <Field label="发送队列长度"><input name="udpspeeder_fec_queue_len" defaultValue={defaults?.fec_queue_len || 200} inputMode="numeric" disabled={disabled} /></Field>
-      <Field label="解码缓存大小"><input name="udpspeeder_decode_buffer" defaultValue={defaults?.decode_buffer || 2000} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="FEC MTU" hint="允许 100-2000；默认 1400，用于承载 IPv6 WireGuard 报文。"><input name="udpspeeder_fec_mtu" defaultValue={defaults?.fec_mtu ?? 1400} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="发送队列长度" hint="允许 1-10000；设置为 1 可让 mode 0 尽快发送。"><input name="udpspeeder_fec_queue_len" defaultValue={defaults?.fec_queue_len ?? 200} inputMode="numeric" disabled={disabled} /></Field>
+      <Field label="解码缓存大小" hint="允许 300-20000。"><input name="udpspeeder_decode_buffer" defaultValue={defaults?.decode_buffer ?? 2000} inputMode="numeric" disabled={disabled} /></Field>
       <div className="formNotice wideField">数据流：WireGuard → 本地 UDPspeeder client → 网络 → UDPspeeder server → 服务端 WireGuard。</div>
     </FormSection>
     </div>

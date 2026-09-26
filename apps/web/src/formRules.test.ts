@@ -99,6 +99,42 @@ describe("统一表单规则", () => {
     expect(issues).toContainEqual({ field: "peer_listen_port", message: "对端监听端口为必填项" });
   });
 
+  it("UDPspeeder 表单允许上游支持的 FEC 边界值", () => {
+    const data = managedWireGuardData({
+      udpspeeder_server_side: "peer",
+      udpspeeder_server_connect_host: "198.51.100.20",
+      udpspeeder_server_listen_host: "0.0.0.0",
+      udpspeeder_server_listen_port: "23002",
+      udpspeeder_server_forward_host: "127.0.0.1",
+      udpspeeder_server_forward_port: "51821",
+      udpspeeder_client_listen_host: "127.0.0.1",
+      udpspeeder_client_listen_port: "23001",
+      udpspeeder_fec: "255:0",
+      udpspeeder_fec_timeout_ms: "0",
+      udpspeeder_fec_mtu: "100",
+      udpspeeder_fec_queue_len: "1",
+      udpspeeder_decode_buffer: "300",
+    });
+
+    const issues = validateFormData(data, managedWireGuardFormRule, { middlewareType: "udpspeeder", requirePeerNode: true });
+
+    expect(issues.filter((issue) => ["udpspeeder_fec", "udpspeeder_fec_timeout_ms", "udpspeeder_fec_mtu", "udpspeeder_fec_queue_len", "udpspeeder_decode_buffer"].includes(issue.field || ""))).toEqual([]);
+  });
+
+  it("UDPspeeder 表单拒绝超过 255 包的 FEC 组合", () => {
+    const data = managedWireGuardData({
+      udpspeeder_fec: "255:1",
+      udpspeeder_fec_timeout_ms: "0",
+      udpspeeder_fec_mtu: "100",
+      udpspeeder_fec_queue_len: "1",
+      udpspeeder_decode_buffer: "300",
+    });
+
+    const issues = validateFormData(data, managedWireGuardFormRule, { middlewareType: "udpspeeder", requirePeerNode: true });
+
+    expect(issues).toContainEqual({ field: "udpspeeder_fec", message: "FEC 数据包和冗余包总数不能大于 255" });
+  });
+
   it("udp2raw 客户端监听端口不能与同机 WireGuard 端口相同", () => {
     const data = managedWireGuardData({ local_listen_port: "23001" });
 

@@ -19,6 +19,7 @@ from .validation import atomic_write_text, managed_child_path, validate_instance
 UDPSPEEDER_BIN = Path(os.getenv("LINK42_UDPSPEEDER_BIN", "/usr/local/bin/udpspeeder"))
 UDPSPEEDER_DIR = Path(os.getenv("LINK42_UDPSPEEDER_CONFIG_DIR", "/etc/link42/middleware/udpspeeder"))
 UDPSPEEDER_PREFIX = os.getenv("LINK42_UDPSPEEDER_SERVICE_PREFIX", "link42-udpspeeder")
+MAX_FEC_PACKET_COUNT = 255
 
 
 def validate_udpspeeder_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -30,10 +31,12 @@ def validate_udpspeeder_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("udpspeeder mode must be client or server")
     listen = _endpoint(payload.get("listen_host"), payload.get("listen_port"), "listen")
     remote = _endpoint(payload.get("remote_host"), payload.get("remote_port"), "remote")
-    for name, minimum, maximum in [("fec_data", 1, 1000), ("fec_redundancy", 0, 1000), ("fec_timeout_ms", 1, 1000), ("fec_mode", 0, 1), ("fec_mtu", 500, 1400), ("fec_queue_len", 10, 10000), ("decode_buffer", 1, 100000)]:
+    for name, minimum, maximum in [("fec_data", 1, 255), ("fec_redundancy", 0, 254), ("fec_timeout_ms", 0, 1000), ("fec_mode", 0, 1), ("fec_mtu", 100, 2000), ("fec_queue_len", 1, 10000), ("decode_buffer", 300, 20000)]:
         value = int(payload.get(name))
         if not minimum <= value <= maximum:
             raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    if int(payload.get("fec_data")) + int(payload.get("fec_redundancy")) > MAX_FEC_PACKET_COUNT:
+        raise ValueError("fec_data + fec_redundancy must be less than or equal to 255")
     return {
         "instance": instance,
         "mode": mode,

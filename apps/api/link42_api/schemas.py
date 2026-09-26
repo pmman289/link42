@@ -6,7 +6,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 
 LOOKING_GLASS_TARGET_HOSTNAME_RE = re.compile(
@@ -1329,14 +1329,22 @@ class UdpSpeederMiddlewareConfig(BaseModel):
     server_forward_port: int | None = None
     client_listen_host: str = "127.0.0.1"
     client_listen_port: int | None = None
-    fec_data: int = Field(default=10, ge=1, le=1000)
-    fec_redundancy: int = Field(default=5, ge=0, le=1000)
-    fec_timeout_ms: int = Field(default=8, ge=1, le=1000)
+    fec_data: int = Field(default=10, ge=1, le=255)
+    fec_redundancy: int = Field(default=5, ge=0, le=254)
+    fec_timeout_ms: int = Field(default=8, ge=0, le=1000)
     fec_mode: int = Field(default=0, ge=0, le=1)
-    # 1400 可容纳 MTU 1280 的 IPv6 WireGuard 加密 UDP 报文。
-    fec_mtu: int = Field(default=1400, ge=500, le=1400)
-    fec_queue_len: int = Field(default=200, ge=10, le=10000)
-    decode_buffer: int = Field(default=2000, ge=1, le=100000)
+    # 1400 可容纳 MTU 1280 的 IPv6 WireGuard 加密 UDP 报文；上游允许 100-2000。
+    fec_mtu: int = Field(default=1400, ge=100, le=2000)
+    fec_queue_len: int = Field(default=200, ge=1, le=10000)
+    decode_buffer: int = Field(default=2000, ge=300, le=20000)
+
+    @model_validator(mode="after")
+    def validate_fec_packet_count(self) -> "UdpSpeederMiddlewareConfig":
+        """校验 FEC 数据包和冗余包总数符合 UDPspeeder 的 Reed-Solomon 限制。"""
+
+        if self.fec_data + self.fec_redundancy > 255:
+            raise ValueError("fec_data + fec_redundancy must be less than or equal to 255")
+        return self
 
     @field_validator("server_side")
     @classmethod

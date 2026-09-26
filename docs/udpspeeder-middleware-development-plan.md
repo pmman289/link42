@@ -125,13 +125,13 @@
 | `server_forward_port` | 对端 WireGuard ListenPort，1-65535 | 自动取 server WG 端口 |
 | `client_listen_host` | client 本地监听地址，通常为 `127.0.0.1` | `127.0.0.1` |
 | `client_listen_port` | 1-65535，必须填写 | 无 |
-| `fec_data` | FEC 原始数据包数量，1-1000 | `10` |
-| `fec_redundancy` | FEC 冗余包数量，0-1000 | `5` |
-| `fec_timeout_ms` | 1-1000 毫秒 | `8` |
+| `fec_data` | FEC 原始数据包数量，1-255；与 `fec_redundancy` 之和不超过 255 | `10` |
+| `fec_redundancy` | FEC 冗余包数量，0-254；与 `fec_data` 之和不超过 255 | `5` |
+| `fec_timeout_ms` | 0-1000 毫秒 | `8` |
 | `fec_mode` | 只允许 `0` 或 `1` | `0` |
-| `fec_mtu` | 500-1400，用于承载 MTU 1280 的 IPv6 WireGuard 加密报文 | `1400` |
-| `fec_queue_len` | 10-10000 | `200` |
-| `decode_buffer` | 10-20000 | `2000` |
+| `fec_mtu` | 100-2000，用于承载 MTU 1280 的 IPv6 WireGuard 加密报文 | `1400` |
+| `fec_queue_len` | 1-10000；mode 0 下设置为 1 可尽快发送 | `200` |
+| `decode_buffer` | 300-20000 | `2000` |
 | `delay_capacity` | 0-20000，0 表示由 UDPspeeder 默认处理 | `0` |
 | `socket_buffer_kib` | 64-10240 | `1024` |
 | `disable_obscure` | 是否关闭非安全性的报文混淆 | `false` |
@@ -149,7 +149,7 @@
 - 两个节点的 server/client 端口不与本节点 WireGuard ListenPort 冲突。
 - server 的 forward port 必须等于 server WireGuard ListenPort，除非明确支持本机额外 UDP 转发；第一阶段不做隐式转发。
 - client UDPspeeder 监听端口必须与本地 WireGuard ListenPort 不同。
-- `fec_data >= 1`，`fec_redundancy >= 0`，且组合后的带宽比例在产品允许范围内。
+- `fec_data >= 1`，`fec_redundancy >= 0`，且 `fec_data + fec_redundancy <= 255`。
 - `fec_mtu` 不得大于外层路径 MTU 的安全上限；创建时提示用户 WireGuard MTU 需要配合调整。
 - `fec_mode=1` 时要求明确填写有效 MTU，并提示该模式对 MTU 更敏感。
 - 连接名、实例名、接口名继续使用现有安全字符校验，不能参与 shell 解释。

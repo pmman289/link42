@@ -372,10 +372,10 @@ export const managedWireGuardFormRule: FormRule<ManagedWireGuardFormContext> = {
     field({ name: "udpspeeder_server_forward_port", label: "UDPspeeder 转发端口", validate: portRule("UDPspeeder 转发端口") }),
     field({ name: "udpspeeder_client_listen_host", label: "UDPspeeder 客户端监听地址", required: (_values, context) => context.middlewareType === "udpspeeder", validate: (value) => isIpAddress(stringValue(value)) ? null : "UDPspeeder 客户端监听地址必须是 IP" }),
     field<ManagedWireGuardFormContext>({ name: "udpspeeder_client_listen_port", label: "UDPspeeder 客户端端口", required: (_values, context) => context.middlewareType === "udpspeeder", validate: portRule("UDPspeeder 客户端端口") }),
-    field({ name: "udpspeeder_fec_timeout_ms", label: "FEC 超时", validate: integerRule("FEC 超时", 1, 1000) }),
-    field({ name: "udpspeeder_fec_mtu", label: "FEC MTU", validate: integerRule("FEC MTU", 500, 1400) }),
-    field({ name: "udpspeeder_fec_queue_len", label: "FEC 队列", validate: integerRule("FEC 队列", 10, 10000) }),
-    field({ name: "udpspeeder_decode_buffer", label: "解码缓存", validate: integerRule("解码缓存", 1, 100000) }),
+    field({ name: "udpspeeder_fec_timeout_ms", label: "FEC 超时", validate: integerRule("FEC 超时", 0, 1000) }),
+    field({ name: "udpspeeder_fec_mtu", label: "FEC MTU", validate: integerRule("FEC MTU", 100, 2000) }),
+    field({ name: "udpspeeder_fec_queue_len", label: "FEC 队列", validate: integerRule("FEC 队列", 1, 10000) }),
+    field({ name: "udpspeeder_decode_buffer", label: "解码缓存", validate: integerRule("解码缓存", 300, 20000) }),
   ],
   validate: (values, context) => {
     const issues = validateWireGuardMtu(values, ["local_tunnel_ips", "peer_tunnel_ips"]);
@@ -385,8 +385,12 @@ export const managedWireGuardFormRule: FormRule<ManagedWireGuardFormContext> = {
     if (context.middlewareType === "udp2raw") issues.push(...validateUdp2Raw(values));
     if (context.middlewareType === "udpspeeder") {
       const fec = fieldString(values, "udpspeeder_fec").split(":");
-      if (fec.length !== 2 || !Number.isInteger(Number(fec[0])) || !Number.isInteger(Number(fec[1])) || Number(fec[0]) < 1 || Number(fec[1]) < 0) {
+      const data = Number(fec[0]);
+      const redundancy = Number(fec[1]);
+      if (fec.length !== 2 || !/^\d+$/.test(fec[0]) || !/^\d+$/.test(fec[1]) || !Number.isSafeInteger(data) || !Number.isSafeInteger(redundancy) || data < 1 || redundancy < 0) {
         issues.push({ field: "udpspeeder_fec", message: "FEC 参数必须使用 data:redundancy 格式" });
+      } else if (data + redundancy > 255) {
+        issues.push({ field: "udpspeeder_fec", message: "FEC 数据包和冗余包总数不能大于 255" });
       }
     }
     return issues;

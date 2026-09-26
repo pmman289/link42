@@ -66,6 +66,71 @@ def test_udpspeeder_rejects_domain_and_invalid_fec() -> None:
         udpspeeder.render_udpspeeder_args(payload)
 
 
+def test_udpspeeder_accepts_upstream_parameter_boundaries() -> None:
+    """验证 Agent 接受 UDPspeeder 上游允许的 FEC 边界值。"""
+
+    payload = {
+        "instance": "test-1",
+        "mode": "client",
+        "listen_host": "127.0.0.1",
+        "listen_port": 24002,
+        "remote_host": "198.51.100.20",
+        "remote_port": 24000,
+        "fec_data": 255,
+        "fec_redundancy": 0,
+        "fec_timeout_ms": 0,
+        "fec_mode": 0,
+        "fec_mtu": 100,
+        "fec_queue_len": 1,
+        "decode_buffer": 300,
+    }
+
+    config = udpspeeder.validate_udpspeeder_payload(payload)
+
+    assert config["fec_timeout_ms"] == 0
+    assert udpspeeder.render_udpspeeder_args(payload)[-4:] == ["-q", "1", "--decode-buf", "300"]
+
+
+def test_udpspeeder_rejects_fec_packet_count_above_upstream_limit() -> None:
+    """验证 FEC 数据包和冗余包总数不能超过 UDPspeeder 的 255 包限制。"""
+
+    payload = {
+        "instance": "test-1",
+        "mode": "client",
+        "listen_host": "127.0.0.1",
+        "listen_port": 24002,
+        "remote_host": "198.51.100.20",
+        "remote_port": 24000,
+        "fec_data": 255,
+        "fec_redundancy": 1,
+        "fec_timeout_ms": 0,
+        "fec_mode": 0,
+        "fec_mtu": 100,
+        "fec_queue_len": 1,
+        "decode_buffer": 300,
+    }
+
+    with pytest.raises(ValueError, match="less than or equal to 255"):
+        udpspeeder.render_udpspeeder_args(payload)
+
+
+def test_udpspeeder_schema_accepts_upstream_parameter_boundaries() -> None:
+    """验证主控 Schema 与 Agent 使用相同的 UDPspeeder 参数边界。"""
+
+    config = schemas.UdpSpeederMiddlewareConfig(
+        fec_data=255,
+        fec_redundancy=0,
+        fec_timeout_ms=0,
+        fec_mtu=100,
+        fec_queue_len=1,
+        decode_buffer=300,
+    )
+
+    assert config.fec_timeout_ms == 0
+    with pytest.raises(ValueError, match="less than or equal to 255"):
+        schemas.UdpSpeederMiddlewareConfig(fec_data=255, fec_redundancy=1)
+
+
 def test_udpspeeder_schema_is_mutually_exclusive_with_existing_middleware() -> None:
     """验证新中间层不能与 udp2raw/mimic 同时启用。"""
 
