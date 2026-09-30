@@ -1476,6 +1476,8 @@ def test_mimic_snippet_uses_official_filter_format_for_ipv6() -> None:
 def test_mimic_runtime_ready_rejects_half_installed_package(monkeypatch) -> None:
     """验证 mimic 半安装状态不会上报 runtime capability。"""
 
+    system.clear_mimic_runtime_health_cache()
+
     def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
         """模拟 Agent 系统命令执行器。"""
         if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
@@ -1503,6 +1505,8 @@ def test_mimic_runtime_ready_rejects_half_installed_package(monkeypatch) -> None
 def test_mimic_runtime_ready_accepts_complete_install(monkeypatch) -> None:
     """验证 mimic 包、unit、用户、模块和版本都正常时才上报 runtime capability。"""
 
+    system.clear_mimic_runtime_health_cache()
+
     def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
         """模拟 Agent 系统命令执行器。"""
         if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
@@ -1526,6 +1530,79 @@ def test_mimic_runtime_ready_accepts_complete_install(monkeypatch) -> None:
     assert system.mimic_runtime_ready() is True
 
 
+def test_mimic_runtime_health_is_cached(monkeypatch) -> None:
+    """验证短时间内复用 mimic 健康状态，避免重复执行 DKMS 检查。"""
+
+    calls: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """记录 mimic 健康探测执行的命令。"""
+        calls.append(command)
+        if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
+            return command_result(command, stdout="ii ")
+        if command == ["mimic", "--version"]:
+            return command_result(command, stdout="mimic 0.7.1\n")
+        return command_result(command)
+
+    monkeypatch.setattr(system.shutil, "which", lambda binary: "/usr/bin/mimic" if binary == "mimic" else None)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    system.clear_mimic_runtime_health_cache()
+
+    first = system.mimic_runtime_health()
+    second = system.mimic_runtime_health()
+
+    assert first == second
+    assert calls.count(["dkms", "status", "-m", "mimic"]) == 1
+
+
+def test_mimic_runtime_health_cache_can_be_cleared(monkeypatch) -> None:
+    """验证清除缓存后下一次探测会重新执行系统检查。"""
+
+    calls = 0
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """统计 mimic 健康探测执行次数。"""
+        nonlocal calls
+        calls += 1
+        if command[:3] == ["dpkg-query", "-W", "-f=${db:Status-Abbrev}"]:
+            return command_result(command, stdout="ii ")
+        if command == ["mimic", "--version"]:
+            return command_result(command, stdout="mimic 0.7.1\n")
+        return command_result(command)
+
+    monkeypatch.setattr(system.shutil, "which", lambda binary: "/usr/bin/mimic" if binary == "mimic" else None)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    system.clear_mimic_runtime_health_cache()
+    system.mimic_runtime_health()
+    system.clear_mimic_runtime_health_cache()
+    system.mimic_runtime_health()
+
+    assert calls > 1
+
+
+def test_mimic_runtime_health_skips_deep_checks_when_service_is_masked(monkeypatch) -> None:
+    """验证已 mask 的 mimic 不会继续执行包、DKMS 和模块探测。"""
+
+    calls: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool, **kwargs: Any) -> dict[str, Any]:
+        """模拟 systemd 报告 mimic unit 已被 mask。"""
+        calls.append(command)
+        if command == ["systemctl", "is-enabled", "mimic@.service"]:
+            return command_result(command, returncode=1, stdout="masked\n")
+        return command_result(command, stdout="ii ")
+
+    monkeypatch.setattr(system.shutil, "which", lambda binary: "/usr/bin/mimic" if binary == "mimic" else None)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    system.clear_mimic_runtime_health_cache()
+
+    health = system.mimic_runtime_health()
+
+    assert health["ready"] is False
+    assert ["dkms", "status", "-m", "mimic"] not in calls
+    assert ["modinfo", "mimic"] not in calls
+
+
 def test_mimic_reboot_required_when_dkms_built_for_new_kernel() -> None:
     """验证 DKMS 已为新内核构建但当前内核未加载模块时提示重启。"""
 
@@ -1546,6 +1623,8 @@ def test_mimic_reboot_required_when_dkms_built_for_new_kernel() -> None:
 
 def test_agent_platform_has_mimic_uses_runtime_health(monkeypatch) -> None:
     """验证 platform.has_mimic 不再被半安装二进制误导。"""
+
+    system.clear_mimic_runtime_health_cache()
 
     monkeypatch.setattr(system, "get_service_manager_name", lambda: "systemd")
     monkeypatch.setattr(system.platform, "system", lambda: "Linux")
@@ -3023,6 +3102,68 @@ def test_run_once_warns_when_link_monitor_fails(monkeypatch, tmp_path: Path) -> 
     main.run_once(FakeClient(), AgentConfig("https://controller", 1, "token"), main.AgentSnapshot([], {}))
 
     assert warning_messages == ["链路监测结果已上报 count=1 failed=1 monitor_ids=[8]"]
+
+
+def test_probe_link_monitors_backs_off_repeated_failures(monkeypatch) -> None:
+    """验证持续失败的监测目标不会反复启动超时 ping 子进程。"""
+
+    probe_calls: list[str] = []
+
+    def fake_probe_latency(target: str, timeout: float) -> dict[str, Any]:
+        """模拟目标持续不可达。"""
+        probe_calls.append(target)
+        return {
+            "success": False,
+            "latency_ms": None,
+            "error": "timeout",
+            "checked_at": "2026-06-30T00:00:00",
+        }
+
+    monkeypatch.setattr(main, "probe_latency", fake_probe_latency)
+    state = main.AgentLogState()
+    monitor = {"id": 9, "target_host": "fe80::2%wg0", "timeout_seconds": 3}
+
+    first = main.probe_link_monitors([monitor], state)
+    state.monitor_failures["9"].next_probe_at = main.time.monotonic() + 60
+    second = main.probe_link_monitors([monitor], state)
+
+    assert len(probe_calls) == 1
+    assert first[0]["success"] is False
+    assert second[0]["success"] is False
+    assert "temporarily suppressed" in second[0]["error"]
+
+
+def test_probe_link_monitors_clears_backoff_after_recovery(monkeypatch) -> None:
+    """验证监测恢复成功后会立即清除失败退避。"""
+
+    results = [
+        {"success": False, "latency_ms": None, "error": "timeout", "checked_at": "first"},
+        {"success": True, "latency_ms": 12.0, "error": None, "checked_at": "second"},
+    ]
+
+    def fake_probe_latency(target: str, timeout: float) -> dict[str, Any]:
+        """按调用顺序模拟先失败后恢复。"""
+        return results.pop(0)
+
+    monkeypatch.setattr(main, "probe_latency", fake_probe_latency)
+    state = main.AgentLogState()
+    monitor = {"id": 10, "target_host": "10.42.0.2", "timeout_seconds": 1}
+
+    main.probe_link_monitors([monitor], state)
+    state.monitor_failures["10"].next_probe_at = 0
+    recovered = main.probe_link_monitors([monitor], state)
+
+    assert recovered[0]["success"] is True
+    assert "10" not in state.monitor_failures
+
+
+def test_task_requires_snapshot_refresh_only_for_environment_changes() -> None:
+    """验证普通任务不会触发高成本能力快照刷新，安装和自升级会触发。"""
+
+    assert main.task_requires_snapshot_refresh("wireguard.status") is False
+    assert main.task_requires_snapshot_refresh("middleware.udp2raw.start") is False
+    assert main.task_requires_snapshot_refresh("middleware.install") is True
+    assert main.task_requires_snapshot_refresh("agent.self_upgrade") is True
 
 
 def test_probe_link_monitors_runs_in_parallel(monkeypatch) -> None:

@@ -10,11 +10,18 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
-from urllib import request
+from urllib import error, request
 
 from .config import AgentConfig
 from .service_manager import OpenWrtUciManager, detect_service_manager
-from .system import kernel_newer_than, mimic_runtime_health, mimic_runtime_ready, read_os_release, run_command
+from .system import (
+    clear_mimic_runtime_health_cache,
+    kernel_newer_than,
+    mimic_runtime_health,
+    mimic_runtime_ready,
+    read_os_release,
+    run_command,
+)
 from .validation import (
     atomic_write_text,
     managed_child_path,
@@ -67,6 +74,7 @@ def install_mimic(payload: dict[str, Any], config: AgentConfig, dry_run: bool = 
 def install_mimic_from_github_latest(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     """从 mimic 官方 GitHub release 选择、下载并安装本机匹配的 deb 包。"""
 
+    clear_mimic_runtime_health_cache()
     repo = str(payload.get("repo") or "hack3ric/mimic")
     if repo != "hack3ric/mimic":
         raise ValueError("unsupported mimic release repository")
@@ -546,16 +554,42 @@ def machine_endian() -> str:
 
 
 def download_asset(config: AgentConfig, asset: str, target: Path, plugin: str = "udp2raw") -> None:
-    """从主控下载指定中间层资产并原子替换目标文件。"""
+    """从主控下载中间层资产，优先校验 SHA256 后再原子替换目标文件。"""
 
     if plugin not in {"udp2raw", "udpspeeder"}:
         raise ValueError("unsupported middleware asset plugin")
     url = f"/api/agent/plugins/{plugin}/assets/{asset}"
-    fd, tmp_name = tempfile.mkstemp(prefix="udp2raw-", dir=str(target.parent))
+    base_url = f"{config.server_url}{url}"
+    headers = {
+        "Authorization": f"Bearer {config.token}",
+        "X-Link42-Agent-Node-ID": str(config.node_id),
+        "User-Agent": "Link42-Agent",
+    }
+    expected_sha256: str | None = None
     try:
-        with request.urlopen(f"{config.server_url}{url}", timeout=60) as response:
-            with os.fdopen(fd, "wb") as handle:
-                shutil.copyfileobj(response, handle)
+        with request.urlopen(request.Request(f"{base_url}.sha256", headers=headers), timeout=30) as response:
+            expected_sha256 = response.read(256).decode("ascii").split()[0].strip().lower()
+    except error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        # 兼容尚未提供摘要接口的旧主控，升级日志会明确记录降级校验。
+        logger.warning("主控未提供中间层资产 SHA256，兼容无校验下载 plugin=%s asset=%s", plugin, asset)
+    if expected_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise RuntimeError(f"invalid {plugin} asset sha256 response")
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{plugin}-", dir=str(target.parent))
+    try:
+        digest = hashlib.sha256()
+        total = 0
+        with request.urlopen(request.Request(base_url, headers=headers), timeout=60) as response, os.fdopen(fd, "wb") as handle:
+            while chunk := response.read(256 * 1024):
+                total += len(chunk)
+                if total > 64 * 1024 * 1024:
+                    raise RuntimeError(f"{plugin} asset is too large")
+                digest.update(chunk)
+                handle.write(chunk)
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            raise RuntimeError(f"{plugin} asset sha256 mismatch")
         Path(tmp_name).replace(target)
     finally:
         if Path(tmp_name).exists():
@@ -630,7 +664,10 @@ def build_udp2raw_args(payload: dict[str, Any]) -> str:
     listen_port = validate_udp2raw_port(payload["listen_port"], "udp2raw listen port")
     remote_host = validate_udp2raw_ip(str(payload["remote_host"]), "udp2raw remote host")
     remote_port = validate_udp2raw_port(payload["remote_port"], "udp2raw remote port")
-    password = shell_quote(str(payload["password"]))
+    password_text = str(payload["password"])
+    if len(password_text) > 128 or any(char in password_text for char in "\r\n\x00"):
+        raise ValueError("udp2raw password must be at most 128 characters without control characters")
+    password = shell_quote(password_text)
     raw_mode = validate_udp2raw_raw_mode(str(payload.get("raw_mode") or "faketcp"))
     cipher_mode = validate_udp2raw_cipher_mode(str(payload.get("cipher_mode") or "xor"))
     auth_mode = validate_udp2raw_auth_mode(str(payload.get("auth_mode") or "md5"))

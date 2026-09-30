@@ -17,7 +17,11 @@ apps/web/dist/
 
 # Agent 二进制构建产物。
 build/
-dist/
+/dist/*
+!/dist/
+!/dist/controller-agent-releases/
+/dist/controller-agent-releases/*
+!/dist/controller-agent-releases/.gitkeep
 *.spec
 
 # 环境变量文件通常包含 token 或密码。

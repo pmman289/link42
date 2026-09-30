@@ -1,9 +1,9 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 
 from link42_common.connection_types import TASK_REQUIREMENTS
+from link42_common.version import parse_version
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -77,8 +77,8 @@ class NodePlugin:
             if action.task_type in TASK_REQUIREMENTS
         ]
         min_versions = [str(requirement.get("min_agent_version") or "0.0.0") for requirement in task_requirements]
-        required_min_version = max([self.min_agent_version, *min_versions], key=parse_semver)
-        version_supported = parse_semver(context.node.agent_version) >= parse_semver(required_min_version)
+        required_min_version = max([self.min_agent_version, *min_versions], key=parse_version)
+        version_supported = parse_version(context.node.agent_version) >= parse_version(required_min_version)
         return {
             **self.describe(),
             "available": not missing and version_supported,
@@ -100,20 +100,3 @@ class NodePlugin:
 
         action_spec = self.actions[action]
         return AgentTaskSpec(task_type=action_spec.task_type, payload=payload)
-
-
-def parse_semver(value: str | None) -> tuple[int, int, int]:
-    """解析三段式版本号，缺失或非法段按 0 处理。"""
-
-    if not value:
-        return (0, 0, 0)
-    parts = value.split("-", 1)[0].split(".")
-    parsed: list[int] = []
-    for part in parts[:3]:
-        try:
-            parsed.append(int(part))
-        except ValueError:
-            parsed.append(0)
-    while len(parsed) < 3:
-        parsed.append(0)
-    return tuple(parsed)  # type: ignore[return-value]

@@ -24,6 +24,8 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
 OPENWRT_INTERFACE_STOP_TIMEOUT_SECONDS = 5.0
 OPENWRT_INTERFACE_STOP_POLL_SECONDS = 0.2
 logger = logging.getLogger("link42.agent.system")
+MIMIC_HEALTH_CACHE_SECONDS = 300.0
+_mimic_health_cache: tuple[float, str | None, dict[str, Any]] | None = None
 
 
 def sanitize_command_for_log(command: list[str]) -> list[str]:
@@ -89,6 +91,7 @@ def get_agent_platform() -> dict[str, Any]:
             libc_name = "musl"
             libc_version = libc_version if libc_version and libc_version != "2.0" else None
     mimic_binary_present = bool(shutil.which("mimic"))
+    # mimic 未安装时不执行 dpkg、DKMS、modinfo 等高开销探测。
     mimic_health = mimic_runtime_health() if mimic_binary_present and service_manager == "systemd" else {"ready": False}
     return {
         "os": platform.system().lower(),
@@ -123,8 +126,18 @@ def mimic_runtime_ready() -> bool:
 def mimic_runtime_health() -> dict[str, Any]:
     """检查 mimic 二进制、包状态、systemd unit、用户和内核模块是否齐备。"""
 
+    global _mimic_health_cache
+    now = time.monotonic()
+    mimic_path = shutil.which("mimic")
+    if (
+        _mimic_health_cache
+        and _mimic_health_cache[1] == mimic_path
+        and now - _mimic_health_cache[0] < MIMIC_HEALTH_CACHE_SECONDS
+    ):
+        return _mimic_health_cache[2]
+
     checks: dict[str, Any] = {
-        "binary": bool(shutil.which("mimic")),
+        "binary": bool(mimic_path),
         "packages": {},
         "systemd_unit": False,
         "user": False,
@@ -133,7 +146,16 @@ def mimic_runtime_health() -> dict[str, Any]:
         "version": None,
     }
     if not checks["binary"]:
-        return {"ready": False, "checks": checks}
+        result = {"ready": False, "checks": checks}
+        _mimic_health_cache = (now, mimic_path, result)
+        return result
+    unit_state = run_command(["systemctl", "is-enabled", "mimic@.service"], True, log_failure=False)
+    unit_state_text = f"{unit_state.get('stdout', '')}\n{unit_state.get('stderr', '')}".lower()
+    if "masked" in unit_state_text:
+        # 已明确禁用的异常安装不具备运行能力，也不再触发包和 DKMS 探测。
+        result = {"ready": False, "checks": checks}
+        _mimic_health_cache = (now, mimic_path, result)
+        return result
     for package in ["mimic", "mimic-dkms"]:
         result = run_command(["dpkg-query", "-W", "-f=${db:Status-Abbrev}", package], True)
         status = str(result.get("stdout") or "").strip()
@@ -154,7 +176,16 @@ def mimic_runtime_health() -> dict[str, Any]:
         and bool(checks["module"])
         and version_result["returncode"] == 0
     )
-    return {"ready": ready, "checks": checks}
+    result = {"ready": ready, "checks": checks}
+    _mimic_health_cache = (now, mimic_path, result)
+    return result
+
+
+def clear_mimic_runtime_health_cache() -> None:
+    """清除 mimic 运行状态缓存，供安装、卸载或测试后立即重新探测。"""
+
+    global _mimic_health_cache
+    _mimic_health_cache = None
 
 
 def read_os_release(path: str = "/etc/os-release") -> dict[str, str]:

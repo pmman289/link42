@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import ipaddress
 import re
 from typing import Any
@@ -16,6 +17,7 @@ LOOKING_GLASS_TARGET_HOSTNAME_RE = re.compile(
 LOOKING_GLASS_BIRD_PROTOCOL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")
 MIN_BGP_ASN = 1
 MAX_BGP_ASN = 4294967295
+INLINE_UNSAFE = re.compile(r"[\r\n\x00-\x1f\x7f]")
 
 
 def serialize_utc_timestamp(value: datetime | None) -> int | None:
@@ -170,6 +172,57 @@ def _validate_linux_interface_name(value: str) -> str:
     return cleaned
 
 
+def _validate_inline_value(value: str | None) -> str | None:
+    """校验会直接渲染为单行配置的字段，拒绝换行和控制字符。"""
+
+    if value is None:
+        return None
+    if INLINE_UNSAFE.search(value):
+        raise ValueError("value must not contain newline or control characters")
+    return value.strip()
+
+
+def _validate_agent_capabilities(values: list[str]) -> list[str]:
+    """限制 Agent 能力上报的数量和单项长度，避免异常请求撑大数据库。"""
+
+    if len(values) > 64:
+        raise ValueError("capabilities cannot contain more than 64 values")
+    result: list[str] = []
+    for value in values:
+        cleaned = _validate_inline_value(value)
+        if not cleaned or len(cleaned) > 128:
+            raise ValueError("capability must be 1-128 characters")
+        result.append(cleaned)
+    return list(dict.fromkeys(result))
+
+
+def _validate_agent_platform(value: dict[str, Any]) -> dict[str, Any]:
+    """限制 Agent 平台快照大小，保留现有扩展字段兼容性。"""
+
+    if len(value) > 100 or len(json.dumps(value, ensure_ascii=False, default=str)) > 32768:
+        raise ValueError("platform metadata is too large")
+
+    def validate_nested(item: Any, depth: int = 0) -> None:
+        """递归检查平台元数据的深度和文本字段，避免异常 JSON 进入日志和数据库。"""
+
+        if depth > 5:
+            raise ValueError("platform metadata is too deeply nested")
+        if isinstance(item, str):
+            if len(item) > 2048 or INLINE_UNSAFE.search(item):
+                raise ValueError("platform metadata contains invalid text")
+        elif isinstance(item, dict):
+            for key, nested in item.items():
+                if not isinstance(key, str) or len(key) > 128 or INLINE_UNSAFE.search(key):
+                    raise ValueError("platform metadata contains invalid key")
+                validate_nested(nested, depth + 1)
+        elif isinstance(item, list):
+            for nested in item:
+                validate_nested(nested, depth + 1)
+
+    validate_nested(value)
+    return value
+
+
 def _validate_gre_interface_name(value: str) -> str:
     """校验 GRE 接口名，遵循 Linux 上限并兼容 OpenWrt UCI 标识符。"""
 
@@ -252,7 +305,7 @@ class NodeCreate(BaseModel):
     """创建节点请求。"""
 
     name: str = Field(min_length=1, max_length=80)
-    hostname: str | None = None
+    hostname: str | None = Field(default=None, max_length=255)
     region: str | None = Field(default=None, max_length=80)
     management_ip: str | None = None
     public_ip: str | None = None
@@ -266,14 +319,43 @@ class NodeCreate(BaseModel):
         """校验节点 GitHub 代理地址。"""
 
         return _validate_optional_http_url(value)
+
+    @field_validator("management_ip", "public_ip")
+    @classmethod
+    def validate_node_ips(cls, value: str | None) -> str | None:
+        """校验节点管理地址和公网地址必须是 IP 字面量。"""
+
+        return _validate_optional_ip_address(value)
+
+    @field_validator("hostname", "topology_endpoint")
+    @classmethod
+    def validate_node_text(cls, value: str | None) -> str | None:
+        """校验节点展示地址字段不含控制字符。"""
+
+        return _validate_inline_value(value)
+
+    @field_validator("endpoint_ips")
+    @classmethod
+    def validate_endpoint_ips(cls, values: list[str]) -> list[str]:
+        """限制节点入口地址数量和长度，同时允许域名兼容旧配置。"""
+
+        if len(values) > 32:
+            raise ValueError("endpoint_ips cannot contain more than 32 values")
+        result = []
+        for value in values:
+            cleaned = _validate_inline_value(value)
+            if not cleaned or len(cleaned) > 255:
+                raise ValueError("endpoint address must be 1-255 characters")
+            result.append(cleaned)
+        return result
 
 
 class NodeUpdate(BaseModel):
     """更新节点基础信息请求。"""
 
-    name: str = Field(min_length=1, max_length=80)
-    endpoint_ips: list[str] = Field(min_length=1)
-    hostname: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    endpoint_ips: list[str] | None = Field(default=None, min_length=1)
+    hostname: str | None = Field(default=None, max_length=255)
     region: str | None = Field(default=None, max_length=80)
     management_ip: str | None = None
     public_ip: str | None = None
@@ -286,6 +368,37 @@ class NodeUpdate(BaseModel):
         """校验节点 GitHub 代理地址。"""
 
         return _validate_optional_http_url(value)
+
+    @field_validator("management_ip", "public_ip")
+    @classmethod
+    def validate_node_ips(cls, value: str | None) -> str | None:
+        """校验节点管理地址和公网地址必须是 IP 字面量。"""
+
+        return _validate_optional_ip_address(value)
+
+    @field_validator("hostname", "topology_endpoint")
+    @classmethod
+    def validate_node_text(cls, value: str | None) -> str | None:
+        """校验节点展示地址字段不含控制字符。"""
+
+        return _validate_inline_value(value)
+
+    @field_validator("endpoint_ips")
+    @classmethod
+    def validate_endpoint_ips(cls, values: list[str] | None) -> list[str] | None:
+        """限制节点入口地址数量和长度，同时允许域名兼容旧配置。"""
+
+        if values is None:
+            return None
+        if len(values) > 32:
+            raise ValueError("endpoint_ips cannot contain more than 32 values")
+        result = []
+        for value in values:
+            cleaned = _validate_inline_value(value)
+            if not cleaned or len(cleaned) > 255:
+                raise ValueError("endpoint address must be 1-255 characters")
+            result.append(cleaned)
+        return result
 
 
 class NodeRead(BaseModel):
@@ -460,9 +573,9 @@ class ControllerSettingsRead(BaseModel):
 class ControllerSettingsUpdate(BaseModel):
     """主控设置更新请求。"""
 
-    controller_url: str = Field(min_length=1, max_length=255)
-    username: str = Field(min_length=1, max_length=80)
-    site_title: str = Field(default="Link42", min_length=1, max_length=80)
+    controller_url: str | None = Field(default=None, min_length=1, max_length=255)
+    username: str | None = Field(default=None, min_length=1, max_length=80)
+    site_title: str | None = Field(default=None, min_length=1, max_length=80)
     site_logo_url: str | None = Field(default=None, max_length=500)
     new_password: str | None = Field(default=None, min_length=6, max_length=255)
 
@@ -477,15 +590,36 @@ class ControllerSettingsUpdate(BaseModel):
 class InterfaceCreate(BaseModel):
     """创建单个 WireGuard 接口请求。"""
 
-    name: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=15)
     tunnel_ips: list[str] = Field(default_factory=list)
     listen_port: int | None = None
     private_key: str | None = None
     public_key: str | None = None
     mtu: int | None = 1420
-    table_name: str | None = "off"
+    table_name: str | None = Field(default="off", max_length=64)
     dns: list[str] = Field(default_factory=list)
-    interface_custom_config: str | None = None
+    interface_custom_config: str | None = Field(default=None, max_length=8192)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        """校验 WireGuard 接口名符合 Linux 内核限制。"""
+
+        return _validate_linux_interface_name(value)
+
+    @field_validator("private_key", "public_key", "table_name")
+    @classmethod
+    def validate_inline_fields(cls, value: str | None) -> str | None:
+        """校验 WireGuard 单值字段不会注入额外配置行。"""
+
+        return _validate_inline_value(value)
+
+    @field_validator("dns")
+    @classmethod
+    def validate_dns(cls, values: list[str]) -> list[str]:
+        """校验 DNS 列表中的值均为单行内容。"""
+
+        return [_validate_inline_value(value) or "" for value in values]
 
     @field_validator("listen_port")
     @classmethod
@@ -506,8 +640,8 @@ class ManagedLinkCreate(BaseModel):
     """创建双端受管 WireGuard 连接请求。"""
 
     peer_node_id: int
-    local_interface_name: str = Field(min_length=1, max_length=32)
-    peer_interface_name: str | None = Field(default=None, min_length=1, max_length=32)
+    local_interface_name: str = Field(min_length=1, max_length=15)
+    peer_interface_name: str | None = Field(default=None, min_length=1, max_length=15)
     local_tunnel_ips: list[str] = Field(min_length=1)
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_allowed_ips: list[str] | None = None
@@ -519,12 +653,12 @@ class ManagedLinkCreate(BaseModel):
     local_listen_port: int | None = None
     peer_listen_port: int | None = None
     mtu: int | None = 1420
-    table_name: str | None = "off"
+    table_name: str | None = Field(default="off", max_length=64)
     persistent_keepalive: int | None = 25
-    local_interface_custom_config: str | None = None
-    local_peer_custom_config: str | None = None
-    peer_interface_custom_config: str | None = None
-    peer_peer_custom_config: str | None = None
+    local_interface_custom_config: str | None = Field(default=None, max_length=8192)
+    local_peer_custom_config: str | None = Field(default=None, max_length=8192)
+    peer_interface_custom_config: str | None = Field(default=None, max_length=8192)
+    peer_peer_custom_config: str | None = Field(default=None, max_length=8192)
     replace_local_interface_id: int | None = None
     replace_peer_interface_id: int | None = None
     force_endpoint_mismatch: bool = False
@@ -562,20 +696,55 @@ class ManagedLinkCreate(BaseModel):
 
         return _validate_cidrs(values or []) if values is not None else None
 
+    @field_validator("local_interface_name", "peer_interface_name")
+    @classmethod
+    def validate_interface_names(cls, value: str | None) -> str | None:
+        """校验受管 WireGuard 接口名符合 Linux 内核限制。"""
+
+        return _validate_linux_interface_name(value) if value is not None else None
+
+    @field_validator("table_name")
+    @classmethod
+    def validate_table_name(cls, value: str | None) -> str | None:
+        """校验路由表字段不会注入额外配置行。"""
+
+        return _validate_inline_value(value)
+
 
 class InterfaceUpdate(BaseModel):
     """更新单个 WireGuard 接口请求。"""
 
-    name: str = Field(min_length=1, max_length=32)
-    tunnel_ips: list[str] = Field(default_factory=list)
+    name: str | None = Field(default=None, min_length=1, max_length=15)
+    tunnel_ips: list[str] | None = None
     listen_port: int | None = None
     private_key: str | None = None
     clear_private_key: bool = False
     public_key: str | None = None
     mtu: int | None = 1420
-    table_name: str | None = None
-    dns: list[str] = Field(default_factory=list)
-    interface_custom_config: str | None = None
+    table_name: str | None = Field(default=None, max_length=64)
+    dns: list[str] | None = None
+    interface_custom_config: str | None = Field(default=None, max_length=8192)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str | None) -> str | None:
+        """校验变更后的接口名符合 Linux 内核限制。"""
+
+        return _validate_linux_interface_name(value) if value is not None else None
+
+    @field_validator("private_key", "public_key", "table_name")
+    @classmethod
+    def validate_inline_fields(cls, value: str | None) -> str | None:
+        """校验 WireGuard 单值字段不会注入额外配置行。"""
+
+        return _validate_inline_value(value)
+
+    @field_validator("dns")
+    @classmethod
+    def validate_dns(cls, values: list[str] | None) -> list[str] | None:
+        """校验 DNS 列表中的值均为单行内容。"""
+
+        return [_validate_inline_value(value) or "" for value in values] if values is not None else None
 
     @field_validator("listen_port")
     @classmethod
@@ -701,10 +870,28 @@ class LinkMonitorCreate(BaseModel):
         return value
 
 
-class LinkMonitorUpdate(LinkMonitorCreate):
-    """更新链路监测目标请求。"""
+class LinkMonitorUpdate(BaseModel):
+    """更新链路监测目标请求，未提供的字段保持原值。"""
 
-    pass
+    target_host: str | None = Field(default=None, min_length=1, max_length=255)
+    name: str | None = Field(default=None, max_length=80)
+    interval_seconds: int | None = Field(default=None, ge=1, le=300)
+    retention_days: int | None = Field(default=None, ge=1, le=90)
+    enabled: bool | None = None
+
+    @field_validator("target_host")
+    @classmethod
+    def validate_optional_target_host(cls, value: str | None) -> str | None:
+        """校验存在的监测目标必须是 IP 地址。"""
+
+        if value is None:
+            return None
+        cleaned = value.strip()
+        try:
+            ipaddress.ip_address(cleaned)
+        except ValueError as exc:
+            raise ValueError("monitor target must be an IPv4 or IPv6 address") from exc
+        return cleaned
 
 
 class LinkMonitorRead(BaseModel):
@@ -1135,14 +1322,21 @@ class PeerCreate(BaseModel):
     """创建 WireGuard Peer 请求。"""
 
     name: str | None = None
-    public_key: str = Field(min_length=1)
-    preshared_key: str | None = None
+    public_key: str = Field(min_length=1, max_length=128)
+    preshared_key: str | None = Field(default=None, max_length=128)
     clear_preshared_key: bool = False
-    endpoint_host: str | None = None
+    endpoint_host: str | None = Field(default=None, max_length=255)
     endpoint_port: int | None = None
     allowed_ips: list[str] = Field(default_factory=list)
     persistent_keepalive: int | None = None
-    peer_custom_config: str | None = None
+    peer_custom_config: str | None = Field(default=None, max_length=8192)
+
+    @field_validator("name", "public_key", "preshared_key", "endpoint_host")
+    @classmethod
+    def validate_inline_fields(cls, value: str | None) -> str | None:
+        """校验 Peer 单值字段不会注入额外配置行。"""
+
+        return _validate_inline_value(value)
 
     @field_validator("endpoint_port")
     @classmethod
@@ -1401,8 +1595,8 @@ class ManagedLinkRead(BaseModel):
 class ManagedLinkUpdate(BaseModel):
     """更新双端受管 WireGuard 连接请求。"""
 
-    local_interface_name: str = Field(min_length=1, max_length=32)
-    peer_interface_name: str = Field(min_length=1, max_length=32)
+    local_interface_name: str = Field(min_length=1, max_length=15)
+    peer_interface_name: str = Field(min_length=1, max_length=15)
     local_tunnel_ips: list[str] = Field(min_length=1)
     peer_tunnel_ips: list[str] = Field(min_length=1)
     local_allowed_ips: list[str] | None = None
@@ -1416,10 +1610,10 @@ class ManagedLinkUpdate(BaseModel):
     mtu: int | None = 1420
     table_name: str | None = None
     persistent_keepalive: int | None = 25
-    local_interface_custom_config: str | None = None
-    local_peer_custom_config: str | None = None
-    peer_interface_custom_config: str | None = None
-    peer_peer_custom_config: str | None = None
+    local_interface_custom_config: str | None = Field(default=None, max_length=8192)
+    local_peer_custom_config: str | None = Field(default=None, max_length=8192)
+    peer_interface_custom_config: str | None = Field(default=None, max_length=8192)
+    peer_peer_custom_config: str | None = Field(default=None, max_length=8192)
     udp2raw: Udp2RawMiddlewareConfig | None = None
     udpspeeder: UdpSpeederMiddlewareConfig | None = None
     mimic: MimicMiddlewareConfig | None = None
@@ -1453,6 +1647,20 @@ class ManagedLinkUpdate(BaseModel):
         """校验双方 Peer AllowedIPs 应包含 CIDR 前缀。"""
 
         return _validate_cidrs(values or []) if values is not None else None
+
+    @field_validator("local_interface_name", "peer_interface_name")
+    @classmethod
+    def validate_interface_names(cls, value: str) -> str:
+        """校验修改后的受管 WireGuard 接口名符合 Linux 内核限制。"""
+
+        return _validate_linux_interface_name(value)
+
+    @field_validator("local_endpoint_host", "peer_endpoint_host", "table_name")
+    @classmethod
+    def validate_inline_fields(cls, value: str | None) -> str | None:
+        """校验受管 WireGuard 单行字段不会注入额外配置行。"""
+
+        return _validate_inline_value(value)
 
 
 class ImportCandidateRead(BaseModel):
@@ -1858,36 +2066,106 @@ class AgentRegisterRequest(BaseModel):
     """Agent 注册请求。"""
 
     node_id: int
-    token: str
-    hostname: str | None = None
+    token: str = Field(min_length=1, max_length=512)
+    hostname: str | None = Field(default=None, max_length=255)
     management_ip: str | None = None
     public_ip: str | None = None
-    agent_version: str | None = None
+    agent_version: str | None = Field(default=None, max_length=32)
     protocol_version: int | None = None
-    capabilities: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
     platform: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("hostname", "agent_version")
+    @classmethod
+    def validate_text_fields(cls, value: str | None) -> str | None:
+        """校验 Agent 注册文本字段。"""
+
+        return _validate_inline_value(value)
+
+    @field_validator("management_ip", "public_ip")
+    @classmethod
+    def validate_reported_ips(cls, value: str | None) -> str | None:
+        """校验 Agent 注册上报的地址字段。"""
+
+        return _validate_optional_ip_address(value)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capability_values(cls, values: list[str]) -> list[str]:
+        """校验 Agent 注册能力列表。"""
+
+        return _validate_agent_capabilities(values)
+
+    @field_validator("platform")
+    @classmethod
+    def validate_platform_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """校验 Agent 注册平台快照大小。"""
+
+        return _validate_agent_platform(value)
 
 
 class AgentHeartbeatRequest(BaseModel):
     """Agent 心跳请求。"""
 
     node_id: int
-    token: str
-    agent_version: str | None = None
+    token: str = Field(min_length=1, max_length=512)
+    agent_version: str | None = Field(default=None, max_length=32)
     protocol_version: int | None = None
-    capabilities: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
     platform: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("agent_version")
+    @classmethod
+    def validate_text_fields(cls, value: str | None) -> str | None:
+        """校验 Agent 心跳版本字段。"""
+
+        return _validate_inline_value(value)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capability_values(cls, values: list[str]) -> list[str]:
+        """校验 Agent 心跳能力列表。"""
+
+        return _validate_agent_capabilities(values)
+
+    @field_validator("platform")
+    @classmethod
+    def validate_platform_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """校验 Agent 心跳平台快照大小。"""
+
+        return _validate_agent_platform(value)
 
 
 class AgentPollRequest(BaseModel):
     """Agent 轮询任务请求。"""
 
     node_id: int
-    token: str
-    agent_version: str | None = None
+    token: str = Field(min_length=1, max_length=512)
+    agent_version: str | None = Field(default=None, max_length=32)
     protocol_version: int | None = None
-    capabilities: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
     platform: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("agent_version")
+    @classmethod
+    def validate_text_fields(cls, value: str | None) -> str | None:
+        """校验 Agent 轮询版本字段。"""
+
+        return _validate_inline_value(value)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capability_values(cls, values: list[str]) -> list[str]:
+        """校验 Agent 轮询能力列表。"""
+
+        return _validate_agent_capabilities(values)
+
+    @field_validator("platform")
+    @classmethod
+    def validate_platform_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """校验 Agent 轮询平台快照大小。"""
+
+        return _validate_agent_platform(value)
 
 
 class AgentTaskRead(BaseModel):
@@ -1908,6 +2186,6 @@ class AgentTaskResultRequest(BaseModel):
     """Agent 上报任务结果请求。"""
 
     node_id: int
-    token: str
-    status: str
+    token: str = Field(min_length=1, max_length=512)
+    status: str = Field(pattern="^(succeeded|failed)$")
     result: dict[str, Any] = Field(default_factory=dict)

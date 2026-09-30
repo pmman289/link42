@@ -1,6 +1,6 @@
 {
   "name": "link42-web",
-  "version": "0.6.26",
+  "version": "0.6.27",
   "private": true,
   "type": "module",
   "scripts": {
@@ -21,7 +21,7 @@
     "react-arborist": "^3.12.0",
     "react-dom": "^18.3.0",
     "react-select": "^5.10.2",
-    "recharts": "^2.15.4"
+    "recharts": "~2.15.4"
   },
   "devDependencies": {
     "@types/babel__core": "^7.20.5",

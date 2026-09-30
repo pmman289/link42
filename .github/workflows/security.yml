@@ -19,7 +19,21 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 安装 Python 测试依赖
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
       - name: 扫描明文凭据
         run: scripts/security/scan-secrets.sh
+      - name: Python 单元测试
+        run: python -m pytest -q
+      - name: Python 编译检查
+        run: python -m compileall -q apps/api apps/agent packages
+      - name: 安装前端依赖
+        run: npm ci --prefix apps/web --no-audit --no-fund
       - name: 审计前端依赖
         run: npm audit --prefix apps/web --audit-level=high
+      - name: 前端单元测试和构建
+        run: npm test --prefix apps/web -- --run && npm run build --prefix apps/web

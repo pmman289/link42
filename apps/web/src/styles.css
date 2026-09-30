@@ -156,6 +156,16 @@ select:focus {
   box-shadow: 0 0 0 3px rgba(33, 111, 134, 0.14);
 }
 
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 input:disabled,
 textarea:disabled,
 select:disabled {
@@ -1497,6 +1507,8 @@ textarea {
 
 .nodeHeader small,
 .configRow small {
+  min-width: 0;
+  overflow-wrap: anywhere;
   color: var(--muted);
 }
 
@@ -1653,6 +1665,8 @@ textarea {
 }
 
 .protocolCard small {
+  min-width: 0;
+  overflow-wrap: anywhere;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.45;
@@ -1747,7 +1761,7 @@ textarea {
 .monitorSummary small {
   font-size: 10px;
   color: currentColor;
-  opacity: 0.76;
+  opacity: 1;
 }
 
 .monitorSummary.healthy {
@@ -1882,6 +1896,11 @@ textarea {
   padding: 10px;
 }
 
+.peer span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .empty {
   border: 1px dashed var(--border-strong);
   border-radius: 6px;
@@ -1916,6 +1935,26 @@ textarea {
   font-size: 12px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.copyField {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+}
+
+.tokenEditForm {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(180px, 220px) auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.compactCheck {
+  min-height: 38px;
+  white-space: nowrap;
 }
 
 .modalBackdrop {
@@ -2171,6 +2210,11 @@ textarea {
     height: 420px;
     min-height: 420px;
     max-height: 62svh;
+    touch-action: pan-y;
+  }
+
+  .topologyCanvas .react-flow__node {
+    touch-action: none;
   }
 
   .topologyCanvasFullscreen {
@@ -2199,7 +2243,8 @@ textarea {
   }
 
   .tokenCreateGrid,
-  .tokenListItem {
+  .tokenListItem,
+  .tokenEditForm {
     grid-template-columns: 1fr;
   }
 
@@ -2297,6 +2342,16 @@ textarea {
   }
 }
 
+@media (max-width: 1024px) and (min-width: 761px) {
+  .portInventoryEntryForm {
+    grid-template-columns: 96px minmax(110px, 140px) minmax(160px, 1fr) auto;
+  }
+
+  .monitorStats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @keyframes toastIn {
   from {
     opacity: 0;
@@ -2332,5 +2387,16 @@ textarea {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }

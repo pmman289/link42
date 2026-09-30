@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -71,6 +71,7 @@ class WireGuardInterface(TimestampMixin, Base):
     """
 
     __tablename__ = "wg_interfaces"
+    __table_args__ = (UniqueConstraint("node_id", "name", name="uq_wg_interface_node_name"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
@@ -331,6 +332,7 @@ class AgentTask(TimestampMixin, Base):
     """由节点 Agent 主动拉取执行的任务。"""
 
     __tablename__ = "agent_tasks"
+    __table_args__ = (Index("ix_agent_tasks_status_started", "status", "started_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
@@ -379,6 +381,7 @@ class LookingGlassQuery(TimestampMixin, Base):
     """Looking Glass 外部查询记录，隔离外部 query_id 和内部 AgentTask ID。"""
 
     __tablename__ = "looking_glass_queries"
+    __table_args__ = (Index("ix_looking_glass_queries_expires_status", "expires_at", "status"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     public_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -435,6 +438,7 @@ class LinkMonitorSample(Base):
     """单次链路探测结果。"""
 
     __tablename__ = "link_monitor_samples"
+    __table_args__ = (Index("ix_link_monitor_samples_monitor_checked", "monitor_id", "checked_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     monitor_id: Mapped[int] = mapped_column(ForeignKey("link_monitors.id"), index=True)

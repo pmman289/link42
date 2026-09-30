@@ -1228,6 +1228,33 @@ function localDateTimeToIso(value: FormDataEntryValue | null): string | null {
   return date.toISOString();
 }
 
+// 把服务端时间转换为 datetime-local 控件需要的本地时间文本。
+function isoToLocalDateTime(value: string | null | undefined): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const offset = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+// 复制文本到剪贴板；HTTP 内网环境下回退到传统选区复制方案。
+async function copyText(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("浏览器不支持复制，请手动选择文本复制");
+}
+
 // 选择拓扑节点展示的首选地址。
 function topologyNodeEndpoint(node: TopologyNode) {
   return node.topology_endpoint || node.endpoint_ips[0] || node.hostname || "未配置地址";
@@ -2206,6 +2233,8 @@ function App() {
   const [lookingGlassTokens, setLookingGlassTokens] = useState<LookingGlassApiToken[]>([]);
   const [revealedLookingGlassToken, setRevealedLookingGlassToken] = useState<RevealedLookingGlassToken | null>(null);
   const [revealedAgentToken, setRevealedAgentToken] = useState<{ nodeId: number; token: string } | null>(null);
+  const [newNodeCredentials, setNewNodeCredentials] = useState<NodeCreateResult | null>(null);
+  const [newNodeControllerUrl, setNewNodeControllerUrl] = useState("");
   const [nodes, setNodes] = useState<NodeItem[]>([]);
   const [topology, setTopology] = useState<TopologyResponse>({ nodes: [], edges: [] });
   const [topologyDraftPositions, setTopologyDraftPositions] = useState<Record<number, { x: number; y: number }>>({});
@@ -2274,6 +2303,7 @@ function App() {
   const [portInventoryPage, setPortInventoryPage] = useState(1);
   const [portScanResults, setPortScanResults] = useState<PortScanResult[]>([]);
   const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
+  const pendingActionsRef = useRef<Set<string>>(new Set());
   const topologyEdgeSelectionRef = useRef<number | null>(null);
   const topologyLocalPositionsRef = useRef<Record<number, { x: number; y: number }>>({});
   const birdSelectedResourceRef = useRef("");
@@ -2495,6 +2525,7 @@ function App() {
     || topologyResetConfirmOpen
     || settingsOpen
     || nodeCreateOpen
+    || newNodeCredentials
     || editingNodeId
     || createDialog
     || selectedConnectionRef?.startsWith("gre:")
@@ -2863,7 +2894,10 @@ function App() {
     setLookingGlassTokens([]);
     setRevealedLookingGlassToken(null);
     setRevealedAgentToken(null);
+    setNewNodeCredentials(null);
+    setNewNodeControllerUrl("");
     closeMonitorDialog();
+    pendingActionsRef.current.clear();
     setPendingActions(new Set());
   }
 
@@ -2875,10 +2909,11 @@ function App() {
   // 包装用户操作，统一处理 pending 状态和错误提示。
   async function runAction(action: () => Promise<void>, key?: string) {
     // 所有用户操作都通过这里展示 API 错误，避免点击后页面无反馈。
-    if (key && pendingActions.has(key)) {
+    if (key && pendingActionsRef.current.has(key)) {
       return;
     }
     if (key) {
+      pendingActionsRef.current.add(key);
       setPendingActions((items) => {
         const next = new Set(items);
         next.add(key);
@@ -2895,6 +2930,7 @@ function App() {
       notify("error", formatUserError(error));
     } finally {
       if (key) {
+        pendingActionsRef.current.delete(key);
         setPendingActions((items) => {
           const next = new Set(items);
           next.delete(key);
@@ -2906,6 +2942,7 @@ function App() {
 
   // 手动占用一个 pending key。
   function holdActionPending(key: string) {
+    pendingActionsRef.current.add(key);
     setPendingActions((items) => {
       const next = new Set(items);
       next.add(key);
@@ -2915,6 +2952,7 @@ function App() {
 
   // 手动释放一个 pending key。
   function releaseActionPending(key: string) {
+    pendingActionsRef.current.delete(key);
     setPendingActions((items) => {
       const next = new Set(items);
       next.delete(key);
@@ -3060,8 +3098,24 @@ function App() {
   // 复制当前显示的一次性 Looking Glass Token。
   async function copyLookingGlassToken() {
     if (!revealedLookingGlassToken) return;
-    await navigator.clipboard.writeText(revealedLookingGlassToken.token);
+    await copyText(revealedLookingGlassToken.token);
     notify("success", "API Token 已复制。");
+  }
+
+  // 修改 Looking Glass Token 的名称、启用状态和过期时间。
+  async function updateLookingGlassToken(token: LookingGlassApiToken, event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    await api<LookingGlassApiToken>(`/api/integrations/looking-glass/tokens/${token.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        name: String(form.get("token_name") || "").trim(),
+        enabled: form.get("token_enabled") === "on",
+        expires_at: localDateTimeToIso(form.get("token_expires_at")),
+      }),
+    });
+    await refreshLookingGlassTokens();
+    notify("success", "Looking Glass API Token 设置已保存。");
   }
 
   // 轮换指定 Looking Glass Token，旧 Token 会立即失效。
@@ -3391,19 +3445,25 @@ function App() {
   // 更新端口台账条目的用途说明。
   async function updatePortInventoryEntryPurpose(entry: PortInventoryEntry, purpose: string) {
     if (!selectedNodeId) return;
-    const updated = await api<PortInventoryEntry>(`/api/nodes/${selectedNodeId}/port-inventory/entries/${entry.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ purpose }),
-    });
-    setPortInventory((current) => current ? {
-      ...current,
-      entries: current.entries.map((item) => item.id === updated.id ? updated : item),
-    } : current);
+    try {
+      const updated = await api<PortInventoryEntry>(`/api/nodes/${selectedNodeId}/port-inventory/entries/${entry.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ purpose }),
+      });
+      setPortInventory((current) => current ? {
+        ...current,
+        entries: current.entries.map((item) => item.id === updated.id ? updated : item),
+      } : current);
+    } catch (error) {
+      await refreshPortInventory(selectedNodeId);
+      throw error;
+    }
   }
 
   // 删除端口台账条目。
   async function deletePortInventoryEntry(entry: PortInventoryEntry) {
     if (!selectedNodeId) return;
+    if (!window.confirm(`确定删除 ${entry.protocol} ${entry.port} 的端口台账条目？`)) return;
     await api(`/api/nodes/${selectedNodeId}/port-inventory/entries/${entry.id}`, { method: "DELETE" });
     setPortInventory((current) => current ? {
       ...current,
@@ -3669,6 +3729,7 @@ function App() {
   // 删除链路监测配置。
   async function deleteLinkMonitor() {
     if (!activeMonitorDetail || !selectedNodeId) return;
+    if (!window.confirm(`确定删除监测目标“${activeMonitorDetail.monitor.name}”？历史样本也会被删除。`)) return;
     const nodeId = selectedNodeId;
     await api<{ status: string }>(`/api/link-monitors/${activeMonitorDetail.monitor.id}`, { method: "DELETE" });
     setMonitorDetail(null);
@@ -3724,6 +3785,7 @@ function App() {
   useEffect(() => {
     if (!authToken) return;
     const timer = window.setInterval(() => {
+      if (document.visibilityState === "hidden") return;
       refreshHome().catch((error) => {
         if (!(error instanceof Error && error.message.startsWith("401:"))) {
           notify("error", formatUserError(error));
@@ -3748,6 +3810,52 @@ function App() {
   }, [modalOpen]);
 
   useEffect(() => {
+    if (!modalOpen) return;
+    // 统一处理弹窗 Escape 关闭，并保留 BIRD 未保存修改的放弃确认。
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      if (topologyResetConfirmOpen) {
+        setTopologyResetConfirmOpen(false);
+      } else if (topologyFullscreenOpen) {
+        setTopologyFullscreenOpen(false);
+      } else if (newNodeCredentials) {
+        setNewNodeCredentials(null);
+      } else if (nodePluginDialogOpen) {
+        closeNodePluginDialog();
+      } else if (monitorDialogConfigId || monitorDialogEndpointRef) {
+        closeMonitorDialog();
+      } else if (deleteDialogOpen) {
+        setDeleteDialogOpen(false);
+      } else if (settingsOpen) {
+        setSettingsOpen(false);
+      } else if (nodeCreateOpen) {
+        setNodeCreateOpen(false);
+      } else if (editingNodeId) {
+        setEditingNodeId(null);
+      } else if (createDialog) {
+        setCreateDialog(null);
+      }
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [
+    modalOpen,
+    topologyResetConfirmOpen,
+    topologyFullscreenOpen,
+    newNodeCredentials,
+    nodePluginDialogOpen,
+    monitorDialogConfigId,
+    monitorDialogEndpointRef,
+    deleteDialogOpen,
+    settingsOpen,
+    nodeCreateOpen,
+    editingNodeId,
+    createDialog,
+    birdHasUnsavedChanges,
+  ]);
+
+  useEffect(() => {
     if (!authToken || !settingsOpen) return;
     refreshLookingGlassTokens().catch((error) => notify("error", formatUserError(error)));
   }, [authToken, settingsOpen]);
@@ -3769,7 +3877,7 @@ function App() {
     } else {
       setEditingNodeEndpointIps([]);
     }
-  }, [editingNodeId]);
+  }, [editingNode]);
 
   useEffect(() => {
     return () => {
@@ -4044,6 +4152,8 @@ function App() {
     formElement.reset();
     setNodeCreateEndpointIps([]);
     setNodeCreateOpen(false);
+    setNewNodeCredentials(result);
+    setNewNodeControllerUrl(controllerUrl);
     await refreshNodes();
     await refreshTopology();
     selectNodeId(null);
@@ -4086,10 +4196,6 @@ function App() {
   // 删除当前编辑的节点，并在删除当前节点时清理选中状态。
   async function deleteEditingNode() {
     if (!editingNode) return;
-    const nodeConfigCount = editingNode.id === selectedNodeId ? configs.length : null;
-    if (nodeConfigCount !== null && nodeConfigCount > 0) {
-      throw new Error("节点下仍有 WireGuard 配置，请先删除所有配置");
-    }
     if (!window.confirm(`确认删除节点 ${editingNode.name}？删除后该节点 Agent 令牌会失效。`)) return;
     await api<{ status: string }>(`/api/nodes/${editingNode.id}`, { method: "DELETE" });
     if (selectedNodeId === editingNode.id) {
@@ -4113,7 +4219,7 @@ function App() {
     if (!command) {
       throw new Error("当前节点没有可查看的 Agent 令牌，请先轮换令牌");
     }
-    await navigator.clipboard.writeText(command);
+    await copyText(command);
     notify("success", "Agent 启动命令已复制。");
   }
 
@@ -4129,7 +4235,7 @@ function App() {
     if (!agentUpgradePlan?.manual_command) {
       throw new Error("当前没有可用的手动升级命令");
     }
-    await navigator.clipboard.writeText(agentUpgradePlan.manual_command);
+    await copyText(agentUpgradePlan.manual_command);
     notify("success", "Agent 升级命令已复制。");
   }
 
@@ -5582,6 +5688,17 @@ function App() {
                         {token.last_used_ip && <small>最后来源：{token.last_used_ip}</small>}
                         <small>过期时间：{formatDateTime(token.expires_at)}</small>
                       </div>
+                      <form className="tokenEditForm" onSubmit={(event) => void runAction(() => updateLookingGlassToken(token, event), `lg-token:update:${token.id}`)}>
+                        <input name="token_name" defaultValue={token.name} aria-label="Token 名称" required />
+                        <input name="token_expires_at" type="datetime-local" defaultValue={isoToLocalDateTime(token.expires_at)} aria-label="过期时间" />
+                        <label className="checkField compactCheck">
+                          <input name="token_enabled" type="checkbox" defaultChecked={token.enabled && !token.revoked_at} />
+                          <span>启用</span>
+                        </label>
+                        <button type="submit" className="secondary" disabled={actionPending(`lg-token:update:${token.id}`)}>
+                          <Check size={15} /> {actionPending(`lg-token:update:${token.id}`) ? "保存中" : "保存"}
+                        </button>
+                      </form>
                       <div className="tokenActions">
                         <button
                           type="button"
@@ -5652,6 +5769,38 @@ function App() {
               </Field>
               <button type="submit" disabled={actionPending("node:create")}><Plus size={16} /> {actionPending("node:create") ? "创建中" : "创建节点"}</button>
             </form>
+          </section>
+        </div>
+      )}
+
+      {newNodeCredentials && (
+        <div className="modalBackdrop" role="presentation">
+          <section className="modalPanel compactModal" role="dialog" aria-modal="true" aria-labelledby="node-credentials-title">
+            <header className="modalHeader">
+              <div>
+                <h2 id="node-credentials-title"><KeyRound size={18} /> 节点已创建</h2>
+                <p className="muted">请在关闭此窗口前完成 Agent 安装。主控不会再次显示这枚明文令牌。</p>
+              </div>
+              <button className="iconButton" onClick={() => setNewNodeCredentials(null)} title="关闭"><X size={18} /></button>
+            </header>
+            <div className="stack">
+              <div className="empty">节点：{newNodeCredentials.node.name} / ID：{newNodeCredentials.node.id}</div>
+              <Field label="Agent 令牌" hint="该令牌只在本次创建流程中显示，请妥善保存。">
+                <div className="copyField">
+                  <input value={newNodeCredentials.agent_token} readOnly aria-label="Agent 令牌" />
+                  <button type="button" className="secondary" onClick={() => void runAction(async () => { await copyText(newNodeCredentials.agent_token); notify("success", "Agent 令牌已复制。"); }, "node:create:copy-token")}>
+                    <Copy size={16} /> 复制
+                  </button>
+                </div>
+              </Field>
+              <Field label="安装命令" hint="在目标节点以 root 或 sudo 执行；命令已包含主控地址、节点 ID 和令牌。">
+                <textarea value={buildAgentCommand(newNodeCredentials.node, newNodeCredentials.agent_token, newNodeControllerUrl || controllerUrl)} readOnly rows={4} />
+                <button type="button" className="secondary" onClick={() => void runAction(async () => { await copyText(buildAgentCommand(newNodeCredentials.node, newNodeCredentials.agent_token, newNodeControllerUrl || controllerUrl)); notify("success", "Agent 安装命令已复制。"); }, "node:create:copy-command")}>
+                  <Copy size={16} /> 复制安装命令
+                </button>
+              </Field>
+              <button type="button" onClick={() => setNewNodeCredentials(null)}>完成</button>
+            </div>
           </section>
         </div>
       )}

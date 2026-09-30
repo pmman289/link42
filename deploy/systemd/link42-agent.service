@@ -11,9 +11,12 @@ Environment=LINK42_NODE_ID=1
 Environment=LINK42_AGENT_TOKEN=replace-me
 Environment=LINK42_WIREGUARD_DIR=/etc/wireguard
 ExecStart=/opt/link42/.venv/bin/python -m link42_agent.main
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+RestrictSUIDSGID=yes
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from contextlib import closing
 import logging
 import json
 from pathlib import Path
@@ -138,9 +139,12 @@ def backup_sqlite_database_for_upgrade() -> Path | None:
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     if temporary_path.exists():
         temporary_path.unlink()
-    with sqlite3.connect(source) as source_connection:
-        with sqlite3.connect(temporary_path) as backup_connection:
-            source_connection.backup(backup_connection)
+    # sqlite3 的连接上下文只负责事务，不负责 close；显式 closing 才能在 Windows
+    # 上可靠释放句柄，随后替换固定备份文件不会被旧连接锁住。
+    with closing(sqlite3.connect(source)) as source_connection, closing(
+        sqlite3.connect(temporary_path)
+    ) as backup_connection:
+        source_connection.backup(backup_connection)
     shutil.copystat(source, temporary_path)
     temporary_path.replace(backup_path)
     return backup_path
@@ -150,7 +154,7 @@ def protect_sqlite_sensitive_values(path: Path) -> int:
     """加密指定 SQLite 文件中的旧敏感明文，并清除可恢复 Agent Token。"""
 
     changed = 0
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         tables = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
@@ -354,6 +358,28 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             )
             connection.execute(text("CREATE INDEX ix_port_inventory_settings_node_id ON port_inventory_settings(node_id)"))
 
+        if table_exists("wg_interfaces"):
+            duplicate_interface = connection.scalar(
+                text(
+                    """
+                    SELECT 1
+                    FROM wg_interfaces
+                    GROUP BY node_id, name
+                    HAVING COUNT(*) > 1
+                    LIMIT 1
+                    """
+                )
+            )
+            if duplicate_interface:
+                logger.warning("旧数据库存在重复 WireGuard 接口名，暂不创建唯一索引，请人工清理")
+            else:
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_wg_interface_node_name "
+                        "ON wg_interfaces(node_id, name)"
+                    )
+                )
+
         if not table_exists("port_inventory_entries"):
             connection.execute(
                 text(
@@ -494,6 +520,20 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                     """
                 )
             )
+        if table_exists("agent_tasks"):
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_agent_tasks_status_started "
+                    "ON agent_tasks(status, started_at)"
+                )
+            )
+        if table_exists("looking_glass_queries"):
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_looking_glass_queries_expires_status "
+                    "ON looking_glass_queries(expires_at, status)"
+                )
+            )
         has_import_candidates_table = connection.scalar(
             text("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'import_candidates'")
         )
@@ -624,6 +664,12 @@ def ensure_sqlite_point_to_point_constraints() -> None:
         )
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_monitor_id ON link_monitor_samples(monitor_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_checked_at ON link_monitor_samples(checked_at)"))
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_monitor_checked "
+                "ON link_monitor_samples(monitor_id, checked_at)"
+            )
+        )
         if node_columns:
             fallback_columns = [name for name in ["public_ip", "management_ip", "hostname"] if name in node_columns]
             if fallback_columns:

@@ -506,6 +506,10 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=$ENV_FILE
 ExecStart=$BIN_PATH
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+RestrictSUIDSGID=yes
 Restart=always
 RestartSec=5
 

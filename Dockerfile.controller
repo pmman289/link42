@@ -2,7 +2,7 @@ FROM node:20-bookworm-slim AS web-build
 
 WORKDIR /src/apps/web
 COPY apps/web/package*.json ./
-RUN npm install
+RUN npm ci --no-audit --no-fund
 COPY apps/web/ ./
 RUN npm run build
 
@@ -43,5 +43,8 @@ RUN mkdir -p /link42/data /link42/config
 
 VOLUME ["/link42"]
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"
 
 CMD ["sh", "-c", "mkdir -p /link42/data /link42/config && uvicorn link42_api.main:app --host 0.0.0.0 --port 8000 --no-access-log"]

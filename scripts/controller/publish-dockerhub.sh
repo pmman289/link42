@@ -87,11 +87,14 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
     exit 1
   fi
 
-  password="$(
-    docker logs "$TEST_CONTAINER" 2>&1 \
-      | sed -n -E 's/.*(Link42 initial login:|Link42 初始登录信息) username=pmman password=([^ ]+).*/\2/p' \
-      | tail -1
-  )"
+  password="$(docker exec "$TEST_CONTAINER" sh -c 'cat /link42/config/initial-admin-password' 2>/dev/null || true)"
+  if [[ -z "$password" ]]; then
+    password="$(
+      docker logs "$TEST_CONTAINER" 2>&1 \
+        | sed -n -E 's/.*(Link42 initial login:|Link42 初始登录信息|Link42 已生成初始管理员凭据) username=pmman password=([^ ;]+).*/\2/p' \
+        | tail -1
+    )"
+  fi
   if [[ -z "$password" ]]; then
     echo "failed to read initial login password from test container logs" >&2
     redacted_test_logs >&2 || true

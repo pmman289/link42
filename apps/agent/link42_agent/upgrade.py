@@ -20,6 +20,7 @@ from .system import get_service_manager_name
 UPGRADE_DIR = Path(os.getenv("LINK42_AGENT_UPGRADE_DIR", "/var/lib/link42/agent"))
 NEW_BINARY = UPGRADE_DIR / "link42-agent.new"
 NEW_SOURCE_ARCHIVE = UPGRADE_DIR / "link42-agent-source.new.tar.gz"
+MAX_UPGRADE_BYTES = 256 * 1024 * 1024
 UPGRADE_SCRIPT = UPGRADE_DIR / "upgrade.sh"
 STATE_FILE = UPGRADE_DIR / "upgrade-state.json"
 OPENWRT_SOURCE_DIR = Path(os.getenv("LINK42_AGENT_SOURCE_DIR", "/opt/link42-agent/src"))
@@ -64,7 +65,10 @@ def self_upgrade(payload: dict[str, Any], config: AgentConfig, dry_run: bool = F
     state_context = {"target_version": target_version, "upgrade_mode": upgrade_mode}
     try:
         write_state({"status": "downloading", **state_context})
-        download_file(config, download_url, target)
+        announced_size = payload.get("size")
+        if announced_size is not None and (not isinstance(announced_size, int) or announced_size < 0 or announced_size > MAX_UPGRADE_BYTES):
+            raise RuntimeError("agent upgrade asset size is invalid or too large")
+        download_file(config, download_url, target, max_bytes=MAX_UPGRADE_BYTES)
         actual_sha256 = sha256_file(target)
         if actual_sha256 != expected_sha256:
             raise RuntimeError("agent upgrade sha256 mismatch")
@@ -73,7 +77,8 @@ def self_upgrade(payload: dict[str, Any], config: AgentConfig, dry_run: bool = F
             extract_source_archive(target, staged_source, target_version)
             write_openwrt_upgrade_script(service_name, source_dir, staged_source, target_version)
         else:
-            verify_binary_version(target, target_version, payload.get("binary_args") or ["--version"])
+            # 版本检查参数由 Agent 固定，不能接受主控任务 payload 注入任意命令行。
+            verify_binary_version(target, target_version, ["--version"])
             write_systemd_upgrade_script(service_name, install_path)
         schedule_upgrade_script(service_manager)
         write_state({"status": "staged", **state_context})
@@ -100,20 +105,27 @@ def ensure_controller_url(download_url: str, server_url: str) -> None:
         raise ValueError("agent upgrade download url must belong to the configured controller")
 
 
-def download_file(config: AgentConfig, url: str, target: Path) -> None:
+def download_file(config: AgentConfig, url: str, target: Path, max_bytes: int = MAX_UPGRADE_BYTES) -> None:
     """从当前主控下载升级资产，并以临时文件原子落盘。"""
 
     tmp = target.with_suffix(".tmp")
     http_request = request.Request(url)
-    with request.urlopen(http_request, timeout=120) as response:
-        with tmp.open("wb") as handle:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-    os.chmod(tmp, 0o755 if target == NEW_BINARY else 0o600)
-    tmp.replace(target)
+    try:
+        total = 0
+        with request.urlopen(http_request, timeout=120) as response:
+            with tmp.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError("agent upgrade asset is too large")
+                    handle.write(chunk)
+        os.chmod(tmp, 0o755 if target == NEW_BINARY else 0o600)
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def sha256_file(path: Path) -> str:

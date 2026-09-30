@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import ipaddress
+import re
 from typing import Optional
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def render_wg_quick(interface: dict, peers: Iterable[dict]) -> str:
@@ -62,7 +66,7 @@ def _append(lines: list[str], key: str, value: Optional[object]) -> None:
     """追加单值字段，空值不输出。"""
     if value is None or value == "":
         return
-    lines.append(f"{key} = {value}")
+    lines.append(f"{key} = {_safe_value(key, value)}")
 
 
 def _append_csv(lines: list[str], key: str, values: Optional[object]) -> None:
@@ -72,7 +76,7 @@ def _append_csv(lines: list[str], key: str, values: Optional[object]) -> None:
     if isinstance(values, str):
         _append(lines, key, values)
         return
-    values_list = [str(value) for value in values if value]
+    values_list = [_safe_value(key, value) for value in values if value]
     if values_list:
         lines.append(f"{key} = {', '.join(values_list)}")
 
@@ -85,6 +89,15 @@ def _append_many(lines: list[str], key: str, values: Optional[object]) -> None:
         values = [values]
     for value in values:
         _append(lines, key, value)
+
+
+def _safe_value(key: str, value: object) -> str:
+    """校验单值配置字段，防止换行或控制字符注入额外 wg-quick 指令。"""
+
+    text = str(value)
+    if _CONTROL_CHARS.search(text):
+        raise ValueError(f"{key} must not contain newline or control characters")
+    return text
 
 
 def _append_raw(lines: list[str], value: Optional[object]) -> None:

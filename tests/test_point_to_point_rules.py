@@ -41,6 +41,7 @@ from link42_api.main import (
     gre_connection_read,
     create_node,
     confirm_change_plan,
+    delete_connection,
     delete_interface,
     delete_managed_link,
     delete_node,
@@ -51,17 +52,20 @@ from link42_api.main import (
     agent_task_result,
     build_agent_upgrade_plan,
     build_topology,
+    enqueue_connection_endpoint_task_once,
     enqueue_interface_task_once,
     ensure_unique_interface_name,
     expire_stale_running_agent_tasks,
     get_controller_settings,
     get_db,
+    health,
     get_looking_glass_node,
     list_node_connections,
     get_setting,
     list_node_plugins_for_node,
     install_node_middleware,
     mark_import_candidate_available_for_interface,
+    purge_retained_runtime_records,
     is_node_online,
     is_api_auth_exempt,
     list_import_candidates,
@@ -106,6 +110,7 @@ from link42_api.main import (
     submit_looking_glass_ping,
     submit_looking_glass_traceroute,
     get_looking_glass_query,
+    update_node,
 )
 from link42_api.schemas import (
     AgentTaskResultRequest,
@@ -118,6 +123,7 @@ from link42_api.schemas import (
     ManagedLinkUpdate,
     MimicMiddlewareConfig,
     NodeCreate,
+    NodeUpdate,
     PeerCreate,
     AgentPollRequest,
     AgentRegisterRequest,
@@ -686,6 +692,40 @@ def test_controller_settings_round_trip() -> None:
     assert username == "admin"
 
 
+def test_partial_updates_preserve_unmentioned_fields() -> None:
+    """验证节点和主控设置的部分更新不会清空未提交字段。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            hostname="host-a",
+            region="华东",
+            management_ip="10.0.0.1",
+            public_ip="203.0.113.1",
+            endpoint_ips=["203.0.113.1"],
+            topology_endpoint="203.0.113.1",
+            agent_token_hash="hash",
+        )
+        session.add(node)
+        session.commit()
+
+        update_node(node.id, NodeUpdate(name="node-renamed"), session)
+        update_controller_settings(ControllerSettingsUpdate(controller_url="http://controller.example"), session)
+        updated_node = session.get(models.Node, node.id)
+        settings = get_controller_settings(session)
+
+    assert updated_node is not None
+    assert updated_node.name == "node-renamed"
+    assert updated_node.hostname == "host-a"
+    assert updated_node.management_ip == "10.0.0.1"
+    assert updated_node.public_ip == "203.0.113.1"
+    assert updated_node.endpoint_ips == ["203.0.113.1"]
+    assert settings.controller_url == "http://controller.example"
+    assert settings.site_title == "Link42"
+
+
 def test_controller_settings_can_change_username_and_password() -> None:
     """验证设置页可修改用户名和密码，并使旧会话失效。"""
 
@@ -1021,6 +1061,15 @@ def test_api_auth_exemptions_keep_health_login_and_agent_public() -> None:
     assert not is_api_auth_exempt("/api/settings")
 
 
+def test_health_check_executes_database_probe() -> None:
+    """验证健康检查实际执行数据库探针，避免容器健康检查误报 503。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        assert health(session) == {"status": "ok"}
+
+
 def test_set_unique_peer_replaces_existing_duplicates() -> None:
     """验证保存唯一对端时会更新已有 Peer。"""
 
@@ -1199,6 +1248,8 @@ def test_interface_rename_plan_can_be_confirmed_without_config_diff() -> None:
 
         plan = plan_apply(interface.id, session)
         confirmed = confirm_change_plan(plan.id, session)
+        with pytest.raises(HTTPException) as duplicate_confirmation:
+            confirm_change_plan(plan.id, session)
         tasks = list(
             session.scalars(
                 select(models.AgentTask)
@@ -1208,6 +1259,7 @@ def test_interface_rename_plan_can_be_confirmed_without_config_diff() -> None:
         )
 
     assert plan.diff.strip()
+    assert duplicate_confirmation.value.status_code == 409
     assert "-InterfaceName = wg-old" in plan.diff
     assert "+InterfaceName = wg-new" in plan.diff
     assert [task.type for task in tasks] == [
@@ -1242,6 +1294,125 @@ def test_enqueue_interface_task_once_is_idempotent() -> None:
     assert first is True
     assert second is False
     assert len(tasks) == 1
+
+
+def test_enqueue_connection_endpoint_task_once_is_idempotent() -> None:
+    """验证 GRE 端点重复点击同一操作不会重复创建 Agent 任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="gre-node",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["gre"],
+        )
+        connection = models.Connection(protocol_type="gre", name="gre-idempotent")
+        endpoint = models.ConnectionEndpoint(
+            connection=connection,
+            node=node,
+            role="local",
+            interface_name="gre-idempotent",
+            tunnel_ips=["10.42.0.1/30"],
+            protocol_config={},
+        )
+        session.add_all([node, connection, endpoint])
+        session.flush()
+
+        first = enqueue_connection_endpoint_task_once(session, endpoint, GRE_TASKS.start)
+        second = enqueue_connection_endpoint_task_once(session, endpoint, GRE_TASKS.start)
+        session.commit()
+        tasks = list(session.scalars(select(models.AgentTask)))
+
+    assert first is not None
+    assert second is first
+    assert len(tasks) == 1
+
+
+def test_agent_poll_second_request_cannot_reclaim_running_task(monkeypatch) -> None:
+    """验证 Agent 重复轮询时同一个任务只会被第一次请求领取。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, _token_hash: token == "token")
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="poll-node",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            agent_version="0.6.0",
+            agent_capabilities=["wireguard"],
+        )
+        session.add(node)
+        session.flush()
+        task = models.AgentTask(node_id=node.id, type=WIREGUARD_TASKS.status, payload={"node_id": node.id})
+        session.add(task)
+        session.commit()
+        request = AgentPollRequest(node_id=node.id, token="token", agent_version="0.6.0", capabilities=["wireguard"])
+
+        first = agent_poll(request, session)
+        second = agent_poll(request, session)
+        session.refresh(task)
+
+    assert [item.id for item in first.tasks] == [task.id]
+    assert second.tasks == []
+    assert task.status == "running"
+
+
+def test_agent_task_result_ignores_duplicate_terminal_report_but_accepts_timeout_success(monkeypatch) -> None:
+    """验证终态任务重复回报无副作用，并兼容超时后 Agent 最终成功的旧流程。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "verify_token", lambda token, _token_hash: token == "token")
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="result-node", agent_token_hash="hash")
+        session.add(node)
+        session.flush()
+        completed = models.AgentTask(
+            node_id=node.id,
+            type=WIREGUARD_TASKS.status,
+            status="succeeded",
+            payload={},
+            result={"original": True},
+        )
+        timed_out = models.AgentTask(
+            node_id=node.id,
+            type=WIREGUARD_TASKS.status,
+            status="failed",
+            payload={},
+            result={"error_code": "task_timeout", "error": "agent task timed out"},
+        )
+        session.add_all([completed, timed_out])
+        session.commit()
+
+        ignored = agent_task_result(
+            completed.id,
+            AgentTaskResultRequest(node_id=node.id, token="token", status="failed", result={"changed": True}),
+            session,
+        )
+        accepted = agent_task_result(
+            timed_out.id,
+            AgentTaskResultRequest(node_id=node.id, token="token", status="succeeded", result={"changed": True}),
+            session,
+        )
+        session.refresh(completed)
+        session.refresh(timed_out)
+
+    assert ignored == {"status": "ignored"}
+    assert completed.status == "succeeded"
+    assert completed.result == {"original": True}
+    assert accepted == {"status": "recorded"}
+    assert timed_out.status == "succeeded"
+    assert timed_out.result == {"changed": True}
 
 
 def test_deleting_imported_config_makes_candidate_importable_again() -> None:
@@ -1355,6 +1526,218 @@ def test_delete_node_requires_all_connection_endpoints_removed() -> None:
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == "node has connections"
+
+
+def test_force_delete_offline_wireguard_cleans_tasks_and_monitor() -> None:
+    """验证 force 删除离线 WireGuard 时只清理面板记录并移除关联任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="offline-wg", agent_token_hash="hash", status="offline")
+        session.add(node)
+        session.flush()
+        interface = models.WireGuardInterface(node_id=node.id, name="wg-offline", runtime_status="stopped")
+        session.add(interface)
+        session.flush()
+        monitor = models.LinkMonitor(node_id=node.id, interface_id=interface.id, name="wg monitor", target_host="10.0.0.2")
+        task = models.AgentTask(
+            node_id=node.id,
+            type="wireguard.apply_config",
+            status="running",
+            payload={"interface_id": interface.id, "node_id": node.id},
+        )
+        session.add_all([monitor, task])
+        session.commit()
+        interface_id = interface.id
+        monitor_id = monitor.id
+        task_id = task.id
+        node_id = node.id
+
+        result = delete_interface(interface_id, db=session, force=True)
+
+        assert result == {"status": "deleted"}
+        assert session.get(models.WireGuardInterface, interface_id) is None
+        assert session.get(models.LinkMonitor, monitor_id) is None
+        assert session.get(models.AgentTask, task_id) is None
+        assert session.get(models.Node, node_id) is not None
+
+
+def test_force_delete_offline_gre_cleans_tasks_and_monitor() -> None:
+    """验证 force 删除离线 GRE 时不会遗留端点任务或监测历史。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="offline-gre", agent_token_hash="hash", status="offline")
+        connection = models.Connection(protocol_type="gre", name="gre-offline")
+        endpoint = models.ConnectionEndpoint(
+            connection=connection,
+            node=node,
+            role="local",
+            interface_name="gre-offline",
+            tunnel_ips=["10.42.0.1/30"],
+            protocol_config={},
+            runtime_status="stopped",
+        )
+        session.add_all([node, connection, endpoint])
+        session.flush()
+        monitor = models.LinkMonitor(
+            node_id=node.id,
+            connection_endpoint_id=endpoint.id,
+            name="gre monitor",
+            target_host="10.42.0.2",
+        )
+        task = models.AgentTask(
+            node_id=node.id,
+            type=GRE_TASKS.apply_config,
+            status="running",
+            payload={"connection_endpoint_id": endpoint.id, "node_id": node.id},
+        )
+        session.add_all([monitor, task])
+        session.commit()
+        connection_id = connection.id
+        endpoint_id = endpoint.id
+        monitor_id = monitor.id
+        task_id = task.id
+
+        result = delete_connection(f"gre:{connection_id}", db=session, force=True)
+
+        assert result == {"status": "deleted"}
+        assert session.get(models.Connection, connection_id) is None
+        assert session.get(models.ConnectionEndpoint, endpoint_id) is None
+        assert session.get(models.LinkMonitor, monitor_id) is None
+        assert session.get(models.AgentTask, task_id) is None
+
+
+def test_force_delete_offline_managed_link_cleans_both_sides() -> None:
+    """验证 force 删除离线受管 WireGuard 时两端接口、对端和任务都会清理。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node_a = models.Node(name="offline-a", agent_token_hash="hash-a", status="offline")
+        node_b = models.Node(name="offline-b", agent_token_hash="hash-b", status="offline")
+        local = models.WireGuardInterface(node=node_a, name="wg-offline-a", source="managed-node", managed=True)
+        peer = models.WireGuardInterface(node=node_b, name="wg-offline-b", source="managed-node", managed=True)
+        session.add_all([node_a, node_b, local, peer])
+        session.flush()
+        local_peer = models.WireGuardPeer(
+            interface=local,
+            peer_interface_id=peer.id,
+            peer_node_id=node_b.id,
+            source="managed-node",
+            public_key="peer-public",
+        )
+        peer_peer = models.WireGuardPeer(
+            interface=peer,
+            peer_interface_id=local.id,
+            peer_node_id=node_a.id,
+            source="managed-node",
+            public_key="local-public",
+        )
+        monitor_a = models.LinkMonitor(node_id=node_a.id, interface=local, name="a", target_host="10.0.0.2")
+        monitor_b = models.LinkMonitor(node_id=node_b.id, interface=peer, name="b", target_host="10.0.0.1")
+        task_a = models.AgentTask(
+            node_id=node_a.id,
+            type=WIREGUARD_TASKS.apply_config,
+            status="running",
+            payload={"interface_id": local.id, "node_id": node_a.id},
+        )
+        task_b = models.AgentTask(
+            node_id=node_b.id,
+            type=WIREGUARD_TASKS.start,
+            status="pending",
+            payload={"interface_id": peer.id, "node_id": node_b.id},
+        )
+        session.add_all([local_peer, peer_peer, monitor_a, monitor_b, task_a, task_b])
+        session.commit()
+        local_id = local.id
+        peer_id = peer.id
+        task_ids = [task_a.id, task_b.id]
+
+        result = delete_managed_link(local_id, db=session, force=True)
+
+        assert result == {"status": "deleted"}
+        assert session.get(models.WireGuardInterface, local_id) is None
+        assert session.get(models.WireGuardInterface, peer_id) is None
+        assert list(session.scalars(select(models.WireGuardPeer))) == []
+        assert list(session.scalars(select(models.LinkMonitor))) == []
+        assert all(session.get(models.AgentTask, task_id) is None for task_id in task_ids)
+
+
+def test_force_delete_offline_node_cleans_all_related_records() -> None:
+    """验证 force 删除离线节点时按外键顺序清理连接、任务、查询和监测数据。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="offline-node", agent_token_hash="hash", status="offline")
+        session.add(node)
+        session.flush()
+        interface = models.WireGuardInterface(node_id=node.id, name="wg-force", runtime_status="stopped")
+        connection = models.Connection(protocol_type="gre", name="gre-force")
+        endpoint = models.ConnectionEndpoint(
+            connection=connection,
+            node_id=node.id,
+            role="local",
+            interface_name="gre-force",
+            tunnel_ips=["10.42.0.1/30"],
+            protocol_config={},
+        )
+        session.add_all([interface, connection, endpoint])
+        session.flush()
+        monitor = models.LinkMonitor(node_id=node.id, interface=interface, name="force monitor", target_host="10.0.0.2")
+        endpoint_monitor = models.LinkMonitor(
+            node_id=node.id,
+            connection_endpoint=endpoint,
+            name="force endpoint monitor",
+            target_host="10.42.0.2",
+        )
+        session.add_all([monitor, endpoint_monitor])
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="force-lg",
+            token_prefix="l42lg_force",
+            token_hash="hash",
+            token_hint="hint",
+        )
+        task = models.AgentTask(
+            node_id=node.id,
+            type=LOOKING_GLASS_PING_TASK,
+            status="succeeded",
+            payload={"node_id": node.id},
+        )
+        session.add_all([api_key, task])
+        session.flush()
+        query = models.LookingGlassQuery(
+            public_id="lgq_force",
+            api_key_id=api_key.id,
+            node_id=node.id,
+            operation="ping",
+            request={},
+            request_fingerprint="force",
+            status="succeeded",
+            agent_task_id=task.id,
+        )
+        session.add(query)
+        session.flush()
+        sample = models.LinkMonitorSample(monitor_id=monitor.id, checked_at=datetime.utcnow(), success=True, latency_ms=1)
+        session.add(sample)
+        session.commit()
+        node_id = node.id
+
+        result = delete_node(node_id, db=session, force=True)
+
+        assert result == {"status": "deleted"}
+        assert session.get(models.Node, node_id) is None
+        assert list(session.scalars(select(models.WireGuardInterface))) == []
+        assert list(session.scalars(select(models.ConnectionEndpoint))) == []
+        assert list(session.scalars(select(models.Connection))) == []
+        assert list(session.scalars(select(models.AgentTask))) == []
+        assert list(session.scalars(select(models.LookingGlassQuery))) == []
+        assert list(session.scalars(select(models.LinkMonitor))) == []
+        assert list(session.scalars(select(models.LinkMonitorSample))) == []
 
 
 def test_delete_node_removes_empty_node_related_tasks_and_candidates() -> None:
@@ -1854,10 +2237,13 @@ def test_mimic_install_task_uses_github_latest_and_node_proxy() -> None:
         session.commit()
 
         result = install_node_middleware(node.id, "mimic", session)
+        duplicate = install_node_middleware(node.id, "mimic", session)
         task = session.get(models.AgentTask, result.task_id)
         install_status = session.get(models.Node, node.id).middleware_install_status
 
     assert result.status == "pending"
+    assert duplicate.task_id == result.task_id
+    assert duplicate.status == result.status
     assert task is not None
     assert task.type == "middleware.install"
     assert task.payload == {
@@ -3136,6 +3522,46 @@ def test_existing_looking_glass_token_accesses_nodes_created_later() -> None:
     assert query.node_ref == f"node_{added_node_id}"
 
 
+def test_looking_glass_online_pagination_filters_before_limit() -> None:
+    """验证 Looking Glass 在线节点分页先过滤状态，不会跳过后续在线节点。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        session.add_all(
+            [
+                models.Node(name="offline-1", agent_token_hash="hash", status="offline"),
+                models.Node(name="online-1", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow()),
+                models.Node(name="offline-2", agent_token_hash="hash", status="offline"),
+                models.Node(name="online-2", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow()),
+            ]
+        )
+        session.flush()
+        api_key = models.IntegrationApiKey(
+            name="pagination-lg",
+            token_prefix="l42lg_page",
+            token_hash="hash",
+            token_hint="hint",
+            scopes=["looking_glass.nodes.read"],
+        )
+        session.add(api_key)
+        session.commit()
+
+        first = list_looking_glass_nodes(online=True, limit=1, api_key=api_key, db=session)
+        second = list_looking_glass_nodes(
+            online=True,
+            limit=1,
+            cursor=first.next_cursor,
+            api_key=api_key,
+            db=session,
+        )
+
+    assert [item.name for item in first.items] == ["online-1"]
+    assert first.next_cursor is not None
+    assert [item.name for item in second.items] == ["online-2"]
+    assert second.next_cursor is None
+
+
 def test_delete_looking_glass_token_removes_token_and_query_audit() -> None:
     """验证删除 Looking Glass Token 会同时删除 Token 和关联查询记录。"""
 
@@ -4097,6 +4523,128 @@ def test_link_monitor_samples_rejects_invalid_window(monkeypatch) -> None:
     assert exc_info.value.detail == "invalid monitor window"
 
 
+def test_monitor_response_is_bounded_and_batch_summary_matches_single_summary() -> None:
+    """验证监测历史响应有上限，且批量摘要与单条摘要保持一致。"""
+
+    import link42_api.main as api_main
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        monitor_a = models.LinkMonitor(node_id=1, name="a", target_host="10.0.0.1", retention_days=7)
+        monitor_b = models.LinkMonitor(node_id=1, name="b", target_host="10.0.0.2", retention_days=7)
+        session.add_all([monitor_a, monitor_b])
+        session.flush()
+        checked_at = datetime.utcnow() - timedelta(minutes=1)
+        session.add_all(
+            [
+                models.LinkMonitorSample(
+                    monitor_id=monitor_a.id,
+                    checked_at=checked_at + timedelta(seconds=index),
+                    success=index % 5 != 0,
+                    latency_ms=float(index) if index % 5 else None,
+                )
+                for index in range(2105)
+            ]
+            + [
+                models.LinkMonitorSample(
+                    monitor_id=monitor_b.id,
+                    checked_at=checked_at,
+                    success=True,
+                    latency_ms=20.0,
+                )
+            ]
+        )
+        session.commit()
+        summaries = api_main.summarize_monitors(session, [monitor_a, monitor_b])
+        single = api_main.summarize_monitor(session, monitor_a)
+        response = api_main.get_link_monitor_samples(monitor_a.id, "1h", session)
+
+    assert summaries[monitor_a.id].model_dump() == single.model_dump()
+    assert summaries[monitor_b.id].sample_count == 1
+    assert response.summary.sample_count == 2105
+    assert len(response.samples) <= api_main.MONITOR_RESPONSE_MAX_SAMPLES
+
+
+def test_purge_retained_runtime_records_removes_expired_records_but_keeps_change_plan_tasks() -> None:
+    """验证运行记录按保留期清理，仍被部署计划引用的任务不会被误删。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    now = datetime.utcnow()
+    old = now - timedelta(days=40)
+    with Session(engine) as session:
+        node = models.Node(name="purge-node", agent_token_hash="hash")
+        session.add(node)
+        session.flush()
+        monitor = models.LinkMonitor(node_id=node.id, name="old monitor", target_host="10.0.0.2", retention_days=1)
+        api_key = models.IntegrationApiKey(
+            name="purge-lg",
+            token_prefix="l42lg_purge",
+            token_hash="hash",
+            token_hint="hint",
+        )
+        plan = models.ChangePlan(title="keep plan", summary="keep task", affected_node_ids=[node.id], diff="diff")
+        session.add_all([monitor, api_key, plan])
+        session.flush()
+        expired_task = models.AgentTask(
+            node_id=node.id,
+            type="looking_glass.ping",
+            status="succeeded",
+            result={"old": True},
+            finished_at=old,
+            updated_at=old,
+        )
+        planned_task = models.AgentTask(
+            node_id=node.id,
+            change_plan_id=plan.id,
+            type=WIREGUARD_TASKS.apply_config,
+            status="succeeded",
+            result={"planned": True},
+            finished_at=old,
+            updated_at=old,
+        )
+        session.add_all([expired_task, planned_task])
+        session.flush()
+        expired_query = models.LookingGlassQuery(
+            public_id="lgq_purge",
+            api_key_id=api_key.id,
+            node_id=node.id,
+            operation="ping",
+            request={},
+            request_fingerprint="purge",
+            status="succeeded",
+            agent_task_id=expired_task.id,
+            expires_at=old,
+        )
+        session.add(expired_query)
+        session.add(
+            models.LinkMonitorSample(
+                monitor_id=monitor.id,
+                checked_at=old,
+                success=True,
+                latency_ms=1.0,
+            )
+        )
+        session.commit()
+        expired_query_id = expired_query.id
+        expired_task_id = expired_task.id
+        planned_task_id = planned_task.id
+        monitor_id = monitor.id
+
+        result = purge_retained_runtime_records(session, now=now)
+        session.commit()
+
+        assert session.get(models.LookingGlassQuery, expired_query_id) is None
+        assert session.get(models.AgentTask, expired_task_id) is None
+        assert session.get(models.AgentTask, planned_task_id) is not None
+        assert session.scalar(select(models.LinkMonitorSample).where(models.LinkMonitorSample.monitor_id == monitor_id)) is None
+
+    assert result["looking_glass_queries"] == 1
+    assert result["agent_tasks"] == 1
+    assert result["monitor_samples"] == 1
+
+
 def test_mimic_requires_non_openwrt_kernel_newer_than_61_and_capability() -> None:
     """验证主控侧 mimic 门禁不只相信表单，必须满足平台和能力要求。"""
 
@@ -4638,6 +5186,84 @@ def test_controller_image_includes_udpspeeder_assets() -> None:
     content = dockerfile.read_text(encoding="utf-8")
 
     assert "COPY plugins/udpspeeder/assets ./plugins/udpspeeder/assets" in content
+
+
+def test_udpspeeder_asset_checksum_endpoint(monkeypatch, tmp_path) -> None:
+    """验证 UDPspeeder 资产摘要接口与下载文件内容一致。"""
+
+    import hashlib
+    import link42_api.main as api_main
+
+    asset = tmp_path / "udpspeeder-x64-static"
+    content = b"test-udpspeeder-binary"
+    asset.write_bytes(content)
+    monkeypatch.setattr(api_main, "resolve_middleware_asset", lambda plugin, name: asset)
+
+    response = api_main.get_udpspeeder_asset_sha256(asset.name)
+
+    assert response == f"{hashlib.sha256(content).hexdigest()}  {asset.name}\n"
+
+
+@pytest.mark.parametrize(
+    ("plugin", "asset_name"),
+    [
+        ("udp2raw", "udp2raw_amd64"),
+        ("udpspeeder", "udpspeeder-x64-static"),
+    ],
+)
+def test_middleware_assets_require_agent_token_and_verify_checksum(
+    monkeypatch,
+    tmp_path,
+    plugin: str,
+    asset_name: str,
+) -> None:
+    """验证中间层二进制和摘要接口都要求节点 Agent token，且摘要匹配下载内容。"""
+
+    import hashlib
+    import link42_api.main as api_main
+
+    asset = tmp_path / asset_name
+    content = f"{plugin}-asset".encode("ascii")
+    asset.write_bytes(content)
+    monkeypatch.setattr(api_main, "resolve_middleware_asset", lambda _plugin, _name: asset)
+    monkeypatch.setattr(api_main, "verify_token", lambda token, _token_hash: token == "agent-secret")
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(name="asset-node", agent_token_hash="stored-hash")
+        session.add(node)
+        session.commit()
+        node_id = node.id
+
+    def override_db():
+        """为资产下载接口提供独立测试数据库会话。"""
+
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        path = f"/api/agent/plugins/{plugin}/assets/{asset_name}"
+        checksum_path = f"{path}.sha256"
+        assert client.get(path).status_code == 401
+        assert client.get(checksum_path, headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+        headers = {
+            "Authorization": "Bearer agent-secret",
+            "X-Link42-Agent-Node-ID": str(node_id),
+        }
+        checksum = client.get(checksum_path, headers=headers)
+        download = client.get(path, headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    digest = hashlib.sha256(content).hexdigest()
+    assert checksum.status_code == 200
+    assert checksum.text == f"{digest}  {asset_name}\n"
+    assert download.status_code == 200
+    assert download.content == content
 
 
 def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) -> None:

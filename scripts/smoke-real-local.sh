@@ -245,6 +245,7 @@ main() {
   cleanup_interface "$IFACE_B"
 
   LINK42_DATABASE_URL="sqlite:///$DB_PATH" \
+    LINK42_CONFIG_DIR="$RUN_DIR/config" \
     LINK42_WEB_DIST_DIR="$ROOT_DIR/apps/web/dist" \
     "$UVICORN_BIN" link42_api.main:app --host "$HOST" --port "$PORT" --no-access-log \
     > "$RUN_DIR/api.log" 2>&1 &
@@ -252,7 +253,10 @@ main() {
   wait_for_api
 
   local password
-  password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/api.log" | tail -1)"
+  password="$(cat "$RUN_DIR/config/initial-admin-password" 2>/dev/null || true)"
+  if [[ -z "$password" ]]; then
+    password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/api.log" | tail -1)"
+  fi
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \
     -d "{\"username\":\"pmman\",\"password\":\"$password\"}" | json_get token)"

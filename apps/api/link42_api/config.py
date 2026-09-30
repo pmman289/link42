@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     agent_offline_after_seconds: int = 15
     # 主控日志等级；排查问题时可设为 DEBUG。
     log_level: str = "INFO"
+    # 默认保留旧版首次部署体验，将一次性初始密码写入主控日志；生产环境可关闭。
+    print_initial_password: bool = True
     # Web 会话空闲和绝对有效期；Bearer 与 Cookie 会话使用同一服务端状态。
     web_session_idle_seconds: int = 8 * 60 * 60
     web_session_absolute_seconds: int = 7 * 24 * 60 * 60

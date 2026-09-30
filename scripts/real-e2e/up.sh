@@ -119,6 +119,7 @@ main() {
   rm -f "$DB_PATH" "$DB_PATH"-* "$RUN_DIR"/*.log "$RUN_DIR"/state.env
 
   LINK42_DATABASE_URL="sqlite:///$DB_PATH" \
+    LINK42_CONFIG_DIR="$RUN_DIR/config" \
     LINK42_WEB_DIST_DIR="$ROOT_DIR/apps/web/dist" \
     PYTHONPATH="$ROOT_DIR/apps/api:$ROOT_DIR/packages" \
     "$UVICORN_BIN" link42_api.main:app --host "$HOST" --port "$PORT" --no-access-log \
@@ -128,7 +129,10 @@ main() {
   wait_for_api
 
   local password
-  password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/controller.log" | tail -1)"
+  password="$(cat "$RUN_DIR/config/initial-admin-password" 2>/dev/null || true)"
+  if [[ -z "$password" ]]; then
+    password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/controller.log" | tail -1)"
+  fi
   [[ -n "$password" ]] || fail "initial password not found in controller log"
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \

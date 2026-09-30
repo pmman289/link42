@@ -7,6 +7,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from link42_common.time import utcnow_naive
+
 from ..system import run_command
 from .base import AgentNodePlugin, AgentPluginContext
 
@@ -258,7 +260,7 @@ def bird_backup_path(path: Path) -> Path:
     """生成当前配置文件的带时间戳备份路径。"""
 
     BIRD_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    stamp = utcnow_naive().strftime("%Y%m%d%H%M%S")
     safe_name = str(path).strip("/").replace("/", "__")
     return BIRD_BACKUP_DIR / f"{safe_name}.{stamp}.bak"
 

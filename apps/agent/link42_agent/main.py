@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
 import inspect
 import json
 import logging
 import os
+import random
 import re
 import sys
 import threading
 import time
-import traceback
 import shutil
 from typing import Any, Union
 
 from link42_common.version import AGENT_VERSION
+from link42_common.time import utcnow_naive
 
 from .client import AgentClient, AgentConnectionError, AgentHttpError
 from .config import AgentConfig
@@ -44,6 +44,10 @@ from .task_handlers import execute_registered_task
 LOGGER_NAME = "link42.agent"
 logger = logging.getLogger(LOGGER_NAME)
 IDLE_DEBUG_LOG_INTERVAL_SECONDS = 60.0
+DEFAULT_SNAPSHOT_REFRESH_SECONDS = 300.0
+AGENT_RETRY_MAX_SECONDS = 60.0
+LINK_MONITOR_RETRY_BASE_SECONDS = 15.0
+LINK_MONITOR_RETRY_MAX_SECONDS = 120.0
 SNAPSHOT_LOG_PLATFORM_KEYS = [
     "os",
     "arch",
@@ -70,6 +74,17 @@ class AgentLogState:
 
     snapshot_signature: tuple[Any, ...] | None = None
     last_idle_debug_at: float = 0.0
+    monitor_failures: dict[str, "LinkMonitorFailureState"] = field(default_factory=dict)
+    last_monitor_warning_at: float = 0.0
+
+
+@dataclass
+class LinkMonitorFailureState:
+    """保存单个链路监测目标的失败退避状态。"""
+
+    target_key: tuple[str, str]
+    consecutive_failures: int = 0
+    next_probe_at: float = 0.0
 
 
 def build_capabilities(platform_info: dict[str, Any] | None = None) -> list[str]:
@@ -177,6 +192,82 @@ def log_idle_cycle(log_state: AgentLogState | None) -> None:
         return
     logger.debug("Agent 空闲：本轮没有待执行任务")
     log_state.last_idle_debug_at = now
+
+
+def snapshot_refresh_seconds() -> float:
+    """读取平台能力快照刷新周期，避免每轮轮询重复执行系统探测。"""
+
+    value = os.getenv("LINK42_SNAPSHOT_REFRESH_SECONDS", str(DEFAULT_SNAPSHOT_REFRESH_SECONDS))
+    try:
+        seconds = float(value)
+    except ValueError:
+        return DEFAULT_SNAPSHOT_REFRESH_SECONDS
+    return seconds if seconds > 0 else DEFAULT_SNAPSHOT_REFRESH_SECONDS
+
+
+def task_requires_snapshot_refresh(task_type: str) -> bool:
+    """判断任务完成后是否需要立即重新采集 Agent 能力。"""
+
+    return task_type == "middleware.install" or task_type == "agent.self_upgrade"
+
+
+def link_monitor_target_key(monitor: dict[str, Any]) -> tuple[str, str]:
+    """生成监测目标签名，目标地址或超时变化时重新计算退避。"""
+
+    return (str(monitor.get("target_host") or ""), str(monitor.get("timeout_seconds") or 2))
+
+
+def suppressed_link_monitor_result(
+    monitor: dict[str, Any],
+    failure: LinkMonitorFailureState,
+    now: float,
+) -> dict[str, Any]:
+    """生成退避期间的失败结果，不再次启动高成本 ping 子进程。"""
+
+    retry_after = max(0, int(round(failure.next_probe_at - now)))
+    return {
+        "monitor_id": monitor["id"],
+        "checked_at": utcnow_naive().isoformat(),
+        "success": False,
+        "latency_ms": None,
+        "error": f"monitor probe temporarily suppressed after repeated failure; retry in {retry_after}s",
+    }
+
+
+def update_link_monitor_failure_state(
+    monitor: dict[str, Any],
+    result: dict[str, Any],
+    log_state: AgentLogState,
+    now: float,
+) -> None:
+    """根据真实探测结果更新失败退避，成功后立即恢复正常探测。"""
+
+    monitor_id = str(monitor["id"])
+    if result.get("success"):
+        log_state.monitor_failures.pop(monitor_id, None)
+        return
+    target_key = link_monitor_target_key(monitor)
+    failure = log_state.monitor_failures.get(monitor_id)
+    if failure is None or failure.target_key != target_key:
+        failure = LinkMonitorFailureState(target_key=target_key)
+        log_state.monitor_failures[monitor_id] = failure
+    failure.consecutive_failures += 1
+    delay = min(
+        LINK_MONITOR_RETRY_MAX_SECONDS,
+        LINK_MONITOR_RETRY_BASE_SECONDS * (2 ** (failure.consecutive_failures - 1)),
+    )
+    failure.next_probe_at = now + delay
+
+
+def should_log_monitor_failure(log_state: AgentLogState | None, now: float) -> bool:
+    """限制重复监测失败的 WARNING 频率，保留首次和周期性排障提示。"""
+
+    if log_state is None:
+        return True
+    if now - log_state.last_monitor_warning_at < 60.0:
+        return False
+    log_state.last_monitor_warning_at = now
+    return True
 
 
 def configure_logging(level_name: str) -> None:
@@ -306,6 +397,18 @@ def execute_task(task: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
     return execute_registered_task(task_type, payload, config)
 
 
+def retry_delay_seconds(config: AgentConfig, failures: int) -> float:
+    """计算主控请求失败后的指数退避时间，并加入少量随机抖动。"""
+
+    if failures <= 0:
+        return max(0.1, float(config.poll_interval))
+    base = min(
+        AGENT_RETRY_MAX_SECONDS,
+        max(0.1, float(config.poll_interval)) * (2 ** min(failures - 1, 6)),
+    )
+    return base * random.uniform(0.8, 1.2)
+
+
 def method_accepts_args(method: Any, *args: Any) -> bool:
     """判断方法签名是否能接收指定参数，避免用 TypeError 做兼容分支。"""
 
@@ -391,31 +494,46 @@ def failed_link_monitor_result(monitor: dict[str, Any], exc: BaseException) -> d
 
     return {
         "monitor_id": monitor["id"],
-        "checked_at": datetime.utcnow().isoformat(),
+        "checked_at": utcnow_naive().isoformat(),
         "success": False,
         "latency_ms": None,
         "error": str(exc),
     }
 
 
-def probe_link_monitors(monitors: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """并发执行链路监测，避免多个 ping 目标串行阻塞整轮 Agent。"""
+def probe_link_monitors(
+    monitors: list[dict[str, Any]],
+    log_state: AgentLogState | None = None,
+) -> list[dict[str, Any]]:
+    """并发执行链路监测，并对持续失败目标做本地退避。"""
 
     if not monitors:
         return []
     results: list[dict[str, Any] | None] = [None] * len(monitors)
-    worker_count = link_monitor_worker_count(len(monitors))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(probe_single_link_monitor, monitor): (index, monitor)
-            for index, monitor in enumerate(monitors)
-        }
-        for future in as_completed(futures):
-            index, monitor = futures[future]
-            try:
-                results[index] = future.result()
-            except Exception as exc:  # noqa: BLE001
-                results[index] = failed_link_monitor_result(monitor, exc)
+    now = time.monotonic()
+    probe_items: list[tuple[int, dict[str, Any]]] = []
+    for index, monitor in enumerate(monitors):
+        failure = log_state.monitor_failures.get(str(monitor["id"])) if log_state else None
+        if failure and failure.target_key == link_monitor_target_key(monitor) and now < failure.next_probe_at:
+            results[index] = suppressed_link_monitor_result(monitor, failure, now)
+            continue
+        probe_items.append((index, monitor))
+    if probe_items:
+        worker_count = link_monitor_worker_count(len(probe_items))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(probe_single_link_monitor, monitor): (index, monitor)
+                for index, monitor in probe_items
+            }
+            for future in as_completed(futures):
+                index, monitor = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    result = failed_link_monitor_result(monitor, exc)
+                results[index] = result
+                if log_state:
+                    update_link_monitor_failure_state(monitor, result, log_state, time.monotonic())
     return [item for item in results if item is not None]
 
 
@@ -424,8 +542,8 @@ def run_once(
     config: Union[AgentConfig, str],
     snapshot: AgentSnapshot | None = None,
     log_state: AgentLogState | None = None,
-) -> None:
-    """执行一次心跳、拉取任务和处理任务的循环。"""
+) -> bool:
+    """执行一次心跳、拉取任务和处理任务的循环，并返回是否应刷新能力快照。"""
 
     if isinstance(config, str):
         config = AgentConfig(server_url="", node_id=0, token="", wireguard_dir=config)
@@ -438,6 +556,7 @@ def run_once(
         log_idle_cycle(log_state)
     heartbeat_stop: threading.Event | None = None
     heartbeat_thread: threading.Thread | None = None
+    refresh_snapshot = False
     if tasks:
         heartbeat_stop, heartbeat_thread = start_background_heartbeat(
             client,
@@ -448,6 +567,7 @@ def run_once(
         for task in tasks:
             task_id = task["id"]
             task_type = task["type"]
+            refresh_snapshot = refresh_snapshot or task_requires_snapshot_refresh(task_type)
             started_at = time.monotonic()
             logger.info("开始执行任务 task_id=%s task_type=%s summary=%s", task_id, task_type, summarize_task(task))
             try:
@@ -470,10 +590,11 @@ def run_once(
                     time.monotonic() - started_at,
                     scrub_text_for_log(exc),
                 )
+                # 堆栈只写本地日志，避免把服务器路径、环境变量和文件名上传到主控。
                 client.report_task(
                     task_id,
                     "failed",
-                    {"error": str(exc), "traceback": traceback.format_exc()},
+                    {"error": scrub_text_for_log(exc, limit=2000), "error_type": type(exc).__name__},
                 )
                 logger.debug("任务结果已上报 task_id=%s task_type=%s status=failed", task_id, task_type)
     finally:
@@ -485,17 +606,20 @@ def run_once(
         monitors = client.poll_link_monitors(snapshot.capabilities, snapshot.platform)
         if monitors:
             logger.debug("开始执行链路监测 count=%d monitor_ids=%s", len(monitors), [item.get("id") for item in monitors])
-        monitor_results = probe_link_monitors(monitors)
+        monitor_results = probe_link_monitors(monitors, log_state)
         if monitor_results:
             client.report_link_monitor_results(monitor_results)
             failed_count = sum(1 for item in monitor_results if not item.get("success"))
-            log_method = logger.warning if failed_count else logger.debug
+            log_method = logger.debug
+            if failed_count and should_log_monitor_failure(log_state, time.monotonic()):
+                log_method = logger.warning
             log_method(
                 "链路监测结果已上报 count=%d failed=%d monitor_ids=%s",
                 len(monitor_results),
                 failed_count,
                 [item.get("monitor_id") for item in monitor_results],
             )
+    return refresh_snapshot
 
 
 def main() -> None:
@@ -523,20 +647,34 @@ def main() -> None:
         config.log_level,
     )
     log_state = AgentLogState()
+    snapshot: AgentSnapshot | None = None
+    snapshot_collected_at = 0.0
+    refresh_snapshot = True
+    consecutive_failures = 0
     while True:
         try:
             client = AgentClient(config)
-            snapshot = collect_agent_snapshot()
+            now = time.monotonic()
+            if snapshot is None or refresh_snapshot or now - snapshot_collected_at >= snapshot_refresh_seconds():
+                snapshot = collect_agent_snapshot()
+                snapshot_collected_at = now
+                refresh_snapshot = False
             client.register(get_hostname(), snapshot.capabilities, snapshot.platform)
             log_snapshot_if_changed(snapshot, log_state)
-            run_once(client, config, snapshot, log_state)
+            refresh_snapshot = run_once(client, config, snapshot, log_state)
+            consecutive_failures = 0
+            delay = retry_delay_seconds(config, 0)
         except AgentConnectionError as exc:
+            consecutive_failures += 1
+            delay = retry_delay_seconds(config, consecutive_failures)
             logger.error(
-                "%s；请检查 LINK42_SERVER_URL、DNS 和网络连接，Agent 将在 %s 秒后重试",
+                "%s；请检查 LINK42_SERVER_URL、DNS 和网络连接，Agent 将在 %.1f 秒后重试",
                 exc,
-                config.poll_interval,
+                delay,
             )
         except AgentHttpError as exc:
+            consecutive_failures += 1
+            delay = retry_delay_seconds(config, consecutive_failures)
             if exc.status_code == 401:
                 logger.error(
                     "agent authentication failed: invalid node id or token; "
@@ -552,9 +690,11 @@ def main() -> None:
             else:
                 logger.warning("Agent API 请求失败 status=%s path=%s body=%s", exc.status_code, exc.path, exc.body[:500])
         except Exception:  # noqa: BLE001
+            consecutive_failures += 1
+            delay = retry_delay_seconds(config, consecutive_failures)
             # 中心 API 重启或网络短暂中断时，Agent 保持运行并在下一轮重试。
-            logger.exception("Agent 主循环异常，等待下一轮重试")
-        time.sleep(config.poll_interval)
+            logger.exception("Agent 主循环异常，%.1f 秒后重试", delay)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
