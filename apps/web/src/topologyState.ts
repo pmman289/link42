@@ -20,15 +20,20 @@ export type TopologyStateDisplayEdge = TopologyStateEdge & {
 
 /** 计算单条拓扑链路的健康状态。 */
 export function topologySingleEdgeTone(edge: TopologyStateEdge): TopologyTone {
-  if ([edge.local_status, edge.peer_status].every((status) => status === "stopped" || status === "stopping")) {
-    return "inactive";
-  }
-
   const summaries = [edge.local_monitor, edge.peer_monitor].filter(
     (summary): summary is TopologyMonitorSummary => summary !== null,
   );
   const sampledSummaries = summaries.filter((summary) => summary.sample_count > 0);
-  if (sampledSummaries.length === 0) return "unknown";
+
+  // 监测摘要是链路质量的主要事实来源：只要还有样本就如实展示，
+  // 不能因为 WireGuard 隧道处于 stopped/stopping 就把已有数据屏蔽成灰色。
+  // runtime_status 只在完全没有样本时用来区分「主动关闭」和「状态未知」。
+  if (sampledSummaries.length === 0) {
+    if ([edge.local_status, edge.peer_status].every((status) => status === "stopped" || status === "stopping")) {
+      return "inactive";
+    }
+    return "unknown";
+  }
 
   // 只有所有已有样本的监测方向最近一次都失败时，才把线路视为真正断开。
   const hasReachableSample = sampledSummaries.some((summary) => typeof summary.last_latency_ms === "number");

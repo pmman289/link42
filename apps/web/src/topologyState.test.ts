@@ -133,11 +133,48 @@ describe("拓扑链路状态", () => {
     expect(topologyEdgeSummary(edge)).toBe("2条链路 · -- / 100.0%");
   });
 
-  it("主动关闭的链路全部不存在时显示灰色状态", () => {
-    const stopped = link({ local_status: "stopped", peer_status: "stopped" });
+  it("没有样本且两端已关闭时显示灰色状态", () => {
+    const stopped = link({
+      local_status: "stopped",
+      peer_status: "stopped",
+      local_monitor: { last_latency_ms: null, packet_loss: 0, sample_count: 0 },
+      peer_monitor: null,
+    });
     const edge = displayEdge([stopped]);
 
     expect(topologyEdgeTone(edge)).toBe("inactive");
     expect(topologyEdgeSummary(edge)).toBe("-- / --");
+  });
+
+  it("两端已关闭但仍在上报样本时保留监测摘要", () => {
+    // WireGuard 隧道处于 stopped，监测却仍在采集样本（例如监测目标走
+    // Tailscale 等其他通道），此时不能把真实监测数据屏蔽成灰色。
+    const stopped = link({ local_status: "stopped", peer_status: "stopped" });
+    const edge = displayEdge([stopped]);
+
+    expect(topologyEdgeTone(edge)).toBe("healthy");
+    expect(topologyEdgeSummary(edge)).toBe("195ms / 0%");
+  });
+
+  it("两端已关闭且样本全部失败时标记为断开而不是灰色", () => {
+    const stopped = link({
+      local_status: "stopped",
+      peer_status: "stopped",
+      local_monitor: { last_latency_ms: null, packet_loss: 1, sample_count: 4 },
+      peer_monitor: { last_latency_ms: null, packet_loss: 1, sample_count: 4 },
+    });
+    const edge = displayEdge([stopped]);
+
+    expect(topologyEdgeTone(edge)).toBe("critical");
+    expect(topologyEdgeSummary(edge)).toBe("-- / 100.0%");
+  });
+
+  it("没有样本但两端未关闭时保持未知而不是灰色", () => {
+    const running = link({
+      local_monitor: { last_latency_ms: null, packet_loss: 0, sample_count: 0 },
+      peer_monitor: null,
+    });
+
+    expect(topologySingleEdgeTone(running)).toBe("unknown");
   });
 });
