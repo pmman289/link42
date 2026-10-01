@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 
 
-AGENT_VERSION = "0.6.22"
+AGENT_VERSION = "0.6.23"
 AGENT_PROTOCOL_VERSION = 1
-CONTROLLER_VERSION = "0.6.27"
+CONTROLLER_VERSION = "0.6.28"
 
 
 def parse_version(value: str | None) -> tuple[int, int, int]:

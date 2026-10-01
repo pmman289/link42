@@ -5503,11 +5503,14 @@ def delete_node(
     db: Session = Depends(get_db),
     force: bool = False,
 ) -> dict[str, str]:
-    """删除节点及其历史数据，force 模式用于离线节点的面板记录清理。"""
+    """删除节点及其历史数据；离线节点自动清理面板侧连接记录。"""
 
     node = db.get(models.Node, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
+    # 永久下线节点无法再完成 stop/delete 任务，继续要求先删连接会形成死锁。
+    # 普通删除在线节点仍要求先删连接；force 参数继续保留显式管理员清理能力。
+    force = force or not is_node_online(node)
     wireguard_interface = db.scalar(
         select(models.WireGuardInterface).where(models.WireGuardInterface.node_id == node_id).limit(1)
     )
@@ -5542,12 +5545,7 @@ def delete_node(
                 )
             )
             delete_link_monitors_where(db, models.LinkMonitor.connection_endpoint_id.in_(endpoint_ids))
-            db.execute(
-                delete(models.AgentTask).where(
-                    models.AgentTask.payload["connection_endpoint_id"].as_integer().in_(endpoint_ids)
-                ),
-                execution_options={"synchronize_session": False},
-            )
+            delete_connection_endpoint_tasks(db, endpoint_ids)
             db.execute(
                 delete(models.ConnectionEndpoint).where(models.ConnectionEndpoint.id.in_(endpoint_ids)),
                 execution_options={"synchronize_session": False},
@@ -5557,27 +5555,36 @@ def delete_node(
                 execution_options={"synchronize_session": False},
             )
         if interface_ids:
-            delete_link_monitors_where(db, models.LinkMonitor.interface_id.in_(interface_ids))
+            # 受管 WireGuard 的两端接口通过 peer_interface_id 成对保存；删除离线节点时，
+            # 同时移除对端接口，避免在线节点留下没有 Peer 的孤立配置。
+            paired_interface_ids = list(
+                db.scalars(
+                    select(models.WireGuardPeer.peer_interface_id).where(
+                        models.WireGuardPeer.interface_id.in_(interface_ids),
+                        models.WireGuardPeer.peer_interface_id.is_not(None),
+                    )
+                )
+            )
+            cleanup_interface_ids = sorted(
+                set(interface_ids).union(
+                    peer_id for peer_id in paired_interface_ids if peer_id is not None
+                )
+            )
+            delete_link_monitors_where(db, models.LinkMonitor.interface_id.in_(cleanup_interface_ids))
+            # Peer 记录可能位于另一个仍保留的节点接口上，必须在删除本节点
+            # 接口前统一清理双方引用，避免跨节点外键阻止永久离线节点删除。
             db.execute(
                 delete(models.WireGuardPeer).where(
                     or_(
-                        models.WireGuardPeer.interface_id.in_(interface_ids),
-                        models.WireGuardPeer.peer_interface_id.in_(interface_ids),
+                        models.WireGuardPeer.interface_id.in_(cleanup_interface_ids),
+                        models.WireGuardPeer.peer_interface_id.in_(cleanup_interface_ids),
                     )
                 ),
                 execution_options={"synchronize_session": False},
             )
+            delete_interface_tasks(db, cleanup_interface_ids)
             db.execute(
-                delete(models.WireGuardInterface).where(models.WireGuardInterface.id.in_(interface_ids)),
-                execution_options={"synchronize_session": False},
-            )
-            db.execute(
-                delete(models.AgentTask).where(
-                    or_(
-                        models.AgentTask.payload["interface_id"].as_integer().in_(interface_ids),
-                        models.AgentTask.payload["peer_interface_id"].as_integer().in_(interface_ids),
-                    )
-                ),
+                delete(models.WireGuardInterface).where(models.WireGuardInterface.id.in_(cleanup_interface_ids)),
                 execution_options={"synchronize_session": False},
             )
         db.execute(

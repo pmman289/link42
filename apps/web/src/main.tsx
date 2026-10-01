@@ -5944,7 +5944,7 @@ function App() {
             </section>
             <section className="modalSection dangerZone">
               <h3>删除节点</h3>
-              <p className="muted">只有节点下所有连接配置都已删除时，才允许删除节点。</p>
+              <p className="muted">在线节点需要先删除连接；离线节点删除时会同时清理主控中的连接记录，无法再向节点下发清理命令。</p>
               <button className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "delete"))} onClick={() => void runAction(deleteEditingNode, nodeActionKey(editingNode.id, "delete"))}>
                 删除节点
               </button>

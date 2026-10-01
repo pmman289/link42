@@ -1481,13 +1481,19 @@ def test_deleting_created_config_does_not_reset_import_candidate() -> None:
     assert candidate.imported is True
 
 
-def test_delete_node_requires_all_wireguard_configs_removed() -> None:
-    """验证节点下仍有 WireGuard 配置时不能删除节点。"""
+def test_delete_online_node_requires_all_wireguard_configs_removed() -> None:
+    """验证在线节点下仍有 WireGuard 配置时不能删除节点。"""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
-        node = models.Node(name="node-a", agent_token_hash="hash", status="offline", endpoint_ips=["10.0.0.1"])
+        node = models.Node(
+            name="node-a",
+            agent_token_hash="hash",
+            status="online",
+            last_seen_at=datetime.utcnow(),
+            endpoint_ips=["10.0.0.1"],
+        )
         session.add(node)
         session.commit()
         interface = models.WireGuardInterface(node_id=node.id, name="wg0")
@@ -1501,13 +1507,13 @@ def test_delete_node_requires_all_wireguard_configs_removed() -> None:
     assert exc_info.value.detail == "node has connections"
 
 
-def test_delete_node_requires_all_connection_endpoints_removed() -> None:
-    """验证节点仍属于 GRE 等通用连接时不能删除节点。"""
+def test_delete_online_node_requires_all_connection_endpoints_removed() -> None:
+    """验证在线节点仍属于 GRE 等通用连接时不能删除节点。"""
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
-        node = models.Node(name="node-a", agent_token_hash="hash", status="offline")
+        node = models.Node(name="node-a", agent_token_hash="hash", status="online", last_seen_at=datetime.utcnow())
         connection = models.Connection(protocol_type="gre", name="gre-a-b")
         endpoint = models.ConnectionEndpoint(
             connection=connection,
@@ -1738,6 +1744,79 @@ def test_force_delete_offline_node_cleans_all_related_records() -> None:
         assert list(session.scalars(select(models.LookingGlassQuery))) == []
         assert list(session.scalars(select(models.LinkMonitor))) == []
         assert list(session.scalars(select(models.LinkMonitorSample))) == []
+
+
+def test_delete_offline_node_automatically_cleans_connections() -> None:
+    """验证永久离线节点无需手动拆链即可删除，并清理双方连接记录。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        offline = models.Node(name="offline-peer", agent_token_hash="hash-a", status="offline")
+        online = models.Node(name="online-peer", agent_token_hash="hash-b", status="online")
+        session.add_all([offline, online])
+        session.flush()
+        local = models.WireGuardInterface(
+            node=offline,
+            name="wg-offline-peer",
+            source="managed-node",
+            managed=True,
+        )
+        peer = models.WireGuardInterface(
+            node=online,
+            name="wg-online-peer",
+            source="managed-node",
+            managed=True,
+        )
+        unrelated = models.WireGuardInterface(
+            node=online,
+            name="wg-online-unrelated",
+            source="created",
+            managed=False,
+        )
+        session.add_all([local, peer, unrelated])
+        session.flush()
+        session.add_all(
+            [
+                models.WireGuardPeer(
+                    interface=local,
+                    peer_interface_id=peer.id,
+                    peer_node_id=online.id,
+                    source="managed-node",
+                    public_key="online-public",
+                ),
+                models.WireGuardPeer(
+                    interface=peer,
+                    peer_interface_id=local.id,
+                    peer_node_id=offline.id,
+                    source="managed-node",
+                    public_key="offline-public",
+                ),
+                models.AgentTask(
+                    node_id=offline.id,
+                    type=WIREGUARD_TASKS.apply_config,
+                    status="running",
+                    payload={"interface_id": local.id, "node_id": offline.id},
+                ),
+            ]
+        )
+        session.commit()
+        offline_id = offline.id
+        online_id = online.id
+        local_id = local.id
+        peer_id = peer.id
+        unrelated_id = unrelated.id
+
+        result = delete_node(offline_id, db=session)
+
+        assert result == {"status": "deleted"}
+        assert session.get(models.Node, offline_id) is None
+        assert session.get(models.Node, online_id) is not None
+        assert session.get(models.WireGuardInterface, local_id) is None
+        assert session.get(models.WireGuardInterface, peer_id) is None
+        assert session.get(models.WireGuardInterface, unrelated_id) is not None
+        assert list(session.scalars(select(models.WireGuardPeer))) == []
+        assert list(session.scalars(select(models.AgentTask))) == []
 
 
 def test_delete_node_removes_empty_node_related_tasks_and_candidates() -> None:
