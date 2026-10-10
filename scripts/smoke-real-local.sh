@@ -289,7 +289,7 @@ main() {
     LINK42_MASTER_KEY_FILE="$RUN_DIR/controller-config/master.key" \
     LINK42_WEB_DIST_DIR="$ROOT_DIR/apps/web/dist" \
     PYTHONPATH="$ROOT_DIR/apps/api:$ROOT_DIR/packages" \
-    "$UVICORN_BIN" link42_api.main:app --host "$HOST" --port "$PORT" --no-access-log \
+    "$UVICORN_BIN" link42_api.main:app --host "$HOST" --port "$PORT" --proxy-headers --timeout-keep-alive 65 --no-access-log \
     > "$RUN_DIR/api.log" 2>&1 &
   PIDS+=("$!")
   wait_for_api

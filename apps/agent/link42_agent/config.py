@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -82,6 +83,9 @@ class AgentConfig:
     gre_dir: str = "/etc/link42/gre"
     dry_run: bool = False
     log_level: str = "INFO"
+    http_timeout: float = 10.0
+    heartbeat_timeout: float = 5.0
+    poll_jitter: float = 0.2
 
 
 def load_config_from_env() -> AgentConfig:
@@ -94,6 +98,17 @@ def load_config_from_env() -> AgentConfig:
     if not 1 <= poll_interval <= 3600:
         raise ValueError("LINK42_POLL_INTERVAL must be between 1 and 3600 seconds")
 
+    http_timeout = _positive_float_from_env("LINK42_HTTP_TIMEOUT", 10.0)
+    heartbeat_timeout = _positive_float_from_env("LINK42_HEARTBEAT_TIMEOUT", 5.0)
+    if heartbeat_timeout > http_timeout:
+        raise ValueError("LINK42_HEARTBEAT_TIMEOUT must not exceed LINK42_HTTP_TIMEOUT")
+    try:
+        poll_jitter = float(os.environ.get("LINK42_POLL_JITTER", "0.2"))
+    except ValueError as exc:
+        raise ValueError("LINK42_POLL_JITTER must be a number between 0 and 1") from exc
+    if not math.isfinite(poll_jitter) or not 0 <= poll_jitter <= 1:
+        raise ValueError("LINK42_POLL_JITTER must be a number between 0 and 1")
+
     return AgentConfig(
         server_url=_required_server_url(os.environ["LINK42_SERVER_URL"]),
         node_id=_required_node_id(os.environ["LINK42_NODE_ID"]),
@@ -103,7 +118,22 @@ def load_config_from_env() -> AgentConfig:
         gre_dir=_managed_directory(os.environ.get("LINK42_GRE_DIR", "/etc/link42/gre"), "LINK42_GRE_DIR"),
         dry_run=os.environ.get("LINK42_AGENT_DRY_RUN", "0") == "1",
         log_level=_validated_log_level(os.environ.get("LINK42_LOG_LEVEL", "INFO")),
+        http_timeout=http_timeout,
+        heartbeat_timeout=heartbeat_timeout,
+        poll_jitter=poll_jitter,
     )
+
+
+def _positive_float_from_env(name: str, default: float) -> float:
+    """读取有限的正浮点配置，避免网络请求被配置成无限等待。"""
+
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
 
 
 def _validated_log_level(value: str) -> str:

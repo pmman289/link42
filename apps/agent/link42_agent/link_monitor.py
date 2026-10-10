@@ -19,7 +19,9 @@ def probe_latency(target_host: str, timeout_seconds: float) -> dict[str, Any]:
         return result(False, None, "ping command not found")
     timeout = max(1, int(round(timeout_seconds)))
     command = [ping_bin, "-n", "-c", "1", "-W", str(timeout), target_host]
-    completed = run_command(command, allow_failure=True)
+    # ping 自身的 -W 只限制探测等待；再给进程一个小的外层上限，避免
+    # 异常实现或解析器把整轮 Agent 轮询拖到通用命令超时。
+    completed = run_command(command, allow_failure=True, timeout=float(timeout) + 1.0)
     output = f"{completed.get('stdout', '')}\n{completed.get('stderr', '')}"
     if completed["returncode"] != 0:
         return result(False, None, output.strip() or "timeout")

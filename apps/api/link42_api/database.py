@@ -22,8 +22,8 @@ connect_args = {}
 if settings.database_url.startswith("sqlite"):
     # FastAPI 在线程中处理请求时，SQLite 需要关闭同线程限制。
     connect_args["check_same_thread"] = False
-    # SQLite 默认只等待 5 秒，Agent 心跳和监测结果集中上报时容易误报 database is locked。
-    connect_args["timeout"] = 30
+    # 写锁只短暂等待，避免数据库争用把 Agent 请求挂过在线窗口。
+    connect_args["timeout"] = settings.sqlite_busy_timeout_ms / 1000
 
 # 全局数据库引擎，由 FastAPI 请求生命周期复用。
 engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
@@ -83,7 +83,7 @@ def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute(f"PRAGMA busy_timeout={settings.sqlite_busy_timeout_ms}")
         cursor.execute("PRAGMA synchronous=NORMAL")
         try:
             cursor.execute("PRAGMA journal_mode=WAL")

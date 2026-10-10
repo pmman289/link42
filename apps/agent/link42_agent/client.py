@@ -21,11 +21,10 @@ AGENT_USER_AGENT = f"Link42-Agent/{AGENT_VERSION}"
 # the limit still bounds an untrusted response before it reaches json.loads.
 MAX_AGENT_RESPONSE_BYTES = 16 * 1024 * 1024
 QUIET_SUCCESS_PATHS = {
-    "/api/agent/register",
-    "/api/agent/heartbeat",
     "/api/agent/tasks/poll",
     "/api/agent/link-monitors/poll",
 }
+HEARTBEAT_PATHS = {"/api/agent/register", "/api/agent/heartbeat"}
 
 
 class AgentHttpError(RuntimeError):
@@ -201,7 +200,8 @@ class AgentClient:
             },
         )
         try:
-            with request.urlopen(http_request, timeout=30) as response:
+            timeout = self.config.heartbeat_timeout if path in HEARTBEAT_PATHS else self.config.http_timeout
+            with request.urlopen(http_request, timeout=timeout) as response:
                 body = self._read_response_body(response, path)
                 if path not in QUIET_SUCCESS_PATHS:
                     logger.debug(

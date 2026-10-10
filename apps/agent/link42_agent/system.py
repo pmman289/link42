@@ -28,7 +28,10 @@ IMPORT_SCAN_MAX_CANDIDATES = 100
 # for JSON metadata when returning imported config contents.
 IMPORT_SCAN_MAX_BYTES = 768 * 1024
 WIREGUARD_CONFIG_MAX_BYTES = 512 * 1024
-DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+# Platform discovery runs several commands before each poll.  Keep a hung
+# helper from occupying the whole offline window; individual long operations
+# pass an explicit larger timeout where they need it.
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 5
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 OPENWRT_INTERFACE_STOP_TIMEOUT_SECONDS = 5.0
 OPENWRT_INTERFACE_STOP_POLL_SECONDS = 0.2

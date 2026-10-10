@@ -10,6 +10,8 @@ services:
       LINK42_DATABASE_URL: sqlite:////link42/data/link42.db
       LINK42_CONFIG_DIR: /link42/config
       LINK42_WEB_DIST_DIR: /opt/link42/web
+      LINK42_TRUSTED_PROXY_CIDRS: ${LINK42_TRUSTED_PROXY_CIDRS:-127.0.0.1/32}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
       - "8000:8000"
 

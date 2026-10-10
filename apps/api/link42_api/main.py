@@ -308,7 +308,7 @@ LOGIN_FAILURE_LIMIT = 5
 LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
 LOGIN_FAILURES: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 LOGIN_FAILURES_LOCK = threading.Lock()
-LOGIN_CONCURRENCY = threading.BoundedSemaphore(2)
+LOGIN_CONCURRENCY = threading.BoundedSemaphore(settings.login_concurrency)
 
 
 def reject_symlink_components(path: Path) -> None:
@@ -1707,6 +1707,15 @@ def refresh_node_runtime_status(node: models.Node, now: datetime | None = None) 
     if node.status == "online" and not is_node_online(node, now=now):
         node.status = "offline"
     return node
+
+
+def touch_node_heartbeat(node: models.Node, now: datetime | None = None) -> datetime:
+    """统一更新 Agent 入口的在线状态和最近上报时间。"""
+
+    current_time = now or datetime.utcnow()
+    node.status = "online"
+    node.last_seen_at = current_time
+    return current_time
 
 
 def node_runtime_status(node: models.Node, now: datetime | None = None) -> str:
@@ -7105,8 +7114,7 @@ def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(
     node.management_ip = payload.management_ip or node.management_ip
     node.public_ip = payload.public_ip or node.public_ip
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
-    node.status = "online"
-    node.last_seen_at = datetime.utcnow()
+    touch_node_heartbeat(node)
     db.commit()
     current_capabilities = sorted(node.agent_capabilities or [])
     if previous_status != "online" or previous_version != node.agent_version or previous_capabilities != current_capabilities:
@@ -7129,12 +7137,19 @@ def agent_heartbeat(payload: schemas.AgentHeartbeatRequest, db: Session = Depend
     """Agent 心跳，用于更新节点在线状态。"""
     node = require_agent(db, payload.node_id, payload.token)
     was_online = is_node_online(node)
+    previous_seen = node.last_seen_at
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
-    node.status = "online"
-    node.last_seen_at = datetime.utcnow()
+    now = touch_node_heartbeat(node)
     db.commit()
     if not was_online:
-        logger.info("Agent 心跳恢复在线 node_id=%s hostname=%s version=%s", node.id, node.hostname, node.agent_version)
+        gap_seconds = (now - previous_seen).total_seconds() if previous_seen else None
+        logger.info(
+            "Agent 心跳恢复在线 node_id=%s hostname=%s version=%s gap_seconds=%s",
+            node.id,
+            node.hostname,
+            node.agent_version,
+            round(gap_seconds, 3) if gap_seconds is not None else None,
+        )
     else:
         logger.debug("Agent 心跳 node_id=%s version=%s", node.id, node.agent_version)
     return {"status": "ok"}
@@ -7146,6 +7161,7 @@ def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db))
     node = require_agent(db, payload.node_id, payload.token)
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     now = datetime.utcnow()
+    touch_node_heartbeat(node, now)
     expired_count = expire_stale_running_agent_tasks(db, node_id=payload.node_id, now=now)
     expired_pending_count = expire_overdue_pending_agent_tasks(db, node_id=payload.node_id, now=now)
     candidate_tasks = list(
@@ -7482,6 +7498,7 @@ def agent_link_monitor_poll(
     node = require_agent(db, payload.node_id, payload.token)
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     now = datetime.utcnow()
+    touch_node_heartbeat(node, now)
     candidates = list(
         db.scalars(
             select(models.LinkMonitor)
@@ -7509,8 +7526,6 @@ def agent_link_monitor_poll(
         )
         if claimed.rowcount == 1:
             monitors.append(monitor)
-    node.status = "online"
-    node.last_seen_at = now
     db.commit()
     if monitors:
         logger.info(

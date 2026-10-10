@@ -87,6 +87,61 @@ def test_agent_configuration_normalizes_safe_environment(monkeypatch) -> None:
     assert config.node_id == 7
     assert config.token == "token"
     assert config.log_level == "DEBUG"
+    assert config.http_timeout == 10.0
+    assert config.heartbeat_timeout == 5.0
+    assert config.poll_jitter == 0.2
+
+
+def test_agent_client_uses_short_heartbeat_timeout(monkeypatch) -> None:
+    """心跳不能沿用普通请求的长超时，避免越过主控在线窗口。"""
+
+    class FakeResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"tasks": []}'
+
+        def getcode(self):
+            return 200
+
+    seen: list[float] = []
+
+    def fake_urlopen(request_obj: Any, timeout: float):
+        seen.append(timeout)
+        return FakeResponse()
+
+    monkeypatch.setattr(agent_client.request, "urlopen", fake_urlopen)
+    client = AgentClient(AgentConfig("https://controller.example", 1, "token", http_timeout=11, heartbeat_timeout=3))
+    client.heartbeat()
+    client.poll_tasks()
+    assert seen == [3, 11]
+
+
+def test_agent_snapshot_cache_reuses_and_resets_platform_probe(monkeypatch) -> None:
+    """平台探测在 TTL 内只执行一次，升级后可主动失效。"""
+
+    calls = 0
+
+    def collect() -> main.AgentSnapshot:
+        nonlocal calls
+        calls += 1
+        return main.AgentSnapshot([f"cap-{calls}"], {"probe": calls})
+
+    monkeypatch.setattr(main, "collect_agent_snapshot", collect)
+    main.reset_snapshot_cache()
+    first = main.cached_agent_snapshot()
+    second = main.cached_agent_snapshot()
+    assert first is second
+    assert calls == 1
+    main.reset_snapshot_cache()
+    assert main.cached_agent_snapshot().platform == {"probe": 2}
+    assert calls == 2
 
 
 def test_socket_scan_uses_local_port_only():
@@ -2602,7 +2657,7 @@ def test_agent_install_script_explicit_env_overrides_existing_env_file() -> None
     assert 'LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"' in script
     assert 'WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"' in script
     assert 'DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"' in script
-    assert 'POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"' in script
+    assert 'POLL_INTERVAL="${LINK42_POLL_INTERVAL:-5}"' in script
     assert script.index('INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"') < script.index('. "$ENV_FILE"')
     assert script.index('. "$ENV_FILE"') < script.index('LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"')
 
@@ -4205,7 +4260,7 @@ def test_probe_latency_parses_ping_time(monkeypatch) -> None:
     monkeypatch.setattr(
         link_monitor,
         "run_command",
-        lambda command, allow_failure: command_result(command, stdout="64 bytes from 10.42.0.2: icmp_seq=1 ttl=64 time=23.4 ms\n"),
+        lambda command, allow_failure, **kwargs: command_result(command, stdout="64 bytes from 10.42.0.2: icmp_seq=1 ttl=64 time=23.4 ms\n"),
     )
 
     result = link_monitor.probe_latency("10.42.0.2", 1)

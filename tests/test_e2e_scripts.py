@@ -19,6 +19,16 @@ def test_controller_container_runs_uvicorn_as_pid_one():
     dockerfile = (ROOT / "Dockerfile.controller").read_text()
     assert 'CMD ["uvicorn", "link42_api.main:app"' in dockerfile
     assert 'CMD ["sh", "-c"' not in dockerfile
+    assert '"--proxy-headers"' in dockerfile
+    assert '"--timeout-keep-alive", "65"' in dockerfile
+
+
+def test_controller_compose_exposes_forwarded_proxy_configuration():
+    """Compose 部署必须能同时配置 Uvicorn 和应用层的可信代理。"""
+
+    compose = (ROOT / "deploy/docker-compose.yml").read_text()
+    assert "FORWARDED_ALLOW_IPS" in compose
+    assert "LINK42_TRUSTED_PROXY_CIDRS" in compose
 
 
 def shell(script, code, tmp_path, **overrides):

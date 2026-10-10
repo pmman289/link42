@@ -27,7 +27,11 @@ class Settings(BaseSettings):
     # 外部 Agent 资源地址；安装脚本会使用该地址下载版本化二进制。
     agent_res_base_url: str = "https://get.pmman.tech/res/link42"
     # Agent 心跳超过该秒数后视为离线，前端和部署确认都会据此拦截。
-    agent_offline_after_seconds: int = 15
+    agent_offline_after_seconds: int = 60
+    # SQLite 写锁只短暂等待，避免数据库争用把 Agent 请求挂过在线窗口。
+    sqlite_busy_timeout_ms: int = 5000
+    # bcrypt 登录校验允许少量并行，避免面板多个请求互相触发 429。
+    login_concurrency: int = 8
     # 主控日志等级；排查问题时可设为 DEBUG。
     log_level: str = "INFO"
     # Web 会话空闲和绝对有效期；Bearer 与 Cookie 会话使用同一服务端状态。
@@ -47,6 +51,15 @@ class Settings(BaseSettings):
 
         if value < 60:
             raise ValueError("session timeout must be at least 60 seconds")
+        return value
+
+    @field_validator("agent_offline_after_seconds", "sqlite_busy_timeout_ms", "login_concurrency")
+    @classmethod
+    def validate_database_and_agent_timeout(cls, value: int) -> int:
+        """拒绝非正的在线窗口和 SQLite 锁等待时间。"""
+
+        if value <= 0:
+            raise ValueError("timeout must be positive")
         return value
 
 

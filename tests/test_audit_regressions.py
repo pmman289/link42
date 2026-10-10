@@ -1592,6 +1592,32 @@ def test_agent_poll_rejects_oversized_legacy_payload(session):
     assert plan.status == "failed"
 
 
+def test_agent_poll_refreshes_node_heartbeat(session):
+    """没有任务和链路监测时，tasks/poll 也必须维持节点在线。"""
+
+    old_seen = datetime.utcnow() - timedelta(seconds=120)
+    node = models.Node(
+        name="poll-heartbeat-node",
+        agent_token_hash="hash",
+        status="offline",
+        last_seen_at=old_seen,
+        agent_version="0.6.0",
+        agent_capabilities=["wireguard"],
+    )
+    session.add(node)
+    session.commit()
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(main, "verify_token", lambda token, token_hash: token == "token")
+        result = main.agent_poll(
+            schemas.AgentPollRequest(node_id=node.id, token="token", agent_version="0.6.0", capabilities=["wireguard"]),
+            session,
+        )
+    assert result.tasks == []
+    session.refresh(node)
+    assert node.status == "online"
+    assert node.last_seen_at is not None and node.last_seen_at > old_seen
+
+
 def test_agent_poll_rejects_non_object_legacy_payload_and_updates_plan(session):
     """旧任务 payload 不是对象时也必须结束关联部署计划。"""
 
