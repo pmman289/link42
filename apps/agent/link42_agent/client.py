@@ -16,6 +16,10 @@ from .config import AgentConfig
 
 logger = logging.getLogger("link42.agent.client")
 AGENT_USER_AGENT = f"Link42-Agent/{AGENT_VERSION}"
+# The controller may return up to five tasks per poll and each task payload is
+# capped at 2 MiB.  Keep enough headroom for JSON framing and task metadata;
+# the limit still bounds an untrusted response before it reaches json.loads.
+MAX_AGENT_RESPONSE_BYTES = 16 * 1024 * 1024
 QUIET_SUCCESS_PATHS = {
     "/api/agent/register",
     "/api/agent/heartbeat",
@@ -56,7 +60,19 @@ def validate_server_url(server_url: str) -> None:
         port = parsed.port
     except ValueError as exc:
         raise AgentConnectionError(server_url, "", "主控地址格式无效") from exc
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    # API 路径会直接拼接到该地址；用户信息、路径、查询串和片段既没有
+    # 配置意义，也会导致请求发往与界面显示不同的 URL。禁止它们同时
+    # 避免把凭据意外交给 URL 中的第三方主机。
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or any(ord(char) < 0x21 or ord(char) == 0x7F for char in server_url)
+    ):
         raise AgentConnectionError(server_url, "", "主控地址格式无效，请以 http:// 或 https:// 开头")
     if port is not None and not 1 <= port <= 65535:
         raise AgentConnectionError(server_url, "", "主控地址端口必须在 1 到 65535 之间")
@@ -85,7 +101,10 @@ class AgentClient:
         """保存配置并创建 HTTP client。"""
 
         validate_server_url(config.server_url)
+        config.server_url = config.server_url.rstrip("/")
         self.config = config
+        # 暂时断网时保留未确认结果；后续循环只重传结果，不重复执行本机任务。
+        self.pending_task_reports: dict[int, dict[str, Any]] = {}
 
     def auth_payload(self) -> dict[str, Any]:
         """生成每个 Agent 请求都需要携带的认证字段。"""
@@ -98,8 +117,10 @@ class AgentClient:
         return {
             "agent_version": AGENT_VERSION,
             "protocol_version": AGENT_PROTOCOL_VERSION,
-            "capabilities": capabilities or ["wireguard", "wg_quick_import"],
-            "platform": platform or {},
+            # 空列表/空对象也是有效的完整快照；只有旧调用方没有传参时
+            # 才使用兼容默认值，不能用 truthiness 把能力卸载覆盖掉。
+            "capabilities": capabilities if capabilities is not None else ["wireguard", "wg_quick_import"],
+            "platform": platform if platform is not None else {},
         }
 
     def register(self, hostname: str, capabilities: Optional[list[str]] = None, platform: Optional[dict[str, Any]] = None) -> None:
@@ -129,7 +150,29 @@ class AgentClient:
         """上报任务执行结果。"""
 
         payload = {**self.auth_payload(), "status": status, "result": result}
-        self._post_json(f"/api/agent/tasks/{task_id}/result", payload)
+        self.pending_task_reports[task_id] = payload
+        self._send_task_report(task_id, payload)
+
+    def _send_task_report(self, task_id: int, payload: dict[str, Any]) -> None:
+        """发送待确认结果；终态冲突或任务已删除时停止重传。"""
+
+        try:
+            self._post_json(f"/api/agent/tasks/{task_id}/result", payload)
+        except AgentHttpError as exc:
+            if 400 <= exc.status_code < 500 and exc.status_code not in {401, 403, 408, 429}:
+                self.pending_task_reports.pop(task_id, None)
+            raise
+        else:
+            self.pending_task_reports.pop(task_id, None)
+
+    def retry_task_reports(self) -> None:
+        """在每轮恢复通信后重传未确认任务结果，保持原始执行状态。"""
+
+        for task_id, payload in list(self.pending_task_reports.items()):
+            try:
+                self._send_task_report(task_id, payload)
+            except (AgentConnectionError, AgentHttpError) as exc:
+                logger.warning("任务结果重传失败 task_id=%s error=%s", task_id, exc)
 
     def poll_link_monitors(self, capabilities: Optional[list[str]] = None, platform: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
         """拉取到期的链路监测目标。"""
@@ -159,7 +202,7 @@ class AgentClient:
         )
         try:
             with request.urlopen(http_request, timeout=30) as response:
-                body = response.read().decode("utf-8")
+                body = self._read_response_body(response, path)
                 if path not in QUIET_SUCCESS_PATHS:
                     logger.debug(
                         "Agent API 请求完成 path=%s status=%s duration=%.2fs",
@@ -168,7 +211,7 @@ class AgentClient:
                         time.monotonic() - started_at,
                     )
         except error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+            body = self._read_response_body(exc, path, errors="replace")
             logger.debug(
                 "Agent API 返回错误 path=%s status=%s duration=%.2fs body=%s",
                 path,
@@ -188,3 +231,26 @@ class AgentClient:
         if not body:
             return {}
         return json.loads(body)
+
+    def _read_response_body(self, response: Any, path: str, *, errors: str = "strict") -> str:
+        """有界读取主控响应，避免异常代理响应耗尽 Agent 内存。"""
+
+        chunks: list[bytes] = []
+        total = 0
+        single_read = False
+        while True:
+            try:
+                chunk = response.read(min(64 * 1024, MAX_AGENT_RESPONSE_BYTES - total + 1))
+            except TypeError:
+                # 兼容最小 HTTP 测试替身；标准 urllib 响应支持 size 参数。
+                chunk = response.read()
+                single_read = True
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_AGENT_RESPONSE_BYTES:
+                raise AgentConnectionError(self.config.server_url, path, "主控响应过大")
+            chunks.append(chunk)
+            if single_read:
+                break
+        return b"".join(chunks).decode("utf-8", errors=errors)

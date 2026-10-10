@@ -307,6 +307,34 @@ def test_node_plugin_action_creates_agent_task() -> None:
     assert task.payload["range_end"] == 23099
 
 
+def test_node_plugin_action_reuses_identical_pending_task() -> None:
+    """重复提交完全相同的插件请求时只保留一个待执行任务。"""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        node = models.Node(
+            name="node-a",
+            endpoint_ips=["203.0.113.1"],
+            status="online",
+            agent_token_hash="hash",
+            agent_version="0.6.0",
+            agent_capabilities=["node_plugin.port_inventory"],
+            last_seen_at=datetime.utcnow(),
+        )
+        session.add(node)
+        session.commit()
+        payload = NodePluginActionRequest(payload={"range_start": 23000, "range_end": 23099})
+
+        first = request_node_plugin_action(node.id, "port-inventory", "scan", payload, session)
+        second = request_node_plugin_action(node.id, "port-inventory", "scan", payload=payload, db=session)
+        tasks = list(session.scalars(select(models.AgentTask).where(models.AgentTask.node_id == node.id)))
+
+    assert second.task_id == first.task_id
+    assert second.message == "插件任务已存在"
+    assert len(tasks) == 1
+
+
 def test_node_plugin_action_rejects_offline_node() -> None:
     """验证插件 action 入口不只依赖前端禁用，后端也拒绝离线节点。"""
 
@@ -683,6 +711,18 @@ def test_controller_settings_round_trip() -> None:
     assert loaded.username == "admin"
     assert stored == "http://10.0.0.1:8000"
     assert username == "admin"
+
+
+@pytest.mark.parametrize("url", [
+    "http://10.0.0.1:8000/link42",
+    "http://10.0.0.1:8000?proxy=1",
+    "http://user:pass@10.0.0.1:8000",
+])
+def test_controller_settings_rejects_non_origin_url(url: str) -> None:
+    """主控地址不能包含会改变 Agent API 目标的路径、查询或用户信息。"""
+
+    with pytest.raises(ValidationError):
+        ControllerSettingsUpdate(controller_url=url, username="admin")
 
 
 def test_controller_settings_can_change_username_and_password() -> None:
@@ -2662,6 +2702,7 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
         apply_task = models.AgentTask(
             node_id=node.id,
             type=GRE_TASKS.apply_config,
+            status="running",
             payload={
                 "node_id": node.id,
                 "connection_endpoint_id": endpoint.id,
@@ -2683,6 +2724,7 @@ def test_gre_apply_keeps_previous_name_until_start_cleanup(monkeypatch) -> None:
         start_task = models.AgentTask(
             node_id=node.id,
             type=GRE_TASKS.start,
+            status="running",
             payload={
                 "node_id": node.id,
                 "connection_endpoint_id": endpoint.id,
@@ -2754,6 +2796,7 @@ def test_gre_start_failure_marks_endpoint_and_connection_failed(monkeypatch) -> 
         start_task = models.AgentTask(
             node_id=node.id,
             type=GRE_TASKS.start,
+            status="running",
             payload={
                 "node_id": node.id,
                 "connection_endpoint_id": endpoint.id,
@@ -3945,6 +3988,7 @@ def test_apply_result_keeps_previous_name_without_cleanup_evidence(monkeypatch) 
         task = models.AgentTask(
             node_id=node.id,
             type="wireguard.apply_config",
+            status="running",
             payload={
                 "node_id": node.id,
                 "interface_id": interface.id,
@@ -4094,6 +4138,36 @@ def test_link_monitor_samples_rejects_invalid_window(monkeypatch) -> None:
 
     assert exc_info.value.status_code == 422
     assert exc_info.value.detail == "invalid monitor window"
+
+
+def test_link_monitor_samples_are_bounded(monkeypatch) -> None:
+    """长时间窗口只返回最近的有限数量样本，避免响应随历史无限增长。"""
+
+    import link42_api.main as api_main
+
+    monkeypatch.setattr(api_main, "LINK_MONITOR_SAMPLE_LIMIT", 3)
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as session:
+        monitor = models.LinkMonitor(
+            node_id=1,
+            name="latency",
+            target_host="10.42.0.2",
+            interval_seconds=10,
+            retention_days=90,
+            enabled=True,
+        )
+        session.add(monitor)
+        session.flush()
+        base = datetime.utcnow() - timedelta(minutes=5)
+        session.add_all([
+            models.LinkMonitorSample(monitor_id=monitor.id, checked_at=base + timedelta(seconds=index), success=True, latency_ms=index)
+            for index in range(5)
+        ])
+        session.commit()
+        response = api_main.get_link_monitor_samples(monitor.id, "30d", session)
+
+    assert [sample.latency_ms for sample in response.samples] == [2, 3, 4]
 
 
 def test_mimic_requires_non_openwrt_kernel_newer_than_61_and_capability() -> None:
@@ -4583,7 +4657,7 @@ def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) 
               "assets": {
                 "linux-x64-glibc2.31": {
                   "path": "agent.bin",
-                  "sha256": "abc123",
+                  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
                   "size": 6
                 }
               }
@@ -4621,7 +4695,7 @@ def test_request_agent_upgrade_creates_self_upgrade_task(monkeypatch, tmp_path) 
     assert node_after.agent_update_status == "queued"
     assert task.payload["target_version"] == "0.2.1"
     assert task.payload["download_url"] == "http://controller:8000/api/agent/releases/0.2.1/download?platform=linux-x64-glibc2.31"
-    assert task.payload["sha256"] == "abc123"
+    assert task.payload["sha256"] == "0000000000000000000000000000000000000000000000000000000000000000"
 
 
 def test_openwrt_agent_upgrade_uses_source_asset(monkeypatch, tmp_path) -> None:
@@ -4640,7 +4714,7 @@ def test_openwrt_agent_upgrade_uses_source_asset(monkeypatch, tmp_path) -> None:
               "assets": {
                 "openwrt-source": {
                   "path": "agent-source.tar.gz",
-                  "sha256": "source-sha",
+                  "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
                   "size": 6,
                   "install_mode": "source"
                 }

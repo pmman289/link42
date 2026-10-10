@@ -7,16 +7,28 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import sys
 from typing import Any
 
 from .system import run_command
-from .validation import atomic_write_text, managed_child_path, validate_interface_name
+from .validation import (
+    atomic_write_bytes,
+    atomic_write_text,
+    ensure_managed_directory,
+    managed_child_path,
+    read_existing_bytes,
+    read_existing_text,
+    validate_interface_name,
+)
 
 
 DEFAULT_GRE_DIR = "/etc/link42/gre"
+GRE_CONFIG_MAX_BYTES = 256 * 1024
 DEFAULT_GRE_SYSTEMD_UNIT_PATH = "/etc/systemd/system/link42-gre@.service"
 OPENWRT_GRE_PROTO_PATH = "/lib/netifd/proto/gre.sh"
+OPENWRT_NETWORK_CONFIG = Path("/etc/config/network")
+OPENWRT_NETWORK_CONFIG_MAX_BYTES = 512 * 1024
 
 
 @lru_cache(maxsize=1)
@@ -186,11 +198,11 @@ def agent_binary_path() -> str:
 def render_gre_systemd_unit(config_dir: str | None = None) -> str:
     """渲染 Link42 GRE systemd 模板服务。"""
 
-    service_environment = [f"Environment=LINK42_GRE_DIR={gre_config_dir(config_dir)}"]
+    service_environment = [systemd_environment_line("LINK42_GRE_DIR", str(gre_config_dir(config_dir)))]
     if not shutil.which("link42-agent"):
         source_pythonpath = agent_source_pythonpath()
         if source_pythonpath:
-            service_environment.append(f"Environment=PYTHONPATH={source_pythonpath}")
+            service_environment.append(systemd_environment_line("PYTHONPATH", source_pythonpath))
 
     return "\n".join(
         [
@@ -213,6 +225,20 @@ def render_gre_systemd_unit(config_dir: str | None = None) -> str:
     )
 
 
+def systemd_environment_line(name: str, value: str) -> str:
+    """渲染不会被 systemd 变量/specifier 解析或换行截断的 Environment 行。"""
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError("invalid systemd environment variable name")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError("systemd environment value contains control characters")
+    if re.fullmatch(r"[A-Za-z0-9_/:.+=@%,-]+", value):
+        escaped = value.replace("%", "%%")
+        return f"Environment={name}={escaped}"
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'Environment="{name}={escaped}"'
+
+
 def install_gre_systemd_unit(config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
     """安装或更新 GRE systemd 模板服务文件。"""
 
@@ -220,8 +246,8 @@ def install_gre_systemd_unit(config_dir: str | None = None, dry_run: bool = Fals
     content = render_gre_systemd_unit(config_dir)
     if dry_run:
         return {"changed": True, "unit_path": str(path), "content": content, "dry_run": True}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    ensure_managed_directory(path.parent)
+    atomic_write_text(path, content, mode=0o644)
     return {"changed": True, "unit_path": str(path)}
 
 
@@ -234,6 +260,17 @@ def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
     remote_address = validate_gre_outer_address(outer_remote_ip, "GRE outer remote address")
     if local_address.version != remote_address.version:
         raise ValueError("GRE outer addresses must use the same IP version")
+    tunnel_ips = [_validate_gre_cidr(item, "GRE tunnel address", interface=True) for item in payload.get("tunnel_ips") or [] if str(item).strip()]
+    routes = [_validate_gre_cidr(item, "GRE route") for item in payload.get("routes") or [] if str(item).strip()]
+    mtu = int(payload.get("mtu") or (1456 if local_address.version == 6 else 1476))
+    if not 576 <= mtu <= 9000:
+        raise ValueError("GRE MTU must be between 576 and 9000")
+    ttl = int(payload["ttl"]) if payload.get("ttl") is not None else None
+    if ttl is not None and not 1 <= ttl <= 255:
+        raise ValueError("GRE TTL must be between 1 and 255")
+    key = str(payload.get("key") or "").strip() or None
+    if key is not None and (not key.isdigit() or not 0 <= int(key) <= 4294967295):
+        raise ValueError("GRE key must be between 0 and 4294967295")
     config = {
         "interface_name": validate_interface_name(payload["interface_name"]),
         "previous_interface_name": (
@@ -244,11 +281,11 @@ def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "outer_local_ip": outer_local_ip,
         "outer_remote_ip": outer_remote_ip,
         "outer_ip_version": local_address.version,
-        "tunnel_ips": [str(item).strip() for item in payload.get("tunnel_ips") or [] if str(item).strip()],
-        "routes": [str(item).strip() for item in payload.get("routes") or [] if str(item).strip()],
-        "mtu": int(payload.get("mtu") or (1456 if local_address.version == 6 else 1476)),
-        "key": str(payload.get("key") or "").strip() or None,
-        "ttl": int(payload["ttl"]) if payload.get("ttl") is not None else None,
+        "tunnel_ips": tunnel_ips,
+        "routes": routes,
+        "mtu": mtu,
+        "key": key,
+        "ttl": ttl,
         "pmtudisc": bool(payload.get("pmtudisc", True)),
         "encaplimit": int(payload["encaplimit"]) if payload.get("encaplimit") is not None else None,
     }
@@ -261,13 +298,48 @@ def normalize_gre_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
+def _validate_gre_cidr(value: object, label: str, *, interface: bool = False) -> str:
+    """校验 GRE 地址/路由为无 zone 的单行 CIDR，防止 iproute2 参数注入。"""
+
+    text = str(value).strip()
+    if not text or any(ord(char) < 0x21 or ord(char) == 0x7F for char in text) or "%" in text:
+        raise ValueError(f"{label} contains unsupported characters")
+    try:
+        parsed = ipaddress.ip_interface(text) if interface else ipaddress.ip_network(text, strict=False)
+    except ValueError as exc:
+        raise ValueError(f"invalid {label}") from exc
+    return str(parsed)
+
+
 def write_gre_config(config: dict[str, Any], config_dir: str | None = None) -> Path:
     """把 GRE 配置写入 Link42 管理目录。"""
 
     target = gre_config_path(config["interface_name"], config_dir)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(target, json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    ensure_managed_directory(target.parent)
+    content = json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    if len(content.encode("utf-8")) > GRE_CONFIG_MAX_BYTES:
+        raise ValueError("GRE config is too large")
+    atomic_write_text(target, content)
     return target
+
+
+def read_gre_config_snapshot(path: Path) -> str | None:
+    """读取待恢复的 GRE 配置并限制其大小，避免异常文件耗尽 Agent 内存。"""
+
+    if not path.exists():
+        return None
+    if path.stat().st_size > GRE_CONFIG_MAX_BYTES:
+        raise ValueError("GRE config file is too large")
+    return read_existing_text(path)
+
+
+def restore_gre_config(path: Path, old_content: str | None) -> None:
+    """恢复 GRE 持久化配置，避免运行失败后留下半写入文件。"""
+
+    if old_content is None:
+        path.unlink(missing_ok=True)
+    else:
+        atomic_write_text(path, old_content)
 
 
 def delete_gre_config_file(interface_name: str | None, config_dir: str | None = None, dry_run: bool = False) -> dict[str, Any]:
@@ -291,7 +363,9 @@ def read_gre_config(payload: dict[str, Any], config_dir: str | None = None) -> d
     path = gre_config_path(interface_name, config_dir)
     if not path.exists():
         return {"exists": False, "config_path": str(path), "config": None}
-    return {"exists": True, "config_path": str(path), "config": json.loads(path.read_text(encoding="utf-8"))}
+    if path.stat().st_size > GRE_CONFIG_MAX_BYTES:
+        raise ValueError("GRE config file is too large")
+    return {"exists": True, "config_path": str(path), "config": json.loads(read_existing_text(path))}
 
 
 def ip_command() -> str:
@@ -508,12 +582,24 @@ def run_openwrt_gre_commands(commands: list[list[str]], allow_delete_failure: bo
     """执行 OpenWrt GRE UCI/ifup 命令并返回每条命令结果。"""
 
     results: list[dict[str, Any]] = []
-    for command in commands:
-        allow_failure = allow_delete_failure and (
-            command[:3] == [uci_command(), "-q", "delete"]
-            or command[0] == ifdown_command()
-        )
-        results.append(run_command(command, allow_failure=allow_failure))
+    try:
+        for command in commands:
+            allow_failure = allow_delete_failure and (
+                command[:3] == [uci_command(), "-q", "delete"]
+                or command[0] == ifdown_command()
+            )
+            results.append(run_command(command, allow_failure=allow_failure))
+    except Exception:
+        # UCI keeps `set`/`add_list` changes in a pending transaction.  If a
+        # later command fails, discard that transaction so a partial GRE
+        # definition cannot leak into the next operator action.  A failure
+        # after `commit` cannot be rolled back here, but it is still reported
+        # to the controller instead of being presented as a successful task.
+        try:
+            run_command([uci_command(), "revert", "network"], allow_failure=True)
+        except Exception:
+            pass
+        raise
     return results
 
 
@@ -521,7 +607,17 @@ def apply_openwrt_gre_config(config: dict[str, Any], config_dir: str | None = No
     """写入 OpenWrt GRE UCI 配置，不主动拉起接口。"""
 
     require_openwrt_gre_family_supported(config)
-    path = write_gre_config(config, config_dir)
+    path = gre_config_path(config["interface_name"], config_dir)
+    network_snapshot = None
+    network_mode = None
+    if not dry_run:
+        if OPENWRT_NETWORK_CONFIG.is_symlink():
+            raise ValueError("OpenWrt network config must not be a symbolic link")
+        if OPENWRT_NETWORK_CONFIG.exists():
+            if OPENWRT_NETWORK_CONFIG.stat().st_size > OPENWRT_NETWORK_CONFIG_MAX_BYTES:
+                raise ValueError("OpenWrt network config is too large")
+            network_snapshot = read_existing_bytes(OPENWRT_NETWORK_CONFIG)
+            network_mode = stat.S_IMODE(OPENWRT_NETWORK_CONFIG.stat().st_mode)
     commands = openwrt_apply_gre_commands(config, autostart=True)
     if dry_run:
         return {
@@ -531,7 +627,20 @@ def apply_openwrt_gre_config(config: dict[str, Any], config_dir: str | None = No
             "config_path": str(path),
             "commands": commands,
         }
-    results = run_openwrt_gre_commands(commands)
+    old_content = read_gre_config_snapshot(path)
+    write_gre_config(config, config_dir)
+    try:
+        results = run_openwrt_gre_commands(commands)
+    except Exception:
+        restore_gre_config(path, old_content)
+        if network_snapshot is not None:
+            try:
+                atomic_write_bytes(OPENWRT_NETWORK_CONFIG, network_snapshot, mode=network_mode or 0o644)
+                if network_mode is not None:
+                    OPENWRT_NETWORK_CONFIG.chmod(network_mode)
+            except (OSError, ValueError) as restore_error:
+                raise RuntimeError("OpenWrt GRE apply failed and UCI config restore failed") from restore_error
+        raise
     return {
         "changed": True,
         "service_backend": "openwrt-uci",
@@ -544,8 +653,18 @@ def start_openwrt_gre_interface(config: dict[str, Any], config_dir: str | None =
     """通过 OpenWrt netifd 启动 GRE 隧道和承载地址的 static 接口。"""
 
     require_openwrt_gre_family_supported(config)
-    path = write_gre_config(config, config_dir)
+    path = gre_config_path(config["interface_name"], config_dir)
     addr_section = openwrt_gre_addr_section(config["interface_name"])
+    network_snapshot = None
+    network_mode = None
+    if not dry_run:
+        if OPENWRT_NETWORK_CONFIG.is_symlink():
+            raise ValueError("OpenWrt network config must not be a symbolic link")
+        if OPENWRT_NETWORK_CONFIG.exists():
+            if OPENWRT_NETWORK_CONFIG.stat().st_size > OPENWRT_NETWORK_CONFIG_MAX_BYTES:
+                raise ValueError("OpenWrt network config is too large")
+            network_snapshot = read_existing_bytes(OPENWRT_NETWORK_CONFIG)
+            network_mode = stat.S_IMODE(OPENWRT_NETWORK_CONFIG.stat().st_mode)
     commands = openwrt_apply_gre_commands(config, autostart=True)
     commands.extend(
         [
@@ -564,7 +683,20 @@ def start_openwrt_gre_interface(config: dict[str, Any], config_dir: str | None =
             "commands": commands,
             "runtime_status": "running",
         }
-    results = run_openwrt_gre_commands(commands)
+    old_content = read_gre_config_snapshot(path)
+    write_gre_config(config, config_dir)
+    try:
+        results = run_openwrt_gre_commands(commands)
+    except Exception:
+        restore_gre_config(path, old_content)
+        if network_snapshot is not None:
+            try:
+                atomic_write_bytes(OPENWRT_NETWORK_CONFIG, network_snapshot, mode=network_mode or 0o644)
+                if network_mode is not None:
+                    OPENWRT_NETWORK_CONFIG.chmod(network_mode)
+            except (OSError, ValueError) as restore_error:
+                raise RuntimeError("OpenWrt GRE start failed and UCI config restore failed") from restore_error
+        raise
     previous_cleanup = delete_openwrt_gre_config_file(config.get("previous_interface_name"), config_dir)
     return {
         "changed": True,
@@ -595,9 +727,18 @@ def stop_openwrt_gre_interface(interface_name: str, dry_run: bool = False) -> di
             "commands": commands,
             "runtime_status": "stopped",
         }
-    results = []
-    for command in commands:
-        results.append(run_command(command, allow_failure=command[0] in {ifdown_command(), uci_command()} and "-q" in command))
+    try:
+        results = []
+        for command in commands:
+            # ifdown 对不存在的接口是幂等失败；UCI set/commit 失败则必须中止，
+            # 否则会把“未禁用自启动”误报成成功停止。
+            results.append(run_command(command, allow_failure=command[0] == ifdown_command()))
+    except Exception:
+        try:
+            run_command([uci_command(), "revert", "network"], allow_failure=True)
+        except Exception:
+            pass
+        raise
     return {
         "changed": True,
         "service_backend": "openwrt-uci",
@@ -624,8 +765,30 @@ def delete_openwrt_gre_config_file(interface_name: str | None, config_dir: str |
             "deleted": config["deleted"],
             "dry_run": True,
         }
-    results = run_openwrt_gre_commands(commands)
+    path = gre_config_path(cleaned, config_dir)
+    old_content = read_gre_config_snapshot(path)
+    network_snapshot = None
+    network_mode = None
+    if OPENWRT_NETWORK_CONFIG.exists():
+        if OPENWRT_NETWORK_CONFIG.is_symlink() or OPENWRT_NETWORK_CONFIG.stat().st_size > OPENWRT_NETWORK_CONFIG_MAX_BYTES:
+            raise ValueError("OpenWrt network config is invalid")
+        network_snapshot = read_existing_bytes(OPENWRT_NETWORK_CONFIG)
+        network_mode = stat.S_IMODE(OPENWRT_NETWORK_CONFIG.stat().st_mode)
+    # 先保存并移除本地快照，再提交 UCI：本地 unlink 失败时不能已经
+    # 清空网络配置。若 UCI 失败则同时恢复两份配置。
     config = delete_gre_config_file(cleaned, config_dir, dry_run=False)
+    try:
+        results = run_openwrt_gre_commands(commands)
+    except Exception:
+        restore_gre_config(path, old_content)
+        if network_snapshot is not None:
+            try:
+                atomic_write_bytes(OPENWRT_NETWORK_CONFIG, network_snapshot, mode=network_mode or 0o644)
+                if network_mode is not None:
+                    OPENWRT_NETWORK_CONFIG.chmod(network_mode)
+            except (OSError, ValueError) as restore_error:
+                raise RuntimeError("OpenWrt GRE delete failed and UCI config restore failed") from restore_error
+        raise
     return {
         "interface_name": cleaned,
         "service_backend": "openwrt-uci",
@@ -665,7 +828,9 @@ def apply_gre_config(payload: dict[str, Any], config_dir: str | None = None, dry
     config = normalize_gre_payload(payload)
     if openwrt_gre_available():
         return apply_openwrt_gre_config(config, config_dir, dry_run=dry_run)
-    path = write_gre_config(config, config_dir)
+    path = gre_config_path(config["interface_name"], config_dir)
+    if not dry_run:
+        write_gre_config(config, config_dir)
     return {"changed": True, "config_path": str(path), "config": config, "dry_run": dry_run}
 
 
@@ -680,7 +845,7 @@ def start_gre_interface(
     config = normalize_gre_payload(payload)
     if use_service and openwrt_gre_available():
         return start_openwrt_gre_interface(config, config_dir, dry_run=dry_run)
-    write_gre_config(config, config_dir)
+    config_path = gre_config_path(config["interface_name"], config_dir)
     commands: list[dict[str, Any]] = []
     if use_service and gre_systemd_available():
         service_commands = gre_systemd_start_commands(config)
@@ -692,14 +857,25 @@ def start_gre_interface(
                 "unit": install_gre_systemd_unit(config_dir, dry_run=True),
                 "commands": service_commands,
                 "runtime_status": "running",
+                "config_path": str(config_path),
             }
-        unit_result = install_gre_systemd_unit(config_dir)
-        for command in service_commands:
-            allow_failure = (
-                command[:3] == [systemctl_command(), "disable", "--now"]
-                or command[:3] == [ip_command(), "link", "del"]
-            )
-            commands.append(run_command(command, allow_failure=allow_failure))
+        # ExecStart 的 gre-start 子进程从 JSON 读取参数，必须先写入再重启。
+        old_content = read_gre_config_snapshot(config_path)
+        try:
+            write_gre_config(config, config_dir)
+            unit_result = install_gre_systemd_unit(config_dir)
+            for command in service_commands:
+                allow_failure = (
+                    command[:3] == [systemctl_command(), "disable", "--now"]
+                    or command[:3] == [ip_command(), "link", "del"]
+                )
+                commands.append(run_command(command, allow_failure=allow_failure))
+        except Exception:
+            if old_content is None:
+                config_path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(config_path, old_content)
+            raise
         previous_cleanup = delete_gre_config_file(config.get("previous_interface_name"), config_dir)
         return {
             "changed": True,
@@ -710,10 +886,26 @@ def start_gre_interface(
             "runtime_status": "running",
         }
     if dry_run:
-        return {"changed": True, "dry_run": True, "commands": gre_start_commands(config), "runtime_status": "running"}
-    for command in gre_start_commands(config):
-        allow_failure = command[:3] == [ip_command(), "link", "del"]
-        commands.append(run_command(command, allow_failure=allow_failure))
+        return {
+            "changed": True,
+            "dry_run": True,
+            "commands": gre_start_commands(config),
+            "config_path": str(config_path),
+            "runtime_status": "running",
+        }
+    old_content = read_gre_config_snapshot(config_path)
+    write_gre_config(config, config_dir)
+    try:
+        for command in gre_start_commands(config):
+            allow_failure = command[:3] == [ip_command(), "link", "del"]
+            commands.append(run_command(command, allow_failure=allow_failure))
+    except Exception:
+        restore_gre_config(config_path, old_content)
+        try:
+            run_command([ip_command(), "link", "del", config["interface_name"]], allow_failure=True)
+        except Exception:
+            pass
+        raise
     previous_cleanup = delete_gre_config_file(config.get("previous_interface_name"), config_dir)
     return {"changed": True, "commands": commands, "previous_config_cleanup": previous_cleanup, "runtime_status": "running"}
 

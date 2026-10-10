@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import shutil
+import stat
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
 from link42_wireguard import parse_wg_quick
+from .validation import atomic_write_bytes, atomic_write_text, read_existing_bytes
 
 
 CommandRunner = Callable[[list[str], bool], dict[str, Any]]
@@ -14,6 +16,8 @@ SYSTEMD_ENABLED_STATES = {"enabled", "enabled-runtime", "linked", "linked-runtim
 OPENRC_RUNLEVEL = "default"
 OPENRC_INIT_DIR = Path("/etc/init.d")
 OPENWRT_WIREGUARD_PROTO = "/lib/netifd/proto/wireguard.sh"
+OPENWRT_NETWORK_CONFIG = Path("/etc/config/network")
+OPENWRT_NETWORK_CONFIG_MAX_BYTES = 512 * 1024
 
 
 class ServiceManager(ABC):
@@ -129,14 +133,20 @@ class OpenRCServiceManager(ServiceManager):
         unit = self.unit(interface_name)
         if unit.startswith("wg-quick."):
             path = OPENRC_INIT_DIR / unit
-            if not path.exists():
-                path.symlink_to(OPENRC_INIT_DIR / "wg-quick")
+            target = OPENRC_INIT_DIR / "wg-quick"
+            if path.is_symlink():
+                if path.resolve(strict=False) != target.resolve(strict=False):
+                    raise ValueError("OpenRC wg-quick service link points outside the standard script")
+            elif not path.exists():
+                path.symlink_to(target)
             return unit
         if not unit.startswith("link42-wg-quick."):
             return unit
         path = OPENRC_INIT_DIR / unit
+        if path.is_symlink():
+            raise ValueError("Link42 OpenRC service path must not be a symbolic link")
         if not path.exists():
-            path.write_text(
+            atomic_write_text(path,
                 f"""#!/sbin/openrc-run
 name="Link42 WireGuard {interface_name}"
 description="Link42 managed WireGuard interface {interface_name}"
@@ -162,9 +172,8 @@ status() {{
   wg show {interface_name} >/dev/null 2>&1
 }}
 """,
-                encoding="utf-8",
+                mode=0o755,
             )
-            path.chmod(0o755)
         return unit
 
     def state(self, interface_name: str) -> dict[str, Any]:
@@ -174,7 +183,9 @@ status() {{
         active_result = self.run_command(["rc-service", unit, "status"], True)
         enabled_result = self.run_command(["rc-update", "show", OPENRC_RUNLEVEL], True)
         active_state = "active" if active_result["returncode"] == 0 else "inactive"
-        enabled = unit in enabled_result["stdout"]
+        enabled = enabled_result["returncode"] == 0 and any(
+            line.split("|", 1)[0].strip() == unit for line in enabled_result["stdout"].splitlines()
+        )
         enabled_state = "enabled" if enabled else "disabled"
         return {
             "manager": self.name,
@@ -318,46 +329,77 @@ class OpenWrtUciManager(ServiceManager):
         parsed = parse_wg_quick(config_text, name=interface_name)
         if not parsed.private_key:
             raise ValueError("OpenWrt UCI deployment requires Interface.PrivateKey")
+        if any(not peer.public_key for peer in parsed.peers):
+            raise ValueError("OpenWrt UCI deployment requires every Peer.PublicKey")
+
+        def run_uci(command: list[str], allow_failure: bool = False) -> dict[str, Any]:
+            """失败时撤销尚未提交的 UCI 修改，避免污染后续任务。"""
+
+            try:
+                return self.run_command(command, allow_failure)
+            except Exception:
+                self.run_command(["uci", "revert", "network"], True)
+                raise
 
         commands: list[dict[str, Any]] = []
+        network_snapshot: bytes | None = None
+        network_mode: int | None = None
+        if OPENWRT_NETWORK_CONFIG.is_symlink():
+            raise ValueError("OpenWrt network config must not be a symbolic link")
+        if OPENWRT_NETWORK_CONFIG.exists():
+            if OPENWRT_NETWORK_CONFIG.stat().st_size > OPENWRT_NETWORK_CONFIG_MAX_BYTES:
+                raise ValueError("OpenWrt network config is too large")
+            network_snapshot = read_existing_bytes(OPENWRT_NETWORK_CONFIG)
+            network_mode = stat.S_IMODE(OPENWRT_NETWORK_CONFIG.stat().st_mode)
         commands.extend(self._delete_existing_config(interface_name))
-        commands.append(self.run_command(["uci", "set", f"network.{interface_name}=interface"], False))
-        commands.append(self.run_command(["uci", "set", f"network.{interface_name}.proto=wireguard"], False))
-        commands.append(self.run_command(["uci", "set", f"network.{interface_name}.private_key={parsed.private_key}"], False))
+        commands.append(run_uci(["uci", "set", f"network.{interface_name}=interface"]))
+        commands.append(run_uci(["uci", "set", f"network.{interface_name}.proto=wireguard"]))
+        commands.append(run_uci(["uci", "set", f"network.{interface_name}.private_key={parsed.private_key}"]))
         for address in parsed.addresses:
-            commands.append(self.run_command(["uci", "add_list", f"network.{interface_name}.addresses={address}"], False))
+            commands.append(run_uci(["uci", "add_list", f"network.{interface_name}.addresses={address}"]))
         if parsed.listen_port is not None:
-            commands.append(self.run_command(["uci", "set", f"network.{interface_name}.listen_port={parsed.listen_port}"], False))
+            commands.append(run_uci(["uci", "set", f"network.{interface_name}.listen_port={parsed.listen_port}"]))
         if parsed.mtu is not None:
-            commands.append(self.run_command(["uci", "set", f"network.{interface_name}.mtu={parsed.mtu}"], False))
+            commands.append(run_uci(["uci", "set", f"network.{interface_name}.mtu={parsed.mtu}"]))
         if parsed.fwmark:
-            commands.append(self.run_command(["uci", "set", f"network.{interface_name}.fwmark={parsed.fwmark}"], False))
+            commands.append(run_uci(["uci", "set", f"network.{interface_name}.fwmark={parsed.fwmark}"]))
 
         route_allowed_ips = "0" if (parsed.table or "").lower() == "off" else "1"
         for peer in parsed.peers:
-            if not peer.public_key:
-                raise ValueError("OpenWrt UCI deployment requires every Peer.PublicKey")
-            add_result = self.run_command(["uci", "add", "network", f"wireguard_{interface_name}"], False)
+            add_result = run_uci(["uci", "add", "network", f"wireguard_{interface_name}"])
             commands.append(add_result)
             section = add_result["stdout"].strip() or f"@wireguard_{interface_name}[-1]"
-            commands.append(self.run_command(["uci", "set", f"network.{section}.public_key={peer.public_key}"], False))
+            commands.append(run_uci(["uci", "set", f"network.{section}.public_key={peer.public_key}"]))
             if peer.preshared_key:
-                commands.append(self.run_command(["uci", "set", f"network.{section}.preshared_key={peer.preshared_key}"], False))
+                commands.append(run_uci(["uci", "set", f"network.{section}.preshared_key={peer.preshared_key}"]))
             for allowed_ip in peer.allowed_ips:
-                commands.append(self.run_command(["uci", "add_list", f"network.{section}.allowed_ips={allowed_ip}"], False))
-            commands.append(self.run_command(["uci", "set", f"network.{section}.route_allowed_ips={route_allowed_ips}"], False))
+                commands.append(run_uci(["uci", "add_list", f"network.{section}.allowed_ips={allowed_ip}"]))
+            commands.append(run_uci(["uci", "set", f"network.{section}.route_allowed_ips={route_allowed_ips}"]))
             endpoint_host, endpoint_port = _split_endpoint(peer.endpoint)
             if endpoint_host:
-                commands.append(self.run_command(["uci", "set", f"network.{section}.endpoint_host={endpoint_host}"], False))
+                commands.append(run_uci(["uci", "set", f"network.{section}.endpoint_host={endpoint_host}"]))
             if endpoint_port:
-                commands.append(self.run_command(["uci", "set", f"network.{section}.endpoint_port={endpoint_port}"], False))
+                commands.append(run_uci(["uci", "set", f"network.{section}.endpoint_port={endpoint_port}"]))
             if peer.persistent_keepalive is not None:
                 commands.append(
-                    self.run_command(["uci", "set", f"network.{section}.persistent_keepalive={peer.persistent_keepalive}"], False)
+                    run_uci(["uci", "set", f"network.{section}.persistent_keepalive={peer.persistent_keepalive}"])
                 )
 
-        commands.append(self.run_command(["uci", "commit", "network"], False))
-        restart_result = self.restart(interface_name)
+        commands.append(run_uci(["uci", "commit", "network"]))
+        try:
+            restart_result = self.restart(interface_name)
+        except Exception:
+            # commit 已完成时 uci revert 无法恢复旧文件；优先恢复完整
+            # /etc/config/network 快照，避免 ifup 失败后留下半套 UCI 配置。
+            self.run_command(["uci", "revert", "network"], True)
+            if network_snapshot is not None:
+                try:
+                    atomic_write_bytes(OPENWRT_NETWORK_CONFIG, network_snapshot, mode=network_mode or 0o644)
+                    if network_mode is not None:
+                        OPENWRT_NETWORK_CONFIG.chmod(network_mode)
+                except (OSError, ValueError) as restore_error:
+                    raise RuntimeError("OpenWrt restart failed and UCI config restore failed") from restore_error
+            raise
         return {
             "changed": True,
             "manager": self.name,
@@ -431,6 +473,10 @@ def _split_endpoint(endpoint: Optional[str]) -> Tuple[Optional[str], Optional[in
         return None, None
     if endpoint.startswith("[") and "]:" in endpoint:
         host, port = endpoint[1:].rsplit("]:", 1)
+    elif endpoint.startswith("[") and endpoint.endswith("]"):
+        return endpoint[1:-1], None
+    elif endpoint.count(":") > 1:
+        return endpoint, None
     elif ":" in endpoint:
         host, port = endpoint.rsplit(":", 1)
     else:

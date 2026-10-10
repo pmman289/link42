@@ -4,10 +4,13 @@ from datetime import datetime
 import hashlib
 import os
 import shutil
+import secrets
+import stat as stat_module
 from pathlib import Path
 from typing import Any
 
 from ..system import run_command
+from ..validation import atomic_write_bytes, ensure_managed_directory, read_existing_bytes
 from .base import AgentNodePlugin, AgentPluginContext
 
 
@@ -16,6 +19,28 @@ BIRD_LEGACY_MAIN = Path("/etc/bird.conf")
 BIRD_DEFAULT_MAIN = BIRD_ROOT / "bird.conf"
 BIRD_BACKUP_DIR = Path("/var/lib/link42/backups/bird")
 BIRD_MAX_FILE_BYTES = 512 * 1024
+
+
+def write_existing_file(path: Path, content: bytes) -> None:
+    """写入既有 BIRD 文件且拒绝在检查后跟随被替换的符号链接。"""
+
+    flags = os.O_WRONLY | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    descriptor = os.open(path, flags)
+    try:
+        if not stat_module.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("BIRD resource must be a regular file")
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 class BirdAgentPlugin(AgentNodePlugin):
@@ -109,10 +134,17 @@ def resolve_bird_resource(resource_key: str) -> Path:
     path = Path(resource_key)
     if not path.is_absolute():
         raise ValueError("resource_key must be an absolute path")
-    resolved = path.resolve()
-    if resolved == BIRD_LEGACY_MAIN.resolve():
-        return resolved
     root = BIRD_ROOT.resolve()
+    # /etc/bird.conf is a supported legacy location, and some distributions
+    # make it a symlink into /etc/bird.  Do not let an arbitrary symlink at
+    # that location turn the legacy exception into access to /etc/shadow or
+    # another unrelated file.
+    if path == BIRD_LEGACY_MAIN:
+        resolved = path.resolve()
+        if path.is_symlink() and resolved != root and root not in resolved.parents:
+            raise ValueError("legacy BIRD resource must resolve inside BIRD configuration roots")
+        return resolved
+    resolved = path.resolve()
     if resolved == root or root not in resolved.parents:
         raise ValueError("resource is outside BIRD configuration roots")
     if not is_bird_config_file(resolved):
@@ -127,7 +159,9 @@ def is_bird_config_file(path: Path) -> bool:
         resolved = path.resolve()
     except FileNotFoundError:
         resolved = path
-    if resolved == BIRD_LEGACY_MAIN.resolve() or resolved == BIRD_DEFAULT_MAIN.resolve():
+    if path == BIRD_LEGACY_MAIN:
+        return True
+    if resolved == BIRD_DEFAULT_MAIN.resolve():
         return True
     return resolved.suffix == ".conf"
 
@@ -135,19 +169,29 @@ def is_bird_config_file(path: Path) -> bool:
 def file_sha256(path: Path) -> str:
     """计算配置文件当前 sha256，用于并发修改检测。"""
 
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    ensure_bird_file_size(path)
+    content = read_existing_bytes(path)
+    if len(content) > BIRD_MAX_FILE_BYTES:
+        raise ValueError("BIRD config file is too large")
+    return hashlib.sha256(content).hexdigest()
 
 
 def read_text_limited(path: Path) -> str:
     """读取文本配置并限制最大文件大小。"""
 
-    if path.stat().st_size > BIRD_MAX_FILE_BYTES:
+    ensure_bird_file_size(path)
+    content = read_existing_bytes(path)
+    return content.decode("utf-8", errors="replace")
+
+
+def ensure_bird_file_size(path: Path) -> None:
+    """限制需要完整读入内存的 BIRD 文件大小。"""
+
+    metadata = path.stat()
+    if not stat_module.S_ISREG(metadata.st_mode):
+        raise ValueError("BIRD resource must be a regular file")
+    if metadata.st_size > BIRD_MAX_FILE_BYTES:
         raise ValueError("BIRD config file is too large")
-    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def bird_resource(path: Path) -> dict[str, Any]:
@@ -233,17 +277,20 @@ def validate_bird_resource(resource_key: str, content: str, dry_run: bool = Fals
     """临时写入指定文件内容并校验完整 BIRD 配置，随后恢复原文件元数据。"""
 
     path = resolve_bird_resource(resource_key)
+    if len(content.encode("utf-8")) > BIRD_MAX_FILE_BYTES:
+        raise ValueError("BIRD config content is too large")
     if dry_run:
         return {"valid": True, "dry_run": True, "resource_key": str(path)}
     if not path.exists():
         raise ValueError("BIRD resource does not exist")
+    ensure_bird_file_size(path)
     original_stat = path.stat()
-    original = path.read_bytes()
+    original = read_existing_bytes(path)
     try:
-        path.write_text(content, encoding="utf-8")
+        write_existing_file(path, content.encode("utf-8"))
         result = run_bird_config_check()
     finally:
-        path.write_bytes(original)
+        write_existing_file(path, original)
         os.chown(path, original_stat.st_uid, original_stat.st_gid)
         os.chmod(path, original_stat.st_mode)
         os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
@@ -257,10 +304,11 @@ def validate_bird_resource(resource_key: str, content: str, dry_run: bool = Fals
 def bird_backup_path(path: Path) -> Path:
     """生成当前配置文件的带时间戳备份路径。"""
 
-    BIRD_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    ensure_managed_directory(BIRD_BACKUP_DIR, mode=0o700)
+    os.chmod(BIRD_BACKUP_DIR, 0o700)
+    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
     safe_name = str(path).strip("/").replace("/", "__")
-    return BIRD_BACKUP_DIR / f"{safe_name}.{stamp}.bak"
+    return BIRD_BACKUP_DIR / f"{safe_name}.{stamp}.{secrets.token_hex(8)}.bak"
 
 
 def apply_bird_resource(
@@ -274,8 +322,11 @@ def apply_bird_resource(
     """应用单个 BIRD 配置文件，校验或 reload 失败时恢复备份。"""
 
     path = resolve_bird_resource(resource_key)
+    if len(content.encode("utf-8")) > BIRD_MAX_FILE_BYTES:
+        raise ValueError("BIRD config content is too large")
     if not path.exists() or not path.is_file():
         raise ValueError("BIRD resource does not exist")
+    ensure_bird_file_size(path)
     current_sha = file_sha256(path)
     if base_sha256 and current_sha != base_sha256:
         raise ValueError("BIRD resource changed on node, please read it again")
@@ -288,42 +339,47 @@ def apply_bird_resource(
         }
 
     backup = bird_backup_path(path)
-    shutil.copy2(path, backup)
-    path.write_text(content, encoding="utf-8")
-    check = run_bird_config_check()
-    if check["returncode"] != 0:
-        shutil.copy2(backup, path)
-        return {
-            "applied": False,
-            "valid": False,
-            "resource_key": str(path),
-            "backup_ref": str(backup),
-            "check": check,
-            "restored": True,
-        }
-    reload_result = None
-    if reload:
-        reload_result = run_bird_configure()
-        if reload_result["returncode"] != 0:
-            shutil.copy2(backup, path)
+    atomic_write_bytes(backup, read_existing_bytes(path), mode=0o600)
+    try:
+        write_existing_file(path, content.encode("utf-8"))
+        check = run_bird_config_check()
+        if check["returncode"] != 0:
+            write_existing_file(path, read_existing_bytes(backup))
             return {
                 "applied": False,
-                "valid": True,
+                "valid": False,
                 "resource_key": str(path),
                 "backup_ref": str(backup),
                 "check": check,
-                "reload": reload_result,
                 "restored": True,
             }
-    return {
-        "applied": True,
-        "valid": True,
-        "resource_key": str(path),
-        "sha256": file_sha256(path),
-        "backup_ref": str(backup),
-        "check": check,
-        "reload": reload_result,
-    }
+        reload_result = None
+        if reload:
+            reload_result = run_bird_configure()
+            if reload_result["returncode"] != 0:
+                write_existing_file(path, read_existing_bytes(backup))
+                return {
+                    "applied": False,
+                    "valid": True,
+                    "resource_key": str(path),
+                    "backup_ref": str(backup),
+                    "check": check,
+                    "reload": reload_result,
+                    "restored": True,
+                }
+        return {
+            "applied": True,
+            "valid": True,
+            "resource_key": str(path),
+            "sha256": file_sha256(path),
+            "backup_ref": str(backup),
+            "check": check,
+            "reload": reload_result,
+        }
+    except Exception:
+        if backup.exists():
+            write_existing_file(path, read_existing_bytes(backup))
+        raise
 
 
 def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> dict[str, Any]:
@@ -342,6 +398,7 @@ def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> di
         seen.add(path)
         if not path.exists() or not path.is_file():
             raise ValueError(f"BIRD resource does not exist: {path}")
+        ensure_bird_file_size(path)
         current_sha = file_sha256(path)
         base_sha = str(item.get("base_sha256") or "") or None
         if base_sha and current_sha != base_sha:
@@ -349,6 +406,8 @@ def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> di
         content = item.get("content")
         if not isinstance(content, str):
             raise ValueError("BIRD resource content must be a string")
+        if len(content.encode("utf-8")) > BIRD_MAX_FILE_BYTES:
+            raise ValueError("BIRD config content is too large")
         changes.append({
             "path": path,
             "content": content,
@@ -366,13 +425,13 @@ def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> di
         for change in changes:
             path = change["path"]
             backup = bird_backup_path(path)
-            shutil.copy2(path, backup)
+            atomic_write_bytes(backup, read_existing_bytes(path), mode=0o600)
             backups[path] = backup
-            path.write_text(change["content"], encoding="utf-8")
+            write_existing_file(path, change["content"].encode("utf-8"))
         check = run_bird_config_check()
         if check["returncode"] != 0:
             for path, backup in backups.items():
-                shutil.copy2(backup, path)
+                write_existing_file(path, read_existing_bytes(backup))
             return {
                 "applied": False,
                 "valid": False,
@@ -386,7 +445,7 @@ def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> di
             reload_result = run_bird_configure()
             if reload_result["returncode"] != 0:
                 for path, backup in backups.items():
-                    shutil.copy2(backup, path)
+                    write_existing_file(path, read_existing_bytes(backup))
                 return {
                     "applied": False,
                     "valid": True,
@@ -413,7 +472,7 @@ def apply_bird_resources(files: list[Any], *, reload: bool, dry_run: bool) -> di
     except Exception:
         for path, backup in backups.items():
             if backup.exists():
-                shutil.copy2(backup, path)
+                write_existing_file(path, read_existing_bytes(backup))
         raise
 
 

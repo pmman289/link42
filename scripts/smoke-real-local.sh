@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # 在本机搭建真实 Link42 主控 + 两个 Agent + 两条本机 WireGuard 接口的冒烟测试。
 # 只操作 l42smoke* 前缀接口和配置文件；会使用真实 /etc/wireguard 和 wg-quick。
@@ -10,8 +11,9 @@ UVICORN_BIN="${UVICORN_BIN:-"$ROOT_DIR/.venv/bin/uvicorn"}"
 HOST="${LINK42_SMOKE_HOST:-127.0.0.1}"
 PORT="${LINK42_SMOKE_PORT:-18042}"
 BASE_URL="http://$HOST:$PORT"
-DB_PATH="${LINK42_SMOKE_DB:-/tmp/link42-real-smoke.db}"
 RUN_DIR="${LINK42_SMOKE_RUN_DIR:-/tmp/link42-real-smoke}"
+DB_PATH="${LINK42_SMOKE_DB:-$RUN_DIR/link42.db}"
+RUN_MARKER="$RUN_DIR/.link42-real-smoke"
 WG_DIR="${LINK42_SMOKE_WG_DIR:-/etc/wireguard}"
 IFACE_A="${LINK42_SMOKE_IFACE_A:-l42smokea}"
 IFACE_B="${LINK42_SMOKE_IFACE_B:-l42smokeb}"
@@ -24,6 +26,15 @@ ADDR_B="${LINK42_SMOKE_ADDR_B:-10.42.10.2/32}"
 PING_A="${ADDR_A%%/*}"
 PING_B="${ADDR_B%%/*}"
 PIDS=()
+
+# 这些值会拼入 /etc/wireguard 路径和 systemd 实例名，只接受合法接口名。
+validate_iface_name() {
+  local iface="$1"
+  [[ "$iface" =~ ^l42smoke[A-Za-z0-9_-]{0,7}$ ]] || {
+    echo "invalid smoke interface name: $iface" >&2
+    exit 1
+  }
+}
 
 # 检查冒烟测试依赖命令。
 require_command() {
@@ -55,7 +66,9 @@ cleanup() {
   done
   cleanup_interface "$IFACE_A"
   cleanup_interface "$IFACE_B"
-  rm -rf "$RUN_DIR"
+  if [[ -f "$RUN_MARKER" && ! -L "$RUN_MARKER" ]]; then
+    rm -rf "$RUN_DIR"
+  fi
   rm -f "$DB_PATH"
 }
 
@@ -236,8 +249,35 @@ main() {
   require_command wg-quick
   require_command ip
   require_command systemctl
+  require_command realpath
+  validate_iface_name "$IFACE_A"
+  validate_iface_name "$IFACE_B"
 
   mkdir -p "$RUN_DIR"
+  [[ ! -L "$RUN_DIR" ]] || {
+    echo "smoke run directory must not be a symbolic link: $RUN_DIR" >&2
+    exit 1
+  }
+  chmod 0700 "$RUN_DIR"
+  if [[ -e "$RUN_MARKER" && ( ! -f "$RUN_MARKER" || -L "$RUN_MARKER" ) ]]; then
+    echo "unsafe smoke run directory marker: $RUN_MARKER" >&2
+    exit 1
+  fi
+  if [[ ! -f "$RUN_MARKER" ]]; then
+    if [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      echo "refusing to reuse non-empty unmarked smoke run directory: $RUN_DIR" >&2
+      exit 1
+    fi
+    printf 'Link42 real smoke run directory\n' > "$RUN_MARKER"
+    chmod 0600 "$RUN_MARKER"
+  fi
+  local run_root db_root
+  run_root="$(realpath -m "$RUN_DIR")"
+  db_root="$(realpath -m "$DB_PATH")"
+  if [[ "$db_root" != "$run_root"/* ]]; then
+    echo "smoke database path must stay inside run directory: $DB_PATH" >&2
+    exit 1
+  fi
   rm -f "$DB_PATH" "$RUN_DIR"/*.log
   trap cleanup EXIT
 
@@ -245,14 +285,18 @@ main() {
   cleanup_interface "$IFACE_B"
 
   LINK42_DATABASE_URL="sqlite:///$DB_PATH" \
+    LINK42_CONFIG_DIR="$RUN_DIR/controller-config" \
+    LINK42_MASTER_KEY_FILE="$RUN_DIR/controller-config/master.key" \
     LINK42_WEB_DIST_DIR="$ROOT_DIR/apps/web/dist" \
+    PYTHONPATH="$ROOT_DIR/apps/api:$ROOT_DIR/packages" \
     "$UVICORN_BIN" link42_api.main:app --host "$HOST" --port "$PORT" --no-access-log \
     > "$RUN_DIR/api.log" 2>&1 &
   PIDS+=("$!")
   wait_for_api
 
   local password
-  password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/api.log" | tail -1)"
+  password="$(sed -n 's/^password=//p' "$RUN_DIR/controller-config/initial-admin-password")"
+  [[ -n "$password" ]] || { echo "initial password file is empty" >&2; return 1; }
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \
     -d "{\"username\":\"pmman\",\"password\":\"$password\"}" | json_get token)"
@@ -266,10 +310,12 @@ main() {
   token_b="$(printf '%s' "$node_b" | json_get agent_token)"
 
   LINK42_SERVER_URL="$BASE_URL" LINK42_NODE_ID="$NODE_A_ID" LINK42_AGENT_TOKEN="$token_a" \
+    PYTHONPATH="$ROOT_DIR/apps/agent:$ROOT_DIR/packages" \
     LINK42_WIREGUARD_DIR="$WG_DIR" LINK42_AGENT_DRY_RUN=0 LINK42_POLL_INTERVAL=1 \
     "$PYTHON_BIN" -m link42_agent.main > "$RUN_DIR/agent-a.log" 2>&1 &
   PIDS+=("$!")
   LINK42_SERVER_URL="$BASE_URL" LINK42_NODE_ID="$NODE_B_ID" LINK42_AGENT_TOKEN="$token_b" \
+    PYTHONPATH="$ROOT_DIR/apps/agent:$ROOT_DIR/packages" \
     LINK42_WIREGUARD_DIR="$WG_DIR" LINK42_AGENT_DRY_RUN=0 LINK42_POLL_INTERVAL=1 \
     "$PYTHON_BIN" -m link42_agent.main > "$RUN_DIR/agent-b.log" 2>&1 &
   PIDS+=("$!")
@@ -294,4 +340,6 @@ main() {
   echo "real local smoke test passed: nodes=$NODE_A_ID,$NODE_B_ID interfaces=$IFACE_A,$IFACE_B"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

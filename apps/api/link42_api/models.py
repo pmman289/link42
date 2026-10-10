@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -71,6 +71,9 @@ class WireGuardInterface(TimestampMixin, Base):
     """
 
     __tablename__ = "wg_interfaces"
+    __table_args__ = (
+        UniqueConstraint("node_id", "name", name="uq_wg_interface_node_name"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
@@ -112,7 +115,8 @@ class WireGuardInterface(TimestampMixin, Base):
     def interface_custom_config(self) -> str | None:
         """返回导入或编辑时保留的 Interface 自定义配置片段。"""
 
-        return (self.extras or {}).get("custom_config")
+        extras = self.extras if isinstance(self.extras, dict) else {}
+        return extras.get("custom_config")
 
     @property
     def has_private_key(self) -> bool:
@@ -184,7 +188,8 @@ class WireGuardPeer(TimestampMixin, Base):
     def peer_custom_config(self) -> str | None:
         """返回导入或编辑时保留的 Peer 自定义配置片段。"""
 
-        return (self.extras or {}).get("custom_config")
+        extras = self.extras if isinstance(self.extras, dict) else {}
+        return extras.get("custom_config")
 
     @property
     def has_preshared_key(self) -> bool:
@@ -311,20 +316,33 @@ class ChangePlan(TimestampMixin, Base):
     )
 
     @property
-    def task_status(self) -> str | None:
-        """返回该计划最近一个 Agent 任务状态，便于前端展示部署进度。"""
+    def status_task(self) -> AgentTask | None:
+        """优先返回失败原因或未完成任务，避免末尾任务掩盖整个计划状态。"""
 
         if not getattr(self, "tasks", None):
             return None
-        return self.tasks[-1].status
+        for status in ("failed", "cancelled", "running", "pending"):
+            for task in self.tasks:
+                if task.status == status:
+                    return task
+        return self.tasks[-1]
+
+    @property
+    def task_status(self) -> str | None:
+        """返回代表整个计划执行状态的任务状态。"""
+
+        task = self.status_task
+        return task.status if task is not None else None
 
     @property
     def task_result(self) -> dict | None:
-        """返回该计划最近一个 Agent 任务结果，便于定位部署失败原因。"""
+        """返回与汇总状态对应的任务结果，优先展示实际失败原因。"""
 
-        if not getattr(self, "tasks", None):
+        task = self.status_task
+        if task is None:
             return None
-        return self.tasks[-1].result
+        result = task.result
+        return result if isinstance(result, dict) else None
 
 
 class AgentTask(TimestampMixin, Base):
@@ -347,6 +365,19 @@ class AgentTask(TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 接口任务的幂等键。仅由 enqueue_interface_task_once 填写；普通/历史任务为空。
+    # 部分唯一索引只约束 pending，允许运行中的任务之后排队一次。
+    dedup_key: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+
+    __table_args__ = (
+        Index(
+            "uq_agent_tasks_pending_dedup_key",
+            "dedup_key",
+            unique=True,
+            sqlite_where=and_(status == "pending", dedup_key.is_not(None)),
+            postgresql_where=and_(status == "pending", dedup_key.is_not(None)),
+        ),
+    )
 
     node: Mapped[Node] = relationship(back_populates="tasks")
     change_plan: Mapped[ChangePlan | None] = relationship(back_populates="tasks")
@@ -397,6 +428,20 @@ class LookingGlassQuery(TimestampMixin, Base):
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    __table_args__ = (
+        # 同一集成 key 的相同请求在排队或执行中只允许一个任务；完成后
+        # 仍可按缓存窗口重新发起查询。
+        Index(
+            "uq_looking_glass_active_fingerprint",
+            "api_key_id",
+            "node_id",
+            "request_fingerprint",
+            unique=True,
+            sqlite_where=status.in_(["queued", "running"]),
+            postgresql_where=status.in_(["queued", "running"]),
+        ),
+    )
+
     api_key: Mapped[IntegrationApiKey] = relationship(back_populates="looking_glass_queries")
     node: Mapped[Node] = relationship()
     agent_task: Mapped[AgentTask | None] = relationship()
@@ -406,7 +451,6 @@ class LinkMonitor(TimestampMixin, Base):
     """从节点本机发起的链路延迟监测目标。"""
 
     __tablename__ = "link_monitors"
-
     id: Mapped[int] = mapped_column(primary_key=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), index=True)
     interface_id: Mapped[int | None] = mapped_column(ForeignKey("wg_interfaces.id"), index=True, nullable=True)
@@ -422,6 +466,23 @@ class LinkMonitor(TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     next_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_link_monitor_interface_id",
+            "interface_id",
+            unique=True,
+            sqlite_where=(interface_id.is_not(None)),
+            postgresql_where=(interface_id.is_not(None)),
+        ),
+        Index(
+            "uq_link_monitor_connection_endpoint_id",
+            "connection_endpoint_id",
+            unique=True,
+            sqlite_where=(connection_endpoint_id.is_not(None)),
+            postgresql_where=(connection_endpoint_id.is_not(None)),
+        ),
+    )
 
     interface: Mapped[WireGuardInterface | None] = relationship(back_populates="link_monitors")
     connection_endpoint: Mapped[ConnectionEndpoint | None] = relationship(back_populates="link_monitors")

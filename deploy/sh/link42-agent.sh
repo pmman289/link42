@@ -17,9 +17,24 @@ MIMIC_CONFIG_DIR="$MIDDLEWARE_DIR/mimic"
 MIMIC_SYSTEM_CONFIG_DIR="${LINK42_MIMIC_SYSTEM_CONFIG_DIR:-/etc/mimic}"
 KEEP_MIDDLEWARE="${LINK42_KEEP_MIDDLEWARE:-0}"
 POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"
+GRE_DIR="${LINK42_GRE_DIR:-/etc/link42/gre}"
+LOG_LEVEL="${LINK42_LOG_LEVEL:-INFO}"
 WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"
 DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"
+# Keep an untrusted release response from filling the filesystem before its
+# checksum can be verified.  This matches the cap used by the in-agent
+# self-upgrade path.
+MAX_AGENT_DOWNLOAD_SIZE=$((512 * 1024 * 1024))
 ACTION="${1:-install}"
+
+# Keep the caller's explicit values separate from values restored from an
+# existing installation.  During uninstall the service environment is the
+# source of truth when the original install used custom paths.
+INPUT_LINK42_INSTALL_DIR="${LINK42_INSTALL_DIR-}"
+INPUT_LINK42_AGENT_BIN="${LINK42_AGENT_BIN-}"
+INPUT_LINK42_ENV_DIR="${LINK42_ENV_DIR-}"
+INPUT_LINK42_UDP2RAW_BIN="${LINK42_UDP2RAW_BIN-}"
+INPUT_LINK42_MIMIC_SYSTEM_CONFIG_DIR="${LINK42_MIMIC_SYSTEM_CONFIG_DIR-}"
 
 log() {
   printf '%s\n' "[link42-agent] $*"
@@ -37,6 +52,68 @@ need_env() {
 
 shell_quote() {
   printf "%s" "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"
+}
+
+systemd_quote() {
+  printf '"'
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
+  printf '"'
+}
+
+systemd_exec_quote() {
+  # ExecStart also expands environment variables; $$ denotes a literal $.
+  systemd_quote "$1" | sed 's/\$/$$/g'
+}
+
+normalize_install_path() {
+  # Normalize lexical components before checking destructive cleanup targets.
+  # Inspect the original path first so normalization cannot conceal a symlink.
+  reject_symlink_path "$1"
+  remaining_path="$1"
+  case "$remaining_path" in
+    /*) ;;
+    *) remaining_path="$(pwd)/$remaining_path" ;;
+  esac
+  normalized_path=""
+  while [ -n "$remaining_path" ]; do
+    component="${remaining_path%%/*}"
+    case "$remaining_path" in
+      */*) remaining_path="${remaining_path#*/}" ;;
+      *) remaining_path="" ;;
+    esac
+    case "$component" in
+      ''|.) ;;
+      ..) normalized_path="${normalized_path%/*}" ;;
+      *) normalized_path="$normalized_path/$component" ;;
+    esac
+  done
+  printf '%s\n' "${normalized_path:-/}"
+}
+
+reject_symlink_path() {
+  path="$1"
+  case "$path" in
+    /*) ;;
+    *) path="$(pwd)/$path" ;;
+  esac
+  while [ "$path" != "/" ] && [ -n "$path" ]; do
+    [ ! -L "$path" ] || fail "path must not contain a symbolic link: $path"
+    path="$(dirname "$path")"
+  done
+}
+
+reject_dangerous_path() {
+  case "$1" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/sys|/tmp|/usr|/usr/local|/var|/var/lib)
+      fail "refusing to use a system root as an installation path: $1"
+      ;;
+  esac
+}
+
+validate_service_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_.@-]*) fail "invalid service name: $1" ;;
+  esac
 }
 
 is_musl_system() {
@@ -62,10 +139,88 @@ Usage:
 EOF
 }
 
+discover_uninstall_env_file() {
+  [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "remove" ] || return
+  [ -n "$INPUT_LINK42_ENV_DIR" ] && return
+
+  candidate=""
+  unit_file="/etc/systemd/system/$SERVICE_NAME.service"
+  if [ -f "$unit_file" ]; then
+    candidate="$(sed -n 's/^EnvironmentFile=//p' "$unit_file" | head -n 1)"
+    case "$candidate" in
+      -*) candidate="${candidate#-}" ;;
+    esac
+    case "$candidate" in
+      \"*\")
+        candidate="${candidate#\"}"
+        candidate="${candidate%\"}"
+        candidate="$(printf '%s' "$candidate" | sed 's/\\\\\\"/\"/g; s/\\\\\\\\/\\\\/g; s/%%/%/g')"
+        ;;
+    esac
+  fi
+
+  # OpenRC and procd templates embed the shell-quoted environment path.
+  if [ -z "$candidate" ] && [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+    candidate="$(sed -n 's/^AGENT_ENV_FILE=//p' "/etc/init.d/$SERVICE_NAME" | head -n 1)"
+    case "$candidate" in
+      \'*\')
+        candidate="${candidate#\'}"
+        candidate="${candidate%\'}"
+        candidate="$(printf '%s' "$candidate" | sed "s/'\\\\''/'/g")"
+        ;;
+    esac
+  fi
+
+  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+    ENV_DIR="$(dirname "$candidate")"
+  fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then
   run_as_root_hint
   fail "please run as root"
 fi
+
+validate_service_name "$SERVICE_NAME"
+discover_uninstall_env_file
+
+# A successful install records all paths needed by uninstall.  Load that
+# metadata before lexical normalization so custom paths are protected and
+# removed consistently.  Explicit command-line values still win.
+if [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "remove" ]; then
+  ENV_FILE="$ENV_DIR/agent.env"
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "${ENV_FILE}"
+    set +a
+    [ -n "$INPUT_LINK42_INSTALL_DIR" ] || INSTALL_DIR="${LINK42_INSTALL_DIR:-$INSTALL_DIR}"
+    [ -n "$INPUT_LINK42_AGENT_BIN" ] || BIN_PATH="${LINK42_AGENT_BIN:-$BIN_PATH}"
+    [ -n "$INPUT_LINK42_ENV_DIR" ] || ENV_DIR="${LINK42_ENV_DIR:-$ENV_DIR}"
+    [ -n "$INPUT_LINK42_UDP2RAW_BIN" ] || UDP2RAW_BIN="${LINK42_UDP2RAW_BIN:-$UDP2RAW_BIN}"
+    [ -n "$INPUT_LINK42_MIMIC_SYSTEM_CONFIG_DIR" ] || MIMIC_SYSTEM_CONFIG_DIR="${LINK42_MIMIC_SYSTEM_CONFIG_DIR:-$MIMIC_SYSTEM_CONFIG_DIR}"
+  fi
+fi
+INSTALL_DIR="$(normalize_install_path "$INSTALL_DIR")"
+BIN_PATH="$(normalize_install_path "$BIN_PATH")"
+ENV_DIR="$(normalize_install_path "$ENV_DIR")"
+WIREGUARD_DIR="$(normalize_install_path "$WIREGUARD_DIR")"
+UDP2RAW_BIN="$(normalize_install_path "$UDP2RAW_BIN")"
+MIMIC_SYSTEM_CONFIG_DIR="$(normalize_install_path "$MIMIC_SYSTEM_CONFIG_DIR")"
+ENV_FILE="$ENV_DIR/agent.env"
+MIDDLEWARE_DIR="$ENV_DIR/middleware"
+UDP2RAW_CONFIG_DIR="$MIDDLEWARE_DIR/udp2raw"
+MIMIC_CONFIG_DIR="$MIDDLEWARE_DIR/mimic"
+reject_dangerous_path "$INSTALL_DIR"
+reject_dangerous_path "$BIN_PATH"
+reject_dangerous_path "$ENV_DIR"
+reject_dangerous_path "$WIREGUARD_DIR"
+reject_dangerous_path "$UDP2RAW_BIN"
+reject_dangerous_path "$MIMIC_SYSTEM_CONFIG_DIR"
+reject_symlink_path "$INSTALL_DIR"
+reject_symlink_path "$BIN_PATH"
+reject_symlink_path "$ENV_DIR"
+reject_symlink_path "$WIREGUARD_DIR"
 
 detect_service_backend() {
   if command -v systemctl >/dev/null 2>&1; then
@@ -207,6 +362,8 @@ INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"
 INPUT_LINK42_WIREGUARD_DIR="${LINK42_WIREGUARD_DIR-}"
 INPUT_LINK42_AGENT_DRY_RUN="${LINK42_AGENT_DRY_RUN-}"
 INPUT_LINK42_POLL_INTERVAL="${LINK42_POLL_INTERVAL-}"
+INPUT_LINK42_GRE_DIR="${LINK42_GRE_DIR-}"
+INPUT_LINK42_LOG_LEVEL="${LINK42_LOG_LEVEL-}"
 
 if [ -f "$ENV_FILE" ]; then
   set -a
@@ -233,10 +390,26 @@ fi
 if [ -n "$INPUT_LINK42_POLL_INTERVAL" ]; then
   LINK42_POLL_INTERVAL="$INPUT_LINK42_POLL_INTERVAL"
 fi
+if [ -n "$INPUT_LINK42_GRE_DIR" ]; then
+  LINK42_GRE_DIR="$INPUT_LINK42_GRE_DIR"
+fi
+if [ -n "$INPUT_LINK42_LOG_LEVEL" ]; then
+  LINK42_LOG_LEVEL="$INPUT_LINK42_LOG_LEVEL"
+fi
 
-WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"
+WIREGUARD_DIR="$(normalize_install_path "${LINK42_WIREGUARD_DIR:-/etc/wireguard}")"
+GRE_DIR="$(normalize_install_path "${LINK42_GRE_DIR:-/etc/link42/gre}")"
 DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"
 POLL_INTERVAL="${LINK42_POLL_INTERVAL:-2}"
+LOG_LEVEL="${LINK42_LOG_LEVEL:-INFO}"
+
+reject_dangerous_path "$WIREGUARD_DIR"
+reject_dangerous_path "$GRE_DIR"
+reject_symlink_path "$INSTALL_DIR"
+reject_symlink_path "$BIN_PATH"
+reject_symlink_path "$ENV_DIR"
+reject_symlink_path "$WIREGUARD_DIR"
+reject_symlink_path "$GRE_DIR"
 
 need_env LINK42_SERVER_URL
 need_env LINK42_NODE_ID
@@ -329,20 +502,31 @@ download_agent() {
 
   log "downloading $url"
   if command -v curl >/dev/null 2>&1; then
-    curl -fL "$url" -o "$tmp_file"
+    curl -fL --max-filesize "$MAX_AGENT_DOWNLOAD_SIZE" "$url" -o "$tmp_file"
   elif command -v wget >/dev/null 2>&1; then
     wget -O "$tmp_file" "$url"
   else
     fail "curl or wget is required to download the agent"
   fi
 
+  downloaded_size="$(wc -c < "$tmp_file")"
+  case "$downloaded_size" in
+    ''|*[!0-9]*) fail "could not determine downloaded agent size" ;;
+  esac
+  [ "$downloaded_size" -le "$MAX_AGENT_DOWNLOAD_SIZE" ] || fail "downloaded agent exceeds maximum size"
+
   sha_url="$url.sha256"
   command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required to verify the downloaded agent"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsL "$sha_url" -o "$tmp_sha" || fail "failed to download agent checksum: $sha_url"
+    curl -fsL --max-filesize 4096 "$sha_url" -o "$tmp_sha" || fail "failed to download agent checksum: $sha_url"
   elif command -v wget >/dev/null 2>&1; then
     wget -q -O "$tmp_sha" "$sha_url" || fail "failed to download agent checksum: $sha_url"
   fi
+  checksum_size="$(wc -c < "$tmp_sha")"
+  case "$checksum_size" in
+    ''|*[!0-9]*) fail "could not determine agent checksum size" ;;
+  esac
+  [ "$checksum_size" -le 4096 ] || fail "agent checksum file is too large"
   expected="$(awk 'NR == 1 {print $1}' "$tmp_sha")"
   case "$expected" in
     *[!0-9a-fA-F]*|'') fail "invalid sha256 file for downloaded agent" ;;
@@ -414,15 +598,17 @@ PY
       fi
       fail "failed to activate downloaded agent source"
     fi
+    source_env_file="$(shell_quote "$ENV_FILE")"
+    source_pythonpath="$(shell_quote "$INSTALL_DIR/src/apps/agent:$INSTALL_DIR/src/packages")"
     cat > "$BIN_PATH" <<EOF
 #!/bin/sh
 set -eu
-if [ -f "$ENV_FILE" ]; then
+if [ -f $source_env_file ]; then
   set -a
-  . "$ENV_FILE"
+  . $source_env_file
   set +a
 fi
-export PYTHONPATH="$INSTALL_DIR/src/apps/agent:$INSTALL_DIR/src/packages"
+export PYTHONPATH=$source_pythonpath
 exec python3 -m link42_agent.main "\$@"
 EOF
     chmod 0755 "$BIN_PATH"
@@ -451,8 +637,15 @@ write_env_file() {
     printf 'LINK42_NODE_ID=%s\n' "$(shell_quote "$LINK42_NODE_ID")"
     printf 'LINK42_AGENT_TOKEN=%s\n' "$(shell_quote "$LINK42_AGENT_TOKEN")"
     printf 'LINK42_WIREGUARD_DIR=%s\n' "$(shell_quote "$WIREGUARD_DIR")"
+    printf 'LINK42_GRE_DIR=%s\n' "$(shell_quote "$GRE_DIR")"
     printf 'LINK42_AGENT_DRY_RUN=%s\n' "$(shell_quote "$DRY_RUN")"
     printf 'LINK42_POLL_INTERVAL=%s\n' "$(shell_quote "$POLL_INTERVAL")"
+    printf 'LINK42_LOG_LEVEL=%s\n' "$(shell_quote "$LOG_LEVEL")"
+    printf 'LINK42_INSTALL_DIR=%s\n' "$(shell_quote "$INSTALL_DIR")"
+    printf 'LINK42_AGENT_BIN=%s\n' "$(shell_quote "$BIN_PATH")"
+    printf 'LINK42_ENV_DIR=%s\n' "$(shell_quote "$ENV_DIR")"
+    printf 'LINK42_UDP2RAW_BIN=%s\n' "$(shell_quote "$UDP2RAW_BIN")"
+    printf 'LINK42_MIMIC_SYSTEM_CONFIG_DIR=%s\n' "$(shell_quote "$MIMIC_SYSTEM_CONFIG_DIR")"
   } > "$ENV_FILE"
   chmod 0600 "$ENV_FILE"
 }
@@ -468,6 +661,8 @@ stop_existing_service() {
 }
 
 install_systemd_service() {
+  systemd_env_file="$(systemd_quote "$ENV_FILE")"
+  systemd_bin_path="$(systemd_exec_quote "$BIN_PATH")"
   cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
 [Unit]
 Description=Link42 Agent
@@ -476,8 +671,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=$ENV_FILE
-ExecStart=$BIN_PATH
+EnvironmentFile=$systemd_env_file
+ExecStart=$systemd_bin_path
 Restart=always
 RestartSec=5
 
@@ -489,11 +684,13 @@ EOF
 }
 
 install_openrc_service() {
+  service_bin_path="$(shell_quote "$BIN_PATH")"
+  service_env_file="$(shell_quote "$ENV_FILE")"
   cat > "/etc/init.d/$SERVICE_NAME" <<EOF
 #!/sbin/openrc-run
 name="Link42 Agent"
 description="Link42 Agent"
-command="$BIN_PATH"
+command=$service_bin_path
 command_background="yes"
 pidfile="/run/$SERVICE_NAME.pid"
 output_log="/var/log/$SERVICE_NAME.log"
@@ -506,9 +703,9 @@ depend() {
 
 start_pre() {
   checkpath -d -m 0755 /run
-  if [ -f "$ENV_FILE" ]; then
+  if [ -f $service_env_file ]; then
     set -a
-    . "$ENV_FILE"
+    . $service_env_file
     set +a
   fi
 }
@@ -519,16 +716,24 @@ EOF
 }
 
 install_openwrt_service() {
+  service_bin_path="$(shell_quote "$BIN_PATH")"
+  service_env_file="$(shell_quote "$ENV_FILE")"
   cat > "/etc/init.d/$SERVICE_NAME" <<EOF
 #!/bin/sh /etc/rc.common
 
 START=95
 STOP=10
 USE_PROCD=1
+AGENT_ENV_FILE=$service_env_file
 
 start_service() {
+  [ -f "\$AGENT_ENV_FILE" ] || return 1
+  set -a
+  . "\$AGENT_ENV_FILE"
+  set +a
   procd_open_instance
-  procd_set_param command $BIN_PATH
+  procd_set_param env LINK42_SERVER_URL="\$LINK42_SERVER_URL" LINK42_NODE_ID="\$LINK42_NODE_ID" LINK42_AGENT_TOKEN="\$LINK42_AGENT_TOKEN" LINK42_WIREGUARD_DIR="\$LINK42_WIREGUARD_DIR" LINK42_GRE_DIR="\$LINK42_GRE_DIR" LINK42_AGENT_DRY_RUN="\$LINK42_AGENT_DRY_RUN" LINK42_POLL_INTERVAL="\$LINK42_POLL_INTERVAL" LINK42_LOG_LEVEL="\$LINK42_LOG_LEVEL"
+  procd_set_param command $service_bin_path
   procd_set_param respawn 10 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
@@ -597,7 +802,7 @@ else
   install_openwrt_service
 fi
 
-installed_version="$($BIN_PATH --version)"
+installed_version="$("$BIN_PATH" --version)"
 if [ "$AGENT_VERSION" != "latest" ] && [ "$installed_version" != "$AGENT_VERSION" ]; then
   rollback_source_install
   if [ "$SERVICE_BACKEND" = "openwrt-procd" ]; then

@@ -173,6 +173,19 @@ def log_idle_cycle(log_state: AgentLogState | None) -> None:
     log_state.last_idle_debug_at = now
 
 
+def truncate_task_error(value: object, max_bytes: int = 64 * 1024) -> str:
+    """截断异常文本，确保失败结果仍能通过主控的 JSON 大小限制。"""
+
+    text_value = str(value)
+    encoded = text_value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text_value
+    marker = "\n...[truncated by agent]"
+    marker_bytes = marker.encode("utf-8")
+    head = encoded[: max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return head + marker
+
+
 def configure_logging(level_name: str) -> None:
     """配置 Agent 日志输出到标准输出，便于 systemd、Docker 和 OpenRC 采集。"""
 
@@ -212,7 +225,9 @@ def run_gre_service_command(argv: list[str]) -> bool:
 def summarize_task(task: dict[str, Any]) -> dict[str, Any]:
     """生成不包含配置正文和密钥的任务日志摘要。"""
 
-    payload = task.get("payload") or {}
+    payload = task.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
     safe_payload_keys = [
         "node_id",
         "interface_id",
@@ -295,6 +310,8 @@ def execute_task(task: dict[str, Any], config: AgentConfig) -> dict[str, Any]:
 
     task_type = task["type"]
     payload = task.get("payload", {})
+    if not isinstance(payload, dict):
+        raise ValueError("agent task payload must be an object")
     return execute_registered_task(task_type, payload, config)
 
 
@@ -386,7 +403,7 @@ def failed_link_monitor_result(monitor: dict[str, Any], exc: BaseException) -> d
         "checked_at": datetime.utcnow().isoformat(),
         "success": False,
         "latency_ms": None,
-        "error": str(exc),
+        "error": truncate_task_error(exc, max_bytes=4096),
     }
 
 
@@ -423,7 +440,10 @@ def run_once(
         config = AgentConfig(server_url="", node_id=0, token="", wireguard_dir=config)
     snapshot = snapshot or collect_agent_snapshot()
     send_heartbeat(client, snapshot)
-    tasks = poll_tasks(client, snapshot)
+    if hasattr(client, "retry_task_reports"):
+        client.retry_task_reports()
+    # 待确认结果未清空时暂停领取新任务，避免结果接口故障期间积压无界内存。
+    tasks = [] if getattr(client, "pending_task_reports", None) else poll_tasks(client, snapshot)
     if tasks:
         logger.info("拉取到 %d 个待执行任务 tasks=%s", len(tasks), [summarize_task(task) for task in tasks])
     else:
@@ -444,6 +464,7 @@ def run_once(
             logger.info("开始执行任务 task_id=%s task_type=%s summary=%s", task_id, task_type, summarize_task(task))
             try:
                 result = execute_task(task, config)
+                status = "succeeded"
                 logger.info(
                     "任务执行成功 task_id=%s task_type=%s duration=%.2fs result=%s",
                     task_id,
@@ -451,8 +472,6 @@ def run_once(
                     time.monotonic() - started_at,
                     summarize_task_result(result),
                 )
-                client.report_task(task_id, "succeeded", result)
-                logger.debug("任务结果已上报 task_id=%s task_type=%s status=succeeded", task_id, task_type)
             except Exception as exc:  # noqa: BLE001
                 # Agent 不能因为单个任务失败而退出；失败信息上报后继续处理后续任务。
                 logger.exception(
@@ -462,12 +481,18 @@ def run_once(
                     time.monotonic() - started_at,
                     scrub_text_for_log(exc),
                 )
-                client.report_task(
-                    task_id,
-                    "failed",
-                    {"error": str(exc), "traceback": traceback.format_exc()},
-                )
-                logger.debug("任务结果已上报 task_id=%s task_type=%s status=failed", task_id, task_type)
+                status = "failed"
+                result = {
+                    "error": truncate_task_error(exc),
+                    "traceback": truncate_task_error(traceback.format_exc()),
+                }
+            try:
+                # 网络上报失败与本机执行失败是不同事件，不能把已执行成功的
+                # 网络操作改报为失败，也不能因此丢弃同一批已领取的后续任务。
+                client.report_task(task_id, status, result)
+                logger.debug("任务结果已上报 task_id=%s task_type=%s status=%s", task_id, task_type, status)
+            except Exception as report_error:  # noqa: BLE001
+                logger.warning("任务结果上报失败 task_id=%s status=%s error=%s", task_id, status, scrub_text_for_log(report_error))
     finally:
         if heartbeat_stop is not None:
             heartbeat_stop.set()
@@ -513,9 +538,16 @@ def main() -> None:
         config.log_level,
     )
     log_state = AgentLogState()
+    # Keep one client for the lifetime of the process.  AgentClient retains
+    # task results that the controller has not acknowledged yet; recreating it
+    # on every retry would silently lose those reports after a transient
+    # connection failure and could cause the same local task to be executed
+    # again once it expires on the controller.
+    client: AgentClient | None = None
     while True:
         try:
-            client = AgentClient(config)
+            if client is None:
+                client = AgentClient(config)
             snapshot = collect_agent_snapshot()
             client.register(get_hostname(), snapshot.capabilities, snapshot.platform)
             log_snapshot_if_changed(snapshot, log_state)
@@ -544,7 +576,7 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             # 中心 API 重启或网络短暂中断时，Agent 保持运行并在下一轮重试。
             logger.exception("Agent 主循环异常，等待下一轮重试")
-        time.sleep(config.poll_interval)
+        time.sleep(max(1, min(3600, int(config.poll_interval))))
 
 
 if __name__ == "__main__":

@@ -23,8 +23,12 @@ class PortInventoryNodePlugin(NodePlugin):
         super().validate_payload(action, payload, context)
         if action != "scan":
             raise ValueError("plugin action not found")
-        range_start = int(payload.get("range_start") or 0)
-        range_end = int(payload.get("range_end") or 0)
+        raw_start = payload.get("range_start")
+        raw_end = payload.get("range_end")
+        if isinstance(raw_start, bool) or not isinstance(raw_start, int) or isinstance(raw_end, bool) or not isinstance(raw_end, int):
+            raise ValueError("port range must be integers")
+        range_start = raw_start
+        range_end = raw_end
         if not 1 <= range_start <= 65535 or not 1 <= range_end <= 65535:
             raise ValueError("port range must be between 1 and 65535")
         if range_start > range_end:

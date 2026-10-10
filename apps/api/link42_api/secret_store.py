@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
+import tempfile
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
@@ -17,6 +19,7 @@ from .config import settings
 
 ENCRYPTED_PREFIX = "l42enc:v1:"
 ASSOCIATED_DATA = b"link42-controller-secret:v1"
+MAX_MASTER_KEY_FILE_BYTES = 4096
 
 
 def decode_master_key(value: str) -> bytes:
@@ -38,28 +41,68 @@ def master_key_path() -> Path:
     return Path(configured) if configured else Path(settings.config_dir) / "master.key"
 
 
+def _reject_symlink_components(path: Path) -> None:
+    """拒绝主密钥路径中的符号链接组件，避免密钥被写到目录外。"""
+
+    current = Path(path.anchor or "/")
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    if not path.is_absolute():
+        current = Path()
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            raise RuntimeError("Link42 master key path must not contain symbolic links")
+
+
 def create_master_key_file(path: Path) -> bytes:
-    """以排他方式生成权限受限的主密钥文件，避免并发启动覆盖密钥。"""
+    """原子发布完整主密钥，并发启动时读取首先成功发布的密钥。"""
 
     key = secrets.token_bytes(32)
     encoded = base64.urlsafe_b64encode(key) + b"\n"
+    _reject_symlink_components(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError("Link42 master key path must be a regular file")
-        path.chmod(0o600)
-        return decode_master_key(path.read_text(encoding="ascii"))
+    _reject_symlink_components(path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".master-key-", dir=path.parent)
+    temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as output:
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+        # link() is exclusive and atomic: no worker can observe an empty or
+        # partially written final key, and no existing key is ever replaced.
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return read_master_key_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return key
+
+
+def read_master_key_file(path: Path) -> bytes:
+    """有界读取普通密钥文件，FIFO 等特殊文件不得阻塞主控启动。"""
+
+    _reject_symlink_components(path.parent)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError("Link42 master key path must be a regular file") from exc
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("Link42 master key path must be a regular file")
+        if metadata.st_size > MAX_MASTER_KEY_FILE_BYTES:
+            raise RuntimeError("Link42 master key file is too large")
+        os.fchmod(source.fileno(), 0o600)
+        encoded_value = source.read(MAX_MASTER_KEY_FILE_BYTES + 1)
+    if len(encoded_value) > MAX_MASTER_KEY_FILE_BYTES:
+        raise RuntimeError("Link42 master key file is too large")
+    try:
+        return decode_master_key(encoded_value.decode("ascii"))
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Link42 master key file must be ASCII base64") from exc
 
 
 @lru_cache(maxsize=1)
@@ -70,14 +113,10 @@ def load_master_key() -> bytes:
     if configured:
         return decode_master_key(configured)
     path = master_key_path()
-    if path.is_symlink():
-        raise RuntimeError("Link42 master key path must be a regular file")
+    _reject_symlink_components(path.parent)
     if not path.exists():
         return create_master_key_file(path)
-    if not path.is_file():
-        raise RuntimeError("Link42 master key path must be a regular file")
-    path.chmod(0o600)
-    return decode_master_key(path.read_text(encoding="ascii"))
+    return read_master_key_file(path)
 
 
 def encrypt_text(value: str) -> str:
@@ -135,7 +174,14 @@ class EncryptedJSON(TypeDecorator[Any]):
         """读库后递归解密 JSON，并兼容早期整列密文。"""
 
         if isinstance(value, str) and value.startswith(ENCRYPTED_PREFIX):
-            return json.loads(decrypt_text(value))
+            decrypted = decrypt_text(value)
+            # 早期版本对根节点字符串直接加密了原文，而对象/数组则
+            # 保存为 JSON 文档。先按文档解析，失败时保留原始字符串，
+            # 避免读取合法但非对象的历史 payload 触发 500。
+            try:
+                return json.loads(decrypted)
+            except json.JSONDecodeError:
+                return decrypted
         return reveal_json_value(value)
 
 

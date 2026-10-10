@@ -2,27 +2,33 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import hashlib
+import fcntl
 import ipaddress
 import logging
+import math
 import os
 import re
 from pathlib import Path
 import secrets
+import stat
 import shlex
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+from pydantic import ValidationError
 from link42_common.connection_types import (
     CONNECTION_TYPE_GRE,
     CONNECTION_TYPE_WIREGUARD,
@@ -36,8 +42,9 @@ from link42_common.connection_types import (
     TASK_REQUIREMENTS,
     WIREGUARD_TASKS,
 )
-from sqlalchemy import String, delete, func, or_, select
+from sqlalchemy import String, delete, func, or_, select, update
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from link42_common.security import (
@@ -77,6 +84,32 @@ from .wireguard_service import (
 
 LOGGER_NAME = "link42.api"
 logger = logging.getLogger(LOGGER_NAME)
+
+
+def json_object(value: Any) -> dict[str, Any]:
+    """将旧库/外部 JSON 字段安全规整为对象。"""
+
+    return value if isinstance(value, dict) else {}
+
+
+def commit_unique_or_conflict(db: Session, detail: str) -> None:
+    """把数据库唯一约束竞态转换成稳定的业务冲突响应。"""
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=detail) from exc
+
+
+def flush_unique_or_conflict(db: Session, detail: str) -> None:
+    """把 flush 阶段的唯一约束竞态转换成稳定冲突响应。"""
+
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=detail) from exc
 
 
 def configure_logging(level_name: str) -> None:
@@ -121,7 +154,10 @@ def validate_wireguard_ipv6_mtu(mtu: int | None, *tunnel_ip_groups: list[str]) -
 def summarize_task_payload(payload: dict | None) -> dict[str, object]:
     """生成可安全写入日志的任务 payload 摘要。"""
 
-    payload = payload or {}
+    # 历史数据库可能包含合法 JSON 但根类型不是对象；日志路径也不能因此
+    # 触发 TypeError，进而掩盖真正的任务状态。
+    if not isinstance(payload, dict):
+        return {}
     safe_keys = [
         "node_id",
         "interface_id",
@@ -228,7 +264,10 @@ async def looking_glass_validation_error_handler(request: Request, exc: RequestV
             status_code=400,
             content={"error": {"code": "invalid_request", "message": "请求参数无效"}},
         )
-    return await request_validation_exception_handler(request, exc)
+    # 默认错误包含原始 input；它可能携带密钥、极深 JSON 或 NaN，
+    # 既会泄露输入，也可能让错误响应本身序列化失败。前端只需要这三个字段。
+    details = [{key: error[key] for key in ("loc", "msg", "type") if key in error} for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": details})
 
 DEFAULT_ADMIN_USERNAME = "pmman"
 ADMIN_USERNAME = DEFAULT_ADMIN_USERNAME
@@ -253,12 +292,16 @@ LOOKING_GLASS_API_PREFIX = "/third-party-api/looking-glass/v1"
 LOOKING_GLASS_NODE_READ_SCOPE = "looking_glass.nodes.read"
 LOOKING_GLASS_BIRD_ROUTE_SCOPE = "looking_glass.bird.route"
 LOOKING_GLASS_QUERY_QUEUE_LIMIT = 20
+MAX_AGENT_TASK_DEPENDENCY_DEPTH = 64
+MAX_AGENT_TASK_PAYLOAD_BYTES = 2 * 1024 * 1024
 LOOKING_GLASS_QUEUE_TIMEOUT = timedelta(seconds=30)
 LOOKING_GLASS_COMMAND_TIMEOUT_SECONDS = 15
 LOOKING_GLASS_TOTAL_DEADLINE = timedelta(seconds=60)
 LOOKING_GLASS_RESULT_RETENTION = timedelta(minutes=10)
 LOOKING_GLASS_CACHE_WINDOW = timedelta(seconds=5)
 LOOKING_GLASS_OUTPUT_LIMIT_BYTES = 256 * 1024
+LINK_MONITOR_SAMPLE_LIMIT = 20_000
+AGENT_RELEASE_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
 WEB_SESSION_COOKIE = "link42_session"
 WEB_CSRF_HEADER = "x-link42-csrf"
 LOGIN_FAILURE_LIMIT = 5
@@ -268,15 +311,74 @@ LOGIN_FAILURES_LOCK = threading.Lock()
 LOGIN_CONCURRENCY = threading.BoundedSemaphore(2)
 
 
+def reject_symlink_components(path: Path) -> None:
+    """拒绝受管路径中已存在的符号链接组件。"""
+
+    current = Path(path.anchor or "/")
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    if not path.is_absolute():
+        current = Path()
+    for part in parts:
+        current /= part
+        try:
+            if current.is_symlink():
+                raise HTTPException(status_code=404, detail="managed path is invalid")
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="managed path is invalid") from exc
+
+
 def uploaded_logo_path() -> Path | None:
     """返回当前上传 Logo 文件路径。"""
 
     logo_dir = Path(settings.config_dir) / "branding"
+    reject_symlink_components(logo_dir)
     for suffix in ["png", "jpg", "webp"]:
         path = logo_dir / f"logo.{suffix}"
-        if path.exists():
+        if path.is_file() and not path.is_symlink():
             return path
     return None
+
+
+@contextmanager
+def branding_logo_lock(logo_dir: Path, *, shared: bool = False):
+    """用持久锁文件协调线程及不同主控 worker 的 Logo 读写。"""
+
+    reject_symlink_components(logo_dir)
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        descriptor = os.open(logo_dir / ".logo.lock", flags, 0o600)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="managed path is invalid") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise HTTPException(status_code=404, detail="managed path is invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def read_uploaded_logo(path: Path) -> tuple[bytes, str]:
+    """以不可跟随最终符号链接的方式读取 Logo。"""
+
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > BRANDING_LOGO_MAX_BYTES:
+                raise OSError("invalid logo file")
+            data = source.read(BRANDING_LOGO_MAX_BYTES + 1)
+        if len(data) > BRANDING_LOGO_MAX_BYTES:
+            raise OSError("logo is too large")
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="logo not uploaded") from None
+    media_type = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".webp": "image/webp",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return data, media_type
 
 
 def detect_logo_extension(content_type: str, data: bytes) -> str:
@@ -293,6 +395,21 @@ def detect_logo_extension(content_type: str, data: bytes) -> str:
         raise HTTPException(status_code=400, detail="logo must be PNG, JPEG, or WebP")
     raise HTTPException(status_code=400, detail="logo must be PNG, JPEG, or WebP")
 
+
+@app.get("/branding/logo", include_in_schema=False)
+def serve_uploaded_logo() -> Response:
+    """返回用户上传并保存在配置目录中的 Logo。"""
+
+    logo_dir = Path(settings.config_dir) / "branding"
+    if not logo_dir.exists():
+        raise HTTPException(status_code=404, detail="logo not uploaded")
+    with branding_logo_lock(logo_dir, shared=True):
+        path = uploaded_logo_path()
+        if not path:
+            raise HTTPException(status_code=404, detail="logo not uploaded")
+        data, media_type = read_uploaded_logo(path)
+    return Response(content=data, media_type=media_type)
+
 def mount_web_panel() -> None:
     """按配置挂载前端静态文件，让主控镜像可以单端口运行。"""
 
@@ -305,15 +422,6 @@ def mount_web_panel() -> None:
         return
     if assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="web-assets")
-    @app.get("/branding/logo", include_in_schema=False)
-    def serve_uploaded_logo() -> FileResponse:
-        """返回用户上传并保存在配置目录中的 Logo。"""
-
-        path = uploaded_logo_path()
-        if not path:
-            raise HTTPException(status_code=404, detail="logo not uploaded")
-        return FileResponse(path)
-
     logo_file = web_dist_dir / "logo.png"
     if logo_file.exists():
         @app.get("/logo.png", include_in_schema=False)
@@ -366,8 +474,17 @@ def ensure_admin_credentials() -> None:
                 db.commit()
             return
         password = secrets.token_urlsafe(18)
+        # 多 worker 同时启动时，只有成功插入密码行的 worker 能发布引导文件；
+        # 其它 worker 看到主键冲突后直接读取已提交凭据，避免文件与数据库不匹配。
+        try:
+            with db.begin_nested():
+                db.add(models.SystemSetting(key=SETTING_ADMIN_PASSWORD_HASH, value=hash_password(password)))
+                db.flush()
+        except IntegrityError:
+            db.expire_all()
+            password = None
+            return
         set_setting(db, SETTING_ADMIN_USERNAME, DEFAULT_ADMIN_USERNAME)
-        set_setting(db, SETTING_ADMIN_PASSWORD_HASH, hash_password(password))
         set_setting(db, SETTING_ADMIN_INITIAL_PASSWORD_PENDING, "1")
         set_setting(db, SETTING_CONTROLLER_URL, get_setting(db, SETTING_CONTROLLER_URL) or "")
         set_setting(db, SETTING_SITE_TITLE, get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE)
@@ -378,9 +495,11 @@ def ensure_admin_credentials() -> None:
     if password is None:
         return
     password_path = Path(settings.config_dir) / "initial-admin-password"
+    reject_symlink_components(password_path.parent)
     if password_path.is_symlink():
         raise RuntimeError("initial admin password path must not be a symbolic link")
     password_path.parent.mkdir(parents=True, exist_ok=True)
+    reject_symlink_components(password_path.parent)
     temporary_path = password_path.with_name(f".{password_path.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -394,9 +513,8 @@ def ensure_admin_credentials() -> None:
         raise
     password_path.chmod(0o600)
     logger.warning(
-        "Link42 初始登录信息 username=%s password=%s backup_path=%s",
+        "Link42 初始登录信息已写入受限文件 username=%s path=%s",
         DEFAULT_ADMIN_USERNAME,
-        password,
         password_path,
     )
 
@@ -895,17 +1013,18 @@ def refresh_looking_glass_query_from_task(query: models.LookingGlassQuery, now: 
     elif task.status == "succeeded":
         query.started_at = query.started_at or task.started_at
         query.finished_at = query.finished_at or task.finished_at or now
-        query.result = task.result or {}
-        if isinstance(task.result, dict) and task.result.get("error_code"):
+        task_result = task.result if isinstance(task.result, dict) else {}
+        query.result = task_result
+        if task_result.get("error_code"):
             query.status = "failed"
-            query.error_code = str(task.result.get("error_code"))
-            query.error_message = str(task.result.get("error") or "查询执行失败")[:500]
+            query.error_code = str(task_result.get("error_code"))
+            query.error_message = str(task_result.get("error") or "查询执行失败")[:500]
         else:
             query.status = "succeeded"
             query.error_code = None
             query.error_message = None
     elif task.status in {"failed", "cancelled"}:
-        result = task.result or {}
+        result = task.result if isinstance(task.result, dict) else {}
         query.status = "failed" if task.status == "failed" else "cancelled"
         query.started_at = query.started_at or task.started_at
         query.finished_at = query.finished_at or task.finished_at or now
@@ -979,7 +1098,7 @@ def add_security_headers(request: Request, response: Response) -> Response:
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
-        "script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+        "script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https:; "
         "font-src 'self' data:; connect-src 'self'",
     )
     if request.url.scheme == "https":
@@ -1129,22 +1248,36 @@ def list_looking_glass_nodes(
             cursor_id = max(0, int(cursor))
         except ValueError as exc:
             raise api_error(400, "invalid_request", "分页游标无效") from exc
-    query = (
-        select(models.Node)
-        .where(models.Node.id > cursor_id)
-        .order_by(models.Node.id)
-        .limit(limit + 1)
-    )
-    if region is not None:
-        query = query.where(models.Node.region == region)
-    nodes = list(db.scalars(query))
     now = datetime.utcnow()
+    # `online` is derived from the heartbeat timestamp and cannot be expressed
+    # reliably as a simple SQL predicate. Scan ordered batches until we have
+    # enough matching rows; limiting before filtering would make a sparse
+    # region/status page appear empty even when later nodes match.
     filtered_nodes: list[models.Node] = []
-    for node in nodes:
-        node_online = is_node_online(node, now=now)
-        if online is not None and node_online != online:
-            continue
-        filtered_nodes.append(node)
+    scan_cursor = cursor_id
+    batch_size = min(500, max(limit + 1, 100))
+    while len(filtered_nodes) <= limit:
+        query = (
+            select(models.Node)
+            .where(models.Node.id > scan_cursor)
+            .order_by(models.Node.id)
+            .limit(batch_size)
+        )
+        if region is not None:
+            query = query.where(models.Node.region == region)
+        batch = list(db.scalars(query))
+        if not batch:
+            break
+        scan_cursor = batch[-1].id
+        for node in batch:
+            node_online = is_node_online(node, now=now)
+            if online is not None and node_online != online:
+                continue
+            filtered_nodes.append(node)
+            if len(filtered_nodes) > limit:
+                break
+        if len(batch) < batch_size:
+            break
     page_nodes = filtered_nodes[:limit]
     next_cursor = str(page_nodes[-1].id) if len(filtered_nodes) > limit and page_nodes else None
     return schemas.LookingGlassNodeList(
@@ -1193,6 +1326,46 @@ def create_looking_glass_query_task(
         raise api_error(409, "node_offline", "节点当前离线，无法执行查询")
     if required_capability not in set(node.agent_capabilities or []):
         raise api_error(409, "capability_missing", capability_error_message)
+    # Serialize admission for this node before checking the queue length.  A
+    # plain count followed by an insert lets concurrent workers all observe
+    # the same free slots and exceed LOOKING_GLASS_QUERY_QUEUE_LIMIT.  The
+    # no-op update takes a row/write lock (including SQLite's writer lock)
+    # for the rest of this transaction, so the next admission sees the task
+    # committed by the previous worker.
+    db.execute(
+        update(models.Node)
+        .where(models.Node.id == node_id)
+        .values(updated_at=models.Node.updated_at)
+    )
+    fingerprint = looking_glass_request_fingerprint(api_key.id, node_id, operation, fingerprint_value)
+    reusable_query = db.scalar(
+        select(models.LookingGlassQuery)
+        .where(
+            models.LookingGlassQuery.api_key_id == api_key.id,
+            models.LookingGlassQuery.node_id == node_id,
+            models.LookingGlassQuery.request_fingerprint == fingerprint,
+            or_(
+                models.LookingGlassQuery.status.in_(["queued", "running"]),
+                (models.LookingGlassQuery.status == "succeeded")
+                & (models.LookingGlassQuery.created_at >= now - LOOKING_GLASS_CACHE_WINDOW),
+            ),
+        )
+        .order_by(models.LookingGlassQuery.id.desc())
+    )
+    if reusable_query is not None:
+        refresh_looking_glass_query_from_task(reusable_query, now=now)
+        if reusable_query.status in {"queued", "running"} or (
+            reusable_query.status == "succeeded"
+            and reusable_query.created_at >= now - LOOKING_GLASS_CACHE_WINDOW
+        ):
+            db.commit()
+            response.status_code = 202
+            response.headers["Location"] = f"{LOOKING_GLASS_API_PREFIX}/queries/{reusable_query.public_id}"
+            response.headers["Retry-After"] = "1"
+            return looking_glass_query_read(reusable_query)
+        db.flush()
+    expire_overdue_pending_agent_tasks(db, node_id=node_id, now=now)
+    expire_stale_running_agent_tasks(db, node_id=node_id, now=now)
     queued_count = db.scalar(
         select(func.count(models.AgentTask.id)).where(
             models.AgentTask.node_id == node_id,
@@ -1202,25 +1375,6 @@ def create_looking_glass_query_task(
     )
     if int(queued_count or 0) >= LOOKING_GLASS_QUERY_QUEUE_LIMIT:
         raise api_error(429, "query_queue_full", "节点查询队列已满，请稍后重试")
-    fingerprint = looking_glass_request_fingerprint(api_key.id, node_id, operation, fingerprint_value)
-    reusable_query = db.scalar(
-        select(models.LookingGlassQuery)
-        .where(
-            models.LookingGlassQuery.api_key_id == api_key.id,
-            models.LookingGlassQuery.node_id == node_id,
-            models.LookingGlassQuery.request_fingerprint == fingerprint,
-            models.LookingGlassQuery.created_at >= now - LOOKING_GLASS_CACHE_WINDOW,
-            models.LookingGlassQuery.status.in_(["queued", "running", "succeeded"]),
-        )
-        .order_by(models.LookingGlassQuery.id.desc())
-    )
-    if reusable_query is not None:
-        refresh_looking_glass_query_from_task(reusable_query, now=now)
-        db.commit()
-        response.status_code = 202
-        response.headers["Location"] = f"{LOOKING_GLASS_API_PREFIX}/queries/{reusable_query.public_id}"
-        response.headers["Retry-After"] = "1"
-        return looking_glass_query_read(reusable_query)
     deadline_at = now + LOOKING_GLASS_TOTAL_DEADLINE
     task_deadline_at = now + LOOKING_GLASS_QUEUE_TIMEOUT
     expires_at = now + LOOKING_GLASS_RESULT_RETENTION
@@ -1236,8 +1390,6 @@ def create_looking_glass_query_task(
         },
         deadline_at=task_deadline_at,
     )
-    db.add(task)
-    db.flush()
     query_record = models.LookingGlassQuery(
         public_id=looking_glass_query_public_id(),
         api_key_id=api_key.id,
@@ -1246,11 +1398,41 @@ def create_looking_glass_query_task(
         request=request_payload,
         request_fingerprint=fingerprint,
         status="queued",
-        agent_task_id=task.id,
         deadline_at=deadline_at,
         expires_at=expires_at,
     )
-    db.add(query_record)
+    try:
+        # 查询记录的部分唯一索引负责跨进程仲裁相同请求；任务和查询必须在
+        # 同一个 savepoint 中写入，避免唯一键冲突后留下孤儿 AgentTask。
+        with db.begin_nested():
+            db.add(task)
+            db.flush()
+            query_record.agent_task_id = task.id
+            db.add(query_record)
+            db.flush()
+    except IntegrityError:
+        reusable_query = db.scalar(
+            select(models.LookingGlassQuery)
+            .where(
+                models.LookingGlassQuery.api_key_id == api_key.id,
+                models.LookingGlassQuery.node_id == node_id,
+                models.LookingGlassQuery.request_fingerprint == fingerprint,
+                or_(
+                    models.LookingGlassQuery.status.in_(["queued", "running"]),
+                    (models.LookingGlassQuery.status == "succeeded")
+                    & (models.LookingGlassQuery.created_at >= now - LOOKING_GLASS_CACHE_WINDOW),
+                ),
+            )
+            .order_by(models.LookingGlassQuery.id.desc())
+        )
+        if reusable_query is None:
+            raise
+        refresh_looking_glass_query_from_task(reusable_query, now=now)
+        db.commit()
+        response.status_code = 202
+        response.headers["Location"] = f"{LOOKING_GLASS_API_PREFIX}/queries/{reusable_query.public_id}"
+        response.headers["Retry-After"] = "1"
+        return looking_glass_query_read(reusable_query)
     db.commit()
     db.refresh(query_record)
     response.status_code = 202
@@ -1573,11 +1755,15 @@ def update_agent_metadata(
         node.agent_version = agent_version
     if protocol_version is not None:
         node.agent_protocol_version = protocol_version
-    if capabilities:
+    # Agent 每次注册/心跳都会完整上报能力列表；空列表也必须覆盖旧值，
+    # 否则 Agent 降级或插件卸载后主控仍会把任务派给已不存在的能力。
+    if capabilities is not None:
         node.agent_capabilities = sorted(set(capabilities))
         if "middleware.mimic" in set(capabilities):
             node.middleware_install_status = "mimic_ready"
-    if platform:
+        elif node.middleware_install_status == "mimic_ready":
+            node.middleware_install_status = None
+    if platform is not None:
         current_platform = dict(platform)
         if "middleware.mimic" in set(node.agent_capabilities or []):
             current_platform.pop("mimic_reboot_required", None)
@@ -1601,7 +1787,11 @@ def agent_satisfies_task(node: models.Node, task_type: str) -> bool:
         return True
     if parse_version(node.agent_version) < parse_version(requirement.get("min_agent_version")):
         return False
-    capabilities = set(node.agent_capabilities or ["wireguard", "wg_quick_import"])
+    capabilities = set(node.agent_capabilities or [])
+    # 尚未注册过的旧节点没有能力快照，保留第一版 WireGuard 兼容默认值；
+    # 已注册 Agent 即使上报空列表也必须按空列表处理。
+    if node.agent_version is None:
+        capabilities.update({"wireguard", "wg_quick_import"})
     return all(capability in capabilities for capability in requirement.get("capabilities", []))
 
 
@@ -1610,7 +1800,7 @@ def node_uses_openwrt_uci(node: models.Node | None) -> bool:
 
     if node is None:
         return False
-    platform = node.agent_platform or {}
+    platform = json_object(node.agent_platform)
     capabilities = set(node.agent_capabilities or [])
     return platform.get("service_manager") == "openwrt-uci" or "service:openwrt-uci" in capabilities
 
@@ -1645,23 +1835,34 @@ def expire_stale_running_agent_tasks(
     )
     if node_id is not None:
         query = query.where(models.AgentTask.node_id == node_id)
-    tasks = list(db.scalars(query.order_by(models.AgentTask.id)))
-    for task in tasks:
-        task.status = "failed"
-        task.finished_at = now
-        task.result = {
-            "error": f"agent task timed out after {int(AGENT_TASK_RUNNING_TIMEOUT.total_seconds())} seconds",
-            "timeout_seconds": int(AGENT_TASK_RUNNING_TIMEOUT.total_seconds()),
-        }
-    if tasks:
-        db.flush()
-        logger.warning(
-            "回收超时 Agent 任务 node_id=%s count=%d task_ids=%s",
-            node_id,
-            len(tasks),
-            [task.id for task in tasks],
+    candidates = list(db.scalars(query.order_by(models.AgentTask.id)))
+    expired = 0
+    affected_plan_ids: set[int] = set()
+    for task in candidates:
+        updated = db.execute(
+            update(models.AgentTask)
+            .where(models.AgentTask.id == task.id, models.AgentTask.status == "running")
+            .values(status="failed", finished_at=now, result={
+                "error": f"agent task timed out after {int(AGENT_TASK_RUNNING_TIMEOUT.total_seconds())} seconds",
+                "timeout_seconds": int(AGENT_TASK_RUNNING_TIMEOUT.total_seconds()),
+            })
+            .execution_options(synchronize_session="fetch")
         )
-    return len(tasks)
+        if updated.rowcount:
+            expired += int(updated.rowcount)
+            if task.change_plan_id is not None:
+                affected_plan_ids.add(task.change_plan_id)
+    for plan_id in affected_plan_ids:
+        plan = db.get(models.ChangePlan, plan_id)
+        if plan is not None:
+            update_change_plan_task_status(db, plan)
+    if expired:
+        logger.warning(
+            "回收超时 Agent 任务 node_id=%s count=%d",
+            node_id,
+            expired,
+        )
+    return expired
 
 
 def expire_overdue_pending_agent_tasks(
@@ -1680,23 +1881,36 @@ def expire_overdue_pending_agent_tasks(
     if node_id is not None:
         query = query.where(models.AgentTask.node_id == node_id)
     tasks = list(db.scalars(query.order_by(models.AgentTask.id)))
+    expired_ids: list[int] = []
+    affected_plan_ids: set[int] = set()
     for task in tasks:
-        task.status = "failed"
-        task.finished_at = now
-        task.result = {
-            "error_code": "query_timeout" if task.queue == "query" else "task_timeout",
-            "error": "task deadline expired before agent polling",
-        }
-    if tasks:
-        db.flush()
-        logger.warning("回收过期待执行任务 node_id=%s count=%d task_ids=%s", node_id, len(tasks), [task.id for task in tasks])
-    return len(tasks)
+        updated = db.execute(
+            update(models.AgentTask)
+            .where(models.AgentTask.id == task.id, models.AgentTask.status == "pending", models.AgentTask.deadline_at <= now)
+            .values(status="failed", finished_at=now, result={
+                "error_code": "query_timeout" if task.queue == "query" else "task_timeout",
+                "error": "task deadline expired before agent polling",
+            })
+            .execution_options(synchronize_session="fetch")
+        )
+        if updated.rowcount == 1:
+            expired_ids.append(task.id)
+            if task.change_plan_id is not None:
+                affected_plan_ids.add(task.change_plan_id)
+    for plan_id in affected_plan_ids:
+        plan = db.get(models.ChangePlan, plan_id)
+        if plan is not None:
+            update_change_plan_task_status(db, plan)
+    if expired_ids:
+        logger.warning("回收过期待执行任务 node_id=%s count=%d task_ids=%s", node_id, len(expired_ids), expired_ids)
+    return len(expired_ids)
 
 
 def task_dependency_id(task: models.AgentTask) -> int | None:
     """读取任务 payload 中的依赖任务 ID。"""
 
-    raw_value = (task.payload or {}).get("depends_on_task_id")
+    task_payload = task.payload if isinstance(task.payload, dict) else {}
+    raw_value = task_payload.get("depends_on_task_id")
     if raw_value in (None, ""):
         return None
     try:
@@ -1709,25 +1923,93 @@ def task_dependency_id(task: models.AgentTask) -> int | None:
 def is_task_ready_for_poll(db: Session, task: models.AgentTask, now: datetime) -> bool:
     """判断 pending 任务的依赖是否已满足；依赖失败时同步标记失败。"""
 
+    def fail_dependency(result: dict[str, Any]) -> bool:
+        """持久化依赖失败，并立即同步部署计划聚合状态。"""
+
+        task.status = "failed"
+        task.finished_at = now
+        task.result = result
+        db.flush()
+        if task.change_plan_id is not None:
+            plan = db.get(models.ChangePlan, task.change_plan_id)
+            if plan is not None:
+                update_change_plan_task_status(db, plan)
+        return False
+
     dependency_id = task_dependency_id(task)
     if dependency_id is None:
         return True
     dependency = db.get(models.AgentTask, dependency_id)
     if dependency is None:
-        task.status = "failed"
-        task.finished_at = now
-        task.result = {
+        result = {
             "error": f"dependency task {dependency_id} was not found",
             "dependency_task_id": dependency_id,
         }
         logger.warning("Agent 任务依赖不存在 task_id=%s dependency_task_id=%s", task.id, dependency_id)
-        return False
-    if dependency.status == "succeeded":
+        return fail_dependency(result)
+    if dependency.node_id != task.node_id:
+        result = {
+            "error": f"dependency task {dependency_id} belongs to another node",
+            "dependency_task_id": dependency_id,
+        }
+        logger.warning("Agent 任务依赖跨节点 task_id=%s dependency_task_id=%s", task.id, dependency_id)
+        return fail_dependency(result)
+    # 依赖来自内部任务编排，但旧库或手工修复可能留下环。沿链检查有限深度，
+    # 发现环或异常深链立即失败，避免 Agent 永久看不到这些任务。
+    seen = {task.id}
+    cursor = dependency
+    for _ in range(MAX_AGENT_TASK_DEPENDENCY_DEPTH):
+        if cursor.id in seen:
+            result = {
+                "error": "agent task dependency cycle detected",
+                "dependency_task_id": dependency_id,
+            }
+            logger.warning("Agent 任务依赖形成环 task_id=%s dependency_task_id=%s", task.id, dependency_id)
+            return fail_dependency(result)
+        seen.add(cursor.id)
+        next_id = task_dependency_id(cursor)
+        if next_id is None:
+            break
+        cursor = db.get(models.AgentTask, next_id)
+        if cursor is None:
+            result = {
+                "error": f"dependency task {next_id} was not found",
+                "dependency_task_id": dependency_id,
+            }
+            logger.warning("Agent 任务依赖链断裂 task_id=%s dependency_task_id=%s", task.id, dependency_id)
+            return fail_dependency(result)
+        if cursor.node_id != task.node_id:
+            result = {
+                "error": f"dependency task {next_id} belongs to another node",
+                "dependency_task_id": dependency_id,
+            }
+            logger.warning("Agent 任务依赖链跨节点 task_id=%s dependency_task_id=%s", task.id, dependency_id)
+            return fail_dependency(result)
+    else:
+        result = {
+            "error": "agent task dependency chain is too deep",
+            "dependency_task_id": dependency_id,
+        }
+        logger.warning("Agent 任务依赖链过深 task_id=%s dependency_task_id=%s", task.id, dependency_id)
+        return fail_dependency(result)
+    # 停止任务只需等待前序部署结束；即使启动失败，也必须允许清理
+    # 可能已部分创建的设备。普通 apply/start/delete 仍要求依赖成功。
+    task_payload = task.payload if isinstance(task.payload, dict) else {}
+    continue_after_failure = (
+        task.type in {
+            WIREGUARD_TASKS.stop,
+            GRE_TASKS.stop,
+            "middleware.udp2raw.delete",
+            "middleware.mimic.delete",
+        }
+        and task_payload.get("continue_after_dependency_failure") is True
+    )
+    if dependency.status == "succeeded" or (
+        continue_after_failure and dependency.status in {"failed", "cancelled"}
+    ):
         return True
     if dependency.status in {"failed", "cancelled"}:
-        task.status = "failed"
-        task.finished_at = now
-        task.result = {
+        result = {
             "error": f"dependency task {dependency_id} ended with status {dependency.status}",
             "dependency_task_id": dependency_id,
             "dependency_status": dependency.status,
@@ -1739,6 +2021,7 @@ def is_task_ready_for_poll(db: Session, task: models.AgentTask, now: datetime) -
             dependency_id,
             dependency.status,
         )
+        return fail_dependency(result)
     return False
 
 
@@ -1759,19 +2042,57 @@ def stop_task_result_failed(result: dict) -> bool:
     return command_result_failed(result.get("down")) or command_result_failed(result.get("stop"))
 
 
-def agent_task_error_summary(result: dict) -> str | None:
+def agent_task_error_summary(result: dict, _depth: int = 0) -> str | None:
     """从 Agent 任务结果中提取适合展示给用户的失败摘要。"""
 
     for key in ["error", "message", "stderr", "stdout"]:
         value = str(result.get(key) or "").strip()
         if value:
             return value[:500]
+    if _depth >= 12:
+        return None
     for value in result.values():
         if isinstance(value, dict):
-            nested = agent_task_error_summary(value)
+            nested = agent_task_error_summary(value, _depth=_depth + 1)
             if nested:
                 return nested
     return None
+
+
+def validate_agent_result_json(value: Any, *, _depth: int = 0, _budget: list[int] | None = None) -> None:
+    """限制 Agent 结果 JSON 的深度和节点数，避免异常结果耗尽解析/序列化资源。"""
+
+    budget = _budget if _budget is not None else [10000]
+    budget[0] -= 1
+    if budget[0] < 0 or _depth > 16:
+        raise ValueError("agent task result is too deeply nested or too large")
+    if isinstance(value, dict):
+        if len(value) > 2000:
+            raise ValueError("agent task result object has too many fields")
+        for key, child in value.items():
+            if not isinstance(key, str) or len(key) > 256 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in key):
+                raise ValueError("agent task result field name is invalid")
+            validate_agent_result_json(child, _depth=_depth + 1, _budget=budget)
+        return
+    if isinstance(value, list):
+        if len(value) > 2000:
+            raise ValueError("agent task result array has too many items")
+        for child in value:
+            validate_agent_result_json(child, _depth=_depth + 1, _budget=budget)
+        return
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("agent task result string is too large")
+        return
+    if isinstance(value, int) and not isinstance(value, bool):
+        if len(str(abs(value))) > 128:
+            raise ValueError("agent task result integer is too large")
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("agent task result contains a non-finite number")
+    if value is None or isinstance(value, (bool, int, float)):
+        return
+    raise ValueError("agent task result contains an unsupported value")
 
 
 def normalize_agent_task_report(
@@ -1784,7 +2105,8 @@ def normalize_agent_task_report(
 
     if status != "succeeded":
         return status, result
-    interface_id = (task.payload or {}).get("interface_id")
+    task_payload = task.payload if isinstance(task.payload, dict) else {}
+    interface_id = task_payload.get("interface_id")
     interface = db.get(models.WireGuardInterface, interface_id) if interface_id else None
     if interface is None:
         return status, result
@@ -1800,10 +2122,46 @@ def normalize_agent_task_report(
     return status, result
 
 
+def has_newer_interface_state_task(
+    db: Session,
+    interface_id: int,
+    task_id: int,
+    driver: Any,
+) -> bool:
+    """判断状态查询之后是否已有更新的接口状态任务。"""
+
+    return db.scalar(
+        select(models.AgentTask.id).where(
+            models.AgentTask.id > task_id,
+            models.AgentTask.payload["interface_id"].as_integer() == interface_id,
+            models.AgentTask.type.in_([driver.tasks.apply_config, driver.tasks.start, driver.tasks.stop]),
+            models.AgentTask.status != "cancelled",
+        ).limit(1)
+    ) is not None
+
+
+def has_newer_endpoint_state_task(
+    db: Session,
+    endpoint_id: int,
+    task_id: int,
+) -> bool:
+    """判断 GRE 状态查询之后是否已有更新的配置任务。"""
+
+    return db.scalar(
+        select(models.AgentTask.id).where(
+            models.AgentTask.id > task_id,
+            models.AgentTask.payload["connection_endpoint_id"].as_integer() == endpoint_id,
+            models.AgentTask.type.in_([GRE_TASKS.apply_config, GRE_TASKS.start, GRE_TASKS.stop]),
+            models.AgentTask.status != "cancelled",
+        ).limit(1)
+    ) is not None
+
+
 def should_clear_previous_interface_name(db: Session, task: models.AgentTask, result: dict) -> bool:
     """确认旧接口清理链路成功后才清除 previous_interface_name 标记。"""
 
-    previous_interface_name = str((task.payload or {}).get("previous_interface_name") or "").strip()
+    task_payload = task.payload if isinstance(task.payload, dict) else {}
+    previous_interface_name = str(task_payload.get("previous_interface_name") or "").strip()
     if not previous_interface_name:
         return True
     dependency_id = task_dependency_id(task)
@@ -1841,17 +2199,33 @@ def agent_release_dir() -> Path:
 def load_agent_release_manifest() -> dict:
     """读取 Agent release manifest；缺失时返回空 manifest。"""
 
-    manifest_path = agent_release_dir() / "manifest.json"
+    release_root = agent_release_dir()
+    try:
+        reject_symlink_components(release_root)
+    except HTTPException:
+        raise
+    manifest_path = release_root / "manifest.json"
     if not manifest_path.exists():
         return {"latest": None, "minimum_supported": None, "releases": {}}
     try:
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise HTTPException(status_code=500, detail="invalid agent release manifest")
+        if manifest_path.stat().st_size > AGENT_RELEASE_MANIFEST_MAX_BYTES:
+            raise HTTPException(status_code=500, detail="agent release manifest is too large")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="invalid agent release manifest") from exc
+    try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=500, detail="invalid agent release manifest") from exc
     if not isinstance(data, dict):
         raise HTTPException(status_code=500, detail="invalid agent release manifest")
-    data.setdefault("releases", {})
-    return data
+    try:
+        # 在所有使用方之前统一校验路径、摘要、大小和安装模式，避免
+        # download/upgrade-plan 对同一份损坏 manifest 产生不一致行为。
+        return schemas.AgentReleaseManifest.model_validate(data).model_dump(mode="python")
+    except ValidationError as exc:
+        raise HTTPException(status_code=500, detail="invalid agent release manifest") from exc
 
 
 def normalize_agent_arch(value: str | None) -> str | None:
@@ -1870,7 +2244,7 @@ def normalize_agent_arch(value: str | None) -> str | None:
 def agent_platform_candidates(node: models.Node) -> list[str]:
     """根据节点上报平台生成可接受的 release asset key。"""
 
-    platform = node.agent_platform or {}
+    platform = json_object(node.agent_platform)
     os_name = str(platform.get("os") or "linux").lower()
     arch = normalize_agent_arch(str(platform.get("arch") or "")) or "x64"
     glibc = platform.get("glibc")
@@ -1904,6 +2278,26 @@ def select_agent_release_asset(node: models.Node, release: dict) -> tuple[str, d
     return (None, None)
 
 
+def resolve_agent_release_asset_path(asset: dict, *, missing_status: int = 404) -> Path:
+    """解析并检查 release 资产路径，禁止逃逸和符号链接组件。"""
+
+    release_root = agent_release_dir()
+    reject_symlink_components(release_root)
+    relative_path = Path(str(asset.get("path") or ""))
+    path = release_root / relative_path
+    try:
+        path.resolve().relative_to(release_root.resolve())
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid agent release asset path") from exc
+    try:
+        reject_symlink_components(path.parent)
+        if path.is_symlink() or not path.exists() or not path.is_file():
+            raise HTTPException(status_code=missing_status, detail="agent release asset file not found")
+    except OSError as exc:
+        raise HTTPException(status_code=missing_status, detail="agent release asset file not found") from exc
+    return path
+
+
 def controller_url_for_agent(db: Session) -> str:
     """返回 Agent 访问主控时应使用的 URL。"""
 
@@ -1918,7 +2312,7 @@ def build_agent_manual_upgrade_command(node: models.Node, target_version: str | 
         "LINK42_RES_BASE_URL": settings.agent_res_base_url,
     }
     env_parts = [f"{key}={shlex.quote(value)}" for key, value in env_values.items()]
-    privilege_prefix = "" if str((node.agent_platform or {}).get("service_manager") or "") == "openwrt-uci" else "sudo "
+    privilege_prefix = "" if str(json_object(node.agent_platform).get("service_manager") or "") == "openwrt-uci" else "sudo "
     return f"curl -fsSL {shlex.quote(settings.agent_install_script_url)} | {privilege_prefix}env {' '.join(env_parts)} sh"
 
 
@@ -1993,6 +2387,29 @@ def build_agent_upgrade_plan(
             target_version=selected_version,
             upgrade_mode="manual",
             reason="主控没有匹配该节点平台的 Agent 资产",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    expected_install_mode = "source" if node_uses_openwrt_uci(node) else "binary"
+    if str(asset.get("install_mode") or "binary") != expected_install_mode:
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="manual",
+            reason="主控发布资产与节点服务后端不匹配",
+            manual_command=manual_command,
+            status=node.agent_update_status,
+        )
+    try:
+        resolve_agent_release_asset_path(asset)
+    except HTTPException:
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="manual",
+            reason="主控缺少目标版本 Agent 资产文件",
             manual_command=manual_command,
             status=node.agent_update_status,
         )
@@ -2077,7 +2494,7 @@ def require_mimic_ip(value: str, field_name: str) -> str:
 def managed_link_middleware(interface: models.WireGuardInterface) -> dict | None:
     """读取受管连接绑定的中间层配置。"""
 
-    middleware = (interface.extras or {}).get("middleware")
+    middleware = json_object(interface.extras).get("middleware")
     return middleware if isinstance(middleware, dict) and middleware.get("enabled") else None
 
 
@@ -2169,7 +2586,7 @@ def parse_kernel_major_minor(value: object) -> tuple[int, int]:
 def node_supports_mimic_platform(node: models.Node) -> tuple[bool, str | None]:
     """判断节点平台是否满足 mimic 的系统、init 和内核要求。"""
 
-    platform = node.agent_platform or {}
+    platform = json_object(node.agent_platform)
     if platform.get("is_openwrt") or node_uses_openwrt_uci(node):
         return False, "mimic is not supported on OpenWrt nodes"
     if str(platform.get("os") or "linux").lower() != "linux":
@@ -2530,14 +2947,40 @@ def enqueue_middleware_cleanup_tasks(
 
     if not old_middleware or old_middleware == new_middleware:
         return
-    for action in ["stop", "delete"]:
-        for interface, task_type, payload in middleware_task_payloads(
-            old_middleware,
-            local_interface,
-            peer_interface,
-            action,
-        ):
-            enqueue_interface_task_once(db, interface, task_type, payload)
+    stop_tasks: dict[int, models.AgentTask] = {}
+    for interface, task_type, payload in middleware_task_payloads(
+        old_middleware,
+        local_interface,
+        peer_interface,
+        "stop",
+    ):
+        _, stop_task = enqueue_interface_task_once_with_task(
+            db,
+            interface,
+            task_type,
+            payload,
+            update_pending_payload=True,
+        )
+        if stop_task is not None:
+            stop_tasks[interface.id] = stop_task
+    for interface, task_type, payload in middleware_task_payloads(
+        old_middleware,
+        local_interface,
+        peer_interface,
+        "delete",
+    ):
+        dependency = stop_tasks.get(interface.id)
+        delete_payload = {**payload}
+        if dependency is not None:
+            delete_payload["depends_on_task_id"] = dependency.id
+            delete_payload["continue_after_dependency_failure"] = True
+        enqueue_interface_task_once(
+            db,
+            interface,
+            task_type,
+            delete_payload,
+            update_pending_payload=True,
+        )
 
 
 def middleware_task_payloads(
@@ -2605,7 +3048,7 @@ def imported_secret_ref(value: str | None) -> str | None:
 def set_extra_value(model: models.WireGuardInterface | models.WireGuardPeer, key: str, value: str | None) -> None:
     """在 JSON extras 中保存可选扩展字段，空值会清理旧值。"""
 
-    extras = dict(model.extras or {})
+    extras = json_object(model.extras).copy()
     cleaned = value.strip() if value else None
     if cleaned:
         extras[key] = cleaned
@@ -2617,7 +3060,7 @@ def set_extra_value(model: models.WireGuardInterface | models.WireGuardPeer, key
 def set_extra_object(model: models.WireGuardInterface | models.WireGuardPeer, key: str, value: dict | None) -> None:
     """在 JSON extras 中保存对象扩展字段。"""
 
-    extras = dict(model.extras or {})
+    extras = json_object(model.extras).copy()
     if value:
         extras[key] = value
     else:
@@ -2630,7 +3073,7 @@ def record_interface_rename(interface: models.WireGuardInterface, next_name: str
 
     if interface.name == next_name:
         return
-    previous_name = (interface.extras or {}).get("previous_interface_name")
+    previous_name = json_object(interface.extras).get("previous_interface_name")
     if previous_name == next_name:
         set_extra_value(interface, "previous_interface_name", None)
         return
@@ -2708,9 +3151,11 @@ def summarize_monitor(
         db.scalars(
             select(models.LinkMonitorSample)
             .where(models.LinkMonitorSample.monitor_id == monitor.id, models.LinkMonitorSample.checked_at >= since)
-            .order_by(models.LinkMonitorSample.checked_at)
+            .order_by(models.LinkMonitorSample.checked_at.desc())
+            .limit(LINK_MONITOR_SAMPLE_LIMIT)
         )
     )
+    samples.sort(key=lambda sample: sample.checked_at)
     sample_count = len(samples)
     if not samples:
         return schemas.LinkMonitorSummary(
@@ -2814,7 +3259,7 @@ def connection_endpoint_read(db: Session, endpoint: models.ConnectionEndpoint) -
     """把数据库连接端点转成通用 API 响应。"""
 
     monitor = connection_endpoint_monitor(db, endpoint.id)
-    extras = endpoint.extras or {}
+    extras = json_object(endpoint.extras)
     return schemas.ConnectionEndpointRead(
         id=endpoint.id,
         endpoint_ref=connection_endpoint_ref(endpoint),
@@ -2826,7 +3271,7 @@ def connection_endpoint_read(db: Session, endpoint: models.ConnectionEndpoint) -
         mtu=endpoint.mtu,
         routes=endpoint.routes or [],
         runtime_status=endpoint.runtime_status,
-        protocol_config=endpoint.protocol_config or {},
+        protocol_config=json_object(endpoint.protocol_config),
         last_error=str(extras.get("last_error") or "").strip() or None,
         monitor_summary=summarize_monitor(db, monitor) if monitor else None,
     )
@@ -2851,9 +3296,9 @@ def gre_connection_read(db: Session, connection: models.Connection) -> schemas.C
     endpoints = sorted(connection.endpoints, key=lambda endpoint: 0 if endpoint.role == "local" else 1)
     manual_connection = len(endpoints) == 1
     endpoint_errors = [
-        f"{endpoint.node.name if endpoint.node else endpoint.interface_name}: {str((endpoint.extras or {}).get('last_error') or '').strip()}"
+        f"{endpoint.node.name if endpoint.node else endpoint.interface_name}: {str(json_object(endpoint.extras).get('last_error') or '').strip()}"
         for endpoint in endpoints
-        if str((endpoint.extras or {}).get("last_error") or "").strip()
+        if str(json_object(endpoint.extras).get("last_error") or "").strip()
     ]
     return schemas.ConnectionRead(
         id=connection.id,
@@ -3031,7 +3476,7 @@ def manual_gre_protocol_config(
 def gre_task_payload(endpoint: models.ConnectionEndpoint) -> dict[str, Any]:
     """把 GRE 端点转换为 Agent 任务 payload。"""
 
-    previous_interface_name = str((endpoint.extras or {}).get("previous_interface_name") or "").strip()
+    previous_interface_name = str(json_object(endpoint.extras).get("previous_interface_name") or "").strip()
     payload = {
         "node_id": endpoint.node_id,
         "connection_id": endpoint.connection_id,
@@ -3040,7 +3485,7 @@ def gre_task_payload(endpoint: models.ConnectionEndpoint) -> dict[str, Any]:
         "tunnel_ips": endpoint.tunnel_ips or [],
         "routes": endpoint.routes or [],
         "mtu": endpoint.mtu,
-        **(endpoint.protocol_config or {}),
+        **json_object(endpoint.protocol_config),
     }
     if previous_interface_name and previous_interface_name != endpoint.interface_name:
         payload["previous_interface_name"] = previous_interface_name
@@ -3052,6 +3497,9 @@ def create_connection_endpoint_task(
     endpoint: models.ConnectionEndpoint,
     task_type: str,
     payload_extra: dict | None = None,
+    *,
+    update_pending_payload: bool = False,
+    queue_after_running: bool = False,
 ) -> models.AgentTask:
     """创建通用连接端点 Agent 任务。"""
 
@@ -3061,9 +3509,65 @@ def create_connection_endpoint_task(
     payload = gre_task_payload(endpoint)
     if payload_extra:
         payload.update(payload_extra)
+    existing = db.scalar(
+        select(models.AgentTask)
+        .where(
+            models.AgentTask.type == task_type,
+            models.AgentTask.status == "pending",
+            models.AgentTask.payload["connection_endpoint_id"].as_integer() == endpoint.id,
+        )
+        .order_by(models.AgentTask.id)
+    )
+    if existing is not None:
+        if not update_pending_payload:
+            return existing
+        refreshed = db.execute(
+            update(models.AgentTask)
+            .where(models.AgentTask.id == existing.id, models.AgentTask.status == "pending")
+            .values(payload=payload)
+            .execution_options(synchronize_session="fetch")
+        )
+        if refreshed.rowcount == 1:
+            return existing
+        db.refresh(existing)
+    running = db.scalar(
+        select(models.AgentTask)
+        .where(
+            models.AgentTask.type == task_type,
+            models.AgentTask.status == "running",
+            models.AgentTask.payload["connection_endpoint_id"].as_integer() == endpoint.id,
+        )
+        .order_by(models.AgentTask.id.desc())
+    )
+    if running is not None:
+        if not queue_after_running:
+            return running
+        payload.setdefault("depends_on_task_id", running.id)
     task = models.AgentTask(node_id=endpoint.node_id, type=task_type, payload=payload)
-    db.add(task)
-    db.flush()
+    task.dedup_key = f"endpoint:{endpoint.id}:{task_type}"
+    try:
+        with db.begin_nested():
+            db.add(task)
+            db.flush()
+    except IntegrityError:
+        existing = db.scalar(
+            select(models.AgentTask)
+            .where(
+                models.AgentTask.dedup_key == f"endpoint:{endpoint.id}:{task_type}",
+                models.AgentTask.status == "pending",
+            )
+            .order_by(models.AgentTask.id)
+        )
+        if existing is None:
+            raise
+        if update_pending_payload:
+            db.execute(
+                update(models.AgentTask)
+                .where(models.AgentTask.id == existing.id, models.AgentTask.status == "pending")
+                .values(payload=payload)
+                .execution_options(synchronize_session="fetch")
+            )
+        return existing
     logger.info("创建连接端点任务 task=%s", summarize_agent_task(task))
     return task
 
@@ -3071,20 +3575,85 @@ def create_connection_endpoint_task(
 def enqueue_gre_apply_and_start(db: Session, endpoint: models.ConnectionEndpoint) -> None:
     """为 GRE 端点下发部署并启动任务。"""
 
-    apply_task = create_connection_endpoint_task(db, endpoint, GRE_TASKS.apply_config)
+    # 已领取任务的 payload 是执行快照；编辑时更新待执行任务或在其后排队，
+    # 不能复用旧 apply/start 后仅保存数据库期望状态。
+    running = db.scalar(
+        select(models.AgentTask)
+        .where(
+            models.AgentTask.payload["connection_endpoint_id"].as_integer() == endpoint.id,
+            models.AgentTask.status == "running",
+            models.AgentTask.type.in_([GRE_TASKS.apply_config, GRE_TASKS.start, GRE_TASKS.stop]),
+        )
+        .order_by(models.AgentTask.id.desc())
+    )
+    apply_task = create_connection_endpoint_task(
+        db, endpoint, GRE_TASKS.apply_config,
+        {"depends_on_task_id": running.id} if running is not None else None,
+        update_pending_payload=True, queue_after_running=True,
+    )
     create_connection_endpoint_task(
         db,
         endpoint,
         GRE_TASKS.start,
         {"depends_on_task_id": apply_task.id},
+        update_pending_payload=True, queue_after_running=True,
     )
     endpoint.runtime_status = "starting"
+
+
+def cancel_pending_gre_deployment_tasks(db: Session, endpoint_id: int) -> int:
+    """停止或删除时取消尚未领取的 GRE 部署链，避免旧任务重新拉起接口。"""
+
+    tasks = list(
+        db.scalars(
+            select(models.AgentTask).where(
+                models.AgentTask.payload["connection_endpoint_id"].as_integer() == endpoint_id,
+                models.AgentTask.type.in_([GRE_TASKS.apply_config, GRE_TASKS.start]),
+                models.AgentTask.status == "pending",
+            )
+        )
+    )
+    affected_plan_ids = {task.change_plan_id for task in tasks if task.change_plan_id is not None}
+    cancelled = db.execute(
+        update(models.AgentTask)
+        .where(
+            models.AgentTask.payload["connection_endpoint_id"].as_integer() == endpoint_id,
+            models.AgentTask.type.in_([GRE_TASKS.apply_config, GRE_TASKS.start]),
+            models.AgentTask.status == "pending",
+        )
+        .values(
+            status="cancelled",
+            finished_at=datetime.utcnow(),
+            result={"reason": "GRE deployment superseded by stop or delete"},
+        )
+        .execution_options(synchronize_session="fetch")
+    )
+    for plan_id in affected_plan_ids:
+        plan = db.get(models.ChangePlan, plan_id)
+        if plan is not None:
+            update_change_plan_task_status(db, plan)
+    return cancelled.rowcount
+
+
+def running_gre_deployment_task_id(db: Session, endpoint_id: int) -> int | None:
+    """返回端点当前正在执行的部署或启动任务，供停止任务建立顺序依赖。"""
+
+    task = db.scalar(
+        select(models.AgentTask)
+        .where(
+            models.AgentTask.payload["connection_endpoint_id"].as_integer() == endpoint_id,
+            models.AgentTask.type.in_([GRE_TASKS.apply_config, GRE_TASKS.start]),
+            models.AgentTask.status == "running",
+        )
+        .order_by(models.AgentTask.id.desc())
+    )
+    return task.id if task is not None else None
 
 
 def set_endpoint_extra_value(endpoint: models.ConnectionEndpoint, key: str, value: str | None) -> None:
     """在连接端点 extras 中写入或清理字符串值。"""
 
-    extras = dict(endpoint.extras or {})
+    extras = json_object(endpoint.extras).copy()
     cleaned = value.strip() if value else None
     if cleaned:
         extras[key] = cleaned
@@ -3096,7 +3665,8 @@ def set_endpoint_extra_value(endpoint: models.ConnectionEndpoint, key: str, valu
 def gre_previous_config_cleanup_confirmed(task: models.AgentTask, result: dict) -> bool:
     """判断 GRE 启动任务是否已经确认清理过旧接口配置。"""
 
-    previous_interface_name = str((task.payload or {}).get("previous_interface_name") or "").strip()
+    task_payload = task.payload if isinstance(task.payload, dict) else {}
+    previous_interface_name = str(task_payload.get("previous_interface_name") or "").strip()
     if not previous_interface_name:
         return True
     cleanup = result.get("previous_config_cleanup")
@@ -3110,7 +3680,7 @@ def record_endpoint_rename(endpoint: models.ConnectionEndpoint, next_name: str) 
 
     if endpoint.interface_name == next_name:
         return
-    previous_name = (endpoint.extras or {}).get("previous_interface_name")
+    previous_name = json_object(endpoint.extras).get("previous_interface_name")
     if previous_name == next_name:
         set_endpoint_extra_value(endpoint, "previous_interface_name", None)
         return
@@ -3228,7 +3798,7 @@ def build_topology(db: Session) -> schemas.TopologyRead:
                 endpoint_ips=node.endpoint_ips or [],
                 topology_endpoint=node.topology_endpoint,
                 agent_version=node.agent_version,
-                agent_platform=node.agent_platform or {},
+                agent_platform=json_object(node.agent_platform),
                 topology_x=node.topology_x,
                 topology_y=node.topology_y,
                 topology_locked=bool(node.topology_locked),
@@ -3338,7 +3908,7 @@ def set_unique_peer(
         set_extra_value(existing_peer, "custom_config", payload.peer_custom_config)
         for extra_peer in existing_peers[1:]:
             db.delete(extra_peer)
-        db.commit()
+        commit_unique_or_conflict(db, "wireguard peer already exists")
         db.refresh(existing_peer)
         return existing_peer
 
@@ -3355,7 +3925,7 @@ def set_unique_peer(
     )
     set_extra_value(peer, "custom_config", payload.peer_custom_config)
     db.add(peer)
-    db.commit()
+    commit_unique_or_conflict(db, "wireguard peer already exists")
     db.refresh(peer)
     return peer
 
@@ -3399,6 +3969,12 @@ def create_interface_task(
         type=task_type,
         payload=payload,
     )
+
+
+def interface_task_dedup_key(interface_id: int, task_type: str) -> str:
+    """返回接口任务的数据库级幂等键。"""
+
+    return f"interface:{interface_id}:{task_type}"
 
 
 def get_interface_task(
@@ -3472,10 +4048,59 @@ def enqueue_interface_task_once_with_task(
     if node is not None:
         require_task_supported(node, task_type)
     task = create_interface_task(interface, task_type, payload_extra=payload_extra)
-    db.add(task)
-    db.flush()
+    # 查询后再插入无法阻止并发请求同时看到空结果；数据库部分唯一索引负责最终仲裁。
+    # 索引仅约束 pending；queue_after_running 允许跟在运行中任务后再排队一次。
+    task.dedup_key = interface_task_dedup_key(interface.id, task_type)
+    try:
+        with db.begin_nested():
+            db.add(task)
+            db.flush()
+    except IntegrityError:
+        # 只有幂等键冲突才应走这里；其它约束错误继续抛出，避免吞掉真实数据错误。
+        if not task.dedup_key:
+            raise
+        existing = get_interface_task(db, interface.id, task_type, ["pending", "running"])
+        if existing is None:
+            raise
+        if update_pending_payload and existing.status == "pending":
+            existing.payload = task.payload
+            return True, existing
+        logger.debug("并发请求复用已创建接口任务 task=%s", summarize_agent_task(existing))
+        return False, existing
     logger.info("创建接口任务 task=%s", summarize_agent_task(task))
     return True, task
+
+
+def cancel_pending_interface_deployment_tasks(db: Session, interface: models.WireGuardInterface) -> int:
+    """停止或删除时取消接口尚未领取的 apply/start 任务。"""
+
+    cancelled = 0
+    driver = connection_driver_for_interface(interface)
+    for task_type in [driver.tasks.apply_config, driver.tasks.start]:
+        cancelled += cancel_pending_interface_tasks(
+            db,
+            interface.id,
+            task_type,
+            "interface deployment superseded by stop or delete",
+        )
+    return cancelled
+
+
+def running_interface_deployment_task_id(db: Session, interface: models.WireGuardInterface) -> int | None:
+    """返回接口当前运行中的 apply/start 任务，供停止任务建立依赖。"""
+
+    driver = connection_driver_for_interface(interface)
+    task = db.scalar(
+        select(models.AgentTask)
+        .where(
+            models.AgentTask.node_id == interface.node_id,
+            models.AgentTask.type.in_([driver.tasks.apply_config, driver.tasks.start]),
+            models.AgentTask.status == "running",
+            models.AgentTask.payload["interface_id"].as_integer() == interface.id,
+        )
+        .order_by(models.AgentTask.id.desc())
+    )
+    return task.id if task is not None else None
 
 
 def cancel_pending_interface_tasks(
@@ -3498,13 +4123,26 @@ def cancel_pending_interface_tasks(
             .order_by(models.AgentTask.id)
         )
     )
+    cancelled = 0
+    affected_plan_ids: set[int] = set()
     for task in tasks:
-        task.status = "cancelled"
-        task.result = {"status": "cancelled", "reason": reason}
-        task.finished_at = now
-    if tasks:
-        logger.info("取消待执行接口任务 interface_id=%s task_type=%s count=%d reason=%s", interface_id, task_type, len(tasks), reason)
-    return len(tasks)
+        updated = db.execute(
+            update(models.AgentTask)
+            .where(models.AgentTask.id == task.id, models.AgentTask.status == "pending")
+            .values(status="cancelled", result={"status": "cancelled", "reason": reason}, finished_at=now)
+            .execution_options(synchronize_session="fetch")
+        )
+        if updated.rowcount:
+            cancelled += int(updated.rowcount)
+            if task.change_plan_id is not None:
+                affected_plan_ids.add(task.change_plan_id)
+    for plan_id in affected_plan_ids:
+        plan = db.get(models.ChangePlan, plan_id)
+        if plan is not None:
+            update_change_plan_task_status(db, plan)
+    if cancelled:
+        logger.info("取消待执行接口任务 interface_id=%s task_type=%s count=%d reason=%s", interface_id, task_type, cancelled, reason)
+    return cancelled
 
 
 def mark_import_candidate_available_for_interface(
@@ -3528,6 +4166,20 @@ def mark_import_candidate_available_for_interface(
     return True
 
 
+def cancel_draft_interface_change_plans(db: Session, interface_id: int) -> None:
+    """删除接口时作废草稿，避免 SQLite 复用 ID 后旧计划误关联新接口。"""
+
+    db.execute(
+        update(models.ChangePlan)
+        .where(
+            models.ChangePlan.status == "draft",
+            models.ChangePlan.payload["task_payload"]["interface_id"].as_integer() == interface_id,
+        )
+        .values(status="cancelled")
+        .execution_options(synchronize_session="fetch")
+    )
+
+
 def existing_interface_names(db: Session, node_id: int) -> set[str]:
     """返回节点下已存在的 WireGuard 接口名，用于排除重复导入候选。"""
 
@@ -3536,6 +4188,129 @@ def existing_interface_names(db: Session, node_id: int) -> set[str]:
             select(models.WireGuardInterface.name).where(models.WireGuardInterface.node_id == node_id)
         )
     )
+
+
+def normalize_import_candidate_parsed(value: Any) -> dict[str, Any] | None:
+    """验证并限制 Agent 返回的导入候选结构。
+
+    Agent 结果经过 token 鉴权仍属于外部输入；导入接口不能假设其中的
+    ``peers``、地址列表或整数始终符合解析器输出，否则一个损坏结果就能
+    让候选导入路径抛出 500 或写入不可渲染的数据。
+    """
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        if not isinstance(value.get("name"), str):
+            return None
+        name = schemas._validate_linux_interface_name(value["name"])
+        private_key = value.get("private_key")
+        if private_key is not None:
+            private_key = schemas._validate_wireguard_key(private_key, "WireGuard private key")
+
+        def text_list(key: str, max_items: int = 128, max_length: int = 4096) -> list[str]:
+            items = value.get(key, [])
+            if not isinstance(items, list) or len(items) > max_items:
+                raise ValueError(f"invalid import candidate {key}")
+            normalized: list[str] = []
+            for item in items:
+                if not isinstance(item, str) or len(item) > max_length or any(ord(char) < 0x20 or ord(char) == 0x7F for char in item):
+                    raise ValueError(f"invalid import candidate {key}")
+                normalized.append(item)
+            return normalized
+
+        addresses = schemas._validate_cidrs(text_list("addresses", max_length=128))
+        dns = text_list("dns", max_length=255)
+        pre_up = text_list("pre_up")
+        post_up = text_list("post_up")
+        pre_down = text_list("pre_down")
+        post_down = text_list("post_down")
+
+        def optional_int(key: str, minimum: int, maximum: int) -> int | None:
+            raw = value.get(key)
+            if raw is None:
+                return None
+            if isinstance(raw, bool) or not isinstance(raw, int) or not minimum <= raw <= maximum:
+                raise ValueError(f"invalid import candidate {key}")
+            return raw
+
+        listen_port = optional_int("listen_port", 1, 65535)
+        mtu = optional_int("mtu", 576, 9000)
+        table = value.get("table")
+        fwmark = value.get("fwmark")
+        if table is not None and (not isinstance(table, str) or len(table) > 64 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in table)):
+            raise ValueError("invalid import candidate table")
+        if fwmark is not None and (not isinstance(fwmark, str) or len(fwmark) > 64 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in fwmark)):
+            raise ValueError("invalid import candidate fwmark")
+
+        peers_value = value.get("peers", [])
+        if not isinstance(peers_value, list) or len(peers_value) > 128:
+            raise ValueError("invalid import candidate peers")
+        peers: list[dict[str, Any]] = []
+        for peer in peers_value:
+            if not isinstance(peer, dict):
+                raise ValueError("invalid import candidate peer")
+            public_key = peer.get("public_key")
+            if public_key is not None:
+                public_key = schemas._validate_wireguard_key(public_key, "WireGuard public key")
+            preshared_key = peer.get("preshared_key")
+            if preshared_key is not None:
+                preshared_key = schemas._validate_wireguard_key(preshared_key, "WireGuard preshared key")
+            allowed_ips_value = peer.get("allowed_ips", [])
+            if not isinstance(allowed_ips_value, list) or len(allowed_ips_value) > 256:
+                raise ValueError("invalid import candidate allowed_ips")
+            if any(not isinstance(item, str) for item in allowed_ips_value):
+                raise ValueError("invalid import candidate allowed_ips")
+            allowed_ips = schemas._validate_cidrs(allowed_ips_value)
+            endpoint = peer.get("endpoint")
+            if endpoint is not None:
+                if not isinstance(endpoint, str) or len(endpoint) > 255 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in endpoint):
+                    raise ValueError("invalid import candidate endpoint")
+                host, port = split_endpoint(endpoint)
+                if host is not None:
+                    schemas._validate_endpoint_host(host)
+                if port is not None and not 1 <= port <= 65535:
+                    raise ValueError("invalid import candidate endpoint port")
+            else:
+                host, port = None, None
+            keepalive = peer.get("persistent_keepalive")
+            if keepalive is not None and (isinstance(keepalive, bool) or not isinstance(keepalive, int) or not 0 <= keepalive <= 65535):
+                raise ValueError("invalid import candidate keepalive")
+            peer_warnings = peer.get("warnings", [])
+            if not isinstance(peer_warnings, list) or any(not isinstance(item, str) or len(item) > 500 for item in peer_warnings[:100]):
+                raise ValueError("invalid import candidate warnings")
+            peers.append({
+                "public_key": public_key,
+                "preshared_key": preshared_key,
+                "allowed_ips": allowed_ips,
+                "endpoint": endpoint,
+                "persistent_keepalive": keepalive,
+                "extras": peer.get("extras") if isinstance(peer.get("extras"), dict) else {},
+                "warnings": peer_warnings[:100],
+            })
+        warnings = value.get("warnings", [])
+        if not isinstance(warnings, list) or any(not isinstance(item, str) or len(item) > 500 for item in warnings[:100]):
+            raise ValueError("invalid import candidate warnings")
+        extras = value.get("extras") if isinstance(value.get("extras"), dict) else {}
+        return {
+            "name": name,
+            "private_key": private_key,
+            "addresses": addresses,
+            "listen_port": listen_port,
+            "dns": dns,
+            "mtu": mtu,
+            "table": table,
+            "fwmark": fwmark,
+            "pre_up": pre_up,
+            "post_up": post_up,
+            "pre_down": pre_down,
+            "post_down": post_down,
+            "extras": extras,
+            "warnings": warnings[:100],
+            "peers": peers,
+        }
+    except (TypeError, ValueError):
+        return None
 
 
 def should_offer_import_candidate(
@@ -3597,7 +4372,7 @@ def enqueue_apply_config(
     """幂等下发某个受管接口配置。"""
 
     driver = connection_driver_for_interface(interface)
-    previous_interface_name = str((interface.extras or {}).get("previous_interface_name") or "").strip()
+    previous_interface_name = str(json_object(interface.extras).get("previous_interface_name") or "").strip()
     if previous_interface_name and previous_interface_name != interface.name:
         logger.info(
             "接口改名部署将先清理旧接口 node_id=%s interface_id=%s previous=%s current=%s",
@@ -3679,11 +4454,32 @@ def queue_replace_interface(db: Session, interface: models.WireGuardInterface) -
     """替换旧配置时先请求 Agent 停止并删除节点文件，再删除数据库记录。"""
 
     driver = connection_driver_for_interface(interface)
-    enqueue_interface_task_once(db, interface, driver.tasks.stop)
+    cancel_pending_interface_deployment_tasks(db, interface)
+    running_id = running_interface_deployment_task_id(db, interface)
+    stop_payload = (
+        {"depends_on_task_id": running_id, "continue_after_dependency_failure": True}
+        if running_id is not None
+        else None
+    )
+    _, stop_task = enqueue_interface_task_once_with_task(
+        db,
+        interface,
+        driver.tasks.stop,
+        payload_extra=stop_payload,
+        update_pending_payload=True,
+    )
     if should_delete_node_config_file(interface):
-        enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
+        delete_payload = {"depends_on_task_id": stop_task.id} if stop_task is not None else None
+        enqueue_interface_task_once(
+            db,
+            interface,
+            driver.tasks.delete_config,
+            payload_extra=delete_payload,
+            update_pending_payload=True,
+        )
     mark_import_candidate_available_for_interface(db, interface)
     delete_link_monitors_where(db, models.LinkMonitor.interface_id == interface.id)
+    cancel_draft_interface_change_plans(db, interface.id)
     db.delete(interface)
 
 
@@ -3760,12 +4556,18 @@ def run_wg_text(args: list[str], input_text: str | None = None) -> str:
             check=False,
             text=True,
             capture_output=True,
+            timeout=10,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail="wireguard tool is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=500, detail="wireguard tool timed out") from exc
     if completed.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"wireguard tool failed: {completed.stderr.strip()}")
-    return completed.stdout.strip()
+        raise HTTPException(status_code=500, detail="wireguard tool failed")
+    output = completed.stdout or ""
+    if len(output.encode("utf-8", errors="replace")) > 4096:
+        raise HTTPException(status_code=500, detail="wireguard tool returned too much output")
+    return output.strip()
 
 
 def generate_wireguard_keypair() -> tuple[str, str]:
@@ -3930,22 +4732,44 @@ async def upload_site_logo(
     if not data:
         raise HTTPException(status_code=400, detail="logo file is required")
     suffix = detect_logo_extension(request.headers.get("content-type", ""), data)
+    # 等待其他 worker 的文件锁或数据库提交时不占住事件循环。
+    return await run_in_threadpool(store_site_logo, data, suffix, db)
+
+
+def store_site_logo(data: bytes, suffix: str, db: Session) -> schemas.ControllerSettingsRead:
+    """原子替换 Logo，并在同一跨进程临界区提交品牌 URL。"""
+
     logo_dir = Path(settings.config_dir) / "branding"
+    reject_symlink_components(logo_dir)
     logo_dir.mkdir(parents=True, exist_ok=True)
-    for stale_suffix in ["png", "jpg", "webp"]:
-        stale_path = logo_dir / f"logo.{stale_suffix}"
-        if stale_path.exists():
-            stale_path.unlink()
-    target = logo_dir / f"logo.{suffix}"
-    target.write_bytes(data)
-    set_setting(db, SETTING_SITE_LOGO_URL, f"/branding/logo?v={time.time_ns()}")
-    db.commit()
-    return schemas.ControllerSettingsRead(
-        controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "",
-        username=admin_username(db),
-        site_title=get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE,
-        site_logo_url=get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL,
-    )
+    reject_symlink_components(logo_dir)
+    with branding_logo_lock(logo_dir):
+        target = logo_dir / f"logo.{suffix}"
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f".{target.name}.", suffix=".tmp", dir=logo_dir, delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(data)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, target)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        for stale_suffix in ["png", "jpg", "webp"]:
+            if stale_suffix != suffix:
+                (logo_dir / f"logo.{stale_suffix}").unlink(missing_ok=True)
+        set_setting(db, SETTING_SITE_LOGO_URL, f"/branding/logo?v={time.time_ns()}")
+        db.commit()
+        return schemas.ControllerSettingsRead(
+            controller_url=get_setting(db, SETTING_CONTROLLER_URL) or "",
+            username=admin_username(db),
+            site_title=get_setting(db, SETTING_SITE_TITLE) or DEFAULT_SITE_TITLE,
+            site_logo_url=get_setting(db, SETTING_SITE_LOGO_URL) or DEFAULT_SITE_LOGO_URL,
+        )
 
 
 @app.get("/api/agent/releases", response_model=schemas.AgentReleaseManifest)
@@ -3966,13 +4790,7 @@ def download_agent_release(version: str, platform: str) -> FileResponse:
     asset = (release.get("assets") or {}).get(platform)
     if not isinstance(asset, dict):
         raise HTTPException(status_code=404, detail="agent release asset not found")
-    path = agent_release_dir() / str(asset.get("path") or "")
-    try:
-        path.resolve().relative_to(agent_release_dir().resolve())
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="invalid agent release asset path") from exc
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="agent release asset file not found")
+    path = resolve_agent_release_asset_path(asset)
     return FileResponse(path, filename=path.name)
 
 
@@ -3987,6 +4805,9 @@ def agent_release_sha256(version: str, platform: str) -> dict[str, str]:
     asset = (release.get("assets") or {}).get(platform)
     if not isinstance(asset, dict) or not asset.get("sha256"):
         raise HTTPException(status_code=404, detail="agent release asset not found")
+    # hash 接口与下载接口必须针对同一份实际存在的普通文件作答，避免
+    # manifest 指向丢失/链接文件时返回看似可信但不可下载的摘要。
+    resolve_agent_release_asset_path(asset)
     return {"sha256": str(asset["sha256"])}
 
 
@@ -4038,6 +4859,7 @@ def request_agent_upgrade(
     task = models.AgentTask(
         node_id=node_id,
         type="agent.self_upgrade",
+        dedup_key=f"node:{node_id}:agent.self_upgrade",
         payload={
             "target_version": plan.target_version,
             "download_url": (
@@ -4052,7 +4874,22 @@ def request_agent_upgrade(
             "rollback": True,
         },
     )
-    db.add(task)
+    try:
+        with db.begin_nested():
+            db.add(task)
+            db.flush()
+    except IntegrityError:
+        active = db.scalar(
+            select(models.AgentTask).where(
+                models.AgentTask.node_id == node_id,
+                models.AgentTask.type == "agent.self_upgrade",
+                models.AgentTask.status.in_(["pending", "running"]),
+            )
+        )
+        if active is None:
+            raise
+        logger.info("并发请求复用 Agent 升级任务 node_id=%s task=%s", node_id, summarize_agent_task(active))
+        return schemas.TaskRequestResult(task_id=active.id, status=active.status, message="升级任务已存在")
     node.agent_update_status = "queued"
     node.agent_last_error = None
     db.commit()
@@ -4088,7 +4925,7 @@ def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> s
         agent_token_hash=hash_token(token),
     )
     db.add(node)
-    db.commit()
+    commit_unique_or_conflict(db, "node name already exists")
     db.refresh(node)
     logger.info("创建节点 node_id=%s name=%s region=%s", node.id, node.name, node.region)
     return schemas.NodeCreateResult(node=node, agent_token=token)
@@ -4119,7 +4956,7 @@ def update_node(
     node.endpoint_ips = payload.endpoint_ips
     node.topology_endpoint = (payload.topology_endpoint or "").strip() or (payload.endpoint_ips[0] if payload.endpoint_ips else None)
     node.github_proxy_url = payload.github_proxy_url
-    db.commit()
+    commit_unique_or_conflict(db, "node name already exists")
     db.refresh(node)
     logger.info("更新节点 node_id=%s name=%s region=%s endpoint_count=%d", node.id, node.name, node.region, len(node.endpoint_ips or []))
     return node
@@ -4267,10 +5104,10 @@ def create_managed_connection(
         protocol_config=gre_protocol_config(outer["peer_bind_ip"], outer["peer_remote_ip"], payload),
     )
     db.add_all([connection, local_endpoint, peer_endpoint])
-    db.flush()
+    flush_unique_or_conflict(db, "interface name already exists on node")
     enqueue_gre_apply_and_start(db, local_endpoint)
     enqueue_gre_apply_and_start(db, peer_endpoint)
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     db.refresh(connection)
     logger.info(
         "创建 GRE 连接 connection_id=%s local_endpoint_id=%s peer_endpoint_id=%s",
@@ -4316,9 +5153,9 @@ def create_manual_connection(
         protocol_config=manual_gre_protocol_config(payload),
     )
     db.add_all([connection, endpoint])
-    db.flush()
+    flush_unique_or_conflict(db, "interface name already exists on node")
     enqueue_gre_apply_and_start(db, endpoint)
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     logger.info("创建手动 GRE 连接 connection_id=%s endpoint_id=%s node_id=%s", connection.id, endpoint.id, node_id)
     return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
 
@@ -4386,7 +5223,7 @@ def update_connection(
     connection.status = "starting"
     enqueue_gre_apply_and_start(db, local_endpoint)
     enqueue_gre_apply_and_start(db, peer_endpoint)
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     logger.info("更新 GRE 连接 connection_id=%s", connection.id)
     return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
 
@@ -4428,7 +5265,7 @@ def update_manual_connection(
         connection.name = f"{payload.interface_name} -> {payload.peer_interface_name}"
     connection.status = "starting"
     enqueue_gre_apply_and_start(db, endpoint)
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     logger.info("更新手动 GRE 连接 connection_id=%s endpoint_id=%s", connection.id, endpoint.id)
     return gre_connection_read(db, get_gre_connection_or_404(db, connection.id))
 
@@ -4443,7 +5280,7 @@ def start_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> 
     connection = get_gre_connection_or_404(db, item_id)
     for endpoint in connection.endpoints:
         node = require_online_node(db, endpoint.node_id)
-        outer_local_ip = str((endpoint.protocol_config or {}).get("outer_local_ip") or "").strip()
+        outer_local_ip = str(json_object(endpoint.protocol_config).get("outer_local_ip") or "").strip()
         outer_ip_version = ipaddress.ip_address(outer_local_ip).version if outer_local_ip else 4
         require_gre_supported(node, outer_ip_version)
         create_connection_endpoint_task(db, endpoint, GRE_TASKS.start)
@@ -4464,7 +5301,15 @@ def stop_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> s
     connection = get_gre_connection_or_404(db, item_id)
     for endpoint in connection.endpoints:
         require_online_node(db, endpoint.node_id)
-        create_connection_endpoint_task(db, endpoint, GRE_TASKS.stop)
+        cancel_pending_gre_deployment_tasks(db, endpoint.id)
+        running_id = running_gre_deployment_task_id(db, endpoint.id)
+        create_connection_endpoint_task(
+            db,
+            endpoint,
+            GRE_TASKS.stop,
+            {"depends_on_task_id": running_id, "continue_after_dependency_failure": True} if running_id is not None else None,
+            update_pending_payload=True,
+        )
         endpoint.runtime_status = "stopping"
     connection.status = "stopping"
     db.commit()
@@ -4500,7 +5345,15 @@ def delete_connection(raw_connection_ref: str, db: Session = Depends(get_db)) ->
     endpoints = list(connection.endpoints)
     for endpoint in endpoints:
         require_online_node(db, endpoint.node_id)
-        stop_task = create_connection_endpoint_task(db, endpoint, GRE_TASKS.stop)
+        cancel_pending_gre_deployment_tasks(db, endpoint.id)
+        running_id = running_gre_deployment_task_id(db, endpoint.id)
+        stop_task = create_connection_endpoint_task(
+            db,
+            endpoint,
+            GRE_TASKS.stop,
+            {"depends_on_task_id": running_id, "continue_after_dependency_failure": True} if running_id is not None else None,
+            update_pending_payload=True,
+        )
         create_connection_endpoint_task(db, endpoint, GRE_TASKS.delete_config, {"depends_on_task_id": stop_task.id})
     delete_link_monitors_where(
         db,
@@ -4551,7 +5404,7 @@ def port_inventory_setting_for_node(node_id: int, db: Session) -> models.PortInv
     if setting is None:
         setting = models.PortInventorySetting(node_id=node_id)
         db.add(setting)
-        db.flush()
+        flush_unique_or_conflict(db, "port inventory setting already exists")
     return setting
 
 
@@ -4640,7 +5493,7 @@ def create_port_inventory_entry(
     validate_port_inventory_entry(node_id, payload.protocol, payload.port, db)
     entry = models.PortInventoryEntry(node_id=node_id, **payload.model_dump())
     db.add(entry)
-    db.commit()
+    commit_unique_or_conflict(db, "port inventory entry already exists")
     db.refresh(entry)
     return entry
 
@@ -4663,7 +5516,7 @@ def update_port_inventory_entry(
     validate_port_inventory_entry(node_id, protocol, port, db, exclude_id=entry.id)
     for key, value in data.items():
         setattr(entry, key, value)
-    db.commit()
+    commit_unique_or_conflict(db, "port inventory entry already exists")
     db.refresh(entry)
     return entry
 
@@ -4712,8 +5565,46 @@ def request_node_plugin_action(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     task_spec = plugin.build_task(action, cleaned_payload, context)
     require_task_supported(node, task_spec.task_type)
-    task = models.AgentTask(node_id=node_id, type=task_spec.task_type, payload=task_spec.payload)
-    db.add(task)
+    # 页面重复点击或自动重试不应无限堆积完全相同的只读/插件任务。
+    # 运行中的任务仍允许在需要时再次排队；数据库唯一索引只约束 pending。
+    payload_fingerprint = hashlib.sha256(
+        json.dumps(task_spec.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    dedup_key = f"plugin:{node_id}:{task_spec.task_type}:{payload_fingerprint}"
+    task = models.AgentTask(
+        node_id=node_id,
+        type=task_spec.task_type,
+        payload=task_spec.payload,
+        dedup_key=dedup_key,
+    )
+    try:
+        with db.begin_nested():
+            db.add(task)
+            db.flush()
+    except IntegrityError:
+        existing = db.scalar(
+            select(models.AgentTask).where(
+                models.AgentTask.dedup_key == dedup_key,
+                models.AgentTask.status == "pending",
+            )
+        )
+        if existing is None:
+            raise
+        task = existing
+        logger.info(
+            "复用已有节点插件任务 node_id=%s plugin=%s action=%s task=%s",
+            node_id,
+            plugin_type,
+            action,
+            summarize_agent_task(task),
+        )
+        return schemas.NodePluginActionResult(
+            task_id=task.id,
+            plugin_type=plugin_type,
+            action=action,
+            status=task.status,
+            message="插件任务已存在",
+        )
     db.commit()
     db.refresh(task)
     logger.info(
@@ -4815,8 +5706,34 @@ def delete_node(node_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
             delete(model).where(model.node_id == node_id),
             execution_options={"synchronize_session": False},
         )
-    db.delete(node)
-    db.commit()
+    # 不使用 ORM 的 delete-orphan 级联：检查完成后新建的配置不能被
+    # 悄悄级联删除。让数据库外键在最终 DELETE 时拒绝仍有关联的节点。
+    try:
+        # 把“仍无连接”的条件放进最终 DELETE，避免旧数据库缺少外键时，
+        # 检查之后新建的连接被错误删除。该条件也与启用外键的数据库一致。
+        deleted = db.execute(
+            delete(models.Node).where(
+                models.Node.id == node_id,
+                ~select(models.WireGuardInterface.id)
+                .where(models.WireGuardInterface.node_id == node_id)
+                .exists(),
+                ~select(models.ConnectionEndpoint.id)
+                .where(models.ConnectionEndpoint.node_id == node_id)
+                .exists(),
+                ~select(models.WireGuardPeer.id)
+                .where(models.WireGuardPeer.peer_node_id == node_id)
+                .exists(),
+            )
+        )
+        if deleted.rowcount != 1:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="node has connections")
+        db.commit()
+    except IntegrityError as exc:
+        # 前面的关联检查与最终删除之间可能有其他请求创建连接；外键约束
+        # 会拒绝删除节点，统一转成可重试的业务冲突而不是 500。
+        db.rollback()
+        raise HTTPException(status_code=409, detail="node has connections") from exc
     logger.info("删除节点 node_id=%s name=%s", node_id, node_name)
     return {"status": "deleted"}
 
@@ -4855,6 +5772,7 @@ def install_node_middleware(
         node_id=node.id,
         type="middleware.install",
         status="pending",
+        dedup_key=f"node:{node.id}:middleware.install:mimic",
         payload={
             "plugin": "mimic",
             "source": "github_latest",
@@ -4863,7 +5781,21 @@ def install_node_middleware(
             "github_proxy_url": node.github_proxy_url,
         },
     )
-    db.add(task)
+    try:
+        with db.begin_nested():
+            db.add(task)
+            db.flush()
+    except IntegrityError:
+        active = db.scalar(
+            select(models.AgentTask).where(
+                models.AgentTask.node_id == node.id,
+                models.AgentTask.type == "middleware.install",
+                models.AgentTask.status.in_(["pending", "running"]),
+            )
+        )
+        if active is None:
+            raise
+        return schemas.TaskRequestResult(task_id=active.id, status=active.status, message="middleware install task already queued")
     node.middleware_install_status = "mimic_installing"
     db.commit()
     db.refresh(task)
@@ -4900,7 +5832,7 @@ def create_interface(
     )
     set_extra_value(interface, "custom_config", payload.interface_custom_config)
     db.add(interface)
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     db.refresh(interface)
     logger.info("创建 WireGuard 配置 node_id=%s interface_id=%s name=%s", node_id, interface.id, interface.name)
     return interface
@@ -4984,7 +5916,7 @@ def create_managed_link(
         runtime_status="starting",
     )
     db.add_all([local_interface, peer_interface])
-    db.flush()
+    flush_unique_or_conflict(db, "interface name already exists on node")
     local_peer = models.WireGuardPeer(
         interface=local_interface,
         peer_node_id=payload.peer_node_id,
@@ -5027,7 +5959,7 @@ def create_managed_link(
         payload.peer_endpoint_port,
     )
     db.add_all([local_peer, peer_peer])
-    db.flush()
+    flush_unique_or_conflict(db, "wireguard peer already exists")
     if replace_local:
         queue_replace_interface(db, replace_local)
     if replace_peer:
@@ -5044,7 +5976,7 @@ def create_managed_link(
     )
     enqueue_apply_config(db, local_interface)
     enqueue_apply_config(db, peer_interface)
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     db.refresh(local_interface)
     db.refresh(peer_interface)
     logger.info(
@@ -5062,6 +5994,8 @@ def create_managed_link(
 @app.get("/api/nodes/{node_id}/wireguard/configs", response_model=list[schemas.InterfaceRead])
 def list_interfaces(node_id: int, db: Session = Depends(get_db)) -> list[schemas.InterfaceRead]:
     """列出指定节点上的 WireGuard 点对点配置。"""
+    if db.get(models.Node, node_id) is None:
+        raise HTTPException(status_code=404, detail="node not found")
     interfaces = list(
         db.scalars(
             select(models.WireGuardInterface)
@@ -5134,7 +6068,7 @@ def upsert_interface_link_monitor(
         monitor.retention_days = payload.retention_days
         monitor.enabled = payload.enabled
         monitor.next_due_at = now if payload.enabled else None
-    db.commit()
+    commit_unique_or_conflict(db, "link monitor already exists for this interface")
     db.refresh(monitor)
     return monitor_read_basic(monitor)
 
@@ -5184,7 +6118,7 @@ def upsert_connection_endpoint_link_monitor(
         monitor.retention_days = payload.retention_days
         monitor.enabled = payload.enabled
         monitor.next_due_at = now if payload.enabled else None
-    db.commit()
+    commit_unique_or_conflict(db, "link monitor already exists for this endpoint")
     db.refresh(monitor)
     return monitor_read_basic(monitor)
 
@@ -5241,9 +6175,11 @@ def get_link_monitor_samples(
         db.scalars(
             select(models.LinkMonitorSample)
             .where(models.LinkMonitorSample.monitor_id == monitor_id, models.LinkMonitorSample.checked_at >= since)
-            .order_by(models.LinkMonitorSample.checked_at)
+            .order_by(models.LinkMonitorSample.checked_at.desc())
+            .limit(LINK_MONITOR_SAMPLE_LIMIT)
         )
     )
+    samples.sort(key=lambda sample: sample.checked_at)
     summary = summarize_monitor(db, monitor, parsed_window)
     monitor_data = schemas.LinkMonitorRead.model_validate(monitor)
     monitor_data.summary = summary
@@ -5348,7 +6284,7 @@ def update_managed_link(
         local_interface.runtime_status = "starting"
     if enqueue_apply_config(db, peer_interface):
         peer_interface.runtime_status = "starting"
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     db.refresh(local_interface)
     db.refresh(peer_interface)
     db.refresh(local_peer)
@@ -5405,7 +6341,16 @@ def stop_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[
     for interface in [local_interface, peer_interface]:
         if interface.runtime_status not in ["stopped", "stopping"]:
             driver = connection_driver_for_interface(interface)
-            if enqueue_interface_task_once(db, interface, driver.tasks.stop):
+            cancel_pending_interface_deployment_tasks(db, interface)
+            running_id = running_interface_deployment_task_id(db, interface)
+            changed, _ = enqueue_interface_task_once_with_task(
+                db,
+                interface,
+                driver.tasks.stop,
+                payload_extra={"depends_on_task_id": running_id, "continue_after_dependency_failure": True} if running_id is not None else None,
+                update_pending_payload=True,
+            )
+            if changed:
                 interface.runtime_status = "stopping"
     if middleware:
         for interface, task_type, task_payload in middleware_task_payloads(middleware, local_interface, peer_interface, "stop"):
@@ -5435,14 +6380,42 @@ def delete_managed_link(
         raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
     middleware = managed_link_middleware(local_interface)
     if middleware and delete_node_config:
+        middleware_stop_tasks: dict[int, models.AgentTask] = {}
+        for target_interface, stop_type, stop_payload in middleware_task_payloads(
+            middleware,
+            local_interface,
+            peer_interface,
+            "stop",
+        ):
+            _, stop_task = enqueue_interface_task_once_with_task(
+                db,
+                target_interface,
+                stop_type,
+                stop_payload,
+                update_pending_payload=True,
+            )
+            if stop_task is not None:
+                middleware_stop_tasks[target_interface.id] = stop_task
         for target_interface, task_type, task_payload in middleware_task_payloads(
             middleware,
             local_interface,
             peer_interface,
             "delete",
         ):
-            enqueue_interface_task_once(db, target_interface, task_type, task_payload)
+            dependency = middleware_stop_tasks.get(target_interface.id)
+            payload = {**task_payload}
+            if dependency is not None:
+                payload["depends_on_task_id"] = dependency.id
+                payload["continue_after_dependency_failure"] = True
+            enqueue_interface_task_once(
+                db,
+                target_interface,
+                task_type,
+                payload,
+                update_pending_payload=True,
+            )
     for interface in [local_interface, peer_interface]:
+        cancel_pending_interface_deployment_tasks(db, interface)
         mark_import_candidate_available_for_interface(db, interface)
         if delete_node_config and should_delete_node_config_file(interface):
             driver = connection_driver_for_interface(interface)
@@ -5459,6 +6432,7 @@ def delete_managed_link(
     peer_interface.peers.remove(peer_peer)
     db.flush()
     for interface in [local_interface, peer_interface]:
+        cancel_draft_interface_change_plans(db, interface.id)
         db.delete(interface)
     db.commit()
     return {"status": "deleted"}
@@ -5495,7 +6469,7 @@ def update_interface(
     interface.table_name = payload.table_name
     interface.dns = payload.dns
     set_extra_value(interface, "custom_config", payload.interface_custom_config)
-    db.commit()
+    commit_unique_or_conflict(db, "interface name already exists on node")
     db.refresh(interface)
     return interface
 
@@ -5657,7 +6631,16 @@ def stop_interface(interface_id: int, db: Session = Depends(get_db)) -> models.W
     if interface.runtime_status in ["stopped", "stopping"]:
         return interface
     driver = connection_driver_for_interface(interface)
-    if enqueue_interface_task_once(db, interface, driver.tasks.stop):
+    cancel_pending_interface_deployment_tasks(db, interface)
+    running_id = running_interface_deployment_task_id(db, interface)
+    changed, _ = enqueue_interface_task_once_with_task(
+        db,
+        interface,
+        driver.tasks.stop,
+        payload_extra={"depends_on_task_id": running_id, "continue_after_dependency_failure": True} if running_id is not None else None,
+        update_pending_payload=True,
+    )
+    if changed:
         interface.runtime_status = "stopping"
     db.commit()
     db.refresh(interface)
@@ -5676,6 +6659,7 @@ def delete_interface(
     if interface.source == "imported" and not interface.managed:
         mark_import_candidate_available_for_interface(db, interface)
         delete_link_monitors_where(db, models.LinkMonitor.interface_id == interface.id)
+        cancel_draft_interface_change_plans(db, interface.id)
         db.delete(interface)
         db.commit()
         return {"status": "deleted"}
@@ -5683,11 +6667,13 @@ def delete_interface(
     require_online_node(db, interface.node_id)
     if interface.runtime_status in ["running", "starting", "stopping"]:
         raise HTTPException(status_code=409, detail="wireguard interface must be stopped before delete")
+    cancel_pending_interface_deployment_tasks(db, interface)
     mark_import_candidate_available_for_interface(db, interface)
     if delete_node_config and should_delete_node_config_file(interface):
         driver = connection_driver_for_interface(interface)
         enqueue_interface_task_once(db, interface, driver.tasks.delete_config)
     delete_link_monitors_where(db, models.LinkMonitor.interface_id == interface.id)
+    cancel_draft_interface_change_plans(db, interface.id)
     db.delete(interface)
     db.commit()
     return {"status": "deleted"}
@@ -5762,16 +6748,41 @@ def confirm_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.C
     if not plan.diff.strip():
         raise HTTPException(status_code=400, detail="change plan has no diff")
 
-    task_payload = plan.payload.get("task_payload")
-    task_type = plan.payload.get("task_type")
-    if not task_payload or not task_type:
+    plan_payload = plan.payload if isinstance(plan.payload, dict) else {}
+    task_payload = plan_payload.get("task_payload")
+    task_type = plan_payload.get("task_type")
+    if not isinstance(task_payload, dict) or not task_payload or not isinstance(task_type, str) or not task_type:
         raise HTTPException(status_code=400, detail="change plan has no task payload")
+    if not isinstance(task_payload.get("node_id"), int) or isinstance(task_payload.get("node_id"), bool):
+        raise HTTPException(status_code=400, detail="change plan task payload has invalid node id")
     node = require_online_node(db, task_payload["node_id"])
     require_task_supported(node, task_type)
+    if "interface_id" in task_payload:
+        interface_id = task_payload["interface_id"]
+        if not isinstance(interface_id, int) or isinstance(interface_id, bool):
+            raise HTTPException(status_code=400, detail="change plan task payload has invalid interface id")
+        interface = db.get(models.WireGuardInterface, interface_id)
+        if (
+            interface is None
+            or interface.node_id != task_payload["node_id"]
+            or interface.name != task_payload.get("interface_name")
+        ):
+            raise HTTPException(status_code=409, detail="change plan interface has changed or been deleted; generate a new plan")
 
-    plan.status = "confirmed"
-    plan.confirmed_at = datetime.utcnow()
-    post_confirm = plan.payload.get("post_confirm") or {}
+    confirmed_at = datetime.utcnow()
+    claimed_plan = db.execute(
+        update(models.ChangePlan)
+        .where(models.ChangePlan.id == plan.id, models.ChangePlan.status == "draft")
+        .values(status="confirmed", confirmed_at=confirmed_at)
+        .execution_options(synchronize_session="fetch")
+    )
+    if claimed_plan.rowcount != 1:
+        db.refresh(plan)
+        raise HTTPException(status_code=409, detail="change plan is no longer draft")
+    db.refresh(plan)
+    post_confirm = plan_payload.get("post_confirm")
+    if not isinstance(post_confirm, dict):
+        post_confirm = {}
     managed_interface_id = post_confirm.get("set_interface_managed")
     if managed_interface_id:
         # 接管导入配置必须等用户确认后才改变归属，避免草稿计划影响真实状态。
@@ -5830,9 +6841,28 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
     task = models.AgentTask(
         node_id=node_id,
         type=WIREGUARD_TASKS.import_scan,
+        dedup_key=f"node:{node_id}:{WIREGUARD_TASKS.import_scan}",
         payload={"node_id": node_id},
     )
-    db.add(task)
+    try:
+        with db.begin_nested():
+            db.add(task)
+            db.flush()
+    except IntegrityError:
+        existing = db.scalar(
+            select(models.AgentTask).where(
+                models.AgentTask.node_id == node_id,
+                models.AgentTask.type == WIREGUARD_TASKS.import_scan,
+                models.AgentTask.status.in_(["pending", "running"]),
+            )
+        )
+        if existing is None:
+            raise
+        return schemas.TaskRequestResult(
+            task_id=existing.id,
+            status=existing.status,
+            message="scan task already queued",
+        )
     db.commit()
     db.refresh(task)
     logger.info("创建导入扫描任务 node_id=%s task=%s", node_id, summarize_agent_task(task))
@@ -5844,8 +6874,12 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
 
 
 @app.get("/api/agent/plugins/udp2raw/assets/{asset_name}")
-def get_udp2raw_asset(asset_name: str) -> FileResponse:
-    """为 Agent 提供主控内置的 udp2raw 二进制资产。"""
+def get_udp2raw_asset(
+    asset_name: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """为已鉴权 Agent 提供主控内置的 udp2raw 二进制资产。"""
 
     allowed = {
         "udp2raw_amd64",
@@ -5861,20 +6895,41 @@ def get_udp2raw_asset(asset_name: str) -> FileResponse:
     }
     if asset_name not in allowed:
         raise HTTPException(status_code=404, detail="udp2raw asset not found")
-    candidates = [
-        Path("/opt/link42/plugins/udp2raw/assets") / asset_name,
-        Path(__file__).resolve().parents[3] / "plugins" / "udp2raw" / "assets" / asset_name,
-        Path(__file__).resolve().parents[3] / "udp2raw_sh" / "udp2raw_bin" / asset_name,
+    try:
+        node_id = int(request.headers.get("X-Link42-Node-ID", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid agent credentials") from exc
+    token = request.headers.get("X-Link42-Agent-Token", "")
+    require_agent(db, node_id, token)
+    roots = [
+        Path("/opt/link42/plugins/udp2raw/assets"),
+        Path(__file__).resolve().parents[3] / "plugins" / "udp2raw" / "assets",
+        Path(__file__).resolve().parents[3] / "udp2raw_sh" / "udp2raw_bin",
     ]
-    for path in candidates:
-        if path.exists():
-            return FileResponse(path)
+    for root in roots:
+        path = root / asset_name
+        try:
+            reject_symlink_components(root)
+            if path.is_symlink() or not path.exists() or not path.is_file():
+                continue
+        except OSError:
+            continue
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return FileResponse(path, headers={"X-Link42-Asset-SHA256": digest.hexdigest()})
+        except OSError:
+            continue
     raise HTTPException(status_code=404, detail="udp2raw asset not found")
 
 
 @app.get("/api/nodes/{node_id}/wireguard/import-candidates", response_model=list[schemas.ImportCandidateRead])
 def list_import_candidates(node_id: int, db: Session = Depends(get_db)) -> list[models.ImportCandidate]:
     """列出 Agent 扫描回来的 wg-quick 导入候选。"""
+    if db.get(models.Node, node_id) is None:
+        raise HTTPException(status_code=404, detail="node not found")
     existing_names = existing_interface_names(db, node_id)
     candidates = list(
         db.scalars(
@@ -5902,7 +6957,9 @@ def import_candidate(
     if candidate.imported:
         raise HTTPException(status_code=409, detail="candidate already imported")
 
-    parsed = candidate.parsed
+    parsed = normalize_import_candidate_parsed(candidate.parsed)
+    if parsed is None:
+        raise HTTPException(status_code=409, detail="import candidate data is invalid")
     import_warnings = list(parsed.get("warnings", []))
     if len(parsed.get("peers", [])) > 1:
         import_warnings.append(
@@ -5930,6 +6987,23 @@ def import_candidate(
         extras=parsed.get("extras", {}),
         warnings=import_warnings,
     )
+
+    # 先用条件更新原子认领候选，避免两个并发请求都通过上面的快照检查，
+    # 随后各自创建出一份相同的接口。后续任意异常都会回滚这次认领。
+    claimed = db.execute(
+        update(models.ImportCandidate)
+        .where(
+            models.ImportCandidate.id == candidate.id,
+            models.ImportCandidate.node_id == node_id,
+            models.ImportCandidate.imported.is_(False),
+        )
+        .values(imported=True)
+        .execution_options(synchronize_session="fetch")
+    )
+    if claimed.rowcount != 1:
+        raise HTTPException(status_code=409, detail="candidate already imported")
+    candidate.imported = True
+
     db.add(interface)
     db.flush()
     for peer_data in parsed.get("peers", [])[:1]:
@@ -5950,7 +7024,6 @@ def import_candidate(
                 warnings=peer_data.get("warnings", []),
             )
         )
-    candidate.imported = True
     db.commit()
     db.refresh(interface)
     return interface
@@ -6043,7 +7116,7 @@ def agent_register(payload: schemas.AgentRegisterRequest, db: Session = Depends(
             node.hostname,
             node.agent_version,
             node.agent_protocol_version,
-            (node.agent_platform or {}).get("service_manager"),
+            json_object(node.agent_platform).get("service_manager"),
             current_capabilities,
         )
     else:
@@ -6084,17 +7157,56 @@ def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db))
         )
     )
     tasks = []
+    failed_plan_ids: set[int] = set()
     for task in candidate_tasks:
         if not agent_satisfies_task(node, task.type):
             continue
+        if not isinstance(task.payload, dict):
+            task.status = "failed"
+            task.finished_at = now
+            task.result = {"error": "agent task payload must be an object"}
+            if task.change_plan_id is not None:
+                failed_plan_ids.add(task.change_plan_id)
+            logger.warning("Agent 任务 payload 类型异常 task_id=%s", task.id)
+            continue
         if not is_task_ready_for_poll(db, task, now):
+            continue
+        try:
+            payload_size = len(json.dumps(task.payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            payload_size = MAX_AGENT_TASK_PAYLOAD_BYTES + 1
+        if payload_size > MAX_AGENT_TASK_PAYLOAD_BYTES:
+            task.status = "failed"
+            task.finished_at = now
+            task.result = {
+                "error": "agent task payload exceeds response size limit",
+                "max_bytes": MAX_AGENT_TASK_PAYLOAD_BYTES,
+            }
+            if task.change_plan_id is not None:
+                failed_plan_ids.add(task.change_plan_id)
+            logger.warning("Agent 任务 payload 过大 task_id=%s bytes=%s", task.id, payload_size)
+            continue
+        # The SELECT may be shared by concurrent polls. Claim only rows that
+        # are still pending at the database write, so exactly one poll owns
+        # each task (including across controller worker processes).
+        db.flush()
+        claimed = db.execute(
+            update(models.AgentTask)
+            .where(models.AgentTask.id == task.id, models.AgentTask.status == "pending")
+            .values(status="running", started_at=now)
+            .execution_options(synchronize_session="fetch")
+        )
+        if claimed.rowcount != 1:
             continue
         tasks.append(task)
         if len(tasks) >= AGENT_TASK_POLL_BATCH_SIZE:
             break
-    for task in tasks:
-        task.status = "running"
-        task.started_at = now
+    if failed_plan_ids:
+        db.flush()
+        for plan_id in failed_plan_ids:
+            plan = db.get(models.ChangePlan, plan_id)
+            if plan is not None:
+                update_change_plan_task_status(db, plan)
     db.commit()
     if tasks:
         logger.info(
@@ -6127,11 +7239,49 @@ def agent_task_result(
     task = db.get(models.AgentTask, task_id)
     if task is None or task.node_id != payload.node_id:
         raise HTTPException(status_code=404, detail="task not found")
-
+    try:
+        validate_agent_result_json(payload.result)
+    except ValueError as exc:
+        # 结果已经无法被安全持久化；若任务仍在执行，立即收敛为失败，
+        # 否则 Agent 会因持续重试同一无效结果而让任务长期保持 running。
+        if task.status == "running":
+            recorded = db.execute(
+                update(models.AgentTask)
+                .where(models.AgentTask.id == task.id, models.AgentTask.status == "running")
+                .values(status="failed", finished_at=datetime.utcnow(), result={"error": str(exc)})
+                .execution_options(synchronize_session="fetch")
+            )
+            if recorded.rowcount == 1 and task.change_plan_id is not None:
+                plan = db.get(models.ChangePlan, task.change_plan_id)
+                if plan is not None:
+                    update_change_plan_task_status(db, plan)
+            db.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 旧库可能保存合法 JSON 数组/字符串作为任务 payload。结果上报仍应
+    # 幂等完成并返回稳定错误，而不是在业务分支中因 `.get()`/`.items()` 触发 500。
+    task_payload = task.payload if isinstance(task.payload, dict) else {}
+    if task.payload is not None and not isinstance(task.payload, dict):
+        logger.warning("Agent 任务 payload 类型异常 task_id=%s type=%s", task.id, type(task.payload).__name__)
     reported_status, reported_result = normalize_agent_task_report(db, task, payload.status, payload.result)
-    task.status = reported_status
-    task.result = reported_result
-    task.finished_at = datetime.utcnow()
+    # 任务只能由实际领取它的 Agent 完成；过期任务的迟到结果不能覆盖
+    # 主控已经记录的失败状态。相同终态的重试保持幂等，避免网络重传造成 409。
+    if task.status != "running":
+        if task.status == reported_status and task.status in {"succeeded", "failed", "cancelled"}:
+            return {"status": "recorded"}
+        raise HTTPException(status_code=409, detail=f"task is not running: {task.status}")
+
+    recorded = db.execute(
+        update(models.AgentTask)
+        .where(models.AgentTask.id == task.id, models.AgentTask.status == "running")
+        .values(status=reported_status, result=reported_result, finished_at=datetime.utcnow())
+        .execution_options(synchronize_session="fetch")
+    )
+    if recorded.rowcount != 1:
+        # 并发重传只能有一次写入和一次业务副作用；其余请求读取已提交终态。
+        db.refresh(task)
+        if task.status == reported_status:
+            return {"status": "recorded"}
+        raise HTTPException(status_code=409, detail=f"task is not running: {task.status}")
     node = db.get(models.Node, payload.node_id)
     log_message = "Agent 上报任务结果 task=%s result=%s"
     log_args = (summarize_agent_task(task), summarize_task_result(reported_result))
@@ -6148,16 +7298,16 @@ def agent_task_result(
         else:
             node.agent_last_error = None
 
-    if task.type == "middleware.install" and node is not None and (task.payload or {}).get("plugin") == "mimic":
+    if task.type == "middleware.install" and node is not None and task_payload.get("plugin") == "mimic":
         if reported_status == "succeeded":
             if reported_result.get("reboot_required"):
                 node.middleware_install_status = "mimic_reboot_required"
-                platform = dict(node.agent_platform or {})
+                platform = json_object(node.agent_platform).copy()
                 platform["mimic_reboot_required"] = True
                 node.agent_platform = platform
             else:
                 node.middleware_install_status = "mimic_ready"
-                platform = dict(node.agent_platform or {})
+                platform = json_object(node.agent_platform).copy()
                 platform.pop("mimic_reboot_required", None)
                 node.agent_platform = platform
         elif reported_status == "failed":
@@ -6179,8 +7329,34 @@ def agent_task_result(
 
     # import_scan 的结果由 Agent 返回候选配置，API 在这里转存为 ImportCandidate。
     if task.type == WIREGUARD_TASKS.import_scan and reported_status == "succeeded":
-        candidates = reported_result.get("candidates", [])
-        scanned_paths = {candidate["path"] for candidate in candidates if candidate.get("path")}
+        raw_candidates = reported_result.get("candidates", [])
+        candidates = raw_candidates if isinstance(raw_candidates, list) else []
+        # Agent results are authenticated but still treated as untrusted input:
+        # a corrupt or outdated agent must not turn a result upload into a 500
+        # or create an import candidate that the later import endpoint cannot
+        # safely consume.
+        valid_candidates: list[dict[str, Any]] = []
+        for candidate in candidates[:1000]:
+            if not isinstance(candidate, dict):
+                continue
+            path = candidate.get("path")
+            parsed = candidate.get("parsed")
+            normalized_parsed = normalize_import_candidate_parsed(parsed)
+            interface_name = normalized_parsed.get("name") if normalized_parsed else None
+            content = candidate.get("content")
+            if (
+                not isinstance(path, str)
+                or not path
+                or len(path) > 512
+                or not isinstance(content, str)
+                or len(content.encode("utf-8")) > 512 * 1024
+                or normalized_parsed is None
+                or not isinstance(interface_name, str)
+            ):
+                continue
+            valid_candidates.append({**candidate, "parsed": normalized_parsed, "content": content, "warnings": normalized_parsed["warnings"]})
+        candidates = valid_candidates
+        scanned_paths = {candidate["path"] for candidate in candidates}
         imported_interface_names = existing_interface_names(db, payload.node_id)
         stale_candidates = db.scalars(
             select(models.ImportCandidate).where(
@@ -6193,7 +7369,7 @@ def agent_task_result(
             db.delete(stale_candidate)
         for candidate in candidates:
             parsed = candidate.get("parsed")
-            if parsed is None or not candidate.get("path"):
+            if not isinstance(parsed, dict) or not candidate.get("path"):
                 continue
             parsed["raw_config"] = candidate.get("content") or parsed.get("raw_config") or ""
             interface_name = parsed["name"]
@@ -6225,14 +7401,14 @@ def agent_task_result(
                 )
             )
 
-    interface_id = task.payload.get("interface_id")
+    interface_id = task_payload.get("interface_id")
     if interface_id and reported_status == "succeeded":
         interface = db.get(models.WireGuardInterface, interface_id)
         if interface is not None:
             driver = connection_driver_for_interface(interface)
             if task.type == driver.tasks.apply_config:
                 # 部署成功后记录节点上的已部署配置，后续 Change Plan diff 才能对比真实基线。
-                interface.deployed_config = task.payload.get("config")
+                interface.deployed_config = task_payload.get("config")
                 interface.runtime_status = "running"
                 if should_clear_previous_interface_name(db, task, reported_result):
                     set_extra_value(interface, "previous_interface_name", None)
@@ -6248,9 +7424,12 @@ def agent_task_result(
             elif task.type == driver.tasks.stop:
                 interface.runtime_status = "stopped"
             elif task.type == driver.tasks.status:
-                interface.runtime_status = reported_result.get("runtime_status") or interface.runtime_status
+                # status 查询可能在 start/stop 前已被领取；迟到结果不能覆盖
+                # 后面已经排队或完成的真实状态变更。
+                if not has_newer_interface_state_task(db, interface.id, task.id, driver):
+                    interface.runtime_status = reported_result.get("runtime_status") or interface.runtime_status
 
-    connection_endpoint_id = task.payload.get("connection_endpoint_id")
+    connection_endpoint_id = task_payload.get("connection_endpoint_id")
     if connection_endpoint_id and reported_status == "failed":
         endpoint = db.get(models.ConnectionEndpoint, connection_endpoint_id)
         if endpoint is not None and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
@@ -6261,17 +7440,24 @@ def agent_task_result(
         endpoint = db.get(models.ConnectionEndpoint, connection_endpoint_id)
         if endpoint is not None and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
             if task.type == GRE_TASKS.apply_config:
-                endpoint.deployed_config = json.dumps(gre_task_payload(endpoint), ensure_ascii=False, sort_keys=True)
+                # 部署基线来自实际执行的任务快照，而非任务执行期间可能被编辑的端点。
+                deployed_payload = {key: value for key, value in task_payload.items() if key != "depends_on_task_id"}
+                endpoint.deployed_config = json.dumps(deployed_payload, ensure_ascii=False, sort_keys=True)
             elif task.type == GRE_TASKS.start:
                 endpoint.runtime_status = "running"
                 set_endpoint_extra_value(endpoint, "last_error", None)
-                if gre_previous_config_cleanup_confirmed(task, reported_result):
+                if (
+                    task_payload.get("interface_name") == endpoint.interface_name
+                    and task_payload.get("previous_interface_name") == json_object(endpoint.extras).get("previous_interface_name")
+                    and gre_previous_config_cleanup_confirmed(task, reported_result)
+                ):
                     set_endpoint_extra_value(endpoint, "previous_interface_name", None)
             elif task.type == GRE_TASKS.stop:
                 endpoint.runtime_status = "stopped"
                 set_endpoint_extra_value(endpoint, "last_error", None)
             elif task.type == GRE_TASKS.status:
-                endpoint.runtime_status = reported_result.get("runtime_status") or endpoint.runtime_status
+                if not has_newer_endpoint_state_task(db, endpoint.id, task.id):
+                    endpoint.runtime_status = reported_result.get("runtime_status") or endpoint.runtime_status
             elif task.type == GRE_TASKS.read_config:
                 endpoint.deployed_config = json.dumps(reported_result.get("config") or {}, ensure_ascii=False, sort_keys=True)
             endpoint.connection.status = gre_connection_status(endpoint.connection)
@@ -6296,7 +7482,7 @@ def agent_link_monitor_poll(
     node = require_agent(db, payload.node_id, payload.token)
     update_agent_metadata(node, payload.agent_version, payload.protocol_version, payload.capabilities, payload.platform)
     now = datetime.utcnow()
-    monitors = list(
+    candidates = list(
         db.scalars(
             select(models.LinkMonitor)
             .where(
@@ -6308,8 +7494,21 @@ def agent_link_monitor_poll(
             .limit(10)
         )
     )
-    for monitor in monitors:
-        monitor.next_due_at = now + timedelta(seconds=monitor.interval_seconds)
+    monitors: list[models.LinkMonitor] = []
+    for monitor in candidates:
+        next_due = now + timedelta(seconds=monitor.interval_seconds)
+        claimed = db.execute(
+            update(models.LinkMonitor)
+            .where(
+                models.LinkMonitor.id == monitor.id,
+                models.LinkMonitor.enabled.is_(True),
+                or_(models.LinkMonitor.next_due_at.is_(None), models.LinkMonitor.next_due_at <= now),
+            )
+            .values(next_due_at=next_due)
+            .execution_options(synchronize_session="fetch")
+        )
+        if claimed.rowcount == 1:
+            monitors.append(monitor)
     node.status = "online"
     node.last_seen_at = now
     db.commit()
@@ -6347,12 +7546,40 @@ def agent_link_monitor_result(
     failed_count = 0
     cleanup_cutoffs: dict[int, datetime] = {}
     last_checked_by_monitor: dict[int, datetime] = {}
+    seen_checked_samples: set[tuple[int, datetime]] = set()
+    generated_sequence = 0
+    generated_base = now - timedelta(microseconds=len(payload.results) + 1)
     for item in payload.results:
         monitor = db.get(models.LinkMonitor, item.monitor_id)
         if monitor is None or monitor.node_id != payload.node_id:
             logger.warning("忽略未知链路监测结果 node_id=%s monitor_id=%s", payload.node_id, item.monitor_id)
             continue
+        # Agent clocks can drift, but a future timestamp must not move the
+        # dashboard's last-check time or keep a sample in every summary window.
         checked_at = item.checked_at or now
+        if checked_at.tzinfo is not None:
+            checked_at = checked_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if checked_at > now:
+            checked_at = now
+        if item.checked_at is None:
+            # Agent 可能一次上报多个未带时间戳的结果；预留一个小的过去
+            # 时间段并按输入顺序递增，让批次内的最后结果保持稳定顺序，
+            # 也不会把 dashboard 的 last_checked_at 推到未来。
+            checked_at = generated_base + timedelta(microseconds=generated_sequence)
+            generated_sequence += 1
+        if item.checked_at is not None:
+            sample_key = (monitor.id, checked_at)
+            if sample_key in seen_checked_samples:
+                continue
+            duplicate = db.scalar(
+                select(models.LinkMonitorSample.id).where(
+                    models.LinkMonitorSample.monitor_id == monitor.id,
+                    models.LinkMonitorSample.checked_at == checked_at,
+                )
+            )
+            if duplicate is not None:
+                continue
+            seen_checked_samples.add(sample_key)
         db.add(
             models.LinkMonitorSample(
                 monitor_id=monitor.id,
@@ -6362,7 +7589,9 @@ def agent_link_monitor_result(
                 error=item.error,
             )
         )
-        last_checked_by_monitor[monitor.id] = checked_at
+        previous_checked_at = last_checked_by_monitor.get(monitor.id)
+        if previous_checked_at is None or checked_at > previous_checked_at:
+            last_checked_by_monitor[monitor.id] = checked_at
         cleanup_cutoffs[monitor.id] = now - timedelta(days=monitor.retention_days)
         recorded_count += 1
         if not item.success:
@@ -6370,7 +7599,8 @@ def agent_link_monitor_result(
     for monitor_id, checked_at in last_checked_by_monitor.items():
         monitor = db.get(models.LinkMonitor, monitor_id)
         if monitor is not None:
-            monitor.last_checked_at = checked_at
+            if monitor.last_checked_at is None or checked_at > monitor.last_checked_at:
+                monitor.last_checked_at = checked_at
     for monitor_id, cutoff in cleanup_cutoffs.items():
         db.execute(
             delete(models.LinkMonitorSample).where(

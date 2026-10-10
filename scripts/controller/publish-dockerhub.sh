@@ -87,13 +87,15 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
     exit 1
   fi
 
-  password="$(
-    docker logs "$TEST_CONTAINER" 2>&1 \
-      | sed -n -E 's/.*(Link42 initial login:|Link42 初始登录信息) username=pmman password=([^ ]+).*/\2/p' \
-      | tail -1
-  )"
+  # 初始密码只写入受限文件，不再记录在日志中；从挂载的运行卷读取。
+  password=""
+  for _ in {1..10}; do
+    password="$(docker exec "$TEST_CONTAINER" awk -F= '$1 == "password" { print substr($0, index($0, "=") + 1); exit }' /link42/config/initial-admin-password 2>/dev/null || true)"
+    [[ -n "$password" ]] && break
+    sleep 1
+  done
   if [[ -z "$password" ]]; then
-    echo "failed to read initial login password from test container logs" >&2
+    echo "failed to read initial login password from /link42/config/initial-admin-password" >&2
     redacted_test_logs >&2 || true
     exit 1
   fi

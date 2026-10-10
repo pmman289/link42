@@ -80,7 +80,7 @@ tests/test_agent_system.py          # Agent 本机执行逻辑测试
 ```text
 endpoint_ips              # 节点可被对端访问的入口地址列表
 agent_token_hash
-agent_token_value         # 可信面板允许再次查看 token
+# 明文 token 只在创建或轮换响应中返回一次，不写入数据库
 agent_version
 agent_protocol_version
 agent_capabilities
@@ -234,7 +234,7 @@ Web 端：
 
 - 单用户登录。
 - 用户名默认 `pmman`。
-- 初次启动生成密码并输出到 Docker 日志。
+- 初次启动生成随机密码并写入配置目录下权限为 `0600` 的 `initial-admin-password` 文件；日志只记录文件位置。
 - Web API 需要 Bearer token。
 - token 过期或 401 时前端应立即弹回登录状态。
 
@@ -293,7 +293,8 @@ docs/release-build-and-push.md
 
 修 UI bug 时注意：
 
-- 离线节点不能进入配置列表，但仍可打开节点设置查看 token。
+- 离线节点不能进入配置列表；如果 Agent token 丢失，需要在节点设置中轮换
+  token，并重新安装或更新 Agent 配置。
 - 弹窗打开后如果节点离线，提交时也必须拦截。
 - 导入为受管连接的弹窗必须可操作，不能被旧弹窗遮挡。
 - Endpoint 输入应同时支持下拉选择和直接输入，当前使用 `react-select/creatable`。

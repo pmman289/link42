@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# 运行状态文件包含 Web/Agent token；整个测试目录默认只允许当前用户访问。
+umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${LINK42_REAL_ENV_FILE:-/tmp/link42-real-e2e.env}"
@@ -9,6 +11,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 RUN_DIR="${LINK42_REAL_RUN_DIR:-/tmp/link42-real-e2e}"
+RUN_MARKER="$RUN_DIR/.link42-real-e2e"
 DB_PATH="${LINK42_REAL_DB:-$RUN_DIR/link42.db}"
 HOST="${LINK42_REAL_HOST:-0.0.0.0}"
 PORT="${LINK42_REAL_PORT:-8016}"
@@ -42,6 +45,22 @@ data=json.load(sys.stdin)
 for key in sys.argv[1].split("."):
     data = data[int(key)] if isinstance(data, list) else data[key]
 print(data)' "$1"
+}
+
+# 把路径和环境值安全嵌入远端 POSIX shell 命令。
+shell_quote() {
+  local value="$1"
+  value=${value//\'/\'\\\'\'}
+  printf "'%s'" "$value"
+}
+
+# 通过 SSH 标准输入传输，内容仅在启动 Agent 时由 shell 解释一次。
+remote_agent_script() {
+  local agent_dir="$1" agent_token="$2"
+  printf '#!/bin/sh\nset -eu\ncd %s\nexport PYTHONPATH=%s\nexport LINK42_SERVER_URL=%s\nexport LINK42_NODE_ID=%s\nexport LINK42_AGENT_TOKEN=%s\nexport LINK42_POLL_INTERVAL=%s\nexec python3 -m link42_agent.main\n' \
+    "$(shell_quote "$agent_dir")" "$(shell_quote 'apps/agent:packages')" \
+    "$(shell_quote "$REMOTE_AGENT_URL")" "$(shell_quote "$REMOTE_NODE_ID")" \
+    "$(shell_quote "$agent_token")" "$(shell_quote "$POLL_INTERVAL")"
 }
 
 # 等待测试主控健康检查通过。
@@ -101,14 +120,15 @@ LINK42_REAL_LOCAL_AGENT_PID=$(printf '%q' "$LOCAL_AGENT_PID")
 LINK42_REAL_REMOTE_AGENT_PID=$(printf '%q' "$REMOTE_AGENT_PID")
 LINK42_REAL_REMOTE_SSH=$(printf '%q' "$REMOTE_SSH")
 EOF
+  chmod 0600 "$RUN_DIR/state.env"
 }
 
 # 执行脚本主流程。
 main() {
   require curl
   require ssh
-  require scp
   require tar
+  require realpath
   [[ -x "$PYTHON_BIN" ]] || fail "python not found: $PYTHON_BIN"
   [[ -x "$UVICORN_BIN" ]] || fail "uvicorn not found: $UVICORN_BIN"
   [[ -n "$LOCAL_ENDPOINT" ]] || fail "set LINK42_REAL_LOCAL_ENDPOINT"
@@ -116,9 +136,27 @@ main() {
   [[ -n "$REMOTE_AGENT_URL" ]] || fail "set LINK42_REAL_REMOTE_AGENT_URL"
 
   mkdir -p "$RUN_DIR"
+  [[ ! -L "$RUN_DIR" ]] || fail "run directory must not be a symbolic link: $RUN_DIR"
+  local run_root db_root
+  run_root="$(realpath -m "$RUN_DIR")"
+  db_root="$(realpath -m "$DB_PATH")"
+  [[ "$db_root" == "$run_root"/* ]] || fail "database path must stay inside run directory: $DB_PATH"
+  chmod 0700 "$RUN_DIR"
+  if [[ -e "$RUN_MARKER" && ( ! -f "$RUN_MARKER" || -L "$RUN_MARKER" ) ]]; then
+    fail "run directory marker is not a regular file: $RUN_MARKER"
+  fi
+  if [[ ! -f "$RUN_MARKER" ]]; then
+    if [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      fail "refusing to reuse non-empty unmarked run directory: $RUN_DIR"
+    fi
+    printf 'Link42 real E2E run directory\n' > "$RUN_MARKER"
+    chmod 0600 "$RUN_MARKER"
+  fi
   rm -f "$DB_PATH" "$DB_PATH"-* "$RUN_DIR"/*.log "$RUN_DIR"/state.env
 
   LINK42_DATABASE_URL="sqlite:///$DB_PATH" \
+    LINK42_CONFIG_DIR="$RUN_DIR/controller-config" \
+    LINK42_MASTER_KEY_FILE="$RUN_DIR/controller-config/master.key" \
     LINK42_WEB_DIST_DIR="$ROOT_DIR/apps/web/dist" \
     PYTHONPATH="$ROOT_DIR/apps/api:$ROOT_DIR/packages" \
     "$UVICORN_BIN" link42_api.main:app --host "$HOST" --port "$PORT" --no-access-log \
@@ -128,8 +166,8 @@ main() {
   wait_for_api
 
   local password
-  password="$(sed -n -E 's/.*password=([^ ]+).*/\1/p' "$RUN_DIR/controller.log" | tail -1)"
-  [[ -n "$password" ]] || fail "initial password not found in controller log"
+  password="$(sed -n 's/^password=//p' "$RUN_DIR/controller-config/initial-admin-password")"
+  [[ -n "$password" ]] || fail "initial password file is empty"
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \
     -d "{\"username\":\"pmman\",\"password\":\"$password\"}" | json_get token)"
@@ -152,24 +190,17 @@ main() {
   echo "$LOCAL_AGENT_PID" > "$RUN_DIR/local-agent.pid"
 
   tar -C "$ROOT_DIR" -czf "$RUN_DIR/agent-src.tar.gz" apps/agent packages
-  ssh "$REMOTE_SSH" "rm -rf '$RUN_DIR/remote-agent' && mkdir -p '$RUN_DIR/remote-agent'"
-  scp -q "$RUN_DIR/agent-src.tar.gz" "$REMOTE_SSH:$RUN_DIR/remote-agent/"
-  ssh "$REMOTE_SSH" "cd '$RUN_DIR/remote-agent' && tar -xzf agent-src.tar.gz"
-  ssh "$REMOTE_SSH" "cat > '$RUN_DIR/remote-agent/start-agent.sh' <<SH
-#!/bin/sh
-cd '$RUN_DIR/remote-agent'
-export PYTHONPATH='apps/agent:packages'
-export LINK42_SERVER_URL='$REMOTE_AGENT_URL'
-export LINK42_NODE_ID='$REMOTE_NODE_ID'
-export LINK42_AGENT_TOKEN='$remote_token'
-export LINK42_POLL_INTERVAL='$POLL_INTERVAL'
-exec python3 -m link42_agent.main
-SH
-chmod 700 '$RUN_DIR/remote-agent/start-agent.sh'"
-  ssh -f -n "$REMOTE_SSH" "cd '$RUN_DIR/remote-agent' && nohup ./start-agent.sh > '$RUN_DIR/remote-agent.log' 2>&1 < /dev/null & echo \$! > '$RUN_DIR/remote-agent.pid'"
+  local remote_agent_dir remote_start_script remote_run_dir_q
+  remote_agent_dir="$RUN_DIR/remote-agent"
+  remote_start_script="$remote_agent_dir/start-agent.sh"
+  remote_run_dir_q="$(shell_quote "$remote_agent_dir")"
+  ssh "$REMOTE_SSH" "umask 077; rm -rf $remote_run_dir_q && mkdir -p $remote_run_dir_q && chmod 700 $remote_run_dir_q && cat > $(shell_quote "$remote_agent_dir/agent-src.tar.gz")" < "$RUN_DIR/agent-src.tar.gz"
+  ssh "$REMOTE_SSH" "cd $remote_run_dir_q && tar -xzf agent-src.tar.gz"
+  remote_agent_script "$remote_agent_dir" "$remote_token" | ssh "$REMOTE_SSH" "umask 077; cat > $(shell_quote "$remote_start_script") && chmod 700 $(shell_quote "$remote_start_script")"
+  ssh -f -n "$REMOTE_SSH" "cd $remote_run_dir_q && nohup ./start-agent.sh > $(shell_quote "$RUN_DIR/remote-agent.log") 2>&1 < /dev/null & echo \$! > $(shell_quote "$RUN_DIR/remote-agent.pid")"
   REMOTE_AGENT_PID=""
   for _ in $(seq 1 50); do
-    REMOTE_AGENT_PID="$(ssh "$REMOTE_SSH" "cat '$RUN_DIR/remote-agent.pid' 2>/dev/null" || true)"
+    REMOTE_AGENT_PID="$(ssh "$REMOTE_SSH" "cat $(shell_quote "$RUN_DIR/remote-agent.pid") 2>/dev/null" || true)"
     if [[ -n "$REMOTE_AGENT_PID" ]]; then
       break
     fi
@@ -187,4 +218,6 @@ chmod 700 '$RUN_DIR/remote-agent/start-agent.sh'"
   echo "  state:      $RUN_DIR/state.env"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

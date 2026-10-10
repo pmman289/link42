@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import io
+import hashlib
 import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tarfile
 import threading
 from typing import Any
@@ -26,7 +29,7 @@ from link42_common.version import AGENT_VERSION
 from link42_agent import client as agent_client
 from link42_agent import gre, link_monitor, looking_glass, main, middleware, service_manager, system, upgrade
 from link42_agent.client import AgentClient, AgentConnectionError, AgentHttpError
-from link42_agent.config import AgentConfig
+from link42_agent.config import AgentConfig, load_config_from_env
 from link42_agent.plugins import bird
 from link42_agent.plugins import port_inventory
 from link42_agent.task_handlers import TASK_HANDLERS, execute_registered_task
@@ -35,6 +38,117 @@ from link42_agent.task_handlers import TASK_HANDLERS, execute_registered_task
 def command_result(command: list[str], returncode: int = 0, stdout: str = "") -> dict[str, Any]:
     """构造测试用的命令执行结果。"""
     return {"command": command, "returncode": returncode, "stdout": stdout, "stderr": ""}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "3601", "invalid"])
+def test_agent_poll_interval_rejects_invalid_environment(monkeypatch, value: str) -> None:
+    """无效轮询间隔不能让 Agent 忙循环或在 sleep 时崩溃。"""
+
+    monkeypatch.setenv("LINK42_SERVER_URL", "https://controller.example")
+    monkeypatch.setenv("LINK42_NODE_ID", "1")
+    monkeypatch.setenv("LINK42_AGENT_TOKEN", "token")
+    monkeypatch.setenv("LINK42_POLL_INTERVAL", value)
+    with pytest.raises(ValueError, match="LINK42_POLL_INTERVAL"):
+        load_config_from_env()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("LINK42_NODE_ID", "0", "LINK42_NODE_ID"),
+        ("LINK42_NODE_ID", "-1", "LINK42_NODE_ID"),
+        ("LINK42_NODE_ID", "bad", "LINK42_NODE_ID"),
+        ("LINK42_AGENT_TOKEN", "", "LINK42_AGENT_TOKEN"),
+        ("LINK42_WIREGUARD_DIR", "/", "LINK42_WIREGUARD_DIR"),
+        ("LINK42_WIREGUARD_DIR", "relative/wireguard", "LINK42_WIREGUARD_DIR"),
+        ("LINK42_GRE_DIR", "/", "LINK42_GRE_DIR"),
+        ("LINK42_LOG_LEVEL", "verbose", "LINK42_LOG_LEVEL"),
+        ("LINK42_SERVER_URL", "ftp://controller.example", "LINK42_SERVER_URL"),
+    ],
+)
+def test_agent_configuration_rejects_unsafe_environment(monkeypatch, name: str, value: str, message: str) -> None:
+    """错误的启动环境应立即失败，而不是让 Agent 以无效配置持续运行。"""
+
+    monkeypatch.setenv("LINK42_SERVER_URL", "https://controller.example")
+    monkeypatch.setenv("LINK42_NODE_ID", "1")
+    monkeypatch.setenv("LINK42_AGENT_TOKEN", "token")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=message):
+        load_config_from_env()
+
+
+def test_agent_configuration_normalizes_safe_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LINK42_SERVER_URL", " https://controller.example/ ")
+    monkeypatch.setenv("LINK42_NODE_ID", " 7 ")
+    monkeypatch.setenv("LINK42_AGENT_TOKEN", " token ")
+    monkeypatch.setenv("LINK42_LOG_LEVEL", "debug")
+    config = load_config_from_env()
+    assert config.server_url == "https://controller.example"
+    assert config.node_id == 7
+    assert config.token == "token"
+    assert config.log_level == "DEBUG"
+
+
+def test_socket_scan_uses_local_port_only():
+    output = '\n'.join([
+        'tcp LISTEN 0 128 127.0.0.1:80 198.51.100.1:51820 users:(("worker:51821",pid=12,fd=3))',
+        'udp UNCONN 0 0 [::]:51822 [::]:* users:(("wireguard",pid=13,fd=4))',
+        'tcp LISTEN 0 128 0.0.0.0:51823 0.0.0.0:*',
+    ])
+    entries = port_inventory.parse_ss_output(output, 51820, 51830)
+    assert [(item["protocol"], item["port"]) for item in entries] == [("UDP", 51822), ("TCP", 51823)]
+
+
+def test_openrc_enabled_state_matches_complete_service_name(monkeypatch, tmp_path):
+    monkeypatch.setattr(service_manager, "OPENRC_INIT_DIR", tmp_path)
+    def run(command, allow_failure):
+        if command[:2] == ["rc-service", "--exists"]:
+            return command_result(command, returncode=0)
+        if command[0] == "rc-service":
+            return command_result(command, returncode=3)
+        return command_result(command, stdout="  wg-quick@wg01 | default\n")
+    result = service_manager.OpenRCServiceManager(run).state("wg0")
+    assert result["enabled_state"] == "disabled"
+    assert result["managed"] is False
+
+
+def test_openrc_wg_quick_compat_link_cannot_target_unrelated_script(tmp_path, monkeypatch):
+    init_dir = tmp_path / "init.d"
+    init_dir.mkdir()
+    standard = init_dir / "wg-quick"
+    unrelated = init_dir / "unrelated"
+    standard.write_text("#!/sbin/openrc-run\n", encoding="utf-8")
+    unrelated.write_text("#!/bin/sh\n", encoding="utf-8")
+    link = init_dir / "wg-quick.wg0"
+    link.symlink_to(unrelated)
+
+    monkeypatch.setattr(service_manager, "OPENRC_INIT_DIR", init_dir)
+    def run(command, allow_failure):
+        if command[:2] == ["rc-service", "--exists"]:
+            return command_result(command, returncode=1)
+        return command_result(command)
+
+    manager = service_manager.OpenRCServiceManager(run)
+    with pytest.raises(ValueError, match="outside the standard script"):
+        manager.ensure_link42_unit("wg0")
+
+
+def test_openrc_generated_unit_cannot_replace_symlink(tmp_path, monkeypatch):
+    init_dir = tmp_path / "init.d"
+    init_dir.mkdir()
+    unrelated = init_dir / "unrelated"
+    unrelated.write_text("#!/bin/sh\n", encoding="utf-8")
+    (init_dir / "link42-wg-quick.wg0").symlink_to(unrelated)
+    monkeypatch.setattr(service_manager, "OPENRC_INIT_DIR", init_dir)
+
+    def run(command, allow_failure):
+        if command[:2] == ["rc-service", "--exists"]:
+            return command_result(command, returncode=1)
+        return command_result(command)
+
+    manager = service_manager.OpenRCServiceManager(run)
+    with pytest.raises(ValueError, match="must not be a symbolic link"):
+        manager.ensure_link42_unit("wg0")
 
 
 def use_service_binaries(
@@ -176,6 +290,15 @@ def test_bird_plugin_lists_and_reads_recursive_config_tree(monkeypatch, tmp_path
     assert read["content"] == "protocol device {}\n"
 
 
+def test_bird_plugin_bounds_existing_file_reads(tmp_path) -> None:
+    """BIRD 备份和校验不能把超大现有配置一次性读入内存。"""
+
+    path = tmp_path / "bird.conf"
+    path.write_bytes(b"x" * (bird.BIRD_MAX_FILE_BYTES + 1))
+    with pytest.raises(ValueError, match="too large"):
+        bird.read_text_limited(path)
+
+
 def test_bird_plugin_rejects_path_outside_config_roots(monkeypatch, tmp_path) -> None:
     """验证 Bird 插件不会读取声明根目录之外的任意文件。"""
 
@@ -187,6 +310,23 @@ def test_bird_plugin_rejects_path_outside_config_roots(monkeypatch, tmp_path) ->
 
     with pytest.raises(ValueError):
         bird.resolve_bird_resource(str(tmp_path / "etc" / "shadow"))
+
+
+def test_bird_plugin_rejects_legacy_symlink_to_unrelated_file(monkeypatch, tmp_path) -> None:
+    """旧版 /etc/bird.conf 位置的符号链接不能绕过配置根目录限制。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    bird_root.mkdir(parents=True)
+    legacy = tmp_path / "etc" / "bird.conf"
+    outside = tmp_path / "shadow"
+    outside.write_text("secret\n", encoding="utf-8")
+    legacy.symlink_to(outside)
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", bird_root / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", legacy)
+
+    with pytest.raises(ValueError, match="legacy BIRD resource"):
+        bird.resolve_bird_resource(str(legacy))
 
 
 def test_bird_plugin_rejects_non_conf_files_under_bird_root(monkeypatch, tmp_path) -> None:
@@ -267,6 +407,28 @@ def test_bird_apply_restores_original_content_when_validation_fails(monkeypatch,
     assert result["restored"] is True
     assert main_config.read_text(encoding="utf-8") == "router id 10.0.0.1;\n"
     assert Path(str(result["backup_ref"])).exists()
+
+
+def test_bird_backup_directory_rejects_symbolic_link(monkeypatch, tmp_path: Path) -> None:
+    """BIRD 备份目录被替换成符号链接时不得把备份写到目录外。"""
+
+    bird_root = tmp_path / "etc" / "bird"
+    bird_root.mkdir(parents=True)
+    main_config = bird_root / "bird.conf"
+    main_config.write_text("router id 10.0.0.1;\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    backup_link = tmp_path / "backup-link"
+    backup_link.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(bird, "BIRD_ROOT", bird_root)
+    monkeypatch.setattr(bird, "BIRD_DEFAULT_MAIN", main_config)
+    monkeypatch.setattr(bird, "BIRD_LEGACY_MAIN", tmp_path / "etc" / "bird.conf")
+    monkeypatch.setattr(bird, "BIRD_BACKUP_DIR", backup_link)
+
+    with pytest.raises(ValueError, match="symbolic links"):
+        bird.bird_backup_path(main_config)
+    assert list(outside.iterdir()) == []
 
 
 def test_bird_apply_same_content_keeps_file_hash(monkeypatch, tmp_path) -> None:
@@ -482,6 +644,19 @@ def test_run_command_timeout_returns_result_or_raises(monkeypatch) -> None:
         assert "timed out" in str(exc)
     else:
         raise AssertionError("timeout did not raise for required command")
+
+
+def test_run_command_bounds_large_stdout(monkeypatch) -> None:
+    """系统命令的大量输出不能让 Agent 保留无界结果。"""
+
+    monkeypatch.setattr(system, "MAX_COMMAND_OUTPUT_BYTES", 32)
+    result = system.run_command(
+        [sys.executable, "-c", "print('x' * 4096)"],
+        allow_failure=False,
+    )
+
+    assert len(result["stdout"].encode("utf-8")) == 32
+    assert result["truncated"] is True
 
 
 def test_run_command_strips_pyinstaller_library_path(monkeypatch) -> None:
@@ -887,6 +1062,39 @@ def test_looking_glass_ping_and_traceroute_use_fixed_argv(monkeypatch) -> None:
     assert traceroute_result["command"] == "traceroute -n -m 8 -w 2 -q 1 2001:db8::1"
 
 
+def test_looking_glass_rejects_non_finite_command_timeout(monkeypatch) -> None:
+    """非法的无穷超时值应回退到有限默认值，不得让任务执行器抛出。"""
+
+    monkeypatch.setattr(looking_glass, "shutil", looking_glass.shutil)
+    monkeypatch.setattr(looking_glass.shutil, "which", lambda binary: "/usr/sbin/birdc" if binary == "birdc" else None)
+    seen: list[dict[str, Any]] = []
+
+    def fake_run(command, **kwargs):
+        seen.append(kwargs)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(looking_glass.subprocess, "run", fake_run)
+    result = looking_glass.execute_bird_protocols({"command_timeout_seconds": "inf"})
+
+    assert result["exit_code"] == 0
+    assert seen[0]["timeout"] == looking_glass.DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS
+
+
+def test_looking_glass_output_limit_is_capped(monkeypatch) -> None:
+    """任务携带异常大的输出上限时，兼容 subprocess 路径也必须限流。"""
+
+    monkeypatch.setattr(looking_glass.shutil, "which", lambda binary: "/usr/sbin/birdc" if binary == "birdc" else None)
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, "x" * (looking_glass.DEFAULT_OUTPUT_LIMIT_BYTES + 1), "")
+
+    monkeypatch.setattr(looking_glass.subprocess, "run", fake_run)
+    result = looking_glass.execute_bird_protocols({"output_limit_bytes": 10**12})
+
+    assert len(result["stdout"].encode("utf-8")) == looking_glass.DEFAULT_OUTPUT_LIMIT_BYTES
+    assert result["truncated"] is True
+
+
 def test_looking_glass_tasks_registered() -> None:
     """验证 Looking Glass 查询任务已注册到 Agent 分派表。"""
 
@@ -1004,6 +1212,73 @@ def test_gre_start_rebuilds_interface_and_routes(monkeypatch, tmp_path: Path) ->
     ]
 
 
+def test_gre_dry_run_does_not_write_config(monkeypatch, tmp_path: Path) -> None:
+    """GRE 演练模式只返回计划，不在受管目录落盘。"""
+
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    config = {
+        "interface_name": "gre_dry",
+        "outer_local_ip": "203.0.113.10",
+        "outer_remote_ip": "198.51.100.20",
+        "tunnel_ips": ["10.42.8.1/30"],
+        "routes": [],
+    }
+
+    applied = gre.apply_gre_config(config, str(tmp_path), dry_run=True)
+    started = gre.start_gre_interface(config, str(tmp_path), dry_run=True, use_service=False)
+
+    assert applied["dry_run"] is True
+    assert started["dry_run"] is True
+    assert not (tmp_path / "gre_dry.json").exists()
+
+
+def test_gre_start_restores_config_and_removes_partial_interface_on_failure(monkeypatch, tmp_path: Path) -> None:
+    """非 systemd GRE 启动失败时不得留下新配置或半创建的接口。"""
+
+    path = tmp_path / "gre0.json"
+    path.write_text("old config\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        if command[:3] == ["/sbin/ip", "addr", "add"]:
+            raise RuntimeError("address setup failed")
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: False)
+    monkeypatch.setattr(gre, "ip_command", lambda: "/sbin/ip")
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    with pytest.raises(RuntimeError, match="address setup failed"):
+        gre.start_gre_interface(
+            {
+                "interface_name": "gre0",
+                "outer_local_ip": "203.0.113.10",
+                "outer_remote_ip": "198.51.100.20",
+                "tunnel_ips": ["10.42.8.1/30"],
+                "routes": [],
+            },
+            str(tmp_path),
+        )
+
+    assert path.read_text(encoding="utf-8") == "old config\n"
+    assert ["/sbin/ip", "link", "del", "gre0"] in commands
+
+
+def test_gre_config_write_has_size_limit(tmp_path: Path) -> None:
+    """GRE 持久化文件必须受大小上限保护。"""
+
+    with pytest.raises(ValueError, match="GRE config is too large"):
+        gre.write_gre_config(
+            {
+                "interface_name": "gre0",
+                "payload": "x" * (gre.GRE_CONFIG_MAX_BYTES + 1),
+            },
+            str(tmp_path),
+        )
+
+
 def test_gre_rejects_ttl_without_pmtu_discovery(tmp_path: Path) -> None:
     """验证 Agent 拒绝 iproute2 不支持的 GRE TTL 和 nopmtudisc 组合。"""
 
@@ -1052,6 +1327,61 @@ def test_gre_delete_config_removes_previous_rename_files(monkeypatch, tmp_path: 
         ["/sbin/ip", "link", "del", "gre_new"],
         ["/sbin/ip", "link", "del", "gre_old"],
     ]
+
+
+def test_openwrt_gre_delete_restores_json_when_uci_commit_fails(monkeypatch, tmp_path: Path) -> None:
+    """UCI 清理失败时，本地 GRE 快照必须恢复，避免两边状态分叉。"""
+
+    config_dir = tmp_path / "gre"
+    config_dir.mkdir()
+    config_path = config_dir / "gre0.json"
+    config_path.write_text('{"interface_name":"gre0"}\n', encoding="utf-8")
+    network_path = tmp_path / "network"
+    network_path.write_text("config interface 'gre0'\n", encoding="utf-8")
+    monkeypatch.setattr(gre, "OPENWRT_NETWORK_CONFIG", network_path)
+    monkeypatch.setattr(gre, "openwrt_delete_gre_config_commands", lambda name: [["uci", "-q", "delete", "network.gre0"]])
+    monkeypatch.setattr(gre, "run_openwrt_gre_commands", lambda commands: (_ for _ in ()).throw(RuntimeError("uci commit failed")))
+
+    with pytest.raises(RuntimeError, match="uci commit failed"):
+        gre.delete_openwrt_gre_config_file("gre0", str(config_dir))
+
+    assert config_path.read_text(encoding="utf-8") == '{"interface_name":"gre0"}\n'
+    assert network_path.read_text(encoding="utf-8") == "config interface 'gre0'\n"
+
+
+def test_openwrt_gre_delete_does_not_commit_uci_when_json_unlink_fails(monkeypatch, tmp_path: Path) -> None:
+    """本地配置不可删除时，不能先提交 UCI 删除而留下两份状态不一致。"""
+
+    config_dir = tmp_path / "gre"
+    config_dir.mkdir()
+    config_path = config_dir / "gre0.json"
+    config_path.write_text('{"interface_name":"gre0"}\n', encoding="utf-8")
+    network_path = tmp_path / "network"
+    network_path.write_text("config interface 'gre0'\n", encoding="utf-8")
+    commands_run = []
+    unlink = Path.unlink
+
+    def fail_config_unlink(path, *args, **kwargs):
+        if path == config_path:
+            raise OSError("read-only config directory")
+        return unlink(path, *args, **kwargs)
+
+    def run_commands(commands):
+        commands_run.extend(commands)
+        network_path.write_text("deleted\n", encoding="utf-8")
+        return [command_result(command) for command in commands]
+
+    monkeypatch.setattr(gre, "OPENWRT_NETWORK_CONFIG", network_path)
+    monkeypatch.setattr(gre, "openwrt_delete_gre_config_commands", lambda name: [["uci", "-q", "delete", "network.gre0"]])
+    monkeypatch.setattr(gre, "run_openwrt_gre_commands", run_commands)
+    monkeypatch.setattr(Path, "unlink", fail_config_unlink)
+
+    with pytest.raises(OSError, match="read-only config directory"):
+        gre.delete_openwrt_gre_config_file("gre0", str(config_dir))
+
+    assert commands_run == []
+    assert config_path.read_text(encoding="utf-8") == '{"interface_name":"gre0"}\n'
+    assert network_path.read_text(encoding="utf-8") == "config interface 'gre0'\n"
 
 
 def test_gre_status_accepts_unknown_state_with_up_flag(monkeypatch) -> None:
@@ -1128,6 +1458,30 @@ def test_openwrt_gre_start_writes_uci_and_reloads_netifd(monkeypatch, tmp_path: 
     assert ["/sbin/ifup", "gre_ab"] in command_values
     assert ["/sbin/ifup", "gre_ab_addr"] in command_values
     assert any(command == ["/sbin/ifdown", "gre_ab"] and allow_failure for command, allow_failure in commands)
+
+
+def test_openwrt_gre_failure_reverts_pending_uci_changes(monkeypatch) -> None:
+    """UCI 中途失败时应清理尚未提交的 Link42 变更。"""
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        if command == ["/sbin/uci", "set", "network.gre_ab.proto=gre"]:
+            raise RuntimeError("uci failed")
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "uci_command", lambda: "/sbin/uci")
+    monkeypatch.setattr(gre, "ifdown_command", lambda: "/sbin/ifdown")
+    monkeypatch.setattr(gre, "run_command", fake_run_command)
+
+    with pytest.raises(RuntimeError, match="uci failed"):
+        gre.run_openwrt_gre_commands([
+            ["/sbin/uci", "set", "network.gre_ab=interface"],
+            ["/sbin/uci", "set", "network.gre_ab.proto=gre"],
+        ])
+
+    assert ["/sbin/uci", "revert", "network"] in commands
 
 
 def test_openwrt_gre_status_reads_ifstatus_and_generated_device(monkeypatch) -> None:
@@ -1283,6 +1637,91 @@ def test_gre_systemd_unit_falls_back_to_python_entry(monkeypatch) -> None:
     assert "Environment=PYTHONPATH=/root/repo/link42/apps/agent:/root/repo/link42/packages" in content
     assert "ExecStart=/usr/bin/python3 -m link42_agent.main gre-start %i" in content
     assert "/root/repo/link42/apps/agent/link42_agent/main.py gre-start" not in content
+
+
+def test_gre_systemd_unit_quotes_custom_config_path(monkeypatch) -> None:
+    """自定义 GRE 目录不能把空格、引号或 systemd specifier 注入 unit。"""
+
+    monkeypatch.setattr(gre.shutil, "which", lambda binary: "/usr/bin/link42-agent" if binary == "link42-agent" else None)
+    content = gre.render_gre_systemd_unit('/tmp/gre dir/%s"quoted"')
+    assert 'Environment="LINK42_GRE_DIR=/tmp/gre dir/%%s\\"quoted\\""' in content
+
+    with pytest.raises(ValueError, match="control characters"):
+        gre.render_gre_systemd_unit("/tmp/gre\nmalicious")
+
+
+@pytest.mark.parametrize("fail_restart", [False, True])
+def test_gre_systemd_reads_new_config_and_restores_on_failure(monkeypatch, tmp_path, fail_restart):
+    """systemd ExecStart 必须读取新配置；失败则恢复先前持久配置。"""
+
+    monkeypatch.setattr(gre, "openwrt_gre_available", lambda: False)
+    monkeypatch.setattr(gre, "gre_systemd_available", lambda: True)
+    monkeypatch.setattr(gre, "install_gre_systemd_unit", lambda *args, **kwargs: {})
+    path = tmp_path / "gre0.json"
+    path.write_text("old config\n", encoding="utf-8")
+
+    def runner(command, allow_failure):
+        """模拟 ExecStart 从新 JSON 读取参数。"""
+        if "restart" in command:
+            assert json.loads(path.read_text())["outer_remote_ip"] == "198.51.100.20"
+            if fail_restart:
+                raise RuntimeError("restart failed")
+        return command_result(command)
+
+    monkeypatch.setattr(gre, "run_command", runner)
+    payload = {"interface_name": "gre0", "outer_local_ip": "203.0.113.10", "outer_remote_ip": "198.51.100.20"}
+    if fail_restart:
+        with pytest.raises(RuntimeError, match="restart failed"):
+            gre.start_gre_interface(payload, str(tmp_path))
+        assert path.read_text() == "old config\n"
+    else:
+        assert gre.start_gre_interface(payload, str(tmp_path))["runtime_status"] == "running"
+
+
+@pytest.mark.parametrize("zone", ["$(id)", "eth0\nfilter = injected", "eth0;id", "`id`"])
+def test_middleware_rejects_injected_ipv6_zone(zone):
+    """IPv6 zone 不能携带 shell 或配置注入内容。"""
+
+    with pytest.raises(ValueError):
+        middleware.validate_udp2raw_ip(f"fe80::1%{zone}", "host")
+    with pytest.raises(ValueError):
+        middleware.format_mimic_endpoint(f"fe80::1%{zone}", 51820)
+
+
+@pytest.mark.parametrize("password", ["key\nother args", "key\r", "key\x00"])
+def test_udp2raw_rejects_multiline_password(password):
+    """逐行读取的 udp2raw 配置不能存储控制字符。"""
+
+    with pytest.raises(ValueError):
+        middleware.shell_quote(password)
+
+
+@pytest.mark.parametrize("size,header,body,success", [
+    (3, "3", b"deb", True),
+    (3, "3", b"de", False),
+    (3, None, b"debb", False),
+    (None, "4", b"deb", False),
+    (3, "9999999999", b"deb", False),
+])
+def test_release_download_size_limits_preserve_existing_file(monkeypatch, tmp_path, size, header, body, success):
+    """下载成功时原子替换，截断和超限响应均保留旧文件且清理临时文件。"""
+
+    response = io.BytesIO(body)
+    response.headers = {"Content-Length": header} if header is not None else {}
+    monkeypatch.setattr(middleware.request, "urlopen", lambda *args, **kwargs: response)
+    target = tmp_path / "asset.deb"
+    target.write_bytes(b"old")
+    asset = {"name": "asset.deb", "browser_download_url": "https://github.com/hack3ric/mimic/releases/download/v1/asset.deb"}
+    if size is not None:
+        asset["size"] = size
+    if success:
+        assert middleware.download_release_asset(asset, tmp_path, None) == target
+        assert target.read_bytes() == body
+    else:
+        with pytest.raises(RuntimeError):
+            middleware.download_release_asset(asset, tmp_path, None)
+        assert target.read_bytes() == b"old"
+    assert list(tmp_path.iterdir()) == [target]
 
 
 def test_mimic_capability_requires_systemd_kernel_newer_than_61_and_binary(monkeypatch) -> None:
@@ -1465,6 +1904,65 @@ def test_mimic_snippet_uses_official_filter_format_for_ipv6() -> None:
     assert "filter = remote=[2001:db8::20]:51821" in snippet
     assert "handshake_interval" not in snippet
     assert "keepalive_interval" not in snippet
+
+
+def test_mimic_apply_failure_restores_both_files(tmp_path: Path, monkeypatch) -> None:
+    """服务失败时同时恢复实例片段和包含用户配置的系统文件。"""
+
+    monkeypatch.setattr(middleware, "MIMIC_CONFIG_DIR", tmp_path / "snippets")
+    monkeypatch.setattr(middleware, "MIMIC_SYSTEM_CONFIG_DIR", tmp_path / "system")
+    monkeypatch.setattr(middleware, "mimic_service_backend", lambda: "systemd")
+    monkeypatch.setattr(middleware.shutil, "which", lambda _: "/usr/bin/mimic")
+    middleware.ensure_mimic_layout()
+    instance_path = middleware.mimic_instance_path("eth0", "link42-1")
+    instance_path.parent.mkdir()
+    instance_path.write_text("old snippet\n", encoding="utf-8")
+    system_path = middleware.mimic_system_config_path("eth0")
+    system_path.write_text("user config\n", encoding="utf-8")
+
+    def fail_restart(command, allow_failure):
+        """首次重启失败，回滚重启验证已恢复旧文件。"""
+        if "restart" in command:
+            if not allow_failure:
+                raise RuntimeError("restart failed")
+            assert instance_path.read_text() == "old snippet\n"
+            assert system_path.read_text() == "user config\n"
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fail_restart)
+    with pytest.raises(RuntimeError, match="restart failed"):
+        middleware.apply_mimic({
+            "instance": "link42-1", "bind_interface": "eth0",
+            "peer_host": "203.0.113.20", "peer_port": 51820,
+        })
+    assert instance_path.read_text() == "old snippet\n"
+    assert system_path.read_text() == "user config\n"
+
+
+def test_udp2raw_apply_failure_preserves_other_instances(tmp_path: Path, monkeypatch) -> None:
+    """服务失败时恢复完整配置，避免破坏同角色其它实例。"""
+
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(middleware, "ensure_udp2raw_layout", lambda: None)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "systemd")
+    target = tmp_path / "server"
+    original = "other -s -k 'keep'\nlink42-1 -s -k 'old'\n"
+    target.write_text(original, encoding="utf-8")
+
+    def fail_service(*args):
+        """模拟配置已经替换后重启失败。"""
+        assert target.read_text() != original
+        raise RuntimeError("restart failed")
+
+    monkeypatch.setattr(middleware, "apply_service", fail_service)
+    monkeypatch.setattr(middleware, "run_command", lambda command, allow_failure: command_result(command))
+    with pytest.raises(RuntimeError, match="restart failed"):
+        middleware.apply_udp2raw({
+            "instance": "link42-1", "mode": "server", "password": "new",
+            "listen_host": "0.0.0.0", "listen_port": 23000,
+            "remote_host": "127.0.0.1", "remote_port": 51820,
+        })
+    assert target.read_text() == original
 
 
 def test_mimic_runtime_ready_rejects_half_installed_package(monkeypatch) -> None:
@@ -1856,6 +2354,42 @@ def test_agent_main_reports_connection_failure_without_traceback(monkeypatch, ca
     assert "urllib.error.URLError" not in output
 
 
+def test_agent_main_reuses_client_across_retry_cycles(monkeypatch) -> None:
+    """重试循环必须复用客户端，以保留未确认的任务结果。"""
+
+    clients: list[object] = []
+
+    class FakeClient:
+        def __init__(self, config: AgentConfig) -> None:
+            clients.append(self)
+            self.register_calls = 0
+
+        def register(self, hostname: str, capabilities: list[str], platform: dict[str, Any]) -> None:
+            self.register_calls += 1
+            if self.register_calls == 1:
+                raise AgentConnectionError("https://controller", "/api/agent/register", "temporary")
+            raise KeyboardInterrupt
+
+    sleep_calls = 0
+
+    def fake_sleep(seconds: int) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+
+    monkeypatch.setattr(main, "load_config_from_env", lambda: AgentConfig("https://controller", 1, "token"))
+    monkeypatch.setattr(main, "AgentClient", FakeClient)
+    monkeypatch.setattr(main, "collect_agent_snapshot", lambda: main.AgentSnapshot(["wireguard"], {}))
+    monkeypatch.setattr(main, "get_hostname", lambda: "node-a")
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        main.main()
+
+    assert len(clients) == 1
+    assert clients[0].register_calls == 2
+    assert sleep_calls == 1
+
+
 def test_agent_main_explains_cdn_403_without_duplicate_warning(monkeypatch, capsys) -> None:
     """验证 CDN 拒绝 Agent 请求时输出可操作提示且不重复记录响应。"""
 
@@ -1893,12 +2427,144 @@ def test_agent_main_explains_cdn_403_without_duplicate_warning(monkeypatch, caps
     assert "Traceback" not in output
 
 
-@pytest.mark.parametrize("server_url", ["controller.example", "ftp://controller.example", "https://"])
+@pytest.mark.parametrize(
+    "server_url",
+    [
+        "controller.example",
+        "ftp://controller.example",
+        "https://",
+        "https://user:password@controller.example",
+        "https://controller.example/base",
+        "https://controller.example?proxy=1",
+        "https://controller.example#fragment",
+    ],
+)
 def test_agent_client_rejects_invalid_controller_url(server_url: str) -> None:
     """验证格式错误的主控地址会得到清晰提示。"""
 
     with pytest.raises(AgentConnectionError, match="主控地址格式无效"):
         AgentClient(AgentConfig(server_url, 1, "token"))
+
+
+def test_agent_client_normalizes_controller_trailing_slash(monkeypatch) -> None:
+    """主控地址末尾斜杠不能让 API 路径变成双斜杠。"""
+
+    class FakeResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"status":"ok"}'
+
+        def getcode(self):
+            return 200
+
+    seen: list[str] = []
+
+    def fake_urlopen(request_obj: Any, timeout: int):
+        seen.append(request_obj.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr(agent_client.request, "urlopen", fake_urlopen)
+    client = AgentClient(AgentConfig("https://controller.example/", 1, "token"))
+    client.heartbeat()
+    assert seen == ["https://controller.example/api/agent/heartbeat"]
+
+
+def test_agent_client_rejects_oversized_response(monkeypatch) -> None:
+    """主控或代理返回异常大响应时，Agent 必须在内存增长前中止。"""
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int = -1):
+            return b"x" * (agent_client.MAX_AGENT_RESPONSE_BYTES + 1)
+
+        def getcode(self):
+            return 200
+
+    monkeypatch.setattr(agent_client.request, "urlopen", lambda *args, **kwargs: FakeResponse())
+    client = AgentClient(AgentConfig("https://controller.example", 1, "token"))
+
+    with pytest.raises(AgentConnectionError, match="主控响应过大"):
+        client.heartbeat()
+
+
+def test_agent_client_accepts_full_poll_batch_response(monkeypatch) -> None:
+    """五个接近 2 MiB 上限的任务不能因客户端响应上限被误拒绝。"""
+
+    payload = json.dumps({"tasks": [{"id": index, "payload": "x" * (2 * 1024 * 1024 - 256)} for index in range(5)]})
+
+    class FakeResponse:
+        def __init__(self):
+            self.offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int = -1):
+            data = payload.encode("utf-8")
+            if size < 0:
+                chunk, self.offset = data[self.offset :], len(data)
+                return chunk
+            chunk = data[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+        def getcode(self):
+            return 200
+
+    monkeypatch.setattr(agent_client.request, "urlopen", lambda *args, **kwargs: FakeResponse())
+    client = AgentClient(AgentConfig("https://controller.example", 1, "token"))
+
+    assert len(client.poll_tasks()) == 5
+
+
+def test_udp2raw_asset_download_sends_agent_auth_and_checks_sha256(tmp_path: Path, monkeypatch) -> None:
+    """资产下载必须携带节点凭据，并拒绝服务端摘要不匹配的内容。"""
+
+    payload = b"udp2raw-test-binary"
+    expected = hashlib.sha256(payload).hexdigest()
+    target = tmp_path / "udp2raw"
+    target.write_bytes(b"old")
+
+    class FakeResponse:
+        headers = {"Content-Length": str(len(payload)), "X-Link42-Asset-SHA256": expected}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int = -1):
+            nonlocal payload
+            value, payload = payload, b""
+            return value
+
+    seen: list[Any] = []
+
+    def fake_urlopen(request_obj: Any, timeout: int):
+        seen.append(request_obj)
+        return FakeResponse()
+
+    monkeypatch.setattr(middleware.request, "urlopen", fake_urlopen)
+    middleware.download_asset(AgentConfig("https://controller.example/", 7, "secret"), "udp2raw_amd64", target)
+    assert target.read_bytes() == b"udp2raw-test-binary"
+    assert seen[0].get_header("X-link42-node-id") == "7"
+    assert seen[0].get_header("X-link42-agent-token") == "secret"
 
 
 def test_agent_install_script_openwrt_init_defines_rc_common_hooks() -> None:
@@ -1952,7 +2618,31 @@ def test_agent_install_script_openwrt_stages_and_rolls_back_source() -> None:
     assert 'backup_source="$INSTALL_DIR/.src.bak"' in script
     assert "rollback_source_install()" in script
     assert '"/etc/init.d/$SERVICE_NAME" status' in script
-    assert 'installed_version="$($BIN_PATH --version)"' in script
+    assert 'installed_version="$("$BIN_PATH" --version)"' in script
+
+
+def test_agent_install_script_rejects_symlink_paths_and_unsafe_service_names() -> None:
+    """root 安装脚本不能把自定义路径或服务名导向任意位置。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+
+    assert "reject_symlink_path()" in script
+    assert 'reject_symlink_path "$INSTALL_DIR"' in script
+    assert 'reject_symlink_path "$BIN_PATH"' in script
+    assert 'reject_symlink_path "$ENV_DIR"' in script
+    assert 'reject_symlink_path "$WIREGUARD_DIR"' in script
+    assert 'reject_symlink_path "$GRE_DIR"' in script
+    assert "validate_service_name()" in script
+    assert 'validate_service_name "$SERVICE_NAME"' in script
+
+
+def test_agent_payload_preserves_explicit_empty_capability_snapshots() -> None:
+    """Agent 卸载插件后上报空能力列表时不能被兼容默认值覆盖。"""
+
+    client = AgentClient(AgentConfig("https://controller.example", 1, "token"))
+    payload = client.agent_payload([], {})
+    assert payload["capabilities"] == []
+    assert payload["platform"] == {}
 
 
 def test_agent_uninstall_script_removes_link42_middleware() -> None:
@@ -1975,6 +2665,31 @@ def test_agent_uninstall_script_removes_link42_middleware() -> None:
     assert 'rm -f "$UDP2RAW_BIN"' in script
     assert "LINK42_KEEP_MIDDLEWARE=1" in script
     assert script.index("uninstall_middleware()") < script.index('rm -f "$BIN_PATH"')
+
+
+def test_agent_install_script_persists_gre_config_and_openwrt_environment() -> None:
+    """OpenWrt procd 重启后必须从受限环境文件恢复 Agent 认证和 GRE 配置。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+    assert 'INPUT_LINK42_GRE_DIR="${LINK42_GRE_DIR-}"' in script
+    assert "LINK42_GRE_DIR=%s" in script
+    assert "procd_set_param env LINK42_SERVER_URL" in script
+    assert 'AGENT_ENV_FILE=$service_env_file' in script
+
+
+def test_agent_uninstall_recovers_custom_paths_from_existing_installation() -> None:
+    """无参数卸载应从已安装环境恢复自定义路径，而不是只清理默认目录。"""
+
+    script = Path("deploy/sh/link42-agent.sh").read_text(encoding="utf-8")
+    assert "discover_uninstall_env_file()" in script
+    assert 'EnvironmentFile=' in script
+    assert 'AGENT_ENV_FILE=' in script
+    assert "LINK42_INSTALL_DIR=%s" in script
+    assert "LINK42_AGENT_BIN=%s" in script
+    assert "LINK42_ENV_DIR=%s" in script
+    assert "LINK42_UDP2RAW_BIN=%s" in script
+    assert "LINK42_MIMIC_SYSTEM_CONFIG_DIR=%s" in script
+    assert script.index("discover_uninstall_env_file") < script.index('INSTALL_DIR="$(normalize_install_path')
 
 
 def test_udp2raw_remove_last_instance_deletes_config_file(tmp_path: Path) -> None:
@@ -2008,6 +2723,121 @@ def test_udp2raw_delete_uses_payload_mode_only(tmp_path: Path, monkeypatch) -> N
     assert ["systemctl", "disable", "--now", "link42-udp2raw-client@link42-1.service"] in commands
     assert not any("link42-udp2raw-server@link42-1.service" in command for command in commands)
     assert not (tmp_path / "client").exists()
+
+
+def test_udp2raw_delete_preserves_config_when_stop_fails(tmp_path: Path, monkeypatch) -> None:
+    """服务停止失败时不能删除配置，否则 respawn 服务会失去可恢复的参数。"""
+
+    config_dir = tmp_path / "udp2raw"
+    config_dir.mkdir()
+    config = config_dir / "client"
+    original = "link42-1 -c -l127.0.0.1:12312\n"
+    config.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "systemd")
+    monkeypatch.setattr(
+        middleware,
+        "run_command",
+        lambda command, allow_failure: command_result(command, returncode=1),
+    )
+
+    with pytest.raises(RuntimeError, match="command failed"):
+        middleware.delete_udp2raw({"instance": "link42-1", "mode": "client"})
+
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_mimic_delete_failure_restores_files(tmp_path: Path, monkeypatch) -> None:
+    """mimic 服务重启失败时恢复被删除的实例片段和系统配置。"""
+
+    monkeypatch.setattr(middleware, "MIMIC_CONFIG_DIR", tmp_path / "snippets")
+    monkeypatch.setattr(middleware, "MIMIC_SYSTEM_CONFIG_DIR", tmp_path / "system")
+    monkeypatch.setattr(middleware, "mimic_service_backend", lambda: "systemd")
+    middleware.ensure_mimic_layout()
+    instance_path = middleware.mimic_instance_path("eth0", "link42-1")
+    instance_path.parent.mkdir(parents=True, exist_ok=True)
+    instance_path.write_text("old snippet\n", encoding="utf-8")
+    system_path = middleware.mimic_system_config_path("eth0")
+    system_path.write_text("user config\n", encoding="utf-8")
+
+    def fake_run_command(command, allow_failure):
+        if command[:2] == ["systemctl", "restart"] and allow_failure:
+            return command_result(command, returncode=1)
+        return command_result(command)
+
+    monkeypatch.setattr(middleware, "run_command", fake_run_command)
+    with pytest.raises(RuntimeError, match="command failed"):
+        middleware.delete_mimic({"instance": "link42-1", "bind_interface": "eth0"})
+
+    assert instance_path.read_text(encoding="utf-8") == "old snippet\n"
+    assert system_path.read_text(encoding="utf-8") == "user config\n"
+
+
+@pytest.mark.parametrize("failure", ["stop", "disable"])
+def test_udp2raw_openwrt_delete_failure_preserves_init_and_config(tmp_path, monkeypatch, failure):
+    config_dir = tmp_path / "configs"
+    init_dir = tmp_path / "init.d"
+    config_dir.mkdir()
+    init_dir.mkdir()
+    config = config_dir / "client"
+    config.write_text("link42-1 -c -k 'secret'\n", encoding="utf-8")
+    init_script = init_dir / "link42-udp2raw-client-link42-1"
+    init_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "OPENWRT_INIT_DIR", init_dir)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "openwrt-procd")
+    monkeypatch.setattr(middleware, "run_command", lambda command, allow_failure:
+                        command_result(command, returncode=1 if command[-1] == failure else 0))
+
+    with pytest.raises(RuntimeError, match="command failed"):
+        middleware.delete_udp2raw({"instance": "link42-1", "mode": "client"})
+    assert config.read_text() == "link42-1 -c -k 'secret'\n"
+    assert init_script.exists()
+
+
+def test_mimic_last_instance_delete_failure_restores_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(middleware, "MIMIC_CONFIG_DIR", tmp_path / "snippets")
+    monkeypatch.setattr(middleware, "MIMIC_SYSTEM_CONFIG_DIR", tmp_path / "system")
+    middleware.ensure_mimic_layout()
+    instance_path = middleware.mimic_instance_path("eth0", "link42-1")
+    instance_path.parent.mkdir()
+    instance_path.write_text("filter = remote=192.0.2.1:51820\n", encoding="utf-8")
+    system_path = middleware.mimic_system_config_path("eth0")
+    original = middleware.render_mimic_config("eth0")
+    system_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(middleware, "run_command", lambda command, allow_failure:
+                        command_result(command, returncode=1 if "disable" in command else 0))
+    with pytest.raises(RuntimeError, match="command failed"):
+        middleware.delete_mimic({"instance": "link42-1", "bind_interface": "eth0"})
+    assert instance_path.exists()
+    assert system_path.read_text() == original
+
+
+@pytest.mark.parametrize("corruption", ["invalid_utf8", "symlink"])
+def test_mimic_apply_does_not_drop_unreadable_other_connection(tmp_path, monkeypatch, corruption):
+    monkeypatch.setattr(middleware, "MIMIC_CONFIG_DIR", tmp_path / "snippets")
+    monkeypatch.setattr(middleware, "MIMIC_SYSTEM_CONFIG_DIR", tmp_path / "system")
+    monkeypatch.setattr(middleware, "mimic_service_backend", lambda: "systemd")
+    monkeypatch.setattr(middleware.shutil, "which", lambda _: "/usr/bin/mimic")
+    middleware.ensure_mimic_layout()
+    instance_path = middleware.mimic_instance_path("eth0", "link42-1")
+    instance_path.parent.mkdir()
+    other_path = instance_path.parent / "other.conf"
+    if corruption == "invalid_utf8":
+        other_path.write_bytes(b"\xff")
+    else:
+        other_path.symlink_to(tmp_path / "external.conf")
+    system_path = middleware.mimic_system_config_path("eth0")
+    original = (f"{middleware.MIMIC_BLOCK_BEGIN}\nfilter = remote=192.0.2.1:51820\n"
+                f"{middleware.MIMIC_BLOCK_END}\n")
+    system_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(middleware, "run_command", lambda command, allow_failure: command_result(command))
+
+    with pytest.raises((UnicodeDecodeError, ValueError)):
+        middleware.apply_mimic({"instance": "link42-1", "bind_interface": "eth0",
+                               "peer_host": "192.0.2.2", "peer_port": 51820})
+    assert system_path.read_text() == original
+    assert not instance_path.exists()
 
 
 def test_udp2raw_stop_uses_payload_mode_only(monkeypatch) -> None:
@@ -2161,6 +2991,28 @@ def test_udp2raw_capabilities_include_icmp(monkeypatch) -> None:
     assert "middleware.udp2raw.icmp" in main.build_capabilities()
 
 
+def test_udp2raw_wrapper_uses_configured_paths_atomically(tmp_path, monkeypatch) -> None:
+    config_dir = tmp_path / "custom config's"
+    config_dir.mkdir()
+    binary = tmp_path / "custom bin" / "udp2raw"
+    binary.parent.mkdir()
+    binary.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "UDP2RAW_BIN", binary)
+    wrapper = tmp_path / "custom-libexec" / "wrapper"
+    monkeypatch.setattr(middleware, "UDP2RAW_LIBEXEC", wrapper)
+    middleware.write_wrapper()
+    content = wrapper.read_text(encoding="utf-8")
+    assert middleware.shell_quote(str(config_dir)) in content
+    assert middleware.shell_quote(str(binary)) in content
+    assert wrapper.stat().st_mode & 0o777 == 0o700
+    assert not list(wrapper.parent.glob("*.tmp"))
+    (config_dir / "client").write_text("test-instance -c -k 'password with spaces'\n", encoding="utf-8")
+    result = subprocess.run([str(wrapper), "client", "test-instance"], text=True, capture_output=True, check=True)
+    assert result.stdout.splitlines() == ["-c", "-k", "password with spaces"]
+
+
 def test_udp2raw_openwrt_result_drops_successful_rc_common_noise() -> None:
     """验证 OpenWrt rc.common 成功路径中的固定 stderr 噪音会被清掉。"""
 
@@ -2219,6 +3071,46 @@ def test_udp2raw_install_uses_openwrt_backend_without_systemd_units(tmp_path: Pa
     assert not server_unit.exists()
     assert not client_unit.exists()
     assert commands == []
+
+
+def test_udp2raw_install_rolls_back_binary_when_unit_generation_fails(tmp_path: Path, monkeypatch) -> None:
+    """下载成功但 systemd 文件生成失败时必须恢复旧二进制和单元。"""
+
+    config_dir = tmp_path / "udp2raw"
+    binary = tmp_path / "bin" / "udp2raw"
+    libexec = tmp_path / "libexec" / "wrapper"
+    server_unit = tmp_path / "systemd" / "server.service"
+    client_unit = tmp_path / "systemd" / "client.service"
+    for path, content in [
+        (binary, b"old-binary"),
+        (libexec, b"old-wrapper"),
+        (server_unit, b"old-server"),
+        (client_unit, b"old-client"),
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    monkeypatch.setattr(middleware, "UDP2RAW_CONFIG_DIR", config_dir)
+    monkeypatch.setattr(middleware, "UDP2RAW_BIN", binary)
+    monkeypatch.setattr(middleware, "UDP2RAW_LIBEXEC", libexec)
+    monkeypatch.setattr(middleware, "UDP2RAW_SERVER_UNIT", server_unit)
+    monkeypatch.setattr(middleware, "UDP2RAW_CLIENT_UNIT", client_unit)
+    monkeypatch.setattr(middleware, "udp2raw_service_backend", lambda: "systemd")
+    monkeypatch.setattr(middleware, "detect_udp2raw_asset", lambda: "udp2raw_amd64")
+    monkeypatch.setattr(middleware, "download_asset", lambda _config, _asset, target: target.write_bytes(b"new-binary"))
+
+    def fail_units() -> None:
+        libexec.write_bytes(b"partial-wrapper")
+        raise RuntimeError("unit generation failed")
+
+    monkeypatch.setattr(middleware, "write_wrapper", fail_units)
+
+    with pytest.raises(RuntimeError, match="unit generation failed"):
+        middleware.install_udp2raw(middleware.AgentConfig(server_url="http://controller", node_id=1, token="t"))
+
+    assert binary.read_bytes() == b"old-binary"
+    assert libexec.read_bytes() == b"old-wrapper"
+    assert server_unit.read_bytes() == b"old-server"
+    assert client_unit.read_bytes() == b"old-client"
 
 
 def test_udp2raw_delete_uses_openwrt_role_init(tmp_path: Path, monkeypatch) -> None:
@@ -2320,6 +3212,221 @@ def test_apply_config_restarts_existing_systemd_service(tmp_path: Path, monkeypa
     assert (tmp_path / "wg0.conf").exists()
 
 
+def test_apply_config_restores_previous_file_when_restart_fails(tmp_path: Path, monkeypatch) -> None:
+    """新配置重启失败时，Agent 应恢复文件并重新加载旧配置。"""
+
+    commands: list[list[str]] = []
+    restart_attempts = 0
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        nonlocal restart_attempts
+        commands.append(command)
+        if command == ["systemctl", "is-active", "wg-quick@wg0.service"]:
+            return command_result(command, stdout="active\n")
+        if command == ["systemctl", "is-enabled", "wg-quick@wg0.service"]:
+            return command_result(command, stdout="enabled\n")
+        if command == ["systemctl", "restart", "wg-quick@wg0.service"]:
+            restart_attempts += 1
+            if restart_attempts == 1:
+                raise RuntimeError("invalid WireGuard configuration")
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=True)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    target = tmp_path / "wg0.conf"
+    target.write_text("old-config\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="invalid WireGuard"):
+        system.apply_wireguard_config(
+            {"interface_name": "wg0", "config": "broken-config\n"},
+            wireguard_dir=str(tmp_path),
+        )
+
+    assert target.read_text(encoding="utf-8") == "old-config\n"
+    assert restart_attempts == 2
+
+
+def test_apply_config_rejects_oversized_existing_file_before_backup(tmp_path: Path, monkeypatch) -> None:
+    """下发前读取旧配置也必须受大小上限保护。"""
+
+    target = tmp_path / "wg0.conf"
+    target.write_bytes(b"x" * (system.WIREGUARD_CONFIG_MAX_BYTES + 1))
+    use_service_binaries(monkeypatch, systemd=False, openrc=False, wg_quick=True)
+    monkeypatch.setattr(system, "run_command", lambda *args, **kwargs: command_result(args[0]))
+
+    with pytest.raises(ValueError, match="too large"):
+        system.apply_wireguard_config(
+            {"interface_name": "wg0", "config": "[Interface]\nPrivateKey = private\n"},
+            wireguard_dir=str(tmp_path),
+        )
+
+
+def test_apply_config_rejects_oversized_new_content(tmp_path: Path, monkeypatch) -> None:
+    """新配置内容也必须受大小上限保护，不能绕过已有文件检查。"""
+
+    use_service_binaries(monkeypatch, systemd=False, openrc=False, wg_quick=True)
+    monkeypatch.setattr(system, "run_command", lambda *args, **kwargs: command_result(args[0]))
+    oversized = "x" * (system.WIREGUARD_CONFIG_MAX_BYTES + 1)
+
+    with pytest.raises(ValueError, match="too large"):
+        system.apply_wireguard_config(
+            {"interface_name": "wg0", "config": oversized},
+            wireguard_dir=str(tmp_path),
+        )
+
+    assert not (tmp_path / "wg0.conf").exists()
+
+
+def test_scan_configs_skips_oversized_candidate_and_continues(tmp_path: Path, monkeypatch) -> None:
+    """导入扫描不能被目录中排在前面的超大配置饿死。"""
+
+    (tmp_path / "a.conf").write_bytes(b"x" * (system.IMPORT_SCAN_MAX_BYTES + 1))
+    valid = tmp_path / "b.conf"
+    valid.write_text("[Interface]\nPrivateKey = private\n", encoding="utf-8")
+    monkeypatch.setattr(system.shutil, "which", lambda name: "/usr/bin/wg-quick" if name == "wg-quick" else None)
+    monkeypatch.setattr(system, "parse_wg_quick", lambda content, name: type("Parsed", (), {
+        "warnings": [],
+        "peers": [],
+    })())
+    monkeypatch.setattr(system, "parsed_interface_to_dict", lambda parsed: {"warnings": []})
+
+    candidates = system.scan_wg_quick_configs(str(tmp_path))
+
+    assert [item["path"] for item in candidates] == [str(valid)]
+
+
+def test_port_inventory_skips_oversized_wireguard_config(tmp_path: Path, monkeypatch) -> None:
+    """端口扫描读取 wg-quick 文件时也不能无界载入异常大内容。"""
+
+    from link42_agent.plugins import port_inventory
+
+    oversized = tmp_path / "wg0.conf"
+    oversized.write_bytes(b"x" * (system.WIREGUARD_CONFIG_MAX_BYTES + 1))
+    monkeypatch.setattr(port_inventory.shutil, "which", lambda name: None)
+
+    assert port_inventory.scan_wg_quick_config_ports(1, 65535, str(tmp_path)) == []
+
+
+def test_openwrt_apply_dry_run_does_not_touch_network(tmp_path: Path, monkeypatch) -> None:
+    """OpenWrt 演练模式必须避免 UCI 写入和接口重启，包括改名清理。"""
+
+    manager = service_manager.OpenWrtUciManager(
+        lambda *args, **kwargs: pytest.fail("dry-run executed a network command"),
+    )
+    monkeypatch.setattr(system, "detect_service_manager", lambda runner: manager)
+
+    result = system.apply_wireguard_config(
+        {
+            "interface_name": "wg-new",
+            "previous_interface_name": "wg-old",
+            "config": "[Interface]\nPrivateKey = private\n",
+        },
+        wireguard_dir=str(tmp_path),
+        dry_run=True,
+    )
+
+    assert result["dry_run"] is True
+    assert result["changed"] is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_openwrt_apply_rejects_missing_peer_key_before_mutation() -> None:
+    """校验所有对端密钥后才能删除既有 UCI 配置。"""
+
+    manager = service_manager.OpenWrtUciManager(
+        lambda *args, **kwargs: pytest.fail("invalid config modified UCI"),
+    )
+    with pytest.raises(ValueError, match="every Peer.PublicKey"):
+        manager.apply_config("wg0", "[Interface]\nPrivateKey = private\n[Peer]\nAllowedIPs = 10.0.0.1/32\n")
+
+
+def test_openwrt_apply_restores_network_file_when_ifup_fails(tmp_path: Path, monkeypatch) -> None:
+    """UCI 已提交但 ifup 失败时应恢复完整 network 配置快照。"""
+
+    network_file = tmp_path / "network"
+    network_file.write_text("config interface 'old'\n", encoding="utf-8")
+    monkeypatch.setattr(service_manager, "OPENWRT_NETWORK_CONFIG", network_file)
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        commands.append(command)
+        if command == ["ifup", "wg0"]:
+            raise RuntimeError("ifup failed")
+        if command == ["uci", "-q", "show", "network"]:
+            return command_result(command)
+        return command_result(command)
+
+    manager = service_manager.OpenWrtUciManager(fake_run_command)
+    with pytest.raises(RuntimeError, match="ifup failed"):
+        manager.apply_config("wg0", "[Interface]\nPrivateKey = private\n")
+
+    assert network_file.read_text(encoding="utf-8") == "config interface 'old'\n"
+    assert ["uci", "revert", "network"] in commands
+
+
+def test_openwrt_apply_rejects_oversized_network_snapshot(tmp_path: Path, monkeypatch) -> None:
+    """恢复快照前限制 OpenWrt network 文件大小，避免异常文件耗尽内存。"""
+
+    network_file = tmp_path / "network"
+    network_file.write_bytes(b"x" * (service_manager.OPENWRT_NETWORK_CONFIG_MAX_BYTES + 1))
+    monkeypatch.setattr(service_manager, "OPENWRT_NETWORK_CONFIG", network_file)
+    manager = service_manager.OpenWrtUciManager(lambda *args, **kwargs: pytest.fail("UCI must not run"))
+
+    with pytest.raises(ValueError, match="network config is too large"):
+        manager.apply_config("wg0", "[Interface]\nPrivateKey = private\n")
+
+
+def test_openwrt_apply_rejects_symlinked_network_config(tmp_path: Path, monkeypatch) -> None:
+    """OpenWrt network 配置若为符号链接时不得执行 UCI。"""
+
+    outside = tmp_path / "outside"
+    outside.write_text("config interface 'outside'\n", encoding="utf-8")
+    network_file = tmp_path / "network"
+    network_file.symlink_to(outside)
+    monkeypatch.setattr(service_manager, "OPENWRT_NETWORK_CONFIG", network_file)
+    manager = service_manager.OpenWrtUciManager(lambda *args, **kwargs: pytest.fail("UCI must not run"))
+
+    with pytest.raises(ValueError, match="must not be a symbolic link"):
+        manager.apply_config("wg0", "[Interface]\nPrivateKey = private\n")
+
+
+def test_openwrt_gre_apply_rejects_symlinked_network_config(tmp_path: Path, monkeypatch) -> None:
+    """OpenWrt GRE 也必须拒绝符号链接 network 配置。"""
+
+    outside = tmp_path / "outside"
+    outside.write_text("config interface 'outside'\n", encoding="utf-8")
+    network_file = tmp_path / "network"
+    network_file.symlink_to(outside)
+    monkeypatch.setattr(gre, "OPENWRT_NETWORK_CONFIG", network_file)
+    monkeypatch.setattr(gre, "openwrt_gre_available", lambda: True)
+    monkeypatch.setattr(gre, "run_command", lambda *args, **kwargs: pytest.fail("UCI must not run"))
+
+    with pytest.raises(ValueError, match="must not be a symbolic link"):
+        gre.apply_gre_config(
+            {
+                "interface_name": "gre0",
+                "outer_local_ip": "203.0.113.1",
+                "outer_remote_ip": "198.51.100.1",
+                "tunnel_ips": ["10.0.0.1/30"],
+                "routes": [],
+            },
+            str(tmp_path / "gre"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("[2001:db8::1]:51820", ("2001:db8::1", 51820)),
+        ("2001:db8::1", ("2001:db8::1", None)),
+        ("[2001:db8::1]", ("2001:db8::1", None)),
+    ],
+)
+def test_openwrt_endpoint_preserves_ipv6(endpoint, expected) -> None:
+    assert service_manager._split_endpoint(endpoint) == expected
+
+
 def test_apply_config_keeps_only_one_wireguard_backup(tmp_path: Path, monkeypatch) -> None:
     """验证同一接口重复下发时只保留一个 Link42 备份文件。"""
 
@@ -2418,6 +3525,39 @@ def test_apply_config_falls_back_to_wg_quick_when_no_systemd_unit(tmp_path: Path
 
     assert result["service"]["managed"] is False
     assert ["wg-quick", "down", "wg0"] in commands
+
+
+def test_apply_config_direct_mode_restores_and_restarts_old_config_on_failure(tmp_path: Path, monkeypatch) -> None:
+    commands: list[list[str]] = []
+    target = tmp_path / "wg0.conf"
+    target.write_text("old-config\n", encoding="utf-8")
+    up_attempts = 0
+
+    def fake_run_command(command: list[str], allow_failure: bool) -> dict[str, Any]:
+        nonlocal up_attempts
+        commands.append(command)
+        if command[:2] == ["systemctl", "is-active"]:
+            return command_result(command, returncode=3, stdout="inactive\n")
+        if command[:2] == ["systemctl", "is-enabled"]:
+            return command_result(command, returncode=1, stdout="disabled\n")
+        if command[:2] == ["wg-quick", "down"]:
+            return command_result(command, returncode=0)
+        if command[:2] == ["wg-quick", "up"]:
+            up_attempts += 1
+            if up_attempts == 1:
+                raise RuntimeError("new config rejected")
+            return command_result(command)
+        raise AssertionError(f"unexpected command: {command}")
+
+    use_service_binaries(monkeypatch, systemd=True)
+    monkeypatch.setattr(system, "run_command", fake_run_command)
+    with pytest.raises(RuntimeError, match="new config rejected"):
+        system.apply_wireguard_config(
+            {"interface_name": "wg0", "config": "new-config\n"},
+            wireguard_dir=str(tmp_path),
+        )
+    assert target.read_text(encoding="utf-8") == "old-config\n"
+    assert up_attempts == 2
     assert ["wg-quick", "up", "wg0"] in commands
 
 
@@ -3118,7 +4258,7 @@ def test_self_upgrade_rejects_foreign_download_url() -> None:
             {
                 "download_url": "https://evil.example/agent",
                 "target_version": "0.2.1",
-                "sha256": "abc123",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             },
             config,
             dry_run=True,
@@ -3127,6 +4267,12 @@ def test_self_upgrade_rejects_foreign_download_url() -> None:
         assert "configured controller" in str(exc)
     else:
         raise AssertionError("foreign download url was accepted")
+
+
+@pytest.mark.parametrize("url", ["http:///api/agent", "http://controller@evil.example/api/agent", "file://controller/agent"])
+def test_self_upgrade_rejects_malformed_controller_url(url: str) -> None:
+    with pytest.raises(ValueError, match="configured controller"):
+        upgrade.ensure_controller_url(url, "http://controller:8000")
 
 
 def test_self_upgrade_dry_run_stages_when_systemd(monkeypatch) -> None:
@@ -3139,7 +4285,7 @@ def test_self_upgrade_dry_run_stages_when_systemd(monkeypatch) -> None:
         {
             "download_url": "http://controller:8000/api/agent/releases/0.2.1/download?platform=linux-x64",
             "target_version": "0.2.1",
-            "sha256": "abc123",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
         },
         config,
         dry_run=True,
@@ -3163,7 +4309,7 @@ def test_self_upgrade_dry_run_stages_openwrt_source(monkeypatch) -> None:
         {
             "download_url": "http://controller:8000/api/agent/releases/0.6.14/download?platform=openwrt-source",
             "target_version": "0.6.14",
-            "sha256": "abc123",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "upgrade_mode": "source",
         },
         config,
@@ -3172,6 +4318,64 @@ def test_self_upgrade_dry_run_stages_openwrt_source(monkeypatch) -> None:
 
     assert result["status"] == "staged"
     assert result["upgrade_mode"] == "source"
+
+
+class _UpgradeResponse:
+    """最小化 urllib 响应，用于验证升级下载边界。"""
+
+    def __init__(self, data: bytes, content_length: str | None = None) -> None:
+        self._stream = io.BytesIO(data)
+        self.headers = {"Content-Length": content_length} if content_length is not None else {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+
+def test_download_file_enforces_expected_size_and_atomic_replace(monkeypatch, tmp_path: Path) -> None:
+    """升级下载应校验 manifest 大小，并成功后才替换旧文件。"""
+
+    target = tmp_path / "link42-agent.new"
+    target.write_bytes(b"old")
+    response = _UpgradeResponse(b"new-agent", content_length="9")
+    monkeypatch.setattr(upgrade.request, "urlopen", lambda *args, **kwargs: response)
+
+    upgrade.download_file(None, "http://controller/agent", target, expected_size=9)
+
+    assert target.read_bytes() == b"new-agent"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("data", "content_length", "expected_size", "error"),
+    [
+        (b"too-large", "9", 8, "size mismatch"),
+        (b"too-large", None, 8, "exceeds expected size"),
+        (b"short", None, 8, "size mismatch"),
+        (b"too-large", None, None, "exceeds expected size"),
+    ],
+)
+def test_download_file_rejects_size_mismatch_and_preserves_target(
+    monkeypatch, tmp_path: Path, data, content_length, expected_size, error,
+) -> None:
+    """响应过大或过小时不能覆盖已有可用升级包。"""
+
+    target = tmp_path / "link42-agent.new"
+    target.write_bytes(b"old")
+    response = _UpgradeResponse(data, content_length=content_length)
+    monkeypatch.setattr(upgrade, "MAX_DOWNLOAD_SIZE", 8 if expected_size is None else 64)
+    monkeypatch.setattr(upgrade.request, "urlopen", lambda *args, **kwargs: response)
+
+    with pytest.raises(RuntimeError, match=error):
+        upgrade.download_file(None, "http://controller/agent", target, expected_size=expected_size)
+
+    assert target.read_bytes() == b"old"
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_extract_source_archive_checks_version_and_paths(tmp_path: Path) -> None:

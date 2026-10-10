@@ -8,6 +8,12 @@ from link42_wireguard import parse_wg_quick, render_wg_quick
 from . import models
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    """把旧库中的异常 JSON 根类型规整为空对象。"""
+
+    return value if isinstance(value, dict) else {}
+
+
 def interface_to_render_dict(interface: models.WireGuardInterface) -> dict[str, Any]:
     """把数据库模型转换成渲染器需要的字典。
 
@@ -28,7 +34,7 @@ def interface_to_render_dict(interface: models.WireGuardInterface) -> dict[str, 
         "post_up": interface.post_up,
         "pre_down": interface.pre_down,
         "post_down": interface.post_down,
-        "custom_config": (interface.extras or {}).get("custom_config"),
+        "custom_config": _json_object(interface.extras).get("custom_config"),
     }
 
 
@@ -44,7 +50,7 @@ def peer_to_render_dict(peer: models.WireGuardPeer) -> dict[str, Any]:
         "endpoint_port": peer.endpoint_port,
         "allowed_ips": peer.allowed_ips,
         "persistent_keepalive": peer.persistent_keepalive,
-        "custom_config": (peer.extras or {}).get("custom_config"),
+        "custom_config": _json_object(peer.extras).get("custom_config"),
     }
 
 
@@ -90,7 +96,7 @@ def build_apply_plan(interface: models.WireGuardInterface) -> dict[str, Any]:
         "managed": interface.managed,
         "import_path": interface.import_path,
     }
-    previous_interface_name = (interface.extras or {}).get("previous_interface_name")
+    previous_interface_name = _json_object(interface.extras).get("previous_interface_name")
     if previous_interface_name and previous_interface_name != interface.name:
         payload["previous_interface_name"] = previous_interface_name
     return payload
@@ -113,7 +119,7 @@ def build_apply_payload_from_config(interface: models.WireGuardInterface, config
         "managed": True,
         "import_path": interface.import_path,
     }
-    previous_interface_name = (interface.extras or {}).get("previous_interface_name")
+    previous_interface_name = _json_object(interface.extras).get("previous_interface_name")
     if previous_interface_name and previous_interface_name != interface.name:
         payload["previous_interface_name"] = previous_interface_name
     return payload
@@ -135,7 +141,7 @@ def build_diff(old_config: str, new_config: str, fromfile: str = "current", tofi
 def build_interface_rename_diff(interface: models.WireGuardInterface) -> str:
     """生成接口名变更 diff，让无配置文本变化的改名也能被确认部署。"""
 
-    previous_interface_name = str((interface.extras or {}).get("previous_interface_name") or "").strip()
+    previous_interface_name = str(_json_object(interface.extras).get("previous_interface_name") or "").strip()
     if not previous_interface_name or previous_interface_name == interface.name:
         return ""
     old_metadata = f"InterfaceName = {previous_interface_name}\n"
@@ -153,6 +159,19 @@ def split_endpoint(endpoint: str | None) -> tuple[str | None, int | None]:
 
     if not endpoint:
         return None, None
+    if endpoint.startswith("[") and "]:" in endpoint:
+        host, port_text = endpoint[1:].rsplit("]:", 1)
+        try:
+            return host, int(port_text)
+        except ValueError:
+            return host, None
+    if endpoint.startswith("[") and endpoint.endswith("]"):
+        return endpoint[1:-1], None
+    # An unbracketed IPv6 literal contains several colons and has no
+    # unambiguous port separator.  Preserve it as the host instead of
+    # treating the final hextet as a port.
+    if endpoint.count(":") > 1:
+        return endpoint, None
     if ":" not in endpoint:
         return endpoint, None
     host, port_text = endpoint.rsplit(":", 1)

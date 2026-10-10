@@ -177,7 +177,6 @@ public_ip
 endpoint_ips            # JSON array of selectable endpoint addresses
 status
 agent_token_hash
-agent_token_value       # stored so trusted admins can view install token again
 last_seen_at
 created_at
 updated_at
@@ -647,7 +646,9 @@ design.
 
 First release security requirements:
 
-- Agent tokens must be random and stored hashed on the API side.
+- Agent tokens must be random and stored hashed on the API side; the cleartext
+  token is returned only by node creation or explicit rotation and cannot be
+  recovered from the node detail API.
 - Agent endpoints must require node identity plus token authentication.
 - Private keys and preshared keys must not appear in frontend logs.
 - Task results must redact private keys before persistence.
@@ -808,7 +809,7 @@ npm run build --prefix apps/web
 git diff --check
 ```
 
-测试结果：`126 passed`，仅有既有 DeprecationWarning。
+测试结果以当前工作区全量回归命令输出为准；示例文档不固定记录测试数量。
 
 ### 当前开发主控验收方式
 
@@ -822,9 +823,5 @@ LINK42_AGENT_OFFLINE_AFTER_SECONDS=3600 \
 .venv/bin/uvicorn link42_api.main:app --host 0.0.0.0 --port 8000 --no-access-log
 ```
 
-当前演示登录信息：
-
-```text
-用户名：pmman
-密码：pmman-demo
-```
+演示库首次启动时会生成随机管理员密码，密码写入配置目录下的
+`initial-admin-password`（权限 `0600`），不要在文档或长期日志中固定记录密码。

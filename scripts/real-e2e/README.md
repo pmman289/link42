@@ -58,6 +58,10 @@ The script writes state, logs, and a temp SQLite database under:
 /tmp/link42-real-e2e
 ```
 
+The run directory is marked and kept mode `0700`; `state.env` contains tokens
+and is kept mode `0600`. The scripts refuse to reuse or remove a non-empty
+directory without the Link42 marker.
+
 It also prints the controller URL and node ids. The remote agent is started from
 a tarball of the current `apps/agent` and `packages` directories, so it tests
 the current working tree.

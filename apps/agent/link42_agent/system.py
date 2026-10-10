@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import glob
 import logging
+import math
 import os
 import platform
 import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -15,15 +17,23 @@ from typing import Any, Optional
 from link42_wireguard import parse_wg_quick, parsed_interface_to_dict
 
 from .service_manager import DirectWgQuickManager, OpenWrtUciManager, UnsupportedServiceManager, detect_service_manager
-from .validation import atomic_write_text, managed_child_path, validate_interface_name
+from .commands import run_bounded_command
+from .validation import atomic_write_bytes, atomic_write_text, ensure_managed_directory, managed_child_path, read_existing_bytes, read_existing_text, validate_interface_name
 
 
 # wg-quick 默认配置目录；可通过环境变量覆盖，便于测试和非标准系统布局。
 DEFAULT_WIREGUARD_DIR = "/etc/wireguard"
+IMPORT_SCAN_MAX_CANDIDATES = 100
+# Agent result uploads are capped at 1 MiB by the controller.  Leave headroom
+# for JSON metadata when returning imported config contents.
+IMPORT_SCAN_MAX_BYTES = 768 * 1024
+WIREGUARD_CONFIG_MAX_BYTES = 512 * 1024
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 OPENWRT_INTERFACE_STOP_TIMEOUT_SECONDS = 5.0
 OPENWRT_INTERFACE_STOP_POLL_SECONDS = 0.2
 logger = logging.getLogger("link42.agent.system")
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
 
 
 def sanitize_command_for_log(command: list[str]) -> list[str]:
@@ -60,7 +70,7 @@ def command_timeout_seconds() -> float:
         timeout = float(value)
     except ValueError:
         return DEFAULT_COMMAND_TIMEOUT_SECONDS
-    return timeout if timeout > 0 else DEFAULT_COMMAND_TIMEOUT_SECONDS
+    return timeout if math.isfinite(timeout) and timeout > 0 else DEFAULT_COMMAND_TIMEOUT_SECONDS
 
 
 def get_hostname() -> str:
@@ -216,11 +226,24 @@ def scan_wg_quick_configs(wireguard_dir: str = DEFAULT_WIREGUARD_DIR) -> list[di
     """
 
     candidates: list[dict[str, Any]] = []
+    total_bytes = 0
     if not shutil.which("wg-quick"):
         return candidates
     for path_text in sorted(glob.glob(os.path.join(wireguard_dir, "*.conf"))):
         path = Path(path_text)
-        content = path.read_text(encoding="utf-8")
+        if path.is_symlink():
+            continue
+        try:
+            path = managed_child_path(wireguard_dir, path.name)
+            content = read_existing_text(path)
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        content_bytes = len(content.encode("utf-8"))
+        if len(candidates) >= IMPORT_SCAN_MAX_CANDIDATES or total_bytes >= IMPORT_SCAN_MAX_BYTES:
+            break
+        # 一个超大或靠近总预算上限的文件不应阻止后面的正常配置被发现。
+        if total_bytes + content_bytes > IMPORT_SCAN_MAX_BYTES:
+            continue
         parsed = parse_wg_quick(content, name=path.stem)
         parsed_json = parsed_interface_to_dict(parsed)
         candidates.append(
@@ -231,6 +254,7 @@ def scan_wg_quick_configs(wireguard_dir: str = DEFAULT_WIREGUARD_DIR) -> list[di
                 "warnings": parsed_json.get("warnings", []),
             }
         )
+        total_bytes += content_bytes
     return candidates
 
 
@@ -247,19 +271,41 @@ def apply_wireguard_config(
 
     interface_name = validate_interface_name(payload["interface_name"])
     config_text = payload["config"]
+    if not isinstance(config_text, str):
+        raise ValueError("WireGuard config must be text")
+    if len(config_text.encode("utf-8")) > WIREGUARD_CONFIG_MAX_BYTES:
+        raise ValueError("WireGuard config is too large")
     enable_on_boot = bool(payload.get("enable_on_boot"))
     manager = detect_service_manager(run_command)
     previous_value = str(payload.get("previous_interface_name") or "").strip()
     previous_interface_name = validate_interface_name(previous_value, "previous interface name") if previous_value else None
-    rename_cleanup = cleanup_previous_wireguard_interface(
-        previous_interface_name,
-        interface_name,
-        manager,
-        wireguard_dir,
-        dry_run,
-    )
+    if isinstance(manager, OpenWrtUciManager) and dry_run:
+        parsed = parse_wg_quick(config_text, name=interface_name)
+        return {
+            "changed": False,
+            "dry_run": True,
+            "manager": manager.name,
+            "config_backend": "uci",
+            "warnings": parsed.warnings + [warning for peer in parsed.peers for warning in peer.warnings],
+            "message": "dry-run enabled, UCI and network state were not changed",
+        }
+    rename_cleanup = None
+    if dry_run:
+        rename_cleanup = cleanup_previous_wireguard_interface(
+            previous_interface_name,
+            interface_name,
+            manager,
+            wireguard_dir,
+            dry_run=True,
+        )
     if isinstance(manager, OpenWrtUciManager):
         result = manager.apply_config(interface_name, config_text, enable_on_boot=enable_on_boot)
+        rename_cleanup = cleanup_previous_wireguard_interface(
+            previous_interface_name,
+            interface_name,
+            manager,
+            wireguard_dir,
+        )
         if rename_cleanup:
             result["rename_cleanup"] = rename_cleanup
         return result
@@ -267,72 +313,106 @@ def apply_wireguard_config(
         raise RuntimeError(manager.state(interface_name)["message"])
 
     target = wireguard_config_path(wireguard_dir, interface_name)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_managed_directory(target.parent)
     service_state = manager.state(interface_name)
 
     backup_path: Optional[str] = None
     if target.exists():
+        if target.stat().st_size > WIREGUARD_CONFIG_MAX_BYTES:
+            raise ValueError("WireGuard config file is too large")
         backup = rotate_wireguard_backup(target)
-        shutil.copy2(target, backup)
+        atomic_write_bytes(backup, read_existing_bytes(target), mode=0o600)
+        shutil.copystat(target, backup, follow_symlinks=False)
         backup_path = str(backup)
 
-    atomic_write_text(target, config_text)
+    config_written = False
+    apply_manager = manager if service_state["managed"] or enable_on_boot else DirectWgQuickManager(run_command)
+    try:
+        atomic_write_text(target, config_text)
+        config_written = True
 
-    if dry_run:
-        return {
-            "changed": True,
-            "dry_run": True,
-            "config_path": str(target),
-            "backup_path": backup_path,
-            "rename_cleanup": rename_cleanup,
-            "message": "dry-run enabled, wg-quick was not executed",
-        }
+        if dry_run:
+            return {
+                "changed": True,
+                "dry_run": True,
+                "config_path": str(target),
+                "backup_path": backup_path,
+                "rename_cleanup": rename_cleanup,
+                "message": "dry-run enabled, wg-quick was not executed",
+            }
 
-    if service_state["managed"]:
-        apply_result = manager.restart(interface_name)
-        enable_result = manager.enable(interface_name) if enable_on_boot else None
-        return {
-            "changed": True,
-            "config_path": str(target),
-            "backup_path": backup_path,
-            "rename_cleanup": rename_cleanup,
-            "service": service_state,
-            "restart": apply_result,
-            "enable": enable_result,
-        }
+        if service_state["managed"]:
+            apply_result = manager.restart(interface_name)
+            enable_result = manager.enable(interface_name) if enable_on_boot else None
+            result = {
+                "changed": True,
+                "config_path": str(target),
+                "backup_path": backup_path,
+                "service": service_state,
+                "restart": apply_result,
+                "enable": enable_result,
+            }
+        elif enable_on_boot:
+            enable_result = manager.enable(interface_name)
+            restart_result = manager.restart(interface_name)
+            result = {
+                "changed": True,
+                "config_path": str(target),
+                "backup_path": backup_path,
+                "service": service_state,
+                "enable": enable_result,
+                "restart": restart_result,
+            }
+        else:
+            restart_result = DirectWgQuickManager(run_command).restart(interface_name)
+            if "down" in restart_result and "up" in restart_result:
+                result = {
+                    "changed": True,
+                    "config_path": str(target),
+                    "backup_path": backup_path,
+                    "service": service_state,
+                    "down": restart_result["down"],
+                    "up": restart_result["up"],
+                }
+            else:
+                result = {
+                    "changed": True,
+                    "config_path": str(target),
+                    "backup_path": backup_path,
+                    "service": service_state,
+                    "restart": restart_result,
+                }
+    except Exception:
+        if config_written:
+            try:
+                if backup_path and Path(backup_path).exists():
+                    atomic_write_text(target, read_existing_text(Path(backup_path)))
+                    if isinstance(apply_manager, DirectWgQuickManager):
+                        # direct 模式没有可靠的 active 状态；重启旧配置才能
+                        # 恢复在尝试新配置前已经运行的隧道。
+                        apply_manager.restart(interface_name)
+                    elif service_state["active_state"] == "inactive":
+                        apply_manager.stop(interface_name)
+                    else:
+                        apply_manager.restart(interface_name)
+                else:
+                    try:
+                        apply_manager.stop(interface_name)
+                    finally:
+                        target.unlink(missing_ok=True)
+            except Exception as restore_error:
+                logger.error("WireGuard 配置失败回滚异常 interface=%s error=%s", interface_name, restore_error)
+        raise
 
-    if enable_on_boot:
-        enable_result = manager.enable(interface_name)
-        restart_result = manager.restart(interface_name)
-        return {
-            "changed": True,
-            "config_path": str(target),
-            "backup_path": backup_path,
-            "rename_cleanup": rename_cleanup,
-            "service": service_state,
-            "enable": enable_result,
-            "restart": restart_result,
-        }
-
-    restart_result = DirectWgQuickManager(run_command).restart(interface_name)
-    if "down" in restart_result and "up" in restart_result:
-        return {
-            "changed": True,
-            "config_path": str(target),
-            "backup_path": backup_path,
-            "rename_cleanup": rename_cleanup,
-            "service": service_state,
-            "down": restart_result["down"],
-            "up": restart_result["up"],
-        }
-    return {
-        "changed": True,
-        "config_path": str(target),
-        "backup_path": backup_path,
-        "rename_cleanup": rename_cleanup,
-        "service": service_state,
-        "restart": restart_result,
-    }
+    if not dry_run:
+        rename_cleanup = cleanup_previous_wireguard_interface(
+            previous_interface_name,
+            interface_name,
+            manager,
+            wireguard_dir,
+        )
+    result["rename_cleanup"] = rename_cleanup
+    return result
 
 
 def cleanup_previous_wireguard_interface(
@@ -440,7 +520,9 @@ def read_wireguard_config(payload: dict[str, Any], wireguard_dir: str = DEFAULT_
         }
     if not target.exists():
         return {"exists": False, "config": "", "config_path": str(target)}
-    return {"exists": True, "config": target.read_text(encoding="utf-8"), "config_path": str(target)}
+    if target.stat().st_size > WIREGUARD_CONFIG_MAX_BYTES:
+        raise ValueError("WireGuard config file is too large")
+    return {"exists": True, "config": read_existing_text(target), "config_path": str(target)}
 
 
 def get_wireguard_status(payload: dict[str, Any]) -> dict[str, Any]:
@@ -602,35 +684,125 @@ def run_command(
     safe_command = sanitize_command_for_log(command)
     started_at = time.monotonic()
     logger.debug("执行系统命令 command=%s timeout=%s allow_failure=%s", safe_command, effective_timeout, allow_failure)
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=effective_timeout,
-            env=effective_env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration = time.monotonic() - started_at
-        log_method = logger.warning if log_failure else logger.debug
-        log_method("系统命令超时 command=%s timeout=%s duration=%.2fs", safe_command, effective_timeout, duration)
-        result = {
-            "command": safe_command,
-            "returncode": 124,
-            "stdout": exc.stdout or "",
-            "stderr": f"command timed out after {effective_timeout:g}s",
-            "timeout": effective_timeout,
+    # 生产路径持续排空两个管道并丢弃超限输出；测试替身仍走兼容路径，
+    # 这样旧调用方可以继续验证命令参数而不改变运行时安全边界。
+    if subprocess.run is _ORIGINAL_SUBPROCESS_RUN:
+        try:
+            bounded = run_bounded_command(
+                command,
+                timeout=effective_timeout,
+                output_limit=MAX_COMMAND_OUTPUT_BYTES,
+                env=effective_env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            duration = time.monotonic() - started_at
+            log_method = logger.warning if log_failure else logger.debug
+            log_method("系统命令超时 command=%s timeout=%s duration=%.2fs", safe_command, effective_timeout, duration)
+            result = {
+                "command": safe_command,
+                "returncode": 124,
+                "stdout": str(exc.stdout or ""),
+                "stderr": str(exc.stderr or "") or f"command timed out after {effective_timeout:g}s",
+                "timeout": effective_timeout,
+                "truncated": True,
+            }
+            if not allow_failure:
+                raise RuntimeError(f"command timed out after {effective_timeout:g}s: {' '.join(safe_command)}") from exc
+            return result
+        completed = {
+            "returncode": bounded.returncode,
+            "stdout": bounded.stdout,
+            "stderr": bounded.stderr,
+            "truncated": bounded.truncated,
         }
-        if not allow_failure:
-            raise RuntimeError(f"command timed out after {effective_timeout:g}s: {' '.join(safe_command)}") from exc
+        duration = time.monotonic() - started_at
+        result = {"command": safe_command, **completed}
+        if completed["returncode"] == 0:
+            logger.debug("系统命令完成 command=%s returncode=%s duration=%.2fs", safe_command, completed["returncode"], duration)
+        else:
+            log_method = logger.warning if log_failure else logger.debug
+            log_method(
+                "系统命令失败 command=%s returncode=%s duration=%.2fs stderr=%s",
+                safe_command,
+                completed["returncode"],
+                duration,
+                (completed["stderr"] or "")[:500],
+            )
+        if completed["returncode"] != 0 and not allow_failure:
+            raise RuntimeError(f"command failed: {' '.join(safe_command)}\n{completed['stderr']}")
         return result
+    def read_captured_output(stream: Any) -> tuple[str, bool]:
+        """读取临时文件中的有限命令输出，避免把异常大输出留在内存。"""
+
+        stream.seek(0)
+        data = stream.read(MAX_COMMAND_OUTPUT_BYTES + 1)
+        encoded = data.encode("utf-8", errors="replace") if isinstance(data, str) else bytes(data or b"")
+        truncated = len(encoded) > MAX_COMMAND_OUTPUT_BYTES
+        if truncated:
+            encoded = encoded[:MAX_COMMAND_OUTPUT_BYTES]
+        return encoded.decode("utf-8", errors="replace"), truncated
+
+    def normalize_output(value: object) -> str:
+        """兼容 subprocess 超时异常在不同 Python 版本中的 bytes/str 输出。"""
+
+        if value is None:
+            return ""
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+
+    # capture_output=True 会先把全部 stdout/stderr 放入 Python 内存。使用
+    # 临时文件承接进程输出，只把上限以内的结果读回，避免恶意或异常命令
+    # 通过大量输出耗尽 Agent 内存。
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                timeout=effective_timeout,
+                env=effective_env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout, stdout_truncated = read_captured_output(stdout_file)
+            stderr, stderr_truncated = read_captured_output(stderr_file)
+            if not stdout:
+                stdout = normalize_output(exc.stdout)
+            if not stderr:
+                stderr = normalize_output(exc.stderr)
+            stdout, extra_stdout_truncated = truncate_command_output(stdout)
+            stderr, extra_stderr_truncated = truncate_command_output(stderr)
+            duration = time.monotonic() - started_at
+            log_method = logger.warning if log_failure else logger.debug
+            log_method("系统命令超时 command=%s timeout=%s duration=%.2fs", safe_command, effective_timeout, duration)
+            result = {
+                "command": safe_command,
+                "returncode": 124,
+                "stdout": stdout,
+                "stderr": stderr or f"command timed out after {effective_timeout:g}s",
+                "timeout": effective_timeout,
+                "truncated": stdout_truncated or stderr_truncated or extra_stdout_truncated or extra_stderr_truncated,
+            }
+            if not allow_failure:
+                raise RuntimeError(f"command timed out after {effective_timeout:g}s: {' '.join(safe_command)}") from exc
+            return result
+
+        # 测试替身可能直接返回 CompletedProcess.stdout；真实 subprocess
+        # 在传入文件句柄后会把输出写入文件，因此两种路径都兼容。
+        stdout, stdout_truncated = read_captured_output(stdout_file)
+        stderr, stderr_truncated = read_captured_output(stderr_file)
+        if completed.stdout not in (None, "", b""):
+            stdout, extra_truncated = truncate_command_output(normalize_output(completed.stdout))
+            stdout_truncated = stdout_truncated or extra_truncated
+        if completed.stderr not in (None, "", b""):
+            stderr, extra_truncated = truncate_command_output(normalize_output(completed.stderr))
+            stderr_truncated = stderr_truncated or extra_truncated
     duration = time.monotonic() - started_at
     result = {
         "command": safe_command,
         "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": stdout_truncated or stderr_truncated,
     }
     if completed.returncode == 0:
         logger.debug("系统命令完成 command=%s returncode=%s duration=%.2fs", safe_command, completed.returncode, duration)
@@ -641,11 +813,20 @@ def run_command(
             safe_command,
             completed.returncode,
             duration,
-            (completed.stderr or "")[:500],
+            (stderr or "")[:500],
         )
     if completed.returncode != 0 and not allow_failure:
-        raise RuntimeError(f"command failed: {' '.join(safe_command)}\n{completed.stderr}")
+        raise RuntimeError(f"command failed: {' '.join(safe_command)}\n{stderr}")
     return result
+
+
+def truncate_command_output(value: str, limit: int = MAX_COMMAND_OUTPUT_BYTES) -> tuple[str, bool]:
+    """按 UTF-8 字节数裁剪命令输出，避免多字节字符破坏结果编码。"""
+
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
 
 
 def subprocess_env() -> dict[str, str]:

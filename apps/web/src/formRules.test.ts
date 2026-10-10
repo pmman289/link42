@@ -33,6 +33,19 @@ describe("统一表单规则", () => {
     expect(validateFormData(formData({ ...base, new_password: "12345" }), settingsFormRule, undefined)[0]?.field).toBe("new_password");
   });
 
+  it("拒绝主控地址中的路径、查询参数和凭据", () => {
+    const base = { username: "pmman", site_title: "Link42" };
+    for (const controller_url of [
+      "https://link42.example.com/panel",
+      "https://link42.example.com/?next=1",
+      "https://user:password@link42.example.com",
+    ]) {
+      expect(validateFormData(formData({ ...base, controller_url }), settingsFormRule, undefined)).toEqual([
+        expect.objectContaining({ field: "controller_url" }),
+      ]);
+    }
+  });
+
   it("节点创建要求至少有一个入口地址", () => {
     const data = formData({ name: "node-a", controller_url: "https://link42.example.com" });
 

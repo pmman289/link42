@@ -50,7 +50,7 @@
 
 - 地址：`http://192.168.123.20:8000`
 - 用户名：`pmman`
-- 密码：`pmman-demo`
+- 密码：由首次启动随机生成，读取配置目录下的 `initial-admin-password` 文件。
 
 演示节点：
 
@@ -203,4 +203,3 @@
 
 - 端口台账扫描任务 `node_plugin.port_inventory.scan` 要求 Agent 版本不低于 `0.5.10`。
 - 老版本 Agent 不会上报端口台账能力，前端应显示不可用或缺少能力。
-

@@ -5,8 +5,12 @@ import re
 import shutil
 from typing import Any
 
-from ..system import run_command
+from ..system import WIREGUARD_CONFIG_MAX_BYTES, run_command
+from ..validation import managed_child_path, read_existing_text
 from .base import AgentNodePlugin, AgentPluginContext
+
+
+PORT_SCAN_MAX_RESULTS = 2000
 
 
 class PortInventoryAgentPlugin(AgentNodePlugin):
@@ -51,6 +55,7 @@ class PortInventoryAgentPlugin(AgentNodePlugin):
             "range_start": range_start,
             "range_end": range_end,
             "ports": ports,
+            "truncated": len(ports) >= PORT_SCAN_MAX_RESULTS,
         }
 
 
@@ -67,7 +72,8 @@ def scan_ports(range_start: int, range_end: int, wireguard_dir: str) -> list[dic
         key = (entry["protocol"], int(entry["port"]), str(entry.get("detected_source") or "wireguard"))
         entries[key] = entry
 
-    return sorted(entries.values(), key=lambda item: (int(item["port"]), str(item["protocol"]), str(item.get("detected_source") or "")))
+    ordered = sorted(entries.values(), key=lambda item: (int(item["port"]), str(item["protocol"]), str(item.get("detected_source") or "")))
+    return ordered[:PORT_SCAN_MAX_RESULTS]
 
 
 def scan_socket_listeners(range_start: int, range_end: int) -> list[dict[str, Any]]:
@@ -90,13 +96,16 @@ def parse_ss_output(output: str, range_start: int, range_end: int) -> list[dict[
     entries: list[dict[str, Any]] = []
     for line in output.splitlines():
         parts = line.split()
-        if not parts:
+        if len(parts) < 6:
             continue
         protocol = protocol_from_token(parts[0])
         if protocol is None:
             continue
-        port = first_port_in_range(parts, range_start, range_end)
-        if port is None:
+        # ss -H -lntup has a fixed Local Address:Port column (index 4).
+        # Scanning the full row may mistake a peer address or process name
+        # containing ':<port>' for a listening local port.
+        port = port_from_address(parts[4])
+        if port is None or not range_start <= port <= range_end:
             continue
         process, pid = parse_process_info(line)
         entries.append({
@@ -190,8 +199,13 @@ def scan_wg_quick_config_ports(range_start: int, range_end: int, wireguard_dir: 
         return entries
     for path in sorted(root.glob("*.conf")):
         try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
+            if path.is_symlink():
+                continue
+            path = managed_child_path(root, path.name)
+            if path.stat().st_size > WIREGUARD_CONFIG_MAX_BYTES:
+                continue
+            text = read_existing_text(path)
+        except (OSError, ValueError, UnicodeDecodeError):
             continue
         match = re.search(r"(?im)^\s*ListenPort\s*=\s*(\d+)\s*$", text)
         if not match:

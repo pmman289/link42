@@ -59,8 +59,13 @@ function mtuRule(value: FormDataEntryValue | FormDataEntryValue[] | undefined): 
 function httpUrlRule(label: string): FieldValidator {
   return (value) => {
     try {
-      const parsed = new URL(stringValue(value));
-      return ["http:", "https:"].includes(parsed.protocol) ? null : `${label}必须以 http:// 或 https:// 开头`;
+      const text = stringValue(value);
+      const parsed = new URL(text);
+      if (!["http:", "https:"].includes(parsed.protocol)) return `${label}必须以 http:// 或 https:// 开头`;
+      if (!parsed.hostname || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+        return `${label}只能填写不带路径、查询参数或凭据的 HTTP/HTTPS 地址`;
+      }
+      return null;
     } catch {
       return `${label}格式不正确`;
     }

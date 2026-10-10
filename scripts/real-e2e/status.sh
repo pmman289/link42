@@ -9,7 +9,24 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 RUN_DIR="${LINK42_REAL_RUN_DIR:-/tmp/link42-real-e2e}"
+[[ ! -L "$RUN_DIR" ]] || {
+  echo "[link42-real-e2e] refusing symbolic-link run directory: $RUN_DIR" >&2
+  exit 1
+}
+RUN_MARKER="$RUN_DIR/.link42-real-e2e"
 if [[ -f "$RUN_DIR/state.env" ]]; then
+  [[ -f "$RUN_MARKER" && ! -L "$RUN_MARKER" ]] || {
+    echo "[link42-real-e2e] refusing to source state from unmarked run directory" >&2
+    exit 1
+  }
+  [[ ! -L "$RUN_DIR/state.env" ]] || {
+    echo "[link42-real-e2e] refusing to source symbolic-link state file" >&2
+    exit 1
+  }
+  [[ "$(stat -c '%a' "$RUN_DIR/state.env" 2>/dev/null || true)" == "600" ]] || {
+    echo "[link42-real-e2e] refusing to source state file with unsafe permissions" >&2
+    exit 1
+  }
   # shellcheck disable=SC1090
   source "$RUN_DIR/state.env"
 fi
@@ -19,6 +36,12 @@ BASE_URL="${LINK42_REAL_BASE_URL:-http://127.0.0.1:${LINK42_REAL_PORT:-8016}}"
 REMOTE_SSH="${LINK42_REAL_REMOTE_SSH:-vpstest}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 
+shell_quote() {
+  local value="$1"
+  value=${value//\'/\'\\\'\'}
+  printf "'%s'" "$value"
+}
+
 echo "== processes =="
 if [[ -f "$RUN_DIR/controller.pid" ]]; then
   ps -p "$(cat "$RUN_DIR/controller.pid")" -o pid,cmd || true
@@ -26,7 +49,7 @@ fi
 if [[ -f "$RUN_DIR/local-agent.pid" ]]; then
   ps -p "$(cat "$RUN_DIR/local-agent.pid")" -o pid,cmd || true
 fi
-ssh "$REMOTE_SSH" "if [ -f '$RUN_DIR/remote-agent.pid' ]; then ps -p \$(cat '$RUN_DIR/remote-agent.pid') -o pid,cmd || true; fi" || true
+ssh "$REMOTE_SSH" "if [ -f $(shell_quote "$RUN_DIR/remote-agent.pid") ]; then ps -p \$(cat $(shell_quote "$RUN_DIR/remote-agent.pid")) -o pid,cmd || true; fi" || true
 
 echo
 echo "== nodes =="

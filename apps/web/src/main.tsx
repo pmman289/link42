@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { createContext, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Check, ChevronDown, ChevronRight, Copy, FileText, Folder, GitBranch, KeyRound, LineChart as LineChartIcon, LogOut, Maximize2, Moon, Network, Pencil, Plug, Plus, RefreshCw, Server, Settings, ShieldCheck, Sun, Trash2, Upload, X } from "lucide-react";
 import { Background, EdgeLabelRenderer, Handle, Position, ReactFlow, type Edge as FlowEdge, type EdgeMouseHandler, type EdgeProps, type EdgeTypes, type Node as FlowNode, type NodeMouseHandler, type OnNodeDrag } from "@xyflow/react";
@@ -14,6 +14,7 @@ import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
 import { validateForm } from "./formValidation";
 import { topologyEdgeSummary, topologyEdgeTone } from "./topologyState";
+import { RequestGeneration, StaleRequestError } from "./requestGeneration";
 import {
   linkMonitorFormRule,
   loginFormRule,
@@ -468,6 +469,7 @@ const DEFAULT_CONTROLLER_URL =
 const DEFAULT_SITE_TITLE = "Link42";
 const DEFAULT_SITE_LOGO_URL = "/logo.png";
 const AUTH_EXPIRED_EVENT = "link42:auth-expired";
+const authRequests = new RequestGeneration();
 const THEME_KEY = "link42.theme";
 const TASK_POLL_INTERVAL_MS = 2000;
 const AGENT_TASK_POLL_LIMIT = 90;
@@ -518,6 +520,7 @@ function optionalInt(value: FormDataEntryValue | null, label = "数值"): number
 }
 
 async function api<T>(path: string, options?: RequestInit & { skipAuth?: boolean }): Promise<T> {
+  return authRequests.run(async (assertCurrent) => {
   // 统一封装 fetch，集中处理 JSON 和错误信息。
   const { skipAuth: _skipAuth, headers, ...fetchOptions } = options || {};
   const response = await fetch(`${API_BASE}${path}`, {
@@ -529,14 +532,17 @@ async function api<T>(path: string, options?: RequestInit & { skipAuth?: boolean
       ...(headers || {}),
     },
   });
+  assertCurrent();
   if (!response.ok) {
     const text = await response.text();
+    assertCurrent();
     if (response.status === 401 && path !== "/api/auth/login") {
       window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
     }
     throw new Error(formatApiError(response.status, text, response.statusText));
   }
   return response.json() as Promise<T>;
+  });
 }
 
 type ApiValidationIssue = {
@@ -634,6 +640,7 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "interface not found": "WireGuard 配置不存在",
   "peer interface not found": "对端 WireGuard 配置不存在",
   "wireguard config not found": "WireGuard 配置不存在",
+  "import candidate data is invalid": "导入候选数据已损坏，请重新扫描节点",
   "managed node link is incomplete": "受管连接数据不完整，请重新创建或检查双方配置",
   "deployable wireguard config must have exactly one enabled peer":
     "可部署配置必须且只能有一个启用对端",
@@ -742,8 +749,28 @@ const API_DETAIL_MESSAGES: Record<string, string> = {
   "port must be between 1 and 65535": "端口必须在 1-65535 之间",
   "CIDR value must contain prefix length": "CIDR 地址必须带前缀长度，例如 10.0.0.1/32",
   "URL must not contain whitespace or quotes": "URL 不能包含空格或引号",
+  "URL must be an HTTP(S) URL without credentials, query or fragment":
+    "URL 必须是 HTTP(S) 地址，不能包含用户名、密码、查询参数或片段",
+  "URL port must be between 1 and 65535": "URL 端口必须在 1-65535 之间",
+  "URL port is invalid": "URL 端口格式无效",
   "URL must start with http:// or https://": "URL 必须以 http:// 或 https:// 开头",
   "URL must be an absolute path or start with http:// or https://": "URL 必须是绝对路径，或以 http:// / https:// 开头",
+  "controller URL must not contain a path": "主控地址只能填写站点根地址，不能包含路径",
+  "endpoint host contains unsupported characters": "Endpoint 主机包含不支持的字符",
+  "endpoint address is required": "至少需要填写一个入口地址",
+  "node name is required": "节点名称不能为空",
+  "field must not be null": "该字段不能设置为空",
+  "CIDR value must not contain control characters or IPv6 zones": "CIDR 地址不能包含控制字符或 IPv6 区域标识",
+  "latency_ms must be a finite value between 0 and 3600000": "延迟必须是 0-3600000 之间的有限数字",
+  "udp2raw password must not contain control characters": "udp2raw 密码不能包含控制字符",
+  "agent metadata is too deeply nested or too large": "Agent 平台信息过大或嵌套过深",
+  "agent metadata object has too many fields": "Agent 平台信息字段过多",
+  "agent metadata field name is invalid": "Agent 平台信息字段名无效",
+  "agent metadata array has too many items": "Agent 平台信息列表过长",
+  "agent metadata string is invalid or too large": "Agent 平台信息包含无效或过长文本",
+  "agent metadata contains a non-finite number": "Agent 平台信息包含无效数字",
+  "agent metadata contains an unsupported value": "Agent 平台信息包含不支持的数据",
+  "agent capability is invalid": "Agent 能力标识无效",
   "persistent_keepalive must be between 0 and 65535": "保活间隔必须在 0-65535 之间",
   "monitor target must be an IPv4 or IPv6 address": "监测目标必须是 IPv4 或 IPv6 地址",
   "interval_seconds must be between 1 and 300": "刷新频率必须在 1-300 秒之间",
@@ -807,6 +834,7 @@ function translateErrorMessage(message: string): string {
 
 // 把未知异常转成用户提示。
 function formatUserError(error: unknown): string {
+  if (error instanceof StaleRequestError) return "";
   return error instanceof Error ? translateErrorMessage(error.message) : translateApiDetail(String(error));
 }
 
@@ -1388,21 +1416,14 @@ function MonitorSummaryButton({
   onClick,
 }: {
   summary: LinkMonitorSummary | null;
-  onClick: (event: React.MouseEvent<HTMLSpanElement>) => void;
+  onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
 }) {
   const tone = monitorTone(summary?.status);
   return (
-    <span
+    <button
+      type="button"
       className={`monitorSummary ${tone}`}
-      role="button"
-      tabIndex={0}
       onClick={onClick}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onClick(event as unknown as React.MouseEvent<HTMLSpanElement>);
-        }
-      }}
       title="查看链路延迟统计"
     >
       {summary ? (
@@ -1414,7 +1435,7 @@ function MonitorSummaryButton({
       ) : (
         <span><strong>未监测</strong><small>点击配置</small></span>
       )}
-    </span>
+    </button>
   );
 }
 
@@ -1505,6 +1526,8 @@ function shellArg(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+const FieldLabelContext = createContext<{ labelId: string; hintId?: string } | null>(null);
+
 // 渲染统一表单字段，自动展示必填标记。
 function Field({
   label,
@@ -1519,17 +1542,27 @@ function Field({
   requiredMark?: boolean;
   children: React.ReactNode;
 }) {
+  const fieldId = useId();
+  const labelId = `${fieldId}-label`;
+  const hintId = hint ? `${fieldId}-hint` : undefined;
   const required = requiredMark ?? hasRequiredControl(children);
-  return (
-    <label className={wide ? "field wideField" : "field"}>
-      <span className="fieldLabel">
+  const childElements = React.Children.toArray(children).filter(React.isValidElement);
+  const canUseNativeLabel = childElements.length === 1
+    && typeof childElements[0].type === "string"
+    && ["input", "select", "textarea"].includes(childElements[0].type);
+  const content = (
+    <>
+      <span className="fieldLabel" id={labelId}>
         {label}
         {required && <span className="requiredMark" aria-label="必填">*</span>}
       </span>
-      {children}
-      {hint && <small>{hint}</small>}
-    </label>
+      <FieldLabelContext.Provider value={{ labelId, hintId }}>{children}</FieldLabelContext.Provider>
+      {hint && <small id={hintId}>{hint}</small>}
+    </>
   );
+  return canUseNativeLabel
+    ? <label className={wide ? "field wideField" : "field"}>{content}</label>
+    : <div className={wide ? "field wideField" : "field"} role="group" aria-labelledby={labelId}>{content}</div>;
 }
 
 // 递归判断字段内是否存在启用状态的 required 控件。
@@ -1682,6 +1715,7 @@ function EndpointSelect({
   disabled?: boolean;
   locked?: boolean;
 }) {
+  const fieldLabel = useContext(FieldLabelContext);
   const [value, setValue] = useState(defaultValue);
   const [inputValue, setInputValue] = useState("");
   const selectedOption = useMemo<EndpointOption | null>(() => {
@@ -1723,6 +1757,9 @@ function EndpointSelect({
     <div className="endpointSelect">
       <CreatableSelect<EndpointOption, false>
         classNamePrefix="endpointSelect"
+        aria-labelledby={fieldLabel?.labelId}
+        aria-describedby={fieldLabel?.hintId}
+        aria-label={fieldLabel ? undefined : placeholder}
         value={selectedOption}
         options={options}
         isDisabled={disabled || locked}
@@ -2106,11 +2143,17 @@ function App() {
   const [manualCreateProtocol, setManualCreateProtocol] = useState<ManualCreateProtocol>("wireguard");
   const [managedCreateProtocol, setManagedCreateProtocol] = useState<ManagedCreateProtocol>("wireguard");
   const [nodeCreateOpen, setNodeCreateOpen] = useState(false);
+  const modalRestoreFocusRef = useRef<HTMLElement | null>(null);
+  const modalWasOpenRef = useRef(false);
+  const modalPanelRef = useRef<HTMLElement | null>(null);
+  const modalPanelFocusRef = useRef(new WeakMap<HTMLElement, HTMLElement>());
   const [nodeCreateEndpointIps, setNodeCreateEndpointIps] = useState<string[]>([]);
   const [editingNodeId, setEditingNodeId] = useState<number | null>(null);
+  const editingNodeIdRef = useRef<number | null>(null);
   const [editingNodeEndpointIps, setEditingNodeEndpointIps] = useState<string[]>([]);
   const [agentUpgradePlan, setAgentUpgradePlan] = useState<AgentUpgradePlan | null>(null);
   const [managedPeerNodeId, setManagedPeerNodeId] = useState<number | null>(null);
+  const managedPeerNodeIdRef = useRef<number | null>(null);
   const [replaceLocalConfigId, setReplaceLocalConfigId] = useState<number | null>(null);
   const [replacePeerConfigId, setReplacePeerConfigId] = useState<number | null>(null);
   const [forceEndpointMismatch, setForceEndpointMismatch] = useState(false);
@@ -2152,12 +2195,22 @@ function App() {
   const [portInventoryPage, setPortInventoryPage] = useState(1);
   const [portScanResults, setPortScanResults] = useState<PortScanResult[]>([]);
   const [pendingActions, setPendingActions] = useState<Set<string>>(() => new Set());
+  const authEpochRef = useRef(0);
+  const refreshHomeRunningRef = useRef<number | null>(null);
+  const settingsRequestsRef = useRef(new RequestGeneration());
+  const pluginRequestsRef = useRef(new RequestGeneration());
+  const lookingGlassRequestsRef = useRef(new RequestGeneration());
+  const monitorDialogRequestsRef = useRef(new RequestGeneration());
+  const monitorDetailRequestsRef = useRef(new RequestGeneration());
+  const monitorWindowRef = useRef("1h");
+  const greRefreshTimersRef = useRef<number[]>([]);
   const topologyEdgeSelectionRef = useRef<number | null>(null);
   const topologyLocalPositionsRef = useRef<Record<number, { x: number; y: number }>>({});
   const birdSelectedResourceRef = useRef("");
   const monitorDialogTargetKeyRef = useRef("none");
   // 统一更新当前选中节点，并同步 ref 防止异步刷新串台。
   function selectNodeId(nodeId: number | null) {
+    if (selectedNodeIdRef.current !== nodeId) pluginRequestsRef.current.invalidate();
     selectedNodeIdRef.current = nodeId;
     setSelectedNodeId(nodeId);
   }
@@ -2177,6 +2230,17 @@ function App() {
   function selectConnectionRef(connectionRef: string | null) {
     selectedConnectionRefRef.current = connectionRef;
     setSelectedConnectionRef(connectionRef);
+  }
+
+  // 统一更新受管链路对端节点，并同步 ref，避免切换选择后旧请求覆盖新表单。
+  function selectManagedPeerNodeId(nodeId: number | null) {
+    managedPeerNodeIdRef.current = nodeId;
+    setManagedPeerNodeId(nodeId);
+  }
+
+  function selectEditingNodeId(nodeId: number | null) {
+    editingNodeIdRef.current = nodeId;
+    setEditingNodeId(nodeId);
   }
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) || null,
@@ -2283,6 +2347,7 @@ function App() {
   const pagedPortEntries = filteredPortEntries.slice(portInventoryPageStart, portInventoryPageStart + PORT_INVENTORY_PAGE_SIZE);
   const birdEditorExtensions = useMemo(
     () => [
+      EditorView.contentAttributes.of({ "aria-label": "配置内容" }),
       ...(birdEditorLineWrapping ? [EditorView.lineWrapping] : []),
       ...(birdEditorSyntax === "bird" ? [StreamLanguage.define(nginx)] : []),
       keymap.of([
@@ -2481,6 +2546,8 @@ function App() {
             </div>
           ),
         },
+        ariaLabel: `节点 ${node.name}，状态${online ? "在线" : "离线"}，地域${node.region || "未设置"}。按 Enter 或空格键打开节点详情。`,
+        ariaRole: "button",
         draggable: true,
         className: online ? "topologyFlowNode online" : "topologyFlowNode",
       };
@@ -2520,14 +2587,15 @@ function App() {
         label: topologyEdgeSummary(edge),
         animated: false,
         className: `topologyEdge ${tone}`,
+        ariaLabel: `${topology.nodes.find((node) => node.id === edge.local_node_id)?.name || edge.local_node_id} 与 ${topology.nodes.find((node) => node.id === edge.peer_node_id)?.name || edge.peer_node_id} 的连接，${topologyEdgeSummary(edge)}。按 Enter 或空格键打开连接详情。`,
+        ariaRole: "button",
         data: { ...edge, tone, disconnected },
       };
     }),
-  [topologyDisplayEdges]);
+  [topologyDisplayEdges, topology.nodes]);
 
   // 点击拓扑节点时选中对应节点并滚动到节点详情。
-  const handleTopologyNodeClick: NodeMouseHandler = (_event, node) => {
-    const nodeId = Number(node.id);
+  function openTopologyNode(nodeId: number) {
     selectNodeId(nodeId);
     selectConfigId(null);
     selectConnectionRef(null);
@@ -2539,7 +2607,29 @@ function App() {
         block: "start",
       });
     }, 180);
-  };
+  }
+
+  const handleTopologyNodeClick: NodeMouseHandler = (_event, node) => openTopologyNode(Number(node.id));
+
+  // React Flow 的键盘 Enter 只改变选中状态，不会触发 onNodeClick；在画布捕获键盘事件，
+  // 让键盘用户获得与鼠标点击相同的节点详情行为。
+  function handleTopologyKeyDownCapture(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const target = event.target;
+    if (!(target instanceof Element) || target.closest("input, textarea, select, [contenteditable='true']")) return;
+    const nodeId = target.closest(".react-flow__node")?.getAttribute("data-id");
+    if (nodeId) {
+      event.preventDefault();
+      if (!event.repeat) openTopologyNode(Number(nodeId));
+      return;
+    }
+    const edgeId = target.closest(".react-flow__edge")?.getAttribute("data-id");
+    const edge = topologyDisplayEdges.find((item) => item.id === edgeId);
+    if (edge) {
+      event.preventDefault();
+      if (!event.repeat) openTopologyEdge(edge);
+    }
+  }
 
   // 节点拖动结束后保存拓扑坐标。
   const handleTopologyNodeDragStop: OnNodeDrag = (_event, node) => {
@@ -2574,7 +2664,10 @@ function App() {
   // 点击拓扑链路时选中对应配置并滚动到配置详情。
   const handleTopologyEdgeClick: EdgeMouseHandler = (_event, edge) => {
     const data = edge.data as TopologyDisplayEdge | undefined;
-    if (!data) return;
+    if (data) openTopologyEdge(data);
+  };
+
+  function openTopologyEdge(data: TopologyDisplayEdge) {
     const links = data.links.length > 0 ? data.links : [data];
     const selectedSideLink = links.find((link) => link.local_node_id === selectedNodeId || link.peer_node_id === selectedNodeId);
     const link = selectedSideLink || links[0];
@@ -2600,10 +2693,11 @@ function App() {
         block: "center",
       });
     }, 180);
-  };
+  }
 
   // 显示短暂 toast 消息。
   function notify(type: Toast["type"], text: string) {
+    if (!text) return;
     // 右上角 toast 避免把所有消息堆在主页主流程里。
     const id = Date.now() + Math.random();
     setToasts((items) => [...items, { id, type, text }]);
@@ -2615,7 +2709,7 @@ function App() {
   // 重置受管连接创建表单的草稿状态。
   function resetManagedLinkDraft(overrides: { replaceLocalConfigId?: number | null } = {}) {
     setManagedCreateProtocol("wireguard");
-    setManagedPeerNodeId(null);
+    selectManagedPeerNodeId(null);
     setReplaceLocalConfigId(overrides.replaceLocalConfigId ?? null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
@@ -2654,7 +2748,7 @@ function App() {
   // 切换受管连接创建协议，并清理另一种协议专用的草稿状态。
   function switchManagedCreateProtocol(protocol: ManagedCreateProtocol) {
     setManagedCreateProtocol(protocol);
-    setManagedPeerNodeId(null);
+    selectManagedPeerNodeId(null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
     if (protocol === "gre") {
@@ -2677,28 +2771,34 @@ function App() {
 
   // 打开 WireGuard 配置的链路监测弹窗，并同步异步请求使用的目标 key。
   function openConfigMonitorDialog(configId: number) {
+    monitorDialogRequestsRef.current.invalidate();
+    monitorDetailRequestsRef.current.invalidate();
     const key = `wireguard:${configId}`;
     monitorDialogTargetKeyRef.current = key;
     setMonitorDetail(null);
     setMonitorDetailTarget("");
     setMonitorDialogEndpointRef(null);
     setMonitorDialogConfigId(configId);
-    setMonitorWindow("1h");
+    selectMonitorWindow("1h");
   }
 
   // 打开通用连接端点的链路监测弹窗，并同步异步请求使用的目标 key。
   function openEndpointMonitorDialog(endpointRef: string) {
+    monitorDialogRequestsRef.current.invalidate();
+    monitorDetailRequestsRef.current.invalidate();
     const key = `endpoint:${endpointRef}`;
     monitorDialogTargetKeyRef.current = key;
     setMonitorDetail(null);
     setMonitorDetailTarget("");
     setMonitorDialogConfigId(null);
     setMonitorDialogEndpointRef(endpointRef);
-    setMonitorWindow("1h");
+    selectMonitorWindow("1h");
   }
 
   // 关闭链路监测弹窗，并让未完成的旧请求失效。
   function closeMonitorDialog() {
+    monitorDialogRequestsRef.current.invalidate();
+    monitorDetailRequestsRef.current.invalidate();
     monitorDialogTargetKeyRef.current = "none";
     setMonitorDialogConfigId(null);
     setMonitorDialogEndpointRef(null);
@@ -2706,10 +2806,22 @@ function App() {
     setMonitorDetailTarget("");
   }
 
+  function selectMonitorWindow(windowValue: string) {
+    monitorDetailRequestsRef.current.invalidate();
+    monitorWindowRef.current = windowValue;
+    setMonitorWindow(windowValue);
+  }
+
   // 清空登录态和所有依赖登录的页面状态。
   function clearAuthenticatedState() {
+    authRequests.invalidate();
+    settingsRequestsRef.current.invalidate();
+    pluginRequestsRef.current.invalidate();
+    lookingGlassRequestsRef.current.invalidate();
+    authEpochRef.current += 1;
     setAuthToken("");
     setCurrentUser(null);
+    setSettingsLogoPreviewUrl("");
     setNodes([]);
     setTopology({ nodes: [], edges: [] });
     setTopologyDraftPositions({});
@@ -2724,9 +2836,9 @@ function App() {
     setPlan(null);
     setCreateDialog(null);
     setNodeCreateOpen(false);
-    setEditingNodeId(null);
+    selectEditingNodeId(null);
     setAgentUpgradePlan(null);
-    setManagedPeerNodeId(null);
+    selectManagedPeerNodeId(null);
     setReplaceLocalConfigId(null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
@@ -2742,6 +2854,7 @@ function App() {
     setRevealedAgentToken(null);
     closeMonitorDialog();
     setPendingActions(new Set());
+    setToasts([]);
   }
 
   // 返回一个可等待的延迟 Promise。
@@ -2751,6 +2864,7 @@ function App() {
 
   // 包装用户操作，统一处理 pending 状态和错误提示。
   async function runAction(action: () => Promise<void>, key?: string) {
+    const epoch = authEpochRef.current;
     // 所有用户操作都通过这里展示 API 错误，避免点击后页面无反馈。
     if (key && pendingActions.has(key)) {
       return;
@@ -2765,13 +2879,14 @@ function App() {
     try {
       await action();
     } catch (error) {
+      if (error instanceof StaleRequestError || authEpochRef.current !== epoch) return;
       if (error instanceof Error && error.message.startsWith("401:")) {
         clearAuthenticatedState();
         return;
       }
       notify("error", formatUserError(error));
     } finally {
-      if (key) {
+      if (key && authEpochRef.current === epoch) {
         setPendingActions((items) => {
           const next = new Set(items);
           next.delete(key);
@@ -2815,10 +2930,15 @@ function App() {
         }),
       });
     } catch (error) {
+      if (error instanceof StaleRequestError) return;
       setLoginError(formatUserError(error).replace(/^401:\s*/, ""));
       return;
     }
+    // 开启新的认证会话，使登录前仍在进行的公开品牌请求不能覆盖已认证状态。
+    authRequests.invalidate();
+    authEpochRef.current += 1;
     setAuthToken("cookie");
+    setPendingActions(new Set());
     setCurrentUser(result.username);
     await refreshSettings();
     await refreshHome();
@@ -2832,7 +2952,12 @@ function App() {
 
   // 刷新主控设置和品牌配置。
   async function refreshSettings() {
+    const epoch = authEpochRef.current;
+    settingsRequestsRef.current.invalidate();
+    const assertCurrent = settingsRequestsRef.current.capture();
     const data = await api<ControllerSettings>("/api/settings");
+    assertCurrent();
+    if (authEpochRef.current !== epoch) return;
     setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
     setSettingsUsername(data.username || "pmman");
     setSiteTitle(data.site_title || DEFAULT_SITE_TITLE);
@@ -2841,13 +2966,20 @@ function App() {
 
   // 刷新 Looking Glass 第三方 API Token 列表。
   async function refreshLookingGlassTokens() {
+    const epoch = authEpochRef.current;
+    lookingGlassRequestsRef.current.invalidate();
+    const assertCurrent = lookingGlassRequestsRef.current.capture();
     const data = await api<LookingGlassApiTokenList>("/api/integrations/looking-glass/tokens");
+    assertCurrent();
+    if (authEpochRef.current !== epoch) return;
     setLookingGlassTokens(data.items || []);
   }
 
   // 未登录时读取公开品牌配置。
   async function refreshBranding() {
+    const epoch = authEpochRef.current;
     const data = await api<BrandingSettings>("/api/branding", { skipAuth: true });
+    if (authEpochRef.current !== epoch) return;
     setSiteTitle(data.site_title || DEFAULT_SITE_TITLE);
     setSiteLogoUrl(data.site_logo_url || DEFAULT_SITE_LOGO_URL);
   }
@@ -2855,6 +2987,9 @@ function App() {
   // 保存主控设置，必要时先上传 logo 文件。
   async function saveSettings(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const epoch = authEpochRef.current;
+    settingsRequestsRef.current.invalidate();
+    const assertCurrent = settingsRequestsRef.current.capture();
     const form = validateForm(event.currentTarget, settingsFormRule);
     const newPassword = String(form.get("new_password") || "");
     const logoFile = form.get("site_logo_file");
@@ -2865,6 +3000,7 @@ function App() {
         headers: { "Content-Type": logoFile.type },
         body: logoFile,
       });
+      assertCurrent();
       uploadedLogoUrl = logoSettings.site_logo_url || DEFAULT_SITE_LOGO_URL;
     }
     const payload: {
@@ -2884,6 +3020,8 @@ function App() {
       method: "PATCH",
       body: JSON.stringify(payload),
     });
+    assertCurrent();
+    if (authEpochRef.current !== epoch) return;
     setControllerUrl(data.controller_url || DEFAULT_CONTROLLER_URL);
     setSettingsUsername(data.username || "pmman");
     setSiteTitle(data.site_title || DEFAULT_SITE_TITLE);
@@ -2916,6 +3054,8 @@ function App() {
     const formElement = event.currentTarget;
     const form = validateForm(formElement, lookingGlassTokenFormRule);
     const scopes = ["looking_glass.nodes.read", "looking_glass.bird.route"];
+    lookingGlassRequestsRef.current.invalidate();
+    const assertCurrent = lookingGlassRequestsRef.current.capture();
     const result = await api<LookingGlassApiTokenCreateResult>("/api/integrations/looking-glass/tokens", {
       method: "POST",
       body: JSON.stringify({
@@ -2924,6 +3064,7 @@ function App() {
         expires_at: localDateTimeToIso(form.get("lg_expires_at")),
       }),
     });
+    assertCurrent();
     setRevealedLookingGlassToken({
       name: result.name,
       token: result.token,
@@ -2944,9 +3085,12 @@ function App() {
   // 轮换指定 Looking Glass Token，旧 Token 会立即失效。
   async function rotateLookingGlassToken(token: LookingGlassApiToken) {
     if (!window.confirm(`确定轮换 ${token.name} 的 API Token？旧 Token 会立即失效。`)) return;
+    lookingGlassRequestsRef.current.invalidate();
+    const assertCurrent = lookingGlassRequestsRef.current.capture();
     const result = await api<LookingGlassApiTokenCreateResult>(`/api/integrations/looking-glass/tokens/${token.id}/rotate`, {
       method: "POST",
     });
+    assertCurrent();
     setRevealedLookingGlassToken({
       name: result.name,
       token: result.token,
@@ -2959,9 +3103,12 @@ function App() {
   // 吊销指定 Looking Glass Token，保留审计记录。
   async function revokeLookingGlassToken(token: LookingGlassApiToken) {
     if (!window.confirm(`确定吊销 ${token.name}？吊销后使用该 Token 的 Looking Glass 将无法访问。`)) return;
+    lookingGlassRequestsRef.current.invalidate();
+    const assertCurrent = lookingGlassRequestsRef.current.capture();
     await api<LookingGlassApiToken>(`/api/integrations/looking-glass/tokens/${token.id}/revoke`, {
       method: "POST",
     });
+    assertCurrent();
     if (revealedLookingGlassToken?.token_prefix === token.token_prefix) {
       setRevealedLookingGlassToken(null);
     }
@@ -2972,9 +3119,12 @@ function App() {
   // 删除 Looking Glass Token，并清理它关联的历史查询记录。
   async function deleteLookingGlassToken(token: LookingGlassApiToken) {
     if (!window.confirm(`确定删除 ${token.name}？删除后该 Token 会立即失效，相关查询记录也会被清理。`)) return;
+    lookingGlassRequestsRef.current.invalidate();
+    const assertCurrent = lookingGlassRequestsRef.current.capture();
     await api<{ status: string }>(`/api/integrations/looking-glass/tokens/${token.id}`, {
       method: "DELETE",
     });
+    assertCurrent();
     if (revealedLookingGlassToken?.token_prefix === token.token_prefix) {
       setRevealedLookingGlassToken(null);
     }
@@ -2985,13 +3135,17 @@ function App() {
   // 刷新节点列表。
   async function refreshNodes() {
     // 刷新节点列表；节点必须由用户主动点选，离线节点不能进入下级菜单。
+    const epoch = authEpochRef.current;
     const data = await api<NodeItem[]>("/api/nodes");
+    if (authEpochRef.current !== epoch) return;
     setNodes(data);
   }
 
   // 刷新拓扑数据，并合并尚未被后端确认的本地拖动坐标。
   async function refreshTopology() {
+    const epoch = authEpochRef.current;
     const data = await api<TopologyResponse>("/api/topology");
+    if (authEpochRef.current !== epoch) return;
     const localPositions = topologyLocalPositionsRef.current;
     const mergedNodes = data.nodes.map((node) => {
       const local = localPositions[node.id];
@@ -3022,26 +3176,52 @@ function App() {
 
   // 在 GRE 任务下发后安排几次短延迟刷新，避免页面长时间停留在 changing。
   function scheduleGreConnectionRefresh(nodeId: number) {
+    greRefreshTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    greRefreshTimersRef.current = [];
     [1000, 2500, 4500, 7000].forEach((delay) => {
-      window.setTimeout(() => {
+      const timer = window.setTimeout(() => {
+        greRefreshTimersRef.current = greRefreshTimersRef.current.filter((item) => item !== timer);
         if (!isCurrentSelectedNode(nodeId)) return;
         void Promise.all([refreshConnections(nodeId), refreshTopology()]).catch((error) => notify("error", formatUserError(error)));
       }, delay);
+      greRefreshTimersRef.current.push(timer);
     });
   }
 
   // 刷新主页所需的节点、拓扑、配置和弹窗详情。
   async function refreshHome(options: { requestSelectedGreStatus?: boolean } = {}) {
+    const epoch = authEpochRef.current;
+    if (refreshHomeRunningRef.current === epoch) return;
+    refreshHomeRunningRef.current = epoch;
+    try {
+    const nodeIdAtStart = selectedNodeIdRef.current;
+    const configIdAtStart = selectedConfigIdRef.current;
+    let refreshedConfigs: ConfigItem[] | null = null;
     await Promise.all([refreshNodes(), refreshTopology()]);
-    if (selectedNodeId) {
-      await Promise.all([
-        refreshConfigs(selectedNodeId, selectedConfigId),
-        refreshConnections(selectedNodeId),
+    if (authEpochRef.current !== epoch) return;
+    if (nodeIdAtStart && selectedNodeIdRef.current === nodeIdAtStart) {
+      [refreshedConfigs] = await Promise.all([
+        refreshConfigs(nodeIdAtStart, configIdAtStart),
+        refreshConnections(nodeIdAtStart),
       ]);
+      if (authEpochRef.current !== epoch) return;
     }
-    if (selectedConfigId) {
-      await refreshPeer(selectedConfigId).catch(() => undefined);
-      await refreshManagedLink(selectedConfigId).catch(() => undefined);
+    if (
+      configIdAtStart
+      && selectedConfigIdRef.current === configIdAtStart
+      && (!nodeIdAtStart || selectedNodeIdRef.current === nodeIdAtStart)
+    ) {
+      await refreshPeer(configIdAtStart).catch(() => undefined);
+      if (authEpochRef.current !== epoch || selectedConfigIdRef.current !== configIdAtStart) return;
+      // 非受管/导入配置没有 managed-link 资源；避免每次主页轮询都触发
+      // 一个必然返回 400 的请求和对应的后端告警日志。
+      const currentConfig = refreshedConfigs?.find((item) => item.id === configIdAtStart)
+        || configs.find((item) => item.id === configIdAtStart);
+      if (currentConfig?.source === "managed-node") {
+        await refreshManagedLink(configIdAtStart).catch(() => undefined);
+      } else {
+        setManagedLink(null);
+      }
     }
     if (monitorDialogConfigId || monitorDialogEndpointRef) {
       await refreshMonitorDetail().catch(() => undefined);
@@ -3052,6 +3232,9 @@ function App() {
       if (requested && nodeId) {
         scheduleGreConnectionRefresh(nodeId);
       }
+    }
+    } finally {
+      if (refreshHomeRunningRef.current === epoch) refreshHomeRunningRef.current = null;
     }
   }
 
@@ -3120,10 +3303,10 @@ function App() {
     nodeId: number,
     preferredConfigId?: number | null,
     options: { forceSelect?: boolean } = {},
-  ) {
+  ): Promise<ConfigItem[] | null> {
     // 刷新某个节点下的 WireGuard 点对点配置列表。
     const data = await api<ConfigItem[]>(`/api/nodes/${nodeId}/wireguard/configs`);
-    if (!isCurrentSelectedNode(nodeId)) return;
+    if (!isCurrentSelectedNode(nodeId)) return null;
     setConfigs(data);
     const currentConfigId = selectedConfigIdRef.current;
     const existing = currentConfigId && data.some((item) => item.id === currentConfigId);
@@ -3133,11 +3316,13 @@ function App() {
     } else if (!existing) {
       selectConfigId(null);
     }
+    return data;
   }
 
   // 读取对端节点可用于替换或导入的配置列表。
   async function refreshPeerNodeConfigs(nodeId: number) {
     const data = await api<ConfigItem[]>(`/api/nodes/${nodeId}/wireguard/configs`);
+    if (managedPeerNodeIdRef.current !== nodeId) return;
     setPeerNodeConfigs(data);
   }
 
@@ -3149,8 +3334,9 @@ function App() {
   }
 
   // 刷新单个 Agent 任务状态并缓存到插件任务表。
-  async function refreshAgentTask(taskId: number, key: string) {
+  async function refreshAgentTask(taskId: number, key: string, assertCurrent: () => void) {
     const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
+    assertCurrent();
     setNodePluginTasks((current) => ({ ...current, [key]: task }));
     return task;
   }
@@ -3158,14 +3344,19 @@ function App() {
   // 触发节点插件 action，并轮询任务直到完成或超时。
   async function executeNodePluginAction(pluginType: string, action: string, payload: Record<string, unknown> = {}) {
     if (!selectedNodeId) return;
+    const assertCurrent = pluginRequestsRef.current.capture();
+    const nodeIdAtStart = selectedNodeId;
     const key = `${pluginType}:${action}`;
     try {
-      const result = await api<NodePluginActionResult>(`/api/nodes/${selectedNodeId}/plugins/${pluginType}/${action}`, {
+      const result = await api<NodePluginActionResult>(`/api/nodes/${nodeIdAtStart}/plugins/${pluginType}/${action}`, {
         method: "POST",
         body: JSON.stringify({ payload }),
       });
+      assertCurrent();
       for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
-        const task = await refreshAgentTask(result.task_id, key);
+        if (selectedNodeIdRef.current !== nodeIdAtStart) return;
+        const task = await refreshAgentTask(result.task_id, key, assertCurrent);
+        assertCurrent();
         if (task.status === "succeeded") {
           return task;
         }
@@ -3177,6 +3368,8 @@ function App() {
       }
       notify("info", "插件任务仍在执行，请稍后刷新节点状态。");
     } catch (error) {
+      if (error instanceof StaleRequestError) return;
+      try { assertCurrent(); } catch { return; }
       if (error instanceof Error && error.message.startsWith("401:")) {
         throw error;
       }
@@ -3187,7 +3380,9 @@ function App() {
   // 读取端口台账范围和条目。
   async function refreshPortInventory(nodeId = selectedNodeId) {
     if (!nodeId) return;
+    const assertCurrent = pluginRequestsRef.current.capture();
     const data = await api<PortInventory>(`/api/nodes/${nodeId}/port-inventory`);
+    assertCurrent();
     if (!isCurrentSelectedNode(nodeId)) return;
     setPortInventory(data);
     setPortRangeStart(data.setting.range_start ? String(data.setting.range_start) : "");
@@ -3197,6 +3392,7 @@ function App() {
   // 保存端口台账范围，并可询问是否立即扫描。
   async function savePortInventoryRange(options: { askScan?: boolean } = {}) {
     if (!selectedNodeId) return;
+    const assertCurrent = pluginRequestsRef.current.capture();
     const rangeStart = Number(portRangeStart);
     const rangeEnd = Number(portRangeEnd);
     if (!isRequiredPort(rangeStart) || !isRequiredPort(rangeEnd) || rangeStart > rangeEnd) {
@@ -3206,6 +3402,7 @@ function App() {
       method: "PUT",
       body: JSON.stringify({ range_start: rangeStart, range_end: rangeEnd }),
     });
+    assertCurrent();
     setPortInventory((current) => ({
       setting,
       entries: current?.entries || [],
@@ -3237,6 +3434,7 @@ function App() {
   // 创建端口台账条目。
   async function createPortInventoryEntry(entry: Omit<PortScanResult, "purpose"> & { purpose?: string }) {
     if (!selectedNodeId) return;
+    const assertCurrent = pluginRequestsRef.current.capture();
     await api<PortInventoryEntry>(`/api/nodes/${selectedNodeId}/port-inventory/entries`, {
       method: "POST",
       body: JSON.stringify({
@@ -3249,7 +3447,9 @@ function App() {
         detected_source: entry.detected_source || null,
       }),
     });
+    assertCurrent();
     await refreshPortInventory();
+    assertCurrent();
     notify("success", "端口条目已添加。");
   }
 
@@ -3268,10 +3468,12 @@ function App() {
   // 更新端口台账条目的用途说明。
   async function updatePortInventoryEntryPurpose(entry: PortInventoryEntry, purpose: string) {
     if (!selectedNodeId) return;
+    const assertCurrent = pluginRequestsRef.current.capture();
     const updated = await api<PortInventoryEntry>(`/api/nodes/${selectedNodeId}/port-inventory/entries/${entry.id}`, {
       method: "PATCH",
       body: JSON.stringify({ purpose }),
     });
+    assertCurrent();
     setPortInventory((current) => current ? {
       ...current,
       entries: current.entries.map((item) => item.id === updated.id ? updated : item),
@@ -3281,7 +3483,9 @@ function App() {
   // 删除端口台账条目。
   async function deletePortInventoryEntry(entry: PortInventoryEntry) {
     if (!selectedNodeId) return;
+    const assertCurrent = pluginRequestsRef.current.capture();
     await api(`/api/nodes/${selectedNodeId}/port-inventory/entries/${entry.id}`, { method: "DELETE" });
+    assertCurrent();
     setPortInventory((current) => current ? {
       ...current,
       entries: current.entries.filter((item) => item.id !== entry.id),
@@ -3308,6 +3512,7 @@ function App() {
   // 打开节点插件弹窗并初始化首个插件。
   function openNodePluginDialog() {
     if (nodePlugins.length === 0) return;
+    pluginRequestsRef.current.invalidate();
     resetBirdEditorState(true);
     setPortInventory(null);
     setPortScanResults([]);
@@ -3321,13 +3526,15 @@ function App() {
   // 关闭节点插件弹窗，必要时提示放弃未保存修改。
   function closeNodePluginDialog() {
     if (!confirmDiscardBirdChanges()) return;
+    pluginRequestsRef.current.invalidate();
     setNodePluginDialogOpen(false);
   }
 
   // 切换节点插件标签页，离开 BIRD 时保护未保存修改。
-  function switchNodePluginTab(pluginType: string) {
-    if (pluginType === activeNodePluginType) return;
-    if (!confirmDiscardBirdChanges()) return;
+  function switchNodePluginTab(pluginType: string): boolean {
+    if (pluginType === activeNodePluginType) return true;
+    if (!confirmDiscardBirdChanges()) return false;
+    pluginRequestsRef.current.invalidate();
     resetBirdEditorState(pluginType === "bird");
     if (pluginType === "port-inventory") {
       setPortInventory(null);
@@ -3336,6 +3543,7 @@ function App() {
       setPortInventoryPage(1);
     }
     setActiveNodePluginType(pluginType);
+    return true;
   }
 
   // 读取 BIRD 配置树。
@@ -3454,7 +3662,7 @@ function App() {
       return;
     }
     if (actionPending("plugin:bird:list") || actionPending("plugin:bird:apply")) return;
-    void runAction(() => applyBirdResources({ confirm: false }), "plugin:bird:apply");
+    void runAction(() => applyBirdResources(), "plugin:bird:apply");
   }
 
   // 刷新当前配置的唯一 WireGuard peer。
@@ -3490,23 +3698,32 @@ function App() {
   }
 
   // 刷新链路监测详情和样本。
-  async function refreshMonitorDetail(windowValue = monitorWindow, target = monitorDialogTarget()) {
+  async function refreshMonitorDetail(windowValue = monitorWindowRef.current, target = monitorDialogTarget()) {
     if (!target) {
-      setMonitorDetail(null);
-      setMonitorDetailTarget("");
       return;
     }
+    if (monitorDialogTargetKeyRef.current !== target.key || monitorWindowRef.current !== windowValue) return;
+    monitorDetailRequestsRef.current.invalidate();
+    const assertDialogCurrent = monitorDialogRequestsRef.current.capture();
+    try {
+    await monitorDetailRequestsRef.current.run(async (assertCurrent) => {
     const monitor = await api<LinkMonitor | null>(target.apiPath);
-    if (monitorDialogTargetKeyRef.current !== target.key) return;
+    assertDialogCurrent();
+    assertCurrent();
     if (!monitor) {
       setMonitorDetail(null);
       setMonitorDetailTarget(target.key);
       return;
     }
     const detail = await api<LinkMonitorSamplesResponse>(`/api/link-monitors/${monitor.id}/samples?window=${encodeURIComponent(windowValue)}`);
-    if (monitorDialogTargetKeyRef.current !== target.key) return;
+    assertDialogCurrent();
+    assertCurrent();
     setMonitorDetail(detail);
     setMonitorDetailTarget(target.key);
+    });
+    } catch (error) {
+      if (!(error instanceof StaleRequestError)) throw error;
+    }
   }
 
   // 保存链路监测配置。
@@ -3514,6 +3731,7 @@ function App() {
     event.preventDefault();
     const target = monitorDialogTarget();
     if (!target || !selectedNodeId) return;
+    const assertCurrent = monitorDialogRequestsRef.current.capture();
     const nodeId = selectedNodeId;
     const currentSamples = activeMonitorDetail?.samples || [];
     const form = validateForm(event.currentTarget, linkMonitorFormRule);
@@ -3526,6 +3744,8 @@ function App() {
         enabled: form.get("enabled") === "on",
       }),
     });
+    assertCurrent();
+    monitorDetailRequestsRef.current.invalidate();
     if (monitorDialogTargetKeyRef.current === target.key) {
       setMonitorDetailTarget(target.key);
       setMonitorDetail({
@@ -3534,7 +3754,7 @@ function App() {
         samples: currentSamples,
       });
     }
-    void refreshMonitorDetail(monitorWindow, target).catch((error) => notify("error", formatUserError(error)));
+    void refreshMonitorDetail(monitorWindowRef.current, target).catch((error) => notify("error", formatUserError(error)));
     void Promise.all([
       refreshConfigs(nodeId, selectedConfigId),
       refreshConnections(nodeId),
@@ -3546,8 +3766,11 @@ function App() {
   // 删除链路监测配置。
   async function deleteLinkMonitor() {
     if (!activeMonitorDetail || !selectedNodeId) return;
+    const assertCurrent = monitorDialogRequestsRef.current.capture();
     const nodeId = selectedNodeId;
     await api<{ status: string }>(`/api/link-monitors/${activeMonitorDetail.monitor.id}`, { method: "DELETE" });
+    assertCurrent();
+    monitorDetailRequestsRef.current.invalidate();
     setMonitorDetail(null);
     setMonitorDetailTarget("");
     void Promise.all([
@@ -3589,7 +3812,8 @@ function App() {
         setCurrentUser(me.username);
         await refreshSettings();
         await refreshHome();
-      } catch {
+      } catch (error) {
+        if (error instanceof StaleRequestError) return;
         clearAuthenticatedState();
       } finally {
         setAuthChecked(true);
@@ -3610,9 +3834,23 @@ function App() {
     return () => window.clearInterval(timer);
   }, [selectedNodeId, selectedConfigId, selectedConnectionRef, monitorDialogConfigId, monitorDialogEndpointRef, monitorWindow, authToken]);
 
+  useEffect(() => () => {
+    greRefreshTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    greRefreshTimersRef.current = [];
+  }, []);
+
   useEffect(() => {
     document.title = siteTitle || DEFAULT_SITE_TITLE;
   }, [siteTitle]);
+
+  // 释放本地 Logo 预览创建的 blob URL，避免反复选择文件或登出后累积内存。
+  useEffect(() => {
+    return () => {
+      if (settingsLogoPreviewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(settingsLogoPreviewUrl);
+      }
+    };
+  }, [settingsLogoPreviewUrl]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -3623,6 +3861,126 @@ function App() {
     document.body.classList.toggle("modal-scroll-lock", modalOpen);
     return () => document.body.classList.remove("modal-scroll-lock");
   }, [modalOpen]);
+
+  // Keep keyboard focus inside the topmost dialog and provide a predictable
+  // Escape action. Without this, Tab can move behind the modal backdrop and
+  // nested confirmation dialogs leave the underlying dialog interactive.
+  useEffect(() => {
+    if (!modalOpen) {
+      modalPanelRef.current = null;
+      modalPanelFocusRef.current = new WeakMap();
+      if (modalWasOpenRef.current) {
+        const restore = modalRestoreFocusRef.current;
+        modalRestoreFocusRef.current = null;
+        modalWasOpenRef.current = false;
+        if (restore?.isConnected) restore.focus();
+      }
+      return;
+    }
+    if (!modalWasOpenRef.current) {
+      modalRestoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      modalWasOpenRef.current = true;
+    }
+    const panels = Array.from(document.querySelectorAll<HTMLElement>(".modalPanel"));
+    const panel = panels[panels.length - 1];
+    if (!panel) return;
+    const focusableSelector = [
+      "button:not(:disabled)",
+      "[href]",
+      "input:not(:disabled):not([type='hidden'])",
+      "select:not(:disabled)",
+      "textarea:not(:disabled)",
+      "[tabindex]:not([tabindex='-1'])",
+    ].join(",");
+    const focusables = (): HTMLElement[] => Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector))
+      .filter((item) => item.tabIndex >= 0 && item.getClientRects().length > 0 && getComputedStyle(item).visibility !== "hidden");
+    panel.tabIndex = -1;
+    const previousPanel = modalPanelRef.current;
+    if (previousPanel !== panel) {
+      const previousFocus = document.activeElement;
+      if (previousFocus instanceof HTMLElement && previousPanel?.contains(previousFocus)) {
+        modalPanelFocusRef.current.set(previousPanel, previousFocus);
+      }
+      modalPanelRef.current = panel;
+      const restore = modalPanelFocusRef.current.get(panel);
+      (restore?.isConnected && panel.contains(restore) ? restore : focusables()[0] || panel).focus();
+    } else if (!panel.contains(document.activeElement)) {
+      (focusables()[0] || panel).focus();
+    }
+
+    function closeTopmostModal() {
+      switch (panel.getAttribute("aria-labelledby")) {
+        case "topology-reset-title": return setTopologyResetConfirmOpen(false);
+        case "node-plugin-error-title": return setNodePluginError("");
+        case "monitor-title": return closeMonitorDialog();
+        case "delete-config-title": return setDeleteDialogOpen(false);
+        case "node-plugin-title": return closeNodePluginDialog();
+        case "peer-modal-title":
+          selectConfigId(null);
+          return setPlan(null);
+        case "gre-config-title":
+          selectConnectionRef(null);
+          return setPlan(null);
+        case "manual-protocol-title":
+        case "manual-link-title":
+        case "manual-gre-title":
+        case "managed-protocol-title":
+        case "managed-link-title": return closeCreateDialog();
+        case "node-edit-title":
+          selectEditingNodeId(null);
+          return setRevealedAgentToken(null);
+        case "node-create-title": return setNodeCreateOpen(false);
+        case "settings-title": return setSettingsOpen(false);
+        case "topology-fullscreen-title": return setTopologyFullscreenOpen(false);
+      }
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeTopmostModal();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const focusedIndex = items.indexOf(document.activeElement as HTMLElement);
+      if (event.shiftKey && focusedIndex <= 0) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (focusedIndex < 0 || document.activeElement === last)) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    panel.addEventListener("keydown", handleKeyDown);
+    return () => {
+      panel.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [
+    modalOpen,
+    topologyResetConfirmOpen,
+    nodePluginError,
+    monitorDialogConfigId,
+    monitorDialogEndpointRef,
+    deleteDialogOpen,
+    nodePluginDialogOpen,
+    selectedConfigId,
+    selectedConnectionRef,
+    createDialog,
+    editingNodeId,
+    nodeCreateOpen,
+    settingsOpen,
+    topologyFullscreenOpen,
+  ]);
 
   useEffect(() => {
     if (!authToken || !settingsOpen) return;
@@ -3689,7 +4047,7 @@ function App() {
         selectConfigId(null);
       }
       setPlan(null);
-      setManagedPeerNodeId(null);
+      selectManagedPeerNodeId(null);
       refreshConfigs(selectedNodeId, preferredConfigId).catch((error) => notify("error", formatUserError(error)));
       refreshConnections(selectedNodeId).catch((error) => notify("error", formatUserError(error)));
       refreshImportCandidates(selectedNodeId).catch((error) => notify("error", formatUserError(error)));
@@ -3812,12 +4170,14 @@ function App() {
   }, [selectedConfigId, selectedConfigIsManagedLink, managedLink]);
 
   useEffect(() => {
+    monitorDialogRequestsRef.current.invalidate();
+    monitorDetailRequestsRef.current.invalidate();
     monitorDialogTargetKeyRef.current = monitorDialogActionTarget;
     setMonitorDetail(null);
     setMonitorDetailTarget("");
     const target = monitorDialogTarget();
     if (!target) return;
-    refreshMonitorDetail(monitorWindow, target).catch((error) => notify("error", formatUserError(error)));
+    refreshMonitorDetail(monitorWindowRef.current, target).catch((error) => notify("error", formatUserError(error)));
   }, [monitorDialogActionTarget, monitorWindow]);
 
   useEffect(() => {
@@ -3830,8 +4190,11 @@ function App() {
     const nodeId = selectedNodeId;
     const configId = selectedConfigId;
     let cancelled = false;
+    let inFlight = false;
     // 定时刷新当前 WireGuard 配置的运行状态。
     async function refreshRuntimeStatus() {
+      if (cancelled || inFlight) return;
+      inFlight = true;
       try {
         await api<ConfigItem>(`/api/wireguard/configs/${configId}/refresh-status`, { method: "POST" });
         if (!cancelled) {
@@ -3841,6 +4204,8 @@ function App() {
         if (!cancelled) {
           notify("error", formatUserError(error));
         }
+      } finally {
+        inFlight = false;
       }
     }
     void refreshRuntimeStatus();
@@ -3855,19 +4220,29 @@ function App() {
 
   useEffect(() => {
     if (!plan || !["confirmed", "dispatching", "running"].includes(plan.status)) return;
+    let cancelled = false;
+    let inFlight = false;
     const timer = window.setInterval(async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
       try {
         const updated = await api<ChangePlan>(`/api/change-plans/${plan.id}`);
+        if (cancelled) return;
         setPlan(updated);
         if (["succeeded", "failed", "cancelled"].includes(updated.status)) {
           notify(updated.status === "succeeded" ? "success" : "error", updated.status === "succeeded" ? "Agent 已完成部署任务。" : formatTaskResultForUser(updated.task_result, "Agent 任务执行失败"));
           window.clearInterval(timer);
         }
       } catch (error) {
-        notify("error", formatUserError(error));
+        if (!cancelled) notify("error", formatUserError(error));
+      } finally {
+        inFlight = false;
       }
     }, 2000);
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [plan?.id, plan?.status]);
 
   // 创建节点后展示一次性 Agent 令牌，用户需要立即保存到节点配置中。
@@ -3914,7 +4289,8 @@ function App() {
     const formElement = event.currentTarget;
     const form = validateForm(formElement, nodeEditFormRule, { endpointIps: editingNodeEndpointIps });
     const endpointIps = uniqueList([...editingNodeEndpointIps, ...splitList(String(form.get("endpoint_ip_draft") || ""))]);
-    const updated = await api<NodeItem>(`/api/nodes/${editingNode.id}`, {
+    const editingNodeIdAtStart = editingNode.id;
+    const updated = await api<NodeItem>(`/api/nodes/${editingNodeIdAtStart}`, {
       method: "PATCH",
       body: JSON.stringify({
         name: form.get("name"),
@@ -3927,6 +4303,7 @@ function App() {
         github_proxy_url: String(form.get("github_proxy_url") || "").trim() || null,
       }),
     });
+    if (editingNodeIdRef.current !== editingNodeIdAtStart) return;
     setNodes((items) => items.map((item) => item.id === updated.id ? updated : item));
     await refreshTopology();
     notify("success", "节点信息已保存。");
@@ -3935,7 +4312,9 @@ function App() {
   // 轮换后旧 Agent 令牌立即失效，编辑弹窗会展示新的令牌。
   async function rotateNodeToken() {
     if (!editingNode) return;
-    const result = await api<NodeCreateResult>(`/api/nodes/${editingNode.id}/rotate-agent-token`, { method: "POST" });
+    const editingNodeIdAtStart = editingNode.id;
+    const result = await api<NodeCreateResult>(`/api/nodes/${editingNodeIdAtStart}/rotate-agent-token`, { method: "POST" });
+    if (editingNodeIdRef.current !== editingNodeIdAtStart) return;
     setNodes((items) => items.map((item) => item.id === result.node.id ? result.node : item));
     setRevealedAgentToken({ nodeId: result.node.id, token: result.agent_token });
     notify("success", "Agent 令牌已轮换，旧令牌已失效；新令牌仅在当前弹窗显示。");
@@ -3949,15 +4328,17 @@ function App() {
       throw new Error("节点下仍有 WireGuard 配置，请先删除所有配置");
     }
     if (!window.confirm(`确认删除节点 ${editingNode.name}？删除后该节点 Agent 令牌会失效。`)) return;
-    await api<{ status: string }>(`/api/nodes/${editingNode.id}`, { method: "DELETE" });
-    if (selectedNodeId === editingNode.id) {
+    const editingNodeIdAtStart = editingNode.id;
+    await api<{ status: string }>(`/api/nodes/${editingNodeIdAtStart}`, { method: "DELETE" });
+    if (editingNodeIdRef.current !== editingNodeIdAtStart) return;
+    if (selectedNodeIdRef.current === editingNodeIdAtStart) {
       selectNodeId(null);
       selectConfigId(null);
       setConfigs([]);
       setImportCandidates([]);
       setPlan(null);
     }
-    setEditingNodeId(null);
+    selectEditingNodeId(null);
     setRevealedAgentToken(null);
     await refreshNodes();
     notify("success", "节点已删除。");
@@ -3979,6 +4360,7 @@ function App() {
   async function refreshAgentUpgradePlan(nodeId: number = editingNodeId || 0) {
     if (!nodeId) return;
     const data = await api<AgentUpgradePlan>(`/api/nodes/${nodeId}/agent/upgrade-plan`);
+    if (editingNodeIdRef.current !== nodeId) return;
     setAgentUpgradePlan(data);
   }
 
@@ -3997,18 +4379,21 @@ function App() {
     if (agentUpgradePlan.upgrade_mode !== "self_upgrade") {
       throw new Error(agentUpgradePlan.reason || "当前节点不能一键升级");
     }
-    const upgradeTaskKey = nodeActionKey(editingNode.id, "agent-upgrade-task");
+    const nodeIdAtStart = editingNode.id;
+    const targetVersionAtStart = agentUpgradePlan.target_version;
+    const upgradeTaskKey = nodeActionKey(nodeIdAtStart, "agent-upgrade-task");
     holdActionPending(upgradeTaskKey);
     try {
-      const result = await api<TaskRequestResult>(`/api/nodes/${editingNode.id}/agent/upgrade`, {
+      const result = await api<TaskRequestResult>(`/api/nodes/${nodeIdAtStart}/agent/upgrade`, {
         method: "POST",
-        body: JSON.stringify({ target_version: agentUpgradePlan.target_version, force: false }),
+        body: JSON.stringify({ target_version: targetVersionAtStart, force: false }),
       });
+      if (editingNodeIdRef.current !== nodeIdAtStart) return;
       notify("success", translateApiDetail(result.message));
       await refreshNodes();
-      await refreshAgentUpgradePlan(editingNode.id);
+      await refreshAgentUpgradePlan(nodeIdAtStart);
       if (result.task_id) {
-        await pollAgentUpgradeTask(result.task_id, editingNode.id);
+        await pollAgentUpgradeTask(result.task_id, nodeIdAtStart);
       }
     } finally {
       releaseActionPending(upgradeTaskKey);
@@ -4022,20 +4407,24 @@ function App() {
     if (!status.installable) {
       throw new Error(status.detail);
     }
-    const result = await api<TaskRequestResult>(`/api/nodes/${editingNode.id}/middleware/mimic/install`, {
+    const nodeIdAtStart = editingNode.id;
+    const result = await api<TaskRequestResult>(`/api/nodes/${nodeIdAtStart}/middleware/mimic/install`, {
       method: "POST",
     });
+    if (editingNodeIdRef.current !== nodeIdAtStart) return;
     notify("success", translateApiDetail(result.message));
     await refreshNodes();
     if (result.task_id) {
-      await pollMiddlewareInstallTask(result.task_id, editingNode.id);
+      await pollMiddlewareInstallTask(result.task_id, nodeIdAtStart);
     }
   }
 
   // 轮询中间层安装任务直到完成或超时。
   async function pollMiddlewareInstallTask(taskId: number, nodeId: number) {
     for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
+      if (editingNodeIdRef.current !== nodeId) return;
       await sleep(TASK_POLL_INTERVAL_MS);
+      if (editingNodeIdRef.current !== nodeId) return;
       const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
       await refreshNodes();
       if (task.status === "succeeded") {
@@ -4057,7 +4446,9 @@ function App() {
   // 轮询 Agent 升级任务直到完成或超时。
   async function pollAgentUpgradeTask(taskId: number, nodeId: number) {
     for (let attempt = 0; attempt < AGENT_TASK_POLL_LIMIT; attempt += 1) {
+      if (editingNodeIdRef.current !== nodeId) return;
       await sleep(TASK_POLL_INTERVAL_MS);
+      if (editingNodeIdRef.current !== nodeId) return;
       const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
       await refreshNodes();
       await refreshAgentUpgradePlan(nodeId);
@@ -4100,12 +4491,14 @@ function App() {
       table_name: form.get("table_name") || null,
       interface_custom_config: form.get("interface_custom_config") || null,
     };
-    const item = mode === "update" && selectedConfigId
-      ? await api<ConfigItem>(`/api/wireguard/configs/${selectedConfigId}`, {
+    const nodeIdAtStart = selectedNodeId;
+    const configIdAtStart = selectedConfigId;
+    const item = mode === "update" && configIdAtStart
+      ? await api<ConfigItem>(`/api/wireguard/configs/${configIdAtStart}`, {
           method: "PATCH",
           body: JSON.stringify(payload),
         })
-      : await api<ConfigItem>(`/api/nodes/${selectedNodeId}/wireguard/configs`, {
+      : await api<ConfigItem>(`/api/nodes/${nodeIdAtStart}/wireguard/configs`, {
           method: "POST",
           body: JSON.stringify(payload),
         });
@@ -4124,8 +4517,9 @@ function App() {
         }),
       });
     }
+    if (!isCurrentSelectedNode(nodeIdAtStart) || (mode === "update" && selectedConfigIdRef.current !== configIdAtStart)) return;
     formElement.reset();
-    await refreshConfigs(selectedNodeId, item.id, { forceSelect: mode === "create" });
+    await refreshConfigs(nodeIdAtStart, item.id, { forceSelect: mode === "create" });
     setPlan(null);
     if (mode === "create") {
       setCreateDialog(null);
@@ -4162,8 +4556,9 @@ function App() {
     if (replaceLocalConfigId && !replacePeerConfigId) {
       throw new Error("请选择对端的导入配置覆盖项");
     }
+    const nodeIdAtStart = selectedNodeId;
     const result = await api<{ local_interface: ConfigItem; peer_interface: ConfigItem }>(
-      `/api/nodes/${selectedNodeId}/wireguard/managed-links`,
+      `/api/nodes/${nodeIdAtStart}/wireguard/managed-links`,
       {
         method: "POST",
         body: JSON.stringify({
@@ -4194,10 +4589,11 @@ function App() {
         }),
       },
     );
+    if (!isCurrentSelectedNode(nodeIdAtStart)) return;
     formElement.reset();
-    await refreshConfigs(selectedNodeId, result.local_interface.id, { forceSelect: true });
+    await refreshConfigs(nodeIdAtStart, result.local_interface.id, { forceSelect: true });
     setPlan(null);
-    setManagedPeerNodeId(null);
+    selectManagedPeerNodeId(null);
     setReplaceLocalConfigId(null);
     setReplacePeerConfigId(null);
     setForceEndpointMismatch(false);
@@ -4209,9 +4605,14 @@ function App() {
     setCreateDialog(null);
     [1000, 2500, 4500].forEach((delay) => {
       window.setTimeout(() => {
-        void refreshConfigs(selectedNodeId, result.local_interface.id);
+        if (!isCurrentSelectedNode(nodeIdAtStart)) return;
+        void refreshConfigs(nodeIdAtStart, result.local_interface.id).catch((error) => {
+          if (isCurrentSelectedNode(nodeIdAtStart)) notify("error", formatUserError(error));
+        });
         if (selectedConfigIdRef.current === result.local_interface.id) {
-          void refreshManagedLink(result.local_interface.id);
+          void refreshManagedLink(result.local_interface.id).catch((error) => {
+            if (isCurrentSelectedNode(nodeIdAtStart)) notify("error", formatUserError(error));
+          });
         }
       }, delay);
     });
@@ -4333,18 +4734,20 @@ function App() {
       peer_node_id: peerNodeId,
       ...commonPayload,
     };
-    const connection = await api<ConnectionItem>(`/api/nodes/${selectedNodeId}/connections/managed`, {
+    const nodeIdAtStart = selectedNodeId;
+    const connection = await api<ConnectionItem>(`/api/nodes/${nodeIdAtStart}/connections/managed`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    if (!isCurrentSelectedNode(nodeIdAtStart)) return;
     setCreateDialog(null);
     setManagedCreateProtocol("wireguard");
-    setManagedPeerNodeId(null);
+    selectManagedPeerNodeId(null);
     formElement.reset();
     selectConfigId(null);
     selectConnectionRef(connection.connection_ref);
-    void Promise.all([refreshConnections(selectedNodeId), refreshTopology()]).catch((error) => notify("error", formatUserError(error)));
-    scheduleGreConnectionRefresh(selectedNodeId);
+    void Promise.all([refreshConnections(nodeIdAtStart), refreshTopology()]).catch((error) => notify("error", formatUserError(error)));
+    scheduleGreConnectionRefresh(nodeIdAtStart);
     notify("success", `GRE 连接 ${connection.name} 已创建，双方部署和启动任务已下发。`);
   }
 
@@ -4425,17 +4828,19 @@ function App() {
     if (ipAddressVersion(payload.outer_local_ip) === 6 && !nodeSupportsGreIpv6(selectedNode)) {
       throw new Error("GRE over IPv6 需要当前节点升级到支持 IPv6 外层的 Agent");
     }
-    const connection = await api<ConnectionItem>(`/api/nodes/${selectedNodeId}/connections/manual`, {
+    const nodeIdAtStart = selectedNodeId;
+    const connection = await api<ConnectionItem>(`/api/nodes/${nodeIdAtStart}/connections/manual`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    if (!isCurrentSelectedNode(nodeIdAtStart)) return;
     formElement.reset();
     setCreateDialog(null);
     setManualCreateProtocol("wireguard");
     selectConfigId(null);
     selectConnectionRef(connection.connection_ref);
-    void refreshConnections(selectedNodeId).catch((error) => notify("error", formatUserError(error)));
-    scheduleGreConnectionRefresh(selectedNodeId);
+    void refreshConnections(nodeIdAtStart).catch((error) => notify("error", formatUserError(error)));
+    scheduleGreConnectionRefresh(nodeIdAtStart);
     notify("success", `GRE 连接 ${connection.name} 已创建，本端部署和启动任务已下发。`);
   }
 
@@ -4462,6 +4867,8 @@ function App() {
         throw new Error("GRE over IPv6 需要连接中的节点升级到支持 IPv6 外层的 Agent");
       }
     }
+    const nodeIdAtStart = selectedNodeId;
+    const connectionRefAtStart = selectedGreConnection.connection_ref;
     const updatePath = selectedGreIsManual
       ? `/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/manual`
       : `/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}`;
@@ -4469,8 +4876,9 @@ function App() {
       method: "PATCH",
       body: JSON.stringify(payload),
     });
-    await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
-    scheduleGreConnectionRefresh(selectedNodeId);
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConnectionRefRef.current !== connectionRefAtStart) return;
+    await Promise.all([refreshConnections(nodeIdAtStart), refreshTopology()]);
+    scheduleGreConnectionRefresh(nodeIdAtStart);
     notify("success", selectedGreIsManual ? "GRE 连接已保存，并已重新下发本端配置。" : "GRE 连接已保存，并已重新下发双方配置。");
   }
 
@@ -4480,9 +4888,12 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能启动 GRE 连接");
     }
-    await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/start`, { method: "POST" });
-    await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
-    scheduleGreConnectionRefresh(selectedNodeId);
+    const nodeIdAtStart = selectedNodeId;
+    const connectionRefAtStart = selectedGreConnection.connection_ref;
+    await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(connectionRefAtStart)}/start`, { method: "POST" });
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConnectionRefRef.current !== connectionRefAtStart) return;
+    await Promise.all([refreshConnections(nodeIdAtStart), refreshTopology()]);
+    scheduleGreConnectionRefresh(nodeIdAtStart);
     notify("success", selectedGreIsManual ? "GRE 启动任务已创建，等待本端 Agent 执行。" : "GRE 启动任务已创建，等待双方 Agent 执行。");
   }
 
@@ -4492,9 +4903,12 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能断开 GRE 连接");
     }
-    await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}/stop`, { method: "POST" });
-    await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
-    scheduleGreConnectionRefresh(selectedNodeId);
+    const nodeIdAtStart = selectedNodeId;
+    const connectionRefAtStart = selectedGreConnection.connection_ref;
+    await api<ConnectionItem>(`/api/connections/${encodedConnectionRef(connectionRefAtStart)}/stop`, { method: "POST" });
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConnectionRefRef.current !== connectionRefAtStart) return;
+    await Promise.all([refreshConnections(nodeIdAtStart), refreshTopology()]);
+    scheduleGreConnectionRefresh(nodeIdAtStart);
     notify("success", selectedGreIsManual ? "GRE 断开任务已创建，等待本端 Agent 执行。" : "GRE 断开任务已创建，等待双方 Agent 执行。");
   }
 
@@ -4502,9 +4916,12 @@ function App() {
   async function deleteSelectedGreConnection() {
     if (!selectedGreConnection || !selectedNodeId) return;
     if (!window.confirm(`确认删除 GRE 连接 ${selectedGreConnection.name}？系统会下发${selectedGreIsManual ? "本端" : "双方"}清理任务。`)) return;
-    await api<{ status: string }>(`/api/connections/${encodedConnectionRef(selectedGreConnection.connection_ref)}`, { method: "DELETE" });
+    const nodeIdAtStart = selectedNodeId;
+    const connectionRefAtStart = selectedGreConnection.connection_ref;
+    await api<{ status: string }>(`/api/connections/${encodedConnectionRef(connectionRefAtStart)}`, { method: "DELETE" });
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConnectionRefRef.current !== connectionRefAtStart) return;
     selectConnectionRef(null);
-    await Promise.all([refreshConnections(selectedNodeId), refreshTopology()]);
+    await Promise.all([refreshConnections(nodeIdAtStart), refreshTopology()]);
     notify("success", `GRE 连接记录已删除，${selectedGreIsManual ? "本端" : "双方"}清理任务已下发。`);
   }
 
@@ -4520,7 +4937,8 @@ function App() {
     const allowedIps = splitList(String(form.get("allowed_ips") || ""));
     const endpointPort = optionalInt(form.get("endpoint_port"), "入口端口");
     const keepalive = optionalInt(form.get("persistent_keepalive"), "保活间隔");
-    await api<PeerItem>(`/api/wireguard/configs/${selectedConfigId}/peer`, {
+    const configIdAtStart = selectedConfigId;
+    await api<PeerItem>(`/api/wireguard/configs/${configIdAtStart}/peer`, {
       method: "PUT",
       body: JSON.stringify({
         name: form.get("name") || null,
@@ -4534,10 +4952,11 @@ function App() {
         peer_custom_config: form.get("peer_custom_config") || null,
       }),
     });
+    if (selectedConfigIdRef.current !== configIdAtStart) return;
     formElement.reset();
-    await refreshPeer(selectedConfigId);
-    if (selectedNodeId) {
-      await refreshConfigs(selectedNodeId, selectedConfigId);
+    await refreshPeer(configIdAtStart);
+    if (selectedNodeId && selectedConfigIdRef.current === configIdAtStart) {
+      await refreshConfigs(selectedNodeId, configIdAtStart);
     }
     notify("success", "对端已保存；生成并确认部署计划后才会下发到 Agent。");
   }
@@ -4565,6 +4984,7 @@ function App() {
     const udp2raw = middlewareType === "udp2raw" ? readUdp2RawForm(form, localListenPort, peerListenPort) : null;
     const mimic = middlewareType === "mimic" ? readMimicForm(form) : null;
     const configId = selectedConfigId;
+    const nodeIdAtStart = selectedNodeId;
     await api<ManagedLink>(`/api/wireguard/configs/${configId}/managed-link`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -4591,12 +5011,18 @@ function App() {
         mimic,
       }),
     });
-    await refreshConfigs(selectedNodeId, configId);
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConfigIdRef.current !== configId) return;
+    await refreshConfigs(nodeIdAtStart, configId);
     [1000, 2500, 4500].forEach((delay) => {
       window.setTimeout(() => {
-        void refreshConfigs(selectedNodeId, configId);
+        if (!isCurrentSelectedNode(nodeIdAtStart)) return;
+        void refreshConfigs(nodeIdAtStart, configId).catch((error) => {
+          if (isCurrentSelectedNode(nodeIdAtStart)) notify("error", formatUserError(error));
+        });
         if (selectedConfigIdRef.current === configId) {
-          void refreshManagedLink(configId);
+          void refreshManagedLink(configId).catch((error) => {
+            if (isCurrentSelectedNode(nodeIdAtStart)) notify("error", formatUserError(error));
+          });
         }
       }, delay);
     });
@@ -4609,9 +5035,11 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能生成部署计划");
     }
-    const data = await api<ChangePlan>(`/api/wireguard/configs/${selectedConfigId}/plan-apply`, {
+    const configIdAtStart = selectedConfigId;
+    const data = await api<ChangePlan>(`/api/wireguard/configs/${configIdAtStart}/plan-apply`, {
       method: "POST",
     });
+    if (selectedConfigIdRef.current !== configIdAtStart) return;
     setPlan(data);
     if (!data.diff.trim()) {
       notify("info", selectedConfig?.source === "imported" && !selectedConfig.managed
@@ -4626,8 +5054,11 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能同步节点配置");
     }
-    await api<ConfigItem>(`/api/wireguard/configs/${selectedConfigId}/refresh-deployed`, { method: "POST" });
-    await refreshConfigs(selectedNodeId, selectedConfigId);
+    const configIdAtStart = selectedConfigId;
+    const nodeIdAtStart = selectedNodeId;
+    await api<ConfigItem>(`/api/wireguard/configs/${configIdAtStart}/refresh-deployed`, { method: "POST" });
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConfigIdRef.current !== configIdAtStart) return;
+    await refreshConfigs(nodeIdAtStart, configIdAtStart);
     notify("success", "已创建同步任务；稍后再次生成部署计划会使用节点当前配置作为基线。");
   }
 
@@ -4637,13 +5068,17 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能启动 WireGuard 连接");
     }
-    if (selectedConfigIsManagedLink) {
-      await api<ManagedLink>(`/api/wireguard/configs/${selectedConfigId}/managed-link/start`, { method: "POST" });
+    const configIdAtStart = selectedConfigId;
+    const nodeIdAtStart = selectedNodeId;
+    const managedAtStart = selectedConfigIsManagedLink;
+    if (managedAtStart) {
+      await api<ManagedLink>(`/api/wireguard/configs/${configIdAtStart}/managed-link/start`, { method: "POST" });
     } else {
-      await api<ConfigItem>(`/api/wireguard/configs/${selectedConfigId}/start`, { method: "POST" });
+      await api<ConfigItem>(`/api/wireguard/configs/${configIdAtStart}/start`, { method: "POST" });
     }
-    await refreshConfigs(selectedNodeId, selectedConfigId);
-    notify("success", selectedConfigIsManagedLink ? "已创建双方启动任务，等待 Agent 执行。" : isConfigRunning ? "WireGuard 连接已经是已连接状态。" : "启动任务已创建，等待 Agent 执行。");
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConfigIdRef.current !== configIdAtStart) return;
+    await refreshConfigs(nodeIdAtStart, configIdAtStart);
+    notify("success", managedAtStart ? "已创建双方启动任务，等待 Agent 执行。" : isConfigRunning ? "WireGuard 连接已经是已连接状态。" : "启动任务已创建，等待 Agent 执行。");
   }
 
   // 断开 WireGuard 接口；删除配置前必须先完成这一步。
@@ -4652,13 +5087,17 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能断开 WireGuard 连接");
     }
-    if (selectedConfigIsManagedLink) {
-      await api<ManagedLink>(`/api/wireguard/configs/${selectedConfigId}/managed-link/stop`, { method: "POST" });
+    const configIdAtStart = selectedConfigId;
+    const nodeIdAtStart = selectedNodeId;
+    const managedAtStart = selectedConfigIsManagedLink;
+    if (managedAtStart) {
+      await api<ManagedLink>(`/api/wireguard/configs/${configIdAtStart}/managed-link/stop`, { method: "POST" });
     } else {
-      await api<ConfigItem>(`/api/wireguard/configs/${selectedConfigId}/stop`, { method: "POST" });
+      await api<ConfigItem>(`/api/wireguard/configs/${configIdAtStart}/stop`, { method: "POST" });
     }
-    await refreshConfigs(selectedNodeId, selectedConfigId);
-    notify("success", selectedConfigIsManagedLink ? "已创建双方断开任务，等待 Agent 执行。" : isConfigStopped ? "WireGuard 连接已经是已断开状态。" : "断开任务已创建，等待 Agent 执行。");
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConfigIdRef.current !== configIdAtStart) return;
+    await refreshConfigs(nodeIdAtStart, configIdAtStart);
+    notify("success", managedAtStart ? "已创建双方断开任务，等待 Agent 执行。" : isConfigStopped ? "WireGuard 连接已经是已断开状态。" : "断开任务已创建，等待 Agent 执行。");
   }
 
   // 打开删除确认弹窗，并在需要触碰节点时检查在线和停止状态。
@@ -4677,23 +5116,29 @@ function App() {
   // 默认只删除 Link42 记录；用户勾选后才同步删除节点配置和服务。
   async function deleteSelectedConfig() {
     if (!selectedConfigId || !selectedNodeId || !selectedConfig) return;
-    const query = deleteNodeConfig ? "?delete_node_config=true" : "";
-    if (selectedConfigIsManagedLink) {
-      await api<{ status: string }>(`/api/wireguard/configs/${selectedConfigId}/managed-link${query}`, { method: "DELETE" });
+    const configIdAtStart = selectedConfigId;
+    const nodeIdAtStart = selectedNodeId;
+    const managedAtStart = selectedConfigIsManagedLink;
+    const importedAtStart = selectedConfigIsUnmanagedImport;
+    const deleteNodeConfigAtStart = deleteNodeConfig;
+    const query = deleteNodeConfigAtStart ? "?delete_node_config=true" : "";
+    if (managedAtStart) {
+      await api<{ status: string }>(`/api/wireguard/configs/${configIdAtStart}/managed-link${query}`, { method: "DELETE" });
     } else {
-      await api<{ status: string }>(`/api/wireguard/configs/${selectedConfigId}${query}`, { method: "DELETE" });
+      await api<{ status: string }>(`/api/wireguard/configs/${configIdAtStart}${query}`, { method: "DELETE" });
     }
+    if (!isCurrentSelectedNode(nodeIdAtStart) || selectedConfigIdRef.current !== configIdAtStart) return;
     setDeleteDialogOpen(false);
     setDeleteNodeConfig(false);
     selectConfigId(null);
     setPlan(null);
-    await refreshConfigs(selectedNodeId, null);
-    await refreshImportCandidates(selectedNodeId);
-    notify("success", selectedConfigIsManagedLink
-      ? (deleteNodeConfig ? "受管连接双方记录已删除，并已下发节点配置清理任务。" : "受管连接双方记录已删除，节点配置已保留。")
-      : selectedConfigIsUnmanagedImport
+    await refreshConfigs(nodeIdAtStart, null);
+    await refreshImportCandidates(nodeIdAtStart);
+    notify("success", managedAtStart
+      ? (deleteNodeConfigAtStart ? "受管连接双方记录已删除，并已下发节点配置清理任务。" : "受管连接双方记录已删除，节点配置已保留。")
+      : importedAtStart
         ? "导入观察记录已删除，节点原始配置文件未改动。"
-        : (deleteNodeConfig ? "WireGuard 记录已删除，并已下发节点配置清理任务。" : "WireGuard 记录已删除，节点配置已保留。"));
+        : (deleteNodeConfigAtStart ? "WireGuard 记录已删除，并已下发节点配置清理任务。" : "WireGuard 记录已删除，节点配置已保留。"));
   }
 
   // 确认计划会创建 Agent 任务，是配置下发前的安全闸门。
@@ -4705,7 +5150,10 @@ function App() {
     if (!hasDeployDiff) {
       throw new Error("本次没有需要下发的配置变化");
     }
-    const data = await api<ChangePlan>(`/api/change-plans/${plan.id}/confirm`, { method: "POST" });
+    const planIdAtStart = plan.id;
+    const configIdAtStart = selectedConfigIdRef.current;
+    const data = await api<ChangePlan>(`/api/change-plans/${planIdAtStart}/confirm`, { method: "POST" });
+    if (plan?.id !== planIdAtStart || selectedConfigIdRef.current !== configIdAtStart) return;
     setPlan(data);
     notify("success", "部署任务已创建，等待 Agent 拉取执行。");
   }
@@ -4716,29 +5164,33 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能扫描节点配置");
     }
-    const data = await api<TaskRequestResult>(`/api/nodes/${selectedNodeId}/wireguard/import-scan`, {
+    const nodeIdAtStart = selectedNodeId;
+    const data = await api<TaskRequestResult>(`/api/nodes/${nodeIdAtStart}/wireguard/import-scan`, {
       method: "POST",
     });
+    if (!isCurrentSelectedNode(nodeIdAtStart)) return;
     notify(
       "success",
       data.status === "pending" ? "扫描任务已创建，等待 Agent 执行。" : "扫描任务已在执行，正在等待结果。",
     );
     await refreshNodes();
-    await refreshConfigs(selectedNodeId, selectedConfigId);
-    await refreshImportCandidates(selectedNodeId);
+    await refreshConfigs(nodeIdAtStart, selectedConfigIdRef.current);
+    await refreshImportCandidates(nodeIdAtStart);
     setImportCandidatesExpanded(true);
     if (data.task_id) {
-      await pollImportScanTask(data.task_id, selectedNodeId);
+      await pollImportScanTask(data.task_id, nodeIdAtStart);
     }
   }
 
   // 轮询导入扫描任务并刷新候选列表。
   async function pollImportScanTask(taskId: number, nodeId: number) {
     for (let attempt = 0; attempt < SHORT_TASK_POLL_LIMIT; attempt += 1) {
+      if (!isCurrentSelectedNode(nodeId)) return;
       await sleep(1000);
+      if (!isCurrentSelectedNode(nodeId)) return;
       const task = await api<AgentTaskStatus>(`/api/tasks/${taskId}`);
       await refreshNodes();
-      await refreshConfigs(nodeId, selectedConfigId);
+      await refreshConfigs(nodeId, selectedConfigIdRef.current);
       await refreshImportCandidates(nodeId);
       if (task.status === "succeeded") {
         notify("success", "扫描完成，已刷新现有 wg-quick 候选和节点配置。");
@@ -4758,13 +5210,15 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能导入节点配置");
     }
-    const item = await api<ConfigItem>(`/api/nodes/${selectedNodeId}/wireguard/import`, {
+    const nodeIdAtStart = selectedNodeId;
+    const item = await api<ConfigItem>(`/api/nodes/${nodeIdAtStart}/wireguard/import`, {
       method: "POST",
       body: JSON.stringify({ candidate_id: candidateId }),
     });
+    if (!isCurrentSelectedNode(nodeIdAtStart)) return;
     notify("success", `已导入 ${item.name}，当前仍未接管管理。`);
-    await refreshConfigs(selectedNodeId);
-    await refreshImportCandidates(selectedNodeId);
+    await refreshConfigs(nodeIdAtStart);
+    await refreshImportCandidates(nodeIdAtStart);
     selectConfigId(item.id);
   }
 
@@ -4774,12 +5228,15 @@ function App() {
     if (!selectedNodeOnline) {
       throw new Error("Agent 离线，不能接管配置");
     }
-    const data = await api<ChangePlan>(`/api/wireguard/configs/${selectedConfigId}/take-over`, {
+    const configIdAtStart = selectedConfigId;
+    const nodeIdAtStart = selectedNodeId;
+    const data = await api<ChangePlan>(`/api/wireguard/configs/${configIdAtStart}/take-over`, {
       method: "POST",
     });
+    if (selectedConfigIdRef.current !== configIdAtStart) return;
     setPlan(data);
-    if (selectedNodeId) {
-      await refreshConfigs(selectedNodeId, selectedConfigId);
+    if (nodeIdAtStart) {
+      await refreshConfigs(nodeIdAtStart, configIdAtStart);
     }
     if (!data.diff.trim()) {
       notify("success", "已接管现有 wg-quick 配置，未重写节点文件。");
@@ -4789,7 +5246,10 @@ function App() {
   // 渲染普通或全屏模式下复用的拓扑画布。
   function renderTopologyCanvas(extraClassName = "") {
     return (
-      <div className={extraClassName ? `topologyCanvas ${extraClassName}` : "topologyCanvas"}>
+      <div
+        className={extraClassName ? `topologyCanvas ${extraClassName}` : "topologyCanvas"}
+        onKeyDownCapture={handleTopologyKeyDownCapture}
+      >
         {topology.nodes.length === 0 ? (
           <div className="empty">创建节点和受管连接后会显示拓扑。</div>
         ) : (
@@ -4801,6 +5261,9 @@ function App() {
             minZoom={0.2}
             maxZoom={1.8}
             nodesConnectable={false}
+            nodesFocusable
+            edgesFocusable
+            deleteKeyCode={null}
             onNodeClick={handleTopologyNodeClick}
             onNodeDrag={handleTopologyNodeDrag}
             onNodeDragStop={handleTopologyNodeDragStop}
@@ -4908,20 +5371,20 @@ function App() {
           </div>
         </div>
         <div className="topbarActions">
-          <button
+          <button aria-label={theme === "dark" ? "切换到日间模式" : "切换到夜间模式"} type="button"
             className="iconButton"
             onClick={() => setTheme((value) => (value === "dark" ? "light" : "dark"))}
             title={theme === "dark" ? "切换到日间模式" : "切换到夜间模式"}
           >
             {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
           </button>
-          <button className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
+          <button aria-label="设置" type="button" className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
             <Settings size={18} />
           </button>
-          <button className="iconButton" onClick={() => void runAction(() => refreshHome({ requestSelectedGreStatus: true }))} title="刷新">
+          <button aria-label="刷新" type="button" className="iconButton" onClick={() => void runAction(() => refreshHome({ requestSelectedGreStatus: true }))} title="刷新">
             <RefreshCw size={18} />
           </button>
-          <button className="iconButton" onClick={() => void runAction(logout)} title="退出">
+          <button aria-label="退出" type="button" className="iconButton" onClick={() => void runAction(logout)} title="退出">
             <LogOut size={18} />
           </button>
         </div>
@@ -4952,7 +5415,7 @@ function App() {
                 >
                   <RefreshCw size={16} /> {actionPending("topology:reset") ? "还原中" : "还原拓扑"}
                 </button>
-                <button className="iconButton" onClick={() => setTopologyFullscreenOpen(false)} title="关闭">
+                <button aria-label="关闭" type="button" className="iconButton" onClick={() => setTopologyFullscreenOpen(false)} title="关闭">
                   <X size={18} />
                 </button>
               </div>
@@ -4970,13 +5433,13 @@ function App() {
                 <h2 id="topology-reset-title"><RefreshCw size={18} /> 还原拓扑</h2>
                 <p className="muted">这会清空所有节点的自定义拓扑位置，并重新使用自动布局。</p>
               </div>
-              <button className="iconButton" onClick={() => setTopologyResetConfirmOpen(false)} disabled={actionPending("topology:reset")}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={() => setTopologyResetConfirmOpen(false)} disabled={actionPending("topology:reset")}>
                 <X size={18} />
               </button>
             </header>
             <div className="actionRow">
-              <button className="secondary" onClick={() => setTopologyResetConfirmOpen(false)} disabled={actionPending("topology:reset")}>取消</button>
-              <button className="danger" disabled={actionPending("topology:reset")} onClick={() => void runAction(resetTopologyLayout, "topology:reset")}>
+              <button type="button" className="secondary" onClick={() => setTopologyResetConfirmOpen(false)} disabled={actionPending("topology:reset")}>取消</button>
+              <button type="button" className="danger" disabled={actionPending("topology:reset")} onClick={() => void runAction(resetTopologyLayout, "topology:reset")}>
                 <RefreshCw size={16} /> {actionPending("topology:reset") ? "还原中" : "确认还原"}
               </button>
             </div>
@@ -4992,7 +5455,7 @@ function App() {
                 <h2 id="node-plugin-title"><Plug size={18} /> 节点插件</h2>
                 <p className="muted">{selectedNode.name} / {selectedNodeOnline ? "在线" : "离线"}</p>
               </div>
-              <button className="iconButton" onClick={closeNodePluginDialog} title="关闭">
+              <button aria-label="关闭" type="button" className="iconButton" onClick={closeNodePluginDialog} title="关闭">
                 <X size={18} />
               </button>
             </header>
@@ -5003,8 +5466,26 @@ function App() {
                   key={plugin.type}
                   type="button"
                   role="tab"
+                  id={`node-plugin-tab-${plugin.type}`}
                   className={plugin.type === activeNodePlugin?.type ? "nodePluginTab active" : "nodePluginTab"}
                   aria-selected={plugin.type === activeNodePlugin?.type}
+                  aria-controls={`node-plugin-panel-${plugin.type}`}
+                  tabIndex={plugin.type === activeNodePlugin?.type ? 0 : -1}
+                  onKeyDown={(event) => {
+                    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                    event.preventDefault();
+                    const currentIndex = nodePlugins.findIndex((item) => item.type === plugin.type);
+                    if (currentIndex < 0) return;
+                    const nextIndex = event.key === 'Home'
+                      ? 0
+                      : event.key === 'End'
+                        ? nodePlugins.length - 1
+                        : (currentIndex + (event.key === 'ArrowRight' ? 1 : -1) + nodePlugins.length) % nodePlugins.length;
+                    const nextPlugin = nodePlugins[nextIndex];
+                    if (switchNodePluginTab(nextPlugin.type)) {
+                      window.setTimeout(() => document.getElementById(`node-plugin-tab-${nextPlugin.type}`)?.focus(), 0);
+                    }
+                  }}
                   onClick={() => switchNodePluginTab(plugin.type)}
                 >
                   <span>{plugin.display_name}</span>
@@ -5013,15 +5494,22 @@ function App() {
               ))}
             </div>
 
-            {activeNodePlugin && !activeNodePlugin.available && (
-              <div className="empty">
-                {!activeNodePlugin.version_supported
-                  ? `Agent 版本过低：当前 ${activeNodePlugin.agent_version || "未知"}，需要 ${activeNodePlugin.min_agent_version} 或更高。`
-                  : `缺少能力：${activeNodePlugin.missing_capabilities.join(", ") || "未知"}；可能需要升级 Agent。`}
-              </div>
-            )}
+            {activeNodePlugin && (
+              <div
+                id={`node-plugin-panel-${activeNodePlugin.type}`}
+                role="tabpanel"
+                tabIndex={0}
+                aria-labelledby={`node-plugin-tab-${activeNodePlugin.type}`}
+              >
+                {!activeNodePlugin.available && (
+                  <div className="empty">
+                    {!activeNodePlugin.version_supported
+                      ? `Agent 版本过低：当前 ${activeNodePlugin.agent_version || "未知"}，需要 ${activeNodePlugin.min_agent_version} 或更高。`
+                      : `缺少能力：${activeNodePlugin.missing_capabilities.join(", ") || "未知"}；可能需要升级 Agent。`}
+                  </div>
+                )}
 
-            {activeNodePlugin?.type === "bird" && (
+                {activeNodePlugin.type === "bird" && (
               <div className="nodePluginBird">
                 <div className="actionRow">
                   <button
@@ -5160,7 +5648,7 @@ function App() {
               </div>
             )}
 
-            {activeNodePlugin?.type === "port-inventory" && (
+                {activeNodePlugin.type === "port-inventory" && (
               <div className="portInventoryPlugin">
                 {actionPending("plugin:port-inventory:load") && !portInventory && (
                   <div className="empty">正在读取端口台账...</div>
@@ -5320,6 +5808,8 @@ function App() {
                   )}
                 </section>
               </div>
+                )}
+              </div>
             )}
           </section>
         </div>
@@ -5333,7 +5823,7 @@ function App() {
                 <h2 id="node-plugin-error-title"><X size={18} /> 插件执行失败</h2>
                 <p className="muted">请根据错误信息调整配置后重试。</p>
               </div>
-              <button className="iconButton" onClick={() => setNodePluginError("")} title="关闭">
+              <button aria-label="关闭" type="button" className="iconButton" onClick={() => setNodePluginError("")} title="关闭">
                 <X size={18} />
               </button>
             </header>
@@ -5353,7 +5843,7 @@ function App() {
                 <h2 id="settings-title"><Settings size={18} /> 系统设置</h2>
                 <p className="muted">主控访问地址用于生成 Agent 安装命令；账号用于登录面板。</p>
               </div>
-              <button className="iconButton" onClick={() => setSettingsOpen(false)}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={() => setSettingsOpen(false)}>
                 <X size={18} />
               </button>
             </header>
@@ -5479,7 +5969,7 @@ function App() {
                 <h2 id="node-create-title"><Server size={18} /> 添加节点</h2>
                 <p className="muted">入口地址会用于受管节点之间互联时选择连接地址。</p>
               </div>
-              <button className="iconButton" onClick={() => setNodeCreateOpen(false)}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={() => setNodeCreateOpen(false)}>
                 <X size={18} />
               </button>
             </header>
@@ -5518,8 +6008,8 @@ function App() {
                 <h2 id="node-edit-title"><Server size={18} /> 节点设置</h2>
                 <p className="muted">节点 ID：{editingNode.id} / {nodeStatusLabel(editingNode.status)}</p>
               </div>
-              <button className="iconButton" onClick={() => {
-                setEditingNodeId(null);
+              <button aria-label="关闭" type="button" className="iconButton" onClick={() => {
+                selectEditingNodeId(null);
                 setRevealedAgentToken(null);
               }}>
                 <X size={18} />
@@ -5561,7 +6051,7 @@ function App() {
                   <p className="muted">{editingNodeMimicStatus.detail}</p>
                   <small>状态：{editingNodeMimicStatus.label} / 安装来源：GitHub 最新发布版本</small>
                 </div>
-                <button
+                <button type="button"
                   className="secondary"
                   disabled={!editingNodeMimicStatus.installable || actionPending(nodeActionKey(editingNode.id, "mimic-install"))}
                   onClick={() => void runAction(requestMimicInstall, nodeActionKey(editingNode.id, "mimic-install"))}
@@ -5590,8 +6080,8 @@ function App() {
                 ) || "轮换令牌后显示 Agent 启动命令。"}
               </pre>
               <div className="actionRow">
-                <button className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
-                <button className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "rotate-token"))} onClick={() => void runAction(rotateNodeToken, nodeActionKey(editingNode.id, "rotate-token"))}>轮换令牌</button>
+                <button type="button" className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
+                <button type="button" className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "rotate-token"))} onClick={() => void runAction(rotateNodeToken, nodeActionKey(editingNode.id, "rotate-token"))}>轮换令牌</button>
               </div>
             </section>
             <section className="modalSection">
@@ -5618,7 +6108,7 @@ function App() {
                     )}
                   </div>
                   <div className="actionRow">
-                    <button
+                    <button type="button"
                       className="secondary"
                       disabled={actionPending(nodeActionKey(editingNode.id, "refresh-upgrade-plan"))}
                       onClick={() => void runAction(() => refreshAgentUpgradePlan(editingNode.id), nodeActionKey(editingNode.id, "refresh-upgrade-plan"))}
@@ -5626,14 +6116,14 @@ function App() {
                       <RefreshCw size={16} /> {actionPending(nodeActionKey(editingNode.id, "refresh-upgrade-plan")) ? "刷新中" : "刷新升级计划"}
                     </button>
                     {agentUpgradePlan.upgrade_mode === "self_upgrade" ? (
-                      <button
+                      <button type="button"
                         disabled={actionPending(nodeActionKey(editingNode.id, "agent-upgrade")) || actionPending(nodeActionKey(editingNode.id, "agent-upgrade-task"))}
                         onClick={() => void runAction(requestAgentUpgrade, nodeActionKey(editingNode.id, "agent-upgrade"))}
                       >
                         <Upload size={16} /> {actionPending(nodeActionKey(editingNode.id, "agent-upgrade")) || actionPending(nodeActionKey(editingNode.id, "agent-upgrade-task")) ? "升级中" : "一键升级"}
                       </button>
                     ) : (
-                      <button className="secondary" disabled={!agentUpgradePlan.manual_command} onClick={() => void runAction(copyAgentUpgradeCommand)}>
+                      <button type="button" className="secondary" disabled={!agentUpgradePlan.manual_command} onClick={() => void runAction(copyAgentUpgradeCommand)}>
                         复制升级命令
                       </button>
                     )}
@@ -5650,7 +6140,7 @@ function App() {
             <section className="modalSection dangerZone">
               <h3>删除节点</h3>
               <p className="muted">只有节点下所有连接配置都已删除时，才允许删除节点。</p>
-              <button className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "delete"))} onClick={() => void runAction(deleteEditingNode, nodeActionKey(editingNode.id, "delete"))}>
+              <button type="button" className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "delete"))} onClick={() => void runAction(deleteEditingNode, nodeActionKey(editingNode.id, "delete"))}>
                 删除节点
               </button>
             </section>
@@ -5666,11 +6156,11 @@ function App() {
                 <h2 id="manual-protocol-title"><Plus size={18} /> 选择连接协议</h2>
                 <p className="muted">手动连接只管理当前节点，对端配置由用户自行维护。</p>
               </div>
-              <button className="iconButton" onClick={closeCreateDialog}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={closeCreateDialog}>
                 <X size={18} />
               </button>
             </header>
-            <div className="protocolChoice protocolChoiceModal" role="radiogroup" aria-label="连接协议">
+            <div className="protocolChoice protocolChoiceModal" role="group" aria-label="连接协议">
               <button
                 type="button"
                 className="protocolCard"
@@ -5713,7 +6203,7 @@ function App() {
                 <h2 id="manual-link-title"><Plus size={18} /> 手动创建连接</h2>
                 <p className="muted">{selectedNode.name} 连接到非受管节点。可在创建时直接填写 Peer，随后生成部署计划。</p>
               </div>
-              <button className="iconButton" onClick={closeCreateDialog}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={closeCreateDialog}>
                 <X size={18} />
               </button>
             </header>
@@ -5784,7 +6274,7 @@ function App() {
                 <h2 id="manual-gre-title"><Network size={18} /> 手动创建 GRE</h2>
                 <p className="muted">仅管理 {selectedNode.name} 上的 GRE 接口，对端配置需要自行维护。</p>
               </div>
-              <button className="iconButton" onClick={closeCreateDialog}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={closeCreateDialog}>
                 <X size={18} />
               </button>
             </header>
@@ -5862,11 +6352,11 @@ function App() {
                 <h2 id="managed-protocol-title"><GitBranch size={18} /> 选择连接协议</h2>
                 <p className="muted">先选择连接类型，下一步再填写对应参数。</p>
               </div>
-              <button className="iconButton" onClick={closeCreateDialog}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={closeCreateDialog}>
                 <X size={18} />
               </button>
             </header>
-            <div className="protocolChoice protocolChoiceModal" role="radiogroup" aria-label="连接协议">
+            <div className="protocolChoice protocolChoiceModal" role="group" aria-label="连接协议">
               <button
                 type="button"
                 className="protocolCard"
@@ -5915,7 +6405,7 @@ function App() {
                 <h2 id="managed-link-title"><GitBranch size={18} /> 创建{managedCreateProtocol === "gre" ? " GRE" : " WireGuard"} 受管连接</h2>
                 <p className="muted">系统会根据所选协议生成双方配置，部署并启动连接，同时启用对应节点的服务或开机配置。</p>
               </div>
-              <button
+              <button aria-label="关闭" type="button"
                 className="iconButton"
                 onClick={closeCreateDialog}
               >
@@ -5939,7 +6429,7 @@ function App() {
                   required
                   disabled={!selectedNodeOnline}
                   onChange={(event) => {
-                    setManagedPeerNodeId(Number(event.currentTarget.value) || null);
+                    selectManagedPeerNodeId(Number(event.currentTarget.value) || null);
                     setReplacePeerConfigId(null);
                   }}
                 >
@@ -6184,7 +6674,7 @@ function App() {
                     name="peer_node_id"
                     required
                     disabled={!nodeSupportsGre(selectedNode)}
-                    onChange={(event) => setManagedPeerNodeId(Number(event.currentTarget.value) || null)}
+                    onChange={(event) => selectManagedPeerNodeId(Number(event.currentTarget.value) || null)}
                   >
                     <option value="">选择节点</option>
                     {selectedGrePeerNodeOptions.map((item) => (
@@ -6390,7 +6880,7 @@ function App() {
                   return (
                     <section key={node.id} data-node-id={node.id} className={expanded ? "nodeCard expanded" : "nodeCard"}>
                       <div className="nodeBar">
-                        <button
+                        <button type="button"
                           className="nodeHeader"
                           disabled={!online}
                           onClick={() => {
@@ -6407,12 +6897,12 @@ function App() {
                           </span>
                           <span className={online ? "statusBadge online" : "statusBadge"}>{nodeStatusLabel(node.status)}</span>
                         </button>
-                        <button
+                        <button type="button"
                           className="iconButton nodeEditButton"
                           title="编辑节点"
                           onClick={() => {
                             setRevealedAgentToken(null);
-                            setEditingNodeId(node.id);
+                            selectEditingNodeId(node.id);
                           }}
                         >
                           <Pencil size={16} />
@@ -6447,7 +6937,7 @@ function App() {
 
                           {selectedNodeSupportsWgQuickImport ? (
                             <div className="sectionActions">
-                              <button
+                              <button type="button"
                                 className="secondary"
                                 disabled={!selectedNodeOnline || actionPending(nodeActionKey(selectedNodeId, "import-scan"))}
                                 onClick={() => void runAction(requestImportScan, nodeActionKey(selectedNodeId, "import-scan"))}
@@ -6480,6 +6970,7 @@ function App() {
                                     {candidate.warnings.length > 0 && <small>{candidate.warnings.join("; ")}</small>}
                                   </div>
                                   <button
+                                    type="button"
                                     disabled={candidate.imported || !selectedNodeOnline || actionPending(candidateActionKey(candidate.id))}
                                     onClick={() => void runAction(() => importCandidate(candidate.id), candidateActionKey(candidate.id))}
                                   >
@@ -6520,12 +7011,13 @@ function App() {
                                 const rowName = nodeEndpoint?.interface_name || item.name;
                                 const externalPeerName = greProtocolString(nodeEndpoint, "peer_interface_name") || "外部对端";
                                 return (
-                                  <button
+                                  <div
                                     key={item.connection_ref}
                                     data-config-id={item.protocol_type === "wireguard" ? nodeEndpoint?.id : undefined}
                                     data-connection-ref={item.protocol_type === "gre" ? item.connection_ref : undefined}
                                     className="configRow protocolRow"
-                                    onClick={() => {
+                                  >
+                                    <button type="button" className="configRowMain" onClick={() => {
                                       if (item.protocol_type === "wireguard") {
                                         selectConnectionRef(null);
                                         selectConfigId(nodeEndpoint?.id || item.id);
@@ -6534,12 +7026,12 @@ function App() {
                                         selectConnectionRef(item.connection_ref);
                                       }
                                       setPlan(null);
-                                    }}
-                                  >
+                                    }}>
                                     <span>
                                       <strong>{rowName}</strong>
                                       <small>{protocolLabel(item)} / {nodeEndpoint?.interface_name || "本端"} → {peerEndpoint?.interface_name || externalPeerName}</small>
                                     </span>
+                                    </button>
                                     <span className="configRowMetrics">
                                       <span className="protocolBadge">{protocolLabel(item)}</span>
                                       <span className={`statusBadge ${item.status === "running" ? "online" : ""}`}>
@@ -6557,7 +7049,7 @@ function App() {
                                         }}
                                       />
                                     </span>
-                                  </button>
+                                  </div>
                                 );
                               })
                             )}
@@ -6585,7 +7077,7 @@ function App() {
                   {" / "}{statusLabel(selectedGreConnection.status)}
                 </p>
               </div>
-              <button
+              <button aria-label="关闭" type="button"
                 className="iconButton"
                 onClick={() => {
                   selectConnectionRef(null);
@@ -6816,21 +7308,21 @@ function App() {
             <section className="modalSection">
               <h3>连接操作</h3>
               <div className="actionRow">
-                <button
+                <button type="button"
                   className="secondary"
                   disabled={!selectedGreAllNodesOnline || isGreBusy || isGreRunning || actionPending(connectionActionKey(selectedGreConnection.connection_ref, "start"))}
                   onClick={() => void runAction(startSelectedGreConnection, connectionActionKey(selectedGreConnection.connection_ref, "start"))}
                 >
                   {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "start")) || selectedGreConnection.status === "starting" ? "启动中" : selectedGreIsManual ? "启动本端连接" : "启动双方连接"}
                 </button>
-                <button
+                <button type="button"
                   className="secondary"
                   disabled={!selectedGreAllNodesOnline || isGreBusy || isGreStopped || actionPending(connectionActionKey(selectedGreConnection.connection_ref, "stop"))}
                   onClick={() => void runAction(stopSelectedGreConnection, connectionActionKey(selectedGreConnection.connection_ref, "stop"))}
                 >
                   {actionPending(connectionActionKey(selectedGreConnection.connection_ref, "stop")) || selectedGreConnection.status === "stopping" ? "断开中" : selectedGreIsManual ? "断开本端连接" : "断开双方连接"}
                 </button>
-                <button
+                <button type="button"
                   className="danger"
                   disabled={!selectedGreAllNodesOnline || isGreBusy || !isGreStopped || actionPending(connectionActionKey(selectedGreConnection.connection_ref, "delete"))}
                   onClick={() => void runAction(deleteSelectedGreConnection, connectionActionKey(selectedGreConnection.connection_ref, "delete"))}
@@ -6851,7 +7343,7 @@ function App() {
                 <h2 id="peer-modal-title">连接配置</h2>
                 <p className="muted">{selectedNode.name} / {selectedConfig.name} / {statusLabel(selectedConfig.runtime_status)}</p>
               </div>
-              <button
+              <button aria-label="关闭" type="button"
                 className="iconButton"
                 onClick={() => {
                   selectConfigId(null);
@@ -7133,10 +7625,10 @@ function App() {
                 <>
                   {selectedConfigIsUnmanagedImport && (
                     <>
-                  <button className="secondary" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfigId, "take-over"))} onClick={() => void runAction(takeOverConfig, configActionKey(selectedConfigId, "take-over"))}>
+                  <button type="button" className="secondary" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfigId, "take-over"))} onClick={() => void runAction(takeOverConfig, configActionKey(selectedConfigId, "take-over"))}>
                     <Upload size={16} /> {actionPending(configActionKey(selectedConfigId, "take-over")) ? "接管中" : "接管导入配置"}
                       </button>
-                      <button
+                      <button type="button"
                         className="secondary"
                         disabled={!selectedNodeOnline}
                         onClick={() => {
@@ -7150,7 +7642,7 @@ function App() {
                     </>
                   )}
                   {!selectedConfigIsUnmanagedImport && (
-                    <button disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfigId, "create-plan"))} onClick={() => void runAction(createApplyPlan, configActionKey(selectedConfigId, "create-plan"))}>
+                    <button type="button" disabled={!selectedNodeOnline || actionPending(configActionKey(selectedConfigId, "create-plan"))} onClick={() => void runAction(createApplyPlan, configActionKey(selectedConfigId, "create-plan"))}>
                       <GitBranch size={16} /> {actionPending(configActionKey(selectedConfigId, "create-plan")) ? "生成中" : "生成部署计划"}
                     </button>
                   )}
@@ -7161,21 +7653,21 @@ function App() {
               )}
               <div className="actionRow">
                 {!selectedConfigIsManagedLink && !selectedConfigIsUnmanagedImport && (
-                  <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || actionPending(configActionKey(selectedConfigId, "refresh-deployed"))} onClick={() => void runAction(refreshDeployedConfig, configActionKey(selectedConfigId, "refresh-deployed"))}>
+                  <button type="button" className="secondary" disabled={!selectedNodeOnline || isConfigBusy || actionPending(configActionKey(selectedConfigId, "refresh-deployed"))} onClick={() => void runAction(refreshDeployedConfig, configActionKey(selectedConfigId, "refresh-deployed"))}>
                     <RefreshCw size={16} /> {actionPending(configActionKey(selectedConfigId, "refresh-deployed")) ? "同步中" : "同步节点配置"}
                   </button>
                 )}
                 {!selectedConfigIsUnmanagedImport && (
                   <>
-                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigRunning || actionPending(configActionKey(selectedConfigId, "start"))} onClick={() => void runAction(startSelectedConfig, configActionKey(selectedConfigId, "start"))}>
+                    <button type="button" className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigRunning || actionPending(configActionKey(selectedConfigId, "start"))} onClick={() => void runAction(startSelectedConfig, configActionKey(selectedConfigId, "start"))}>
                       {actionPending(configActionKey(selectedConfigId, "start")) || selectedConfig.runtime_status === "starting" ? "启动中" : selectedConfigIsManagedLink ? "启动双方连接" : "启动连接"}
                     </button>
-                    <button className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigStopped || actionPending(configActionKey(selectedConfigId, "stop"))} onClick={() => void runAction(stopSelectedConfig, configActionKey(selectedConfigId, "stop"))}>
+                    <button type="button" className="secondary" disabled={!selectedNodeOnline || isConfigBusy || isConfigStopped || actionPending(configActionKey(selectedConfigId, "stop"))} onClick={() => void runAction(stopSelectedConfig, configActionKey(selectedConfigId, "stop"))}>
                       {actionPending(configActionKey(selectedConfigId, "stop")) || selectedConfig.runtime_status === "stopping" ? "断开中" : selectedConfigIsManagedLink ? "断开双方连接" : "断开连接"}
                     </button>
                   </>
                 )}
-                <button className="danger" disabled={selectedConfigIsUnmanagedImport ? selectedConfigAnyTaskPending : (!selectedNodeOnline || isConfigBusy || !isConfigStopped || selectedConfigAnyTaskPending)} onClick={() => void runAction(openDeleteDialog)}>
+                <button type="button" className="danger" disabled={selectedConfigIsUnmanagedImport ? selectedConfigAnyTaskPending : (!selectedNodeOnline || isConfigBusy || !isConfigStopped || selectedConfigAnyTaskPending)} onClick={() => void runAction(openDeleteDialog)}>
                   {selectedConfigIsManagedLink ? "删除双方配置" : selectedConfigIsUnmanagedImport ? "删除观察记录" : "删除配置"}
                 </button>
               </div>
@@ -7191,7 +7683,7 @@ function App() {
                   {plan.task_result && (plan.status === "failed" || plan.task_status === "failed") && (
                     <pre>{formatTaskResultForUser(plan.task_result, "部署任务执行失败")}</pre>
                   )}
-                  <button disabled={!selectedNodeOnline || plan.status !== "draft" || !hasDeployDiff || actionPending(configActionKey(selectedConfigId, "confirm-plan"))} onClick={() => void runAction(confirmPlan, configActionKey(selectedConfigId, "confirm-plan"))}>
+                  <button type="button" disabled={!selectedNodeOnline || plan.status !== "draft" || !hasDeployDiff || actionPending(configActionKey(selectedConfigId, "confirm-plan"))} onClick={() => void runAction(confirmPlan, configActionKey(selectedConfigId, "confirm-plan"))}>
                     <Check size={16} /> {actionPending(configActionKey(selectedConfigId, "confirm-plan")) ? "执行中" : "确认执行"}
                   </button>
                 </div>
@@ -7209,7 +7701,7 @@ function App() {
                 <h2 id="monitor-title"><LineChartIcon size={18} /> 链路延迟统计</h2>
                 <p className="muted">{monitorDialogNodeName} / {monitorDialogSubjectName}</p>
               </div>
-              <button
+              <button aria-label="关闭" type="button"
                 className="iconButton"
                 onClick={closeMonitorDialog}
               >
@@ -7267,7 +7759,7 @@ function App() {
                   key={item}
                   type="button"
                   className={monitorWindow === item ? "" : "secondary"}
-                  onClick={() => setMonitorWindow(item)}
+                  onClick={() => selectMonitorWindow(item)}
                 >
                   {item}
                 </button>
@@ -7317,7 +7809,7 @@ function App() {
                 <h2 id="delete-config-title">删除配置</h2>
                 <p className="muted">{selectedNode?.name || "节点"} / {selectedConfig.name}</p>
               </div>
-              <button className="iconButton" onClick={() => setDeleteDialogOpen(false)}>
+              <button aria-label="关闭" type="button" className="iconButton" onClick={() => setDeleteDialogOpen(false)}>
                 <X size={18} />
               </button>
             </header>
@@ -7340,8 +7832,8 @@ function App() {
                 </label>
               )}
               <div className="actionRow">
-                <button className="secondary" onClick={() => setDeleteDialogOpen(false)}>取消</button>
-                <button
+                <button type="button" className="secondary" onClick={() => setDeleteDialogOpen(false)}>取消</button>
+                <button type="button"
                   className="danger"
                   disabled={actionPending(configActionKey(selectedConfig.id, "delete"))}
                   onClick={() => void runAction(deleteSelectedConfig, configActionKey(selectedConfig.id, "delete"))}

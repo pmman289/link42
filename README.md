@@ -54,13 +54,13 @@ docker run -d \
 http://<主控IP>:8000
 ```
 
-首次启动会自动生成登录密码，可在容器日志中查看：
+首次启动会自动生成登录密码，在宿主机读取权限受限的引导文件：
 
 ```bash
-docker logs link42
+sudo cat /opt/link42/config/initial-admin-password
 ```
 
-密码也会写入权限为 `0600` 的 `/opt/link42/config/initial-admin-password`；修改管理员密码后，该文件会被自动删除。
+该文件权限为 `0600`；修改管理员密码后会被自动删除。容器日志只记录文件位置。
 
 登录后建议先进入“设置”，确认主控访问地址，例如：
 

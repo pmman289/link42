@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import re
 import shutil
 import subprocess
 import time
 from typing import Any
+
+from .commands import run_bounded_command
 
 
 DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS = 8.0
@@ -73,7 +76,7 @@ def positive_float(value: object, default: float) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         return default
-    return parsed if parsed > 0 else default
+    return parsed if math.isfinite(parsed) and parsed > 0 else default
 
 
 def positive_int(value: object, default: int) -> int:
@@ -131,10 +134,46 @@ def bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+def bounded_output_limit(value: object) -> int:
+    """限制任务请求的输出上限，即使调用方传入异常大的值。"""
+
+    return min(positive_int(value, DEFAULT_OUTPUT_LIMIT_BYTES), DEFAULT_OUTPUT_LIMIT_BYTES)
+
+
 def run_fixed_command(command: list[str], timeout: float, output_limit: int, timeout_message: str) -> dict[str, Any]:
     """执行固定参数命令，统一裁剪输出并返回原始 stdout/stderr。"""
 
     started_at = time.monotonic()
+    # 生产路径持续排空管道，避免 birdc/ping 等命令通过大量输出耗尽
+    # Agent 内存；测试替身继续使用 subprocess.run 兼容路径。
+    if getattr(subprocess.run, "__module__", None) == "subprocess":
+        try:
+            completed = run_bounded_command(command, timeout=timeout, output_limit=output_limit)
+        except subprocess.TimeoutExpired as exc:
+            stdout, stdout_truncated = truncate_text(coerce_text(exc.stdout), output_limit)
+            stderr, stderr_truncated = truncate_text(coerce_text(exc.stderr), output_limit)
+            return {
+                "command": " ".join(command[1:]),
+                "exit_code": None,
+                "stdout": stdout,
+                "stderr": stderr or f"command timed out after {timeout:g}s",
+                "truncated": stdout_truncated or stderr_truncated or True,
+                "duration_ms": int((time.monotonic() - started_at) * 1000),
+                "error_code": "timeout",
+                "error": timeout_message,
+            }
+        result = {
+            "command": " ".join(command[1:]),
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "truncated": completed.truncated,
+            "duration_ms": int((time.monotonic() - started_at) * 1000),
+        }
+        if completed.returncode != 0:
+            result["error_code"] = "command_failed"
+            result["error"] = "命令执行失败"
+        return result
     try:
         completed = subprocess.run(
             command,
@@ -177,7 +216,7 @@ def execute_bird_route_lookup(payload: dict[str, Any]) -> dict[str, Any]:
 
     target_ip = normalized_ip(payload.get("ip"))
     timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS)
-    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    output_limit = bounded_output_limit(payload.get("output_limit_bytes"))
     command = [birdc_binary(), "show", "route", "for", target_ip, "all"]
     result = run_fixed_command(command, timeout, output_limit, f"BIRD 查询超过 {timeout:g} 秒未返回")
     result["command"] = f"birdc show route for {target_ip} all"
@@ -191,7 +230,7 @@ def execute_bird_routes_by_origin_as(payload: dict[str, Any]) -> dict[str, Any]:
 
     asn = normalized_bgp_asn(payload.get("asn"))
     timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS)
-    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    output_limit = bounded_output_limit(payload.get("output_limit_bytes"))
     command = [
         birdc_binary(),
         "show",
@@ -214,7 +253,7 @@ def execute_bird_protocols(payload: dict[str, Any]) -> dict[str, Any]:
     """执行受限的 birdc show protocols 查询并返回原始输出。"""
 
     timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS)
-    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    output_limit = bounded_output_limit(payload.get("output_limit_bytes"))
     command = [birdc_binary(), "show", "protocols"]
     result = run_fixed_command(command, timeout, output_limit, f"BIRD 协议状态查询超过 {timeout:g} 秒未返回")
     result["command"] = "birdc show protocols"
@@ -228,7 +267,7 @@ def execute_bird_protocol_detail(payload: dict[str, Any]) -> dict[str, Any]:
 
     protocol_name = normalized_protocol_name(payload.get("protocol_name"))
     timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_BIRD_COMMAND_TIMEOUT_SECONDS)
-    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    output_limit = bounded_output_limit(payload.get("output_limit_bytes"))
     command = [birdc_binary(), "show", "protocols", "all", protocol_name]
     result = run_fixed_command(command, timeout, output_limit, f"BIRD 协议详情查询超过 {timeout:g} 秒未返回")
     result["command"] = f"birdc show protocols all {protocol_name}"
@@ -244,7 +283,7 @@ def execute_ping(payload: dict[str, Any]) -> dict[str, Any]:
     count = bounded_int(payload.get("count"), 4, 1, 10)
     per_probe_timeout = bounded_int(payload.get("per_probe_timeout_seconds"), 2, 1, 10)
     timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_PING_COMMAND_TIMEOUT_SECONDS)
-    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    output_limit = bounded_output_limit(payload.get("output_limit_bytes"))
     command = [required_binary("ping"), "-c", str(count), "-W", str(per_probe_timeout), target]
     result = run_fixed_command(command, timeout, output_limit, f"ping 超过 {timeout:g} 秒未返回")
     result["command"] = f"ping -c {count} -W {per_probe_timeout} {target}"
@@ -261,7 +300,7 @@ def execute_traceroute(payload: dict[str, Any]) -> dict[str, Any]:
     wait_seconds = bounded_int(payload.get("wait_seconds"), 3, 1, 10)
     queries = bounded_int(payload.get("queries"), 3, 1, 5)
     timeout = positive_float(payload.get("command_timeout_seconds"), DEFAULT_TRACEROUTE_COMMAND_TIMEOUT_SECONDS)
-    output_limit = positive_int(payload.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES)
+    output_limit = bounded_output_limit(payload.get("output_limit_bytes"))
     command = [required_binary("traceroute"), "-n", "-m", str(max_hops), "-w", str(wait_seconds), "-q", str(queries), target]
     result = run_fixed_command(command, timeout, output_limit, f"traceroute 超过 {timeout:g} 秒未返回")
     result["command"] = f"traceroute -n -m {max_hops} -w {wait_seconds} -q {queries} {target}"

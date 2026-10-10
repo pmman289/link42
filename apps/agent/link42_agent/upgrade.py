@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -14,7 +15,9 @@ from urllib import request
 from urllib.parse import urlparse
 
 from .config import AgentConfig
+from .commands import run_bounded_command
 from .system import get_service_manager_name
+from .validation import atomic_write_text, ensure_managed_directory
 
 
 UPGRADE_DIR = Path(os.getenv("LINK42_AGENT_UPGRADE_DIR", "/var/lib/link42/agent"))
@@ -24,6 +27,9 @@ UPGRADE_SCRIPT = UPGRADE_DIR / "upgrade.sh"
 STATE_FILE = UPGRADE_DIR / "upgrade-state.json"
 OPENWRT_SOURCE_DIR = Path(os.getenv("LINK42_AGENT_SOURCE_DIR", "/opt/link42-agent/src"))
 AGENT_SERVICE_NAME = os.getenv("LINK42_AGENT_SERVICE_NAME", "link42-agent")
+# Prevent a malformed controller response (or a corrupted release manifest)
+# from filling the agent's filesystem even when the manifest omits ``size``.
+MAX_DOWNLOAD_SIZE = 512 * 1024 * 1024
 
 
 def self_upgrade(payload: dict[str, Any], config: AgentConfig, dry_run: bool = False) -> dict[str, Any]:
@@ -58,13 +64,14 @@ def self_upgrade(payload: dict[str, Any], config: AgentConfig, dry_run: bool = F
             "upgrade_mode": upgrade_mode,
         }
 
-    UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_managed_directory(UPGRADE_DIR)
+    ensure_managed_directory(source_dir.parent)
     target = NEW_SOURCE_ARCHIVE if upgrade_mode == "source" else NEW_BINARY
     staged_source = source_dir.parent / ".link42-agent-src.new"
     state_context = {"target_version": target_version, "upgrade_mode": upgrade_mode}
     try:
         write_state({"status": "downloading", **state_context})
-        download_file(config, download_url, target)
+        download_file(config, download_url, target, expected_size=payload.get("size"))
         actual_sha256 = sha256_file(target)
         if actual_sha256 != expected_sha256:
             raise RuntimeError("agent upgrade sha256 mismatch")
@@ -96,24 +103,84 @@ def ensure_controller_url(download_url: str, server_url: str) -> None:
 
     download = urlparse(download_url)
     server = urlparse(server_url)
-    if download.scheme != server.scheme or download.netloc != server.netloc:
+    if (
+        download.scheme not in {"http", "https"}
+        or server.scheme not in {"http", "https"}
+        or not download.hostname
+        or not server.hostname
+        or download.username
+        or download.password
+        or server.username
+        or server.password
+        or download.scheme != server.scheme
+        or download.hostname.casefold() != server.hostname.casefold()
+        or download.port != server.port
+    ):
         raise ValueError("agent upgrade download url must belong to the configured controller")
 
 
-def download_file(config: AgentConfig, url: str, target: Path) -> None:
+def download_file(
+    config: AgentConfig,
+    url: str,
+    target: Path,
+    expected_size: int | None = None,
+) -> None:
     """从当前主控下载升级资产，并以临时文件原子落盘。"""
 
-    tmp = target.with_suffix(".tmp")
+    del config  # 保留参数以兼容现有调用方；认证由 URL/传输层负责。
+    if expected_size is not None:
+        if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size < 0:
+            raise ValueError("agent upgrade asset size must be a non-negative integer")
+        if expected_size > MAX_DOWNLOAD_SIZE:
+            raise ValueError("agent upgrade asset exceeds maximum download size")
+
+    ensure_managed_directory(target.parent)
+    temporary_path: Path | None = None
     http_request = request.Request(url)
-    with request.urlopen(http_request, timeout=120) as response:
-        with tmp.open("wb") as handle:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-    os.chmod(tmp, 0o755 if target == NEW_BINARY else 0o600)
-    tmp.replace(target)
+    try:
+        with request.urlopen(http_request, timeout=120) as response:
+            content_length = response.headers.get("Content-Length")
+            advertised_size = None
+            if content_length is not None:
+                try:
+                    advertised_size = int(content_length)
+                except ValueError as exc:
+                    raise RuntimeError("invalid agent upgrade Content-Length") from exc
+                if advertised_size < 0 or advertised_size > MAX_DOWNLOAD_SIZE:
+                    raise RuntimeError("agent upgrade response exceeds maximum download size")
+                if expected_size is not None and advertised_size != expected_size:
+                    raise RuntimeError("agent upgrade response size mismatch")
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=target.parent,
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                downloaded_size = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    downloaded_size += len(chunk)
+                    maximum_size = expected_size if expected_size is not None else MAX_DOWNLOAD_SIZE
+                    if downloaded_size > maximum_size:
+                        raise RuntimeError("agent upgrade download exceeds expected size")
+                    handle.write(chunk)
+                if expected_size is not None and downloaded_size != expected_size:
+                    raise RuntimeError("agent upgrade download size mismatch")
+                if advertised_size is not None and downloaded_size != advertised_size:
+                    raise RuntimeError("agent upgrade Content-Length mismatch")
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o755 if target == NEW_BINARY else 0o600)
+        os.replace(temporary_path, target)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def sha256_file(path: Path) -> str:
@@ -130,17 +197,24 @@ def verify_binary_version(path: Path, target_version: str, args: list[Any]) -> N
     """执行下载后的 Agent 二进制，确认其版本符合目标版本。"""
 
     command = [str(path), *[str(arg) for arg in args]]
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
-    output = (result.stdout or result.stderr).strip()
-    if target_version not in output:
+    try:
+        result = run_bounded_command(command, timeout=15, output_limit=64 * 1024)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("downloaded agent version command failed") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"downloaded agent version command failed: {result.stderr[:500]}")
+    stdout = result.stdout
+    stderr = result.stderr
+    output = f"{stdout}\n{stderr}".strip()
+    if output != target_version:
         raise RuntimeError(f"downloaded agent version mismatch: {output}")
 
 
 def write_state(data: dict[str, Any]) -> None:
     """写入自升级状态文件，供主控或用户排查升级进度。"""
 
-    UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
+    ensure_managed_directory(UPGRADE_DIR)
+    atomic_write_text(STATE_FILE, json.dumps(data, ensure_ascii=False) + "\n")
 
 
 def write_systemd_upgrade_script(service_name: str, install_path: Path) -> None:
@@ -155,43 +229,74 @@ STATE_DIR={shell_quote(str(UPGRADE_DIR))}
 NEW_BIN={shell_quote(str(NEW_BINARY))}
 BACKUP_BIN={shell_quote(str(backup_path))}
 STATE_FILE={shell_quote(str(STATE_FILE))}
+TEMP_BIN="$INSTALL_PATH.upgrade.$$"
+BACKUP_TMP="$BACKUP_BIN.$$"
+SERVICE_STOPPED=0
+REPLACED=0
 
 write_state() {{
-  printf '%s\\n' "$1" > "$STATE_FILE"
+  (umask 077; set -C; printf '%s\\n' "$1" > "$STATE_FILE.tmp")
+  mv -f "$STATE_FILE.tmp" "$STATE_FILE"
 }}
 
+rollback() {{
+  trap - 0 HUP INT TERM
+  if [ "$REPLACED" = 1 ]; then
+    if ! install -m 0755 "$BACKUP_BIN" "$TEMP_BIN" || ! mv -f "$TEMP_BIN" "$INSTALL_PATH"; then
+      write_state '{{"status":"failed","error":"binary rollback failed"}}' || true
+      rm -f "$TEMP_BIN"
+      exit 1
+    fi
+  fi
+  rm -f "$TEMP_BIN"
+  if [ "$SERVICE_STOPPED" = 1 ]; then
+    if ! systemctl start "$SERVICE_NAME"; then
+      write_state '{{"status":"failed","error":"service rollback failed"}}' || true
+      exit 1
+    fi
+  fi
+  write_state '{{"status":"rolled_back"}}' || true
+  exit 1
+}}
+trap rollback 0 HUP INT TERM
+
+# Complete fallible preparation before stopping the running agent.
+install -m 0755 "$INSTALL_PATH" "$BACKUP_TMP"
+mv -f "$BACKUP_TMP" "$BACKUP_BIN"
+install -m 0755 "$NEW_BIN" "$TEMP_BIN"
 write_state '{{"status":"restarting"}}'
+SERVICE_STOPPED=1
 systemctl stop "$SERVICE_NAME"
-cp "$INSTALL_PATH" "$BACKUP_BIN"
-install -m 0755 "$NEW_BIN" "$INSTALL_PATH"
+mv -f "$TEMP_BIN" "$INSTALL_PATH"
+REPLACED=1
 
 if systemctl start "$SERVICE_NAME"; then
   sleep 5
   if systemctl is-active --quiet "$SERVICE_NAME"; then
     write_state '{{"status":"healthy"}}'
+    trap - 0 HUP INT TERM
     exit 0
   fi
 fi
 
-install -m 0755 "$BACKUP_BIN" "$INSTALL_PATH"
-systemctl start "$SERVICE_NAME" || true
-write_state '{{"status":"rolled_back"}}'
 exit 1
 """
-    UPGRADE_SCRIPT.write_text(script, encoding="utf-8")
-    UPGRADE_SCRIPT.chmod(0o755)
+    atomic_write_text(UPGRADE_SCRIPT, script, mode=0o700)
 
 
 def extract_source_archive(archive_path: Path, destination: Path, target_version: str) -> None:
     """安全解压 OpenWrt Agent 源码包，并确认包内版本符合升级目标。"""
 
+    ensure_managed_directory(destination.parent)
     if destination.exists():
         shutil.rmtree(destination)
-    destination.mkdir(parents=True, exist_ok=True)
+    ensure_managed_directory(destination)
     with tarfile.open(archive_path, "r:gz") as archive:
         members = archive.getmembers()
         if len(members) > 10000 or sum(member.size for member in members) > 64 * 1024 * 1024:
             raise RuntimeError("agent source archive exceeds safety limits")
+        destination_resolved = destination.resolve()
+        seen_members: set[str] = set()
         for member in members:
             path = PurePosixPath(member.name)
             if (
@@ -203,7 +308,32 @@ def extract_source_archive(archive_path: Path, destination: Path, target_version
                 or not (member.isdir() or member.isfile())
             ):
                 raise RuntimeError(f"unsafe agent source archive member: {member.name}")
-        archive.extractall(destination, members=members)
+            normalized_name = "/".join(path.parts)
+            if normalized_name in seen_members:
+                raise RuntimeError(f"duplicate agent source archive member: {member.name}")
+            seen_members.add(normalized_name)
+            target = destination.joinpath(*path.parts)
+            try:
+                target.resolve(strict=False).relative_to(destination_resolved)
+            except ValueError as exc:
+                raise RuntimeError(f"unsafe agent source archive member: {member.name}") from exc
+            if member.isdir():
+                ensure_managed_directory(target, mode=0o755)
+                target.chmod(0o755)
+                continue
+            ensure_managed_directory(target.parent, mode=0o755)
+            source = archive.extractfile(member)
+            if source is None:
+                raise RuntimeError(f"cannot read agent source archive member: {member.name}")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(target, flags, 0o755 if member.mode & 0o111 else 0o644)
+            except OSError as exc:
+                raise RuntimeError(f"cannot create agent source archive member: {member.name}") from exc
+            with source, os.fdopen(descriptor, "wb") as output:
+                shutil.copyfileobj(source, output)
     version_file = destination / "packages/link42_common/version.py"
     if not version_file.exists():
         raise RuntimeError("agent source archive is missing version metadata")
@@ -223,6 +353,7 @@ def write_openwrt_upgrade_script(
 
     backup_source = source_dir.parent / ".link42-agent-src.bak"
     service_path = Path("/etc/init.d") / service_name
+    state_format = json.dumps({"status": "%s", "target_version": target_version.replace("%", "%%"), "upgrade_mode": "source"})
     script = f"""#!/bin/sh
 set -eu
 SERVICE={shell_quote(str(service_path))}
@@ -231,38 +362,64 @@ NEW_SOURCE={shell_quote(str(staged_source))}
 BACKUP_SOURCE={shell_quote(str(backup_source))}
 STATE_FILE={shell_quote(str(STATE_FILE))}
 TARGET_VERSION={shell_quote(target_version)}
+SERVICE_STOPPED=0
+SOURCE_MOVED=0
+REPLACED=0
 
 write_state() {{
-  printf '{{"status":"%s","target_version":"%s","upgrade_mode":"source"}}\n' "$1" "$TARGET_VERSION" > "$STATE_FILE"
+  (umask 077; printf {shell_quote(state_format + chr(10))} "$1" > "$STATE_FILE.tmp")
+  mv -f "$STATE_FILE.tmp" "$STATE_FILE"
 }}
 
-write_state restarting
-"$SERVICE" stop >/dev/null 2>&1 || true
+rollback() {{
+  trap - 0 HUP INT TERM
+  if [ "$REPLACED" = 1 ]; then
+    "$SERVICE" stop >/dev/null 2>&1 || true
+    if ! rm -rf "$SOURCE_DIR"; then
+      write_state failed || true
+      exit 1
+    fi
+  fi
+  if [ "$SOURCE_MOVED" = 1 ]; then
+    if ! mv "$BACKUP_SOURCE" "$SOURCE_DIR"; then
+      write_state failed || true
+      exit 1
+    fi
+  fi
+  if [ "$SERVICE_STOPPED" = 1 ]; then
+    if ! "$SERVICE" start >/dev/null 2>&1; then
+      write_state failed || true
+      exit 1
+    fi
+  fi
+  write_state rolled_back || true
+  exit 1
+}}
+trap rollback 0 HUP INT TERM
+
+test -d "$SOURCE_DIR"
+test -d "$NEW_SOURCE"
 rm -rf "$BACKUP_SOURCE"
-if [ -d "$SOURCE_DIR" ]; then
-  mv "$SOURCE_DIR" "$BACKUP_SOURCE"
-fi
+write_state restarting
+SERVICE_STOPPED=1
+"$SERVICE" stop >/dev/null 2>&1
+mv "$SOURCE_DIR" "$BACKUP_SOURCE"
+SOURCE_MOVED=1
 mv "$NEW_SOURCE" "$SOURCE_DIR"
+REPLACED=1
 
 if "$SERVICE" start >/dev/null 2>&1; then
   sleep 5
   if "$SERVICE" status >/dev/null 2>&1; then
     write_state healthy
+    trap - 0 HUP INT TERM
     exit 0
   fi
 fi
 
-"$SERVICE" stop >/dev/null 2>&1 || true
-rm -rf "$SOURCE_DIR"
-if [ -d "$BACKUP_SOURCE" ]; then
-  mv "$BACKUP_SOURCE" "$SOURCE_DIR"
-fi
-"$SERVICE" start >/dev/null 2>&1 || true
-write_state rolled_back
 exit 1
 """
-    UPGRADE_SCRIPT.write_text(script, encoding="utf-8")
-    UPGRADE_SCRIPT.chmod(0o755)
+    atomic_write_text(UPGRADE_SCRIPT, script, mode=0o700)
 
 
 def schedule_upgrade_script(service_manager: str) -> None:
@@ -272,6 +429,7 @@ def schedule_upgrade_script(service_manager: str) -> None:
         subprocess.run(
             ["systemd-run", "--unit=link42-agent-upgrade", "--on-active=1", str(UPGRADE_SCRIPT)],
             check=True,
+            timeout=15,
         )
         return
     subprocess.Popen(  # noqa: S603

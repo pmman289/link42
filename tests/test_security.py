@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
@@ -29,7 +34,62 @@ from link42_api.main import (
     require_web_session,
     set_setting,
 )
-from link42_api.secret_store import decrypt_text, encrypt_text, load_master_key
+from link42_api.secret_store import create_master_key_file, decrypt_text, encrypt_text, load_master_key
+
+
+@pytest.mark.parametrize("operation", ["load_master_key", "create_master_key_file"])
+def test_master_key_fifo_is_rejected_without_blocking(tmp_path, operation):
+    path = tmp_path / "master.key"
+    os.mkfifo(path)
+    child_env = os.environ.copy()
+    child_env.pop("LINK42_MASTER_KEY", None)
+    child_env["LINK42_MASTER_KEY_FILE"] = str(path)
+    child_env["PYTHONPATH"] = os.pathsep.join(sys.path)
+    script = '''
+from pathlib import Path
+import sys
+from link42_api import secret_store
+try:
+    if sys.argv[1] == "load_master_key":
+        secret_store.load_master_key()
+    else:
+        secret_store.create_master_key_file(Path(sys.argv[2]))
+except RuntimeError as exc:
+    assert "regular file" in str(exc)
+else:
+    raise AssertionError("FIFO accepted")
+'''
+    result = subprocess.run([sys.executable, "-c", script, operation, str(path)],
+                            env=child_env, capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0, result.stderr
+
+
+def test_master_key_creation_publishes_only_complete_key(tmp_path, monkeypatch):
+    from link42_api import secret_store
+
+    path = tmp_path / "master.key"
+    creator_paused = threading.Event()
+    creator_resume = threading.Event()
+    actual_fsync = secret_store.os.fsync
+
+    def pause_first_writer(descriptor):
+        actual_fsync(descriptor)
+        if threading.current_thread().name.startswith("key-creator"):
+            creator_paused.set()
+            assert creator_resume.wait(3)
+
+    monkeypatch.setattr(secret_store.os, "fsync", pause_first_writer)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="key-creator") as executor:
+        pending = executor.submit(create_master_key_file, path)
+        try:
+            assert creator_paused.wait(3)
+            assert not path.exists(), "incomplete key was published"
+            winner = create_master_key_file(path)
+        finally:
+            creator_resume.set()
+        assert pending.result(timeout=3) == winner
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.iterdir()) == [path]
 from link42_api.schemas import AgentTaskStatusRead, ChangePlanRead, LoginRequest
 from link42_common.security import hash_password, hash_token, verify_password
 
@@ -200,12 +260,26 @@ def test_encrypted_value_fails_closed_with_wrong_master_key(monkeypatch) -> None
     original = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
     monkeypatch.setenv("LINK42_MASTER_KEY", original)
     load_master_key.cache_clear()
+
     encrypted = encrypt_text("secret")
     monkeypatch.setenv("LINK42_MASTER_KEY", "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI=")
     load_master_key.cache_clear()
     with pytest.raises(RuntimeError, match="authentication failed"):
         decrypt_text(encrypted)
     monkeypatch.setenv("LINK42_MASTER_KEY", original)
+    load_master_key.cache_clear()
+
+
+def test_master_key_file_has_bounded_size(tmp_path, monkeypatch) -> None:
+    """异常大的主密钥文件不能被一次性读入内存。"""
+
+    path = tmp_path / "master.key"
+    path.write_bytes(b"A" * 5000)
+    monkeypatch.delenv("LINK42_MASTER_KEY", raising=False)
+    monkeypatch.setenv("LINK42_MASTER_KEY_FILE", str(path))
+    load_master_key.cache_clear()
+    with pytest.raises(RuntimeError, match="too large"):
+        load_master_key()
     load_master_key.cache_clear()
 
 
@@ -282,6 +356,19 @@ def test_agent_rejects_symlink_escape(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="managed path"):
         managed_child_path(root, "nested", "config.conf")
+
+
+def test_master_key_rejects_symlinked_parent(tmp_path) -> None:
+    """主密钥生成不能跟随配置目录中的符号链接。"""
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "keys").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symbolic links"):
+        create_master_key_file(config / "keys" / "master.key")
+    assert not (outside / "master.key").exists()
 
 
 def test_udp2raw_handler_rejects_unsafe_instance_name() -> None:

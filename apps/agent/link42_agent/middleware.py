@@ -11,13 +11,16 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 from urllib import request
+from urllib.parse import urlsplit
 
 from .config import AgentConfig
 from .service_manager import OpenWrtUciManager, detect_service_manager
-from .system import kernel_newer_than, mimic_runtime_health, mimic_runtime_ready, read_os_release, run_command
+from .system import kernel_newer_than, mimic_runtime_health, read_os_release, run_command
 from .validation import (
     atomic_write_text,
+    ensure_managed_directory,
     managed_child_path,
+    read_existing_text,
     validate_instance_name as validate_managed_instance_name,
     validate_interface_name,
 )
@@ -40,6 +43,18 @@ MIMIC_BIN = Path("/usr/bin/mimic")
 MIMIC_BLOCK_BEGIN = "# BEGIN Link42 managed mimic filters"
 MIMIC_BLOCK_END = "# END Link42 managed mimic filters"
 MIMIC_OFFICIAL_RELEASE_CODENAMES = {"bookworm", "noble", "trixie"}
+MAX_MIMIC_METADATA_BYTES = 4 * 1024 * 1024
+MAX_MIMIC_ASSET_BYTES = 512 * 1024 * 1024
+MAX_UDP2RAW_ASSET_BYTES = 512 * 1024 * 1024
+MAX_MANAGED_MIDDLEWARE_CONFIG_BYTES = 256 * 1024
+
+
+def read_managed_middleware_text(path: Path) -> str:
+    """读取受管中间层配置并限制单文件大小，避免本地文件耗尽 Agent 内存。"""
+
+    if path.stat().st_size > MAX_MANAGED_MIDDLEWARE_CONFIG_BYTES:
+        raise ValueError(f"managed middleware config is too large: {path.name}")
+    return read_existing_text(path)
 
 
 def install_middleware(payload: dict[str, Any], config: AgentConfig, dry_run: bool = False) -> dict[str, Any]:
@@ -255,10 +270,23 @@ def validate_proxy_url(value: Any) -> str | None:
     text = str(value).strip()
     if not text:
         return None
-    if any(char.isspace() or char in "'\"" for char in text):
+    if any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F or char in "'\"\\" for char in text):
         raise ValueError("github proxy url must not contain whitespace or quotes")
-    if not re.match(r"^https?://[^/]+", text):
-        raise ValueError("github proxy url must start with http:// or https://")
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise ValueError("invalid proxy URL")
+    except ValueError as exc:
+        raise ValueError("github proxy url must be an HTTP(S) URL without credentials, query or fragment") from exc
     return text.rstrip("/") + "/"
 
 
@@ -283,7 +311,13 @@ def fetch_github_release(repo: str, allow_prerelease: bool, proxy_url: str | Non
                 },
             )
             with request.urlopen(request_obj, timeout=60) as response:
-                release = json.loads(response.read().decode("utf-8"))
+                try:
+                    metadata = response.read(MAX_MIMIC_METADATA_BYTES + 1)
+                except TypeError:  # compatibility with minimal custom response objects
+                    metadata = response.read()
+                if len(metadata) > MAX_MIMIC_METADATA_BYTES:
+                    raise RuntimeError("GitHub release metadata is too large")
+                release = json.loads(metadata.decode("utf-8"))
             if release.get("prerelease") and not allow_prerelease:
                 raise RuntimeError("latest mimic release is a prerelease")
             return release
@@ -353,16 +387,70 @@ def download_release_asset(asset: dict[str, Any], directory: Path, proxy_url: st
     if not url.startswith("https://github.com/"):
         raise ValueError("release asset download url must be a GitHub URL")
     target = directory / name
-    with request.urlopen(proxied_url(url, proxy_url), timeout=180) as response:
-        target.write_bytes(response.read())
+    expected_size = asset.get("size")
+    if expected_size is not None:
+        if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size < 0:
+            raise ValueError("release asset size is invalid")
+        if expected_size > MAX_MIMIC_ASSET_BYTES:
+            raise ValueError("release asset is too large")
+    temporary: Path | None = None
+    try:
+        with request.urlopen(proxied_url(url, proxy_url), timeout=180) as response:
+            content_length = response.headers.get("Content-Length")
+            advertised_size = None
+            if content_length is not None:
+                try:
+                    advertised_size = int(content_length)
+                except ValueError as exc:
+                    raise RuntimeError("invalid release asset Content-Length") from exc
+                if advertised_size < 0 or advertised_size > MAX_MIMIC_ASSET_BYTES:
+                    raise RuntimeError("release asset is too large")
+                if expected_size is not None and advertised_size != expected_size:
+                    raise RuntimeError("release asset size mismatch")
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f".{name}.", suffix=".tmp", dir=directory, delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                downloaded = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    maximum = expected_size if expected_size is not None else MAX_MIMIC_ASSET_BYTES
+                    if downloaded > maximum:
+                        raise RuntimeError("release asset exceeds expected size")
+                    handle.write(chunk)
+                if expected_size is not None and downloaded != expected_size:
+                    raise RuntimeError("release asset size mismatch")
+                if advertised_size is not None and downloaded != advertised_size:
+                    raise RuntimeError("release asset Content-Length mismatch")
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return target
 
 
 def verify_sha256_file(package_path: Path, sha_path: Path) -> None:
     """使用旁路 sha256 文件校验下载后的 deb 包。"""
 
-    expected = sha_path.read_text(encoding="utf-8").split()[0].strip().lower()
-    actual = hashlib.sha256(package_path.read_bytes()).hexdigest()
+    if sha_path.stat().st_size > 4096:
+        raise RuntimeError(f"sha256 file is too large for {package_path.name}")
+    fields = read_existing_text(sha_path).split()
+    expected = fields[0].lower() if fields else ""
+    if len(fields) > 2:
+        expected = ""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise RuntimeError(f"invalid sha256 file for {package_path.name}")
+    digest = hashlib.sha256()
+    with package_path.open("rb") as package:
+        for chunk in iter(lambda: package.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
     if not expected or actual != expected:
         raise RuntimeError(f"sha256 mismatch for {package_path.name}")
 
@@ -390,14 +478,34 @@ def apply_mimic(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any
         raise RuntimeError("mimic is not installed on this node")
     ensure_mimic_layout()
     instance_path = mimic_instance_path(bind_interface, instance)
-    instance_path.parent.mkdir(parents=True, exist_ok=True)
-    instance_path.write_text(snippet, encoding="utf-8")
-    write_mimic_system_config(config_path, render_mimic_config(bind_interface))
-    commands = [
-        run_command(["systemctl", "daemon-reload"], False),
-        run_command(["systemctl", "enable", mimic_unit_name(bind_interface)], False),
-        run_command(["systemctl", "restart", mimic_unit_name(bind_interface)], False),
-    ]
+    ensure_managed_directory(instance_path.parent)
+    old_instance = read_managed_middleware_text(instance_path) if instance_path.exists() else None
+    old_system = read_managed_middleware_text(config_path) if config_path.exists() else None
+    commands: list[dict[str, Any]] = []
+    try:
+        atomic_write_text(instance_path, snippet, mode=0o644)
+        write_mimic_system_config(config_path, render_mimic_config(bind_interface))
+        commands = [
+            run_command(["systemctl", "daemon-reload"], False),
+            run_command(["systemctl", "enable", mimic_unit_name(bind_interface)], False),
+            run_command(["systemctl", "restart", mimic_unit_name(bind_interface)], False),
+        ]
+    except Exception:
+        # 服务启动失败时恢复两个受管文件，并尽力让旧配置重新生效。
+        if old_instance is None:
+            instance_path.unlink(missing_ok=True)
+        else:
+            atomic_write_text(instance_path, old_instance, mode=0o644)
+        if old_system is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            write_mimic_system_config(config_path, old_system)
+        try:
+            run_command(["systemctl", "daemon-reload"], True)
+            run_command(["systemctl", "restart" if old_system else "stop", mimic_unit_name(bind_interface)], True)
+        except Exception:
+            pass
+        raise
     return {
         "changed": True,
         "instance": instance,
@@ -428,15 +536,40 @@ def delete_mimic(payload: dict[str, Any], dry_run: bool = False) -> dict[str, An
     if dry_run:
         return {"changed": False, "dry_run": True, "instance": instance, "bind_interface": bind_interface}
     instance_path = mimic_instance_path(bind_interface, instance)
-    instance_path.unlink(missing_ok=True)
-    rendered = render_mimic_config(bind_interface)
+    old_instance = read_managed_middleware_text(instance_path) if instance_path.exists() else None
+    old_system = read_managed_middleware_text(config_path) if config_path.exists() else None
     commands: list[dict[str, Any]] = []
-    if rendered.strip():
-        write_mimic_system_config(config_path, rendered)
-        commands.append(run_command(["systemctl", "restart", mimic_unit_name(bind_interface)], True))
-    else:
-        config_path.unlink(missing_ok=True)
-        commands.append(run_command(["systemctl", "disable", "--now", mimic_unit_name(bind_interface)], True))
+    try:
+        instance_path.unlink(missing_ok=True)
+        rendered = render_mimic_config(bind_interface)
+        if rendered.strip():
+            write_mimic_system_config(config_path, rendered)
+            result = run_command(["systemctl", "restart", mimic_unit_name(bind_interface)], True)
+        else:
+            config_path.unlink(missing_ok=True)
+            result = run_command(["systemctl", "disable", "--now", mimic_unit_name(bind_interface)], True)
+        commands.append(result)
+        if int(result.get("returncode", 1)) != 0:
+            raise RuntimeError(command_failure_message(result))
+    except Exception:
+        # 删除后的服务动作失败时恢复两个受管文件，避免服务仍运行但配置已丢失。
+        if old_instance is None:
+            instance_path.unlink(missing_ok=True)
+        else:
+            atomic_write_text(instance_path, old_instance, mode=0o644)
+        if old_system is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            write_mimic_system_config(config_path, old_system)
+        try:
+            run_command(["systemctl", "daemon-reload"], True)
+            run_command(
+                ["systemctl", "restart" if old_system else "stop", mimic_unit_name(bind_interface)],
+                True,
+            )
+        except Exception:
+            pass
+        raise
     return {"changed": True, "instance": instance, "bind_interface": bind_interface, "commands": commands}
 
 
@@ -457,8 +590,25 @@ def apply_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, A
     if dry_run:
         return {"changed": False, "dry_run": True, "args": args, "config_file": str(config_file)}
     ensure_udp2raw_layout()
+    old_config = read_managed_middleware_text(config_file) if config_file.exists() else None
     upsert_instance(config_file, instance, args)
-    commands = apply_service(mode, instance, payload)
+    try:
+        commands = apply_service(mode, instance, payload)
+    except Exception:
+        if old_config is None:
+            config_file.unlink(missing_ok=True)
+        else:
+            atomic_write_text(config_file, old_config, mode=0o600)
+        # 重新加载旧配置；恢复失败不应掩盖原始服务错误。
+        try:
+            if udp2raw_service_backend() == "openwrt-procd":
+                run_command([str(init_path(mode, instance)), "restart"], True)
+            else:
+                run_command(["systemctl", "daemon-reload"], True)
+                run_command(["systemctl", "restart", unit_name(mode, instance)], True)
+        except Exception:
+            pass
+        raise
     return {"changed": True, "mode": mode, "instance": instance, "config_file": str(config_file), "commands": commands}
 
 
@@ -484,7 +634,12 @@ def delete_udp2raw(payload: dict[str, Any], dry_run: bool = False) -> dict[str, 
     results: list[dict[str, Any]] = []
     for mode in modes:
         results.extend(delete_service(mode, instance))
+    # 先确认所有角色都已停止/禁用，再删除配置和 OpenWrt init 文件。
+    # 多角色旧任务中若第二端失败，保留第一端配置便于人工恢复。
+    for mode in modes:
         remove_instance(config_file_for_mode(mode), instance)
+        if udp2raw_service_backend() == "openwrt-procd":
+            init_path(mode, instance).unlink(missing_ok=True)
     results.extend(reload_services())
     return {"changed": True, "instance": instance, "modes": modes, "commands": results}
 
@@ -506,12 +661,43 @@ def install_udp2raw(config: AgentConfig, dry_run: bool = False) -> dict[str, Any
     if dry_run:
         return {"changed": False, "dry_run": True, "asset": asset, "backend": backend}
     ensure_udp2raw_layout()
-    download_asset(config, asset, UDP2RAW_BIN)
-    UDP2RAW_BIN.chmod(0o755)
+    # Keep every file touched by installation restorable.  A successful
+    # download followed by a unit-generation or daemon-reload failure must not
+    # leave a new binary paired with old services (or half-written units).
+    backup_dir = Path(tempfile.mkdtemp(prefix="link42-udp2raw-install-", dir=str(UDP2RAW_BIN.parent)))
+    backups: dict[Path, Path | None] = {}
+    touched = [UDP2RAW_BIN]
     if backend == "systemd":
-        write_wrapper()
-        write_units()
-    result = reload_services()
+        touched.extend([UDP2RAW_LIBEXEC, UDP2RAW_SERVER_UNIT, UDP2RAW_CLIENT_UNIT])
+    try:
+        for path in touched:
+            if path.exists():
+                backup = backup_dir / str(len(backups))
+                shutil.copy2(path, backup)
+                backups[path] = backup
+            else:
+                backups[path] = None
+        download_asset(config, asset, UDP2RAW_BIN)
+        UDP2RAW_BIN.chmod(0o755)
+        if backend == "systemd":
+            write_wrapper()
+            write_units()
+        result = reload_services()
+    except Exception:
+        for path, backup in backups.items():
+            try:
+                if backup is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    ensure_managed_directory(path.parent)
+                    shutil.copy2(backup, path)
+            except OSError:
+                # Preserve the original install error; the next task/status
+                # call will still expose any file that could not be restored.
+                pass
+        raise
+    finally:
+        shutil.rmtree(backup_dir, ignore_errors=True)
     return {"changed": True, "asset": asset, "binary": str(UDP2RAW_BIN), "backend": backend, "service_reload": result}
 
 
@@ -549,13 +735,54 @@ def download_asset(config: AgentConfig, asset: str, target: Path) -> None:
     """从主控下载中间层内置二进制资产并原子替换目标文件。"""
 
     url = f"/api/agent/plugins/udp2raw/assets/{asset}"
+    http_request = request.Request(
+        f"{config.server_url.rstrip('/')}{url}",
+        headers={
+            "Accept": "application/octet-stream",
+            "X-Link42-Node-ID": str(config.node_id),
+            "X-Link42-Agent-Token": config.token,
+        },
+    )
+    ensure_managed_directory(target.parent)
     fd, tmp_name = tempfile.mkstemp(prefix="udp2raw-", dir=str(target.parent))
+    fd_owned = True
     try:
-        with request.urlopen(f"{config.server_url}{url}", timeout=60) as response:
+        with request.urlopen(http_request, timeout=60) as response:
+            expected_sha256 = str(response.headers.get("X-Link42-Asset-SHA256") or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise RuntimeError("udp2raw asset response is missing a valid SHA-256")
+            content_length = getattr(response, "headers", {}).get("Content-Length")
+            advertised_size = None
+            if content_length is not None:
+                try:
+                    advertised_size = int(content_length)
+                    if advertised_size < 0 or advertised_size > MAX_UDP2RAW_ASSET_BYTES:
+                        raise RuntimeError("udp2raw asset is too large")
+                except ValueError as exc:
+                    raise RuntimeError("invalid udp2raw asset Content-Length") from exc
             with os.fdopen(fd, "wb") as handle:
-                shutil.copyfileobj(response, handle)
+                fd_owned = False
+                downloaded = 0
+                digest = hashlib.sha256()
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > MAX_UDP2RAW_ASSET_BYTES:
+                        raise RuntimeError("udp2raw asset is too large")
+                    digest.update(chunk)
+                    handle.write(chunk)
+                if advertised_size is not None and downloaded != advertised_size:
+                    raise RuntimeError("udp2raw asset Content-Length mismatch")
+                if digest.hexdigest() != expected_sha256:
+                    raise RuntimeError("udp2raw asset sha256 mismatch")
+                handle.flush()
+                os.fsync(handle.fileno())
         Path(tmp_name).replace(target)
     finally:
+        if fd_owned:
+            os.close(fd)
         if Path(tmp_name).exists():
             Path(tmp_name).unlink()
 
@@ -564,42 +791,44 @@ def ensure_udp2raw_layout() -> None:
     """创建 udp2raw 二进制、配置和服务文件需要的目录结构。"""
 
     backend = udp2raw_service_backend()
-    UDP2RAW_BIN.parent.mkdir(parents=True, exist_ok=True)
-    UDP2RAW_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_managed_directory(UDP2RAW_BIN.parent)
+    ensure_managed_directory(UDP2RAW_CONFIG_DIR)
     if backend == "systemd":
-        UDP2RAW_LIBEXEC.parent.mkdir(parents=True, exist_ok=True)
-        UDP2RAW_SERVER_UNIT.parent.mkdir(parents=True, exist_ok=True)
+        ensure_managed_directory(UDP2RAW_LIBEXEC.parent)
+        ensure_managed_directory(UDP2RAW_SERVER_UNIT.parent)
     if backend == "openwrt-procd":
-        OPENWRT_INIT_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_managed_directory(OPENWRT_INIT_DIR)
     for name in ["server", "client"]:
         path = UDP2RAW_CONFIG_DIR / name
         if not path.exists():
-            path.write_text("", encoding="utf-8")
+            atomic_write_text(path, "", mode=0o600)
 
 
 def write_wrapper() -> None:
     """写入 systemd 后端读取实例配置并启动 udp2raw 的包装脚本。"""
 
-    UDP2RAW_LIBEXEC.write_text(
+    config_root = shell_quote(str(UDP2RAW_CONFIG_DIR))
+    binary_path = shell_quote(str(UDP2RAW_BIN))
+    atomic_write_text(UDP2RAW_LIBEXEC,
         """#!/bin/sh
 set -eu
 mode="$1"
 instance="$2"
-config="/etc/link42/middleware/udp2raw/$mode"
+config_dir=CONFIG_ROOT
+config="$config_dir/$mode"
 line=$(awk -v name="$instance" 'NF && $1 !~ /^#/ { key=$1; sub(/=$/, "", key); if (key == name) { sub(/^[[:space:]]*[^[:space:]=]+[[:space:]]*=?[[:space:]]*/, ""); print; found=1; exit } } END { if (!found) exit 1 }' "$config")
 eval "set -- $line"
-exec /usr/local/bin/udp2raw "$@"
-""",
-        encoding="utf-8",
+exec UDP2RAW_BINARY "$@"
+""".replace("CONFIG_ROOT", config_root).replace("UDP2RAW_BINARY", binary_path),
+        mode=0o700,
     )
-    UDP2RAW_LIBEXEC.chmod(0o755)
 
 
 def write_units() -> None:
     """写入 systemd 模板 unit，用于管理 udp2raw server/client 实例。"""
 
     for mode, path in [("server", UDP2RAW_SERVER_UNIT), ("client", UDP2RAW_CLIENT_UNIT)]:
-        path.write_text(
+        atomic_write_text(path,
             f"""[Unit]
 Description=Link42 udp2raw {mode} instance %i
 After=network.target
@@ -616,7 +845,7 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 """,
-            encoding="utf-8",
+            mode=0o644,
         )
 
 
@@ -650,9 +879,13 @@ def validate_udp2raw_ip(value: str, field_name: str) -> str:
     """校验 udp2raw 地址并返回压缩后的 IP 字面量。"""
 
     try:
-        return ipaddress.ip_address(value.strip()).compressed
+        address = ipaddress.ip_address(value.strip())
     except ValueError as exc:
         raise ValueError(f"{field_name} must be an IPv4 or IPv6 address") from exc
+    scope_id = getattr(address, "scope_id", None)
+    if scope_id is not None:
+        validate_interface_name(scope_id, f"{field_name} IPv6 zone")
+    return address.compressed
 
 
 def validate_udp2raw_port(value: Any, field_name: str) -> int:
@@ -705,6 +938,8 @@ def auto_rule_arg() -> str:
 def shell_quote(value: str) -> str:
     """为写入配置文件的 shell 参数做单引号转义。"""
 
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("udp2raw password must not contain control characters")
     return "'" + value.replace("'", "'\\''") + "'"
 
 
@@ -798,9 +1033,14 @@ def delete_service(mode: str, instance: str) -> list[dict[str, Any]]:
             ],
             allow_failure=True,
         )
-        path.unlink(missing_ok=True)
+        failed = next((result for result in results if int(result.get("returncode", 1)) != 0), None)
+        if failed is not None:
+            raise RuntimeError(command_failure_message(failed))
         return results
-    return [run_command(["systemctl", "disable", "--now", unit_name(mode, instance)], True)]
+    result = run_command(["systemctl", "disable", "--now", unit_name(mode, instance)], True)
+    if int(result.get("returncode", 1)) != 0:
+        raise RuntimeError(command_failure_message(result))
+    return [result]
 
 
 def reload_services() -> list[dict[str, Any]]:
@@ -848,7 +1088,7 @@ def instance_args_from_config(path: Path, instance: str) -> Optional[str]:
 
     if not path.exists():
         return None
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_managed_middleware_text(path).splitlines():
         parts = line.split(maxsplit=1)
         key = parts[0].removesuffix("=") if parts else ""
         if key == instance and len(parts) > 1:
@@ -905,7 +1145,7 @@ def write_openwrt_init(mode: str, instance: str) -> None:
         "} "
         "} END { if (!found) exit 1 }"
     )
-    path.write_text(
+    atomic_write_text(path,
         f"""#!/bin/sh /etc/rc.common
 
 START=95
@@ -948,9 +1188,8 @@ status_service() {{
   return 3
 }}
 """,
-        encoding="utf-8",
+        mode=0o755,
     )
-    path.chmod(0o755)
 
 
 def upsert_instance(path: Path, instance: str, args: str) -> None:
@@ -958,12 +1197,12 @@ def upsert_instance(path: Path, instance: str, args: str) -> None:
 
     lines = []
     if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in read_managed_middleware_text(path).splitlines():
             key = line.split(None, 1)[0].removesuffix("=") if line.split() else ""
             if key != instance:
                 lines.append(line)
     lines.append(f"{instance} {args}")
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n", mode=0o600)
 
 
 def remove_instance(path: Path, instance: str) -> None:
@@ -972,13 +1211,13 @@ def remove_instance(path: Path, instance: str) -> None:
     if not path.exists():
         return
     lines = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_managed_middleware_text(path).splitlines():
         parts = line.split()
         key = parts[0].removesuffix("=") if parts else ""
         if key != instance:
             lines.append(line)
     if lines:
-        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        atomic_write_text(path, "\n".join(lines).rstrip() + "\n", mode=0o600)
     else:
         path.unlink()
 
@@ -1026,7 +1265,7 @@ def instance_exists(path: Path, instance: str) -> bool:
 
     if not path.exists():
         return False
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_managed_middleware_text(path).splitlines():
         parts = line.split()
         key = parts[0].removesuffix("=") if parts else ""
         if key == instance:
@@ -1045,8 +1284,8 @@ def mimic_service_backend() -> str:
 def ensure_mimic_layout() -> None:
     """创建 Link42 管理 mimic 配置所需目录并设置基础权限。"""
 
-    MIMIC_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    MIMIC_SYSTEM_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_managed_directory(MIMIC_CONFIG_DIR)
+    ensure_managed_directory(MIMIC_SYSTEM_CONFIG_DIR)
     MIMIC_CONFIG_DIR.chmod(0o755)
     MIMIC_SYSTEM_CONFIG_DIR.chmod(0o755)
 
@@ -1119,6 +1358,9 @@ def format_mimic_endpoint(host: str, port: int) -> str:
     """把 IP 和端口格式化为 mimic filter 接受的 endpoint 字符串。"""
 
     ip = ipaddress.ip_address(host)
+    scope_id = getattr(ip, "scope_id", None)
+    if scope_id is not None:
+        validate_interface_name(scope_id, "mimic IPv6 zone")
     host_text = f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
     return f"{host_text}:{port}"
 
@@ -1129,20 +1371,25 @@ def render_mimic_config(bind_interface: str, instance: str | None = None, snippe
     snippets: list[str] = []
     directory = managed_child_path(MIMIC_CONFIG_DIR, validate_mimic_interface(bind_interface))
     if directory.exists():
-        snippets.extend(path.read_text(encoding="utf-8").strip() for path in sorted(directory.glob("*.conf")))
+        for path in sorted(directory.glob("*.conf")):
+            if path.is_symlink():
+                raise ValueError("managed mimic snippet must not be a symbolic link")
+            # 不能静默跳过损坏/不可读的其它连接片段：重写受管块会丢掉它们
+            # 的 filter，并把单连接编辑变成同网卡其它连接的中断。
+            snippets.append(read_managed_middleware_text(path).strip())
     if instance and snippet:
         existing_path = mimic_instance_path(bind_interface, instance)
         snippets = [
             item
             for item in snippets
-            if not existing_path.exists() or item != existing_path.read_text(encoding="utf-8").strip()
+            if not existing_path.exists() or item != read_managed_middleware_text(existing_path).strip()
         ]
         snippets.append(snippet.strip())
     link42_block = ""
     if snippets:
         link42_block = f"{MIMIC_BLOCK_BEGIN}\n" + "\n\n".join(snippets).strip() + f"\n{MIMIC_BLOCK_END}\n"
     config_path = mimic_system_config_path(bind_interface)
-    base = strip_mimic_link42_block(config_path.read_text(encoding="utf-8") if config_path.exists() else "")
+    base = strip_mimic_link42_block(read_managed_middleware_text(config_path) if config_path.exists() else "")
     parts = [part for part in [base.strip(), link42_block.strip()] if part]
     return "\n\n".join(parts).rstrip() + ("\n" if parts else "")
 

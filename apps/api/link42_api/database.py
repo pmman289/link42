@@ -105,7 +105,11 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     """初始化数据库表结构。"""
     # 后续应由 Alembic 管理迁移；第一版先启动时建表，降低本地试用门槛。
-    from . import models  # noqa: F401
+    from . import models
+    # Importing the module registers every mapped class on Base.metadata;
+    # keep the local binding explicit so static analyzers do not mistake this
+    # required side effect for an accidental unused import.
+    del models
 
     Base.metadata.create_all(bind=engine)
     ensure_sqlite_point_to_point_constraints()
@@ -288,6 +292,8 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("nodes", node_columns, "agent_last_error", "TEXT")
             add_column("nodes", node_columns, "middleware_install_status", "VARCHAR(64)")
             add_column("nodes", node_columns, "last_seen_at", "DATETIME")
+            add_column("nodes", node_columns, "created_at", "DATETIME")
+            add_column("nodes", node_columns, "updated_at", "DATETIME")
 
         interface_columns = table_columns("wg_interfaces")
         if interface_columns:
@@ -313,6 +319,53 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("wg_interfaces", interface_columns, "import_path", "VARCHAR(512)")
             add_column("wg_interfaces", interface_columns, "extras", "JSON DEFAULT '{}'")
             add_column("wg_interfaces", interface_columns, "warnings", "JSON DEFAULT '[]'")
+            add_column("wg_interfaces", interface_columns, "created_at", "DATETIME")
+            add_column("wg_interfaces", interface_columns, "updated_at", "DATETIME")
+            # 早期版本只在业务层检查接口名，多个并发请求可能已经写入
+            # 重复值。保留记录但为重复项生成可识别的 legacy 名称后再建
+            # 唯一索引，避免启动迁移因历史脏数据失败。
+            duplicate_names = connection.execute(
+                text(
+                    "SELECT node_id, name FROM wg_interfaces "
+                    "GROUP BY node_id, name HAVING COUNT(*) > 1"
+                )
+            ).fetchall()
+            for node_id, name in duplicate_names:
+                duplicate_ids = [
+                    row[0]
+                    for row in connection.execute(
+                        text(
+                            "SELECT id FROM wg_interfaces WHERE node_id = :node_id AND name = :name "
+                            "ORDER BY id"
+                        ),
+                        {"node_id": node_id, "name": name},
+                    ).fetchall()
+                ][1:]
+                for interface_id in duplicate_ids:
+                    suffix = f"-legacy-{interface_id}"
+                    base_name = str(name or "")[: max(1, 32 - len(suffix))]
+                    candidate = f"{base_name}{suffix}"
+                    sequence = 1
+                    while connection.scalar(
+                        text(
+                            "SELECT COUNT(*) FROM wg_interfaces "
+                            "WHERE node_id = :node_id AND name = :name AND id != :id"
+                        ),
+                        {"node_id": node_id, "name": candidate[:32], "id": interface_id},
+                    ):
+                        extra = f"-{sequence}"
+                        candidate = f"{base_name[: max(1, 32 - len(suffix) - len(extra))]}{suffix}{extra}"
+                        sequence += 1
+                    connection.execute(
+                        text("UPDATE wg_interfaces SET name = :name WHERE id = :id"),
+                        {"name": candidate[:32], "id": interface_id},
+                    )
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_wg_interface_node_name "
+                    "ON wg_interfaces(node_id, name)"
+                )
+            )
 
         peer_columns = table_columns("wg_peers")
         if peer_columns:
@@ -330,11 +383,64 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("wg_peers", peer_columns, "enabled", "BOOLEAN DEFAULT 1")
             add_column("wg_peers", peer_columns, "extras", "JSON DEFAULT '{}'")
             add_column("wg_peers", peer_columns, "warnings", "JSON DEFAULT '[]'")
+            add_column("wg_peers", peer_columns, "created_at", "DATETIME")
+            add_column("wg_peers", peer_columns, "updated_at", "DATETIME")
 
         candidate_columns = table_columns("import_candidates")
         if candidate_columns:
             add_column("import_candidates", candidate_columns, "warnings", "JSON DEFAULT '[]'")
             add_column("import_candidates", candidate_columns, "imported", "BOOLEAN DEFAULT 0")
+            add_column("import_candidates", candidate_columns, "created_at", "DATETIME")
+            add_column("import_candidates", candidate_columns, "updated_at", "DATETIME")
+
+        sample_columns = table_columns("link_monitor_samples")
+        if sample_columns:
+            # checked_at 是 Agent 的观测时间，不是样本主键：同一时刻可能有
+            # 多次探测（或来自不同线程的批量结果）。旧版本曾创建唯一索引，
+            # 既会丢失历史样本，也会让合法的批量写入失败。移除旧索引；
+            # 重试幂等由上报接口的显式时间点检查负责。
+            connection.execute(text("DROP INDEX IF EXISTS uq_link_monitor_sample_checked_at"))
+
+        monitor_columns = table_columns("link_monitors")
+        if monitor_columns:
+            for column, index_name in [
+                ("interface_id", "uq_link_monitor_interface_id"),
+                ("connection_endpoint_id", "uq_link_monitor_connection_endpoint_id"),
+            ]:
+                duplicate_rows = connection.execute(
+                    text(
+                        f"SELECT {column}, MIN(id) FROM link_monitors "
+                        f"WHERE {column} IS NOT NULL GROUP BY {column} HAVING COUNT(*) > 1"
+                    )
+                ).fetchall()
+                for target_id, keep_id in duplicate_rows:
+                    duplicate_ids = [
+                        row[0]
+                        for row in connection.execute(
+                            text(
+                                f"SELECT id FROM link_monitors WHERE {column} = :target_id AND id != :keep_id"
+                            ),
+                            {"target_id": target_id, "keep_id": keep_id},
+                        ).fetchall()
+                    ]
+                    if duplicate_ids and table_exists("link_monitor_samples"):
+                        placeholders = ",".join(f":id_{index}" for index in range(len(duplicate_ids)))
+                        connection.execute(
+                            text(f"DELETE FROM link_monitor_samples WHERE monitor_id IN ({placeholders})"),
+                            {f"id_{index}": value for index, value in enumerate(duplicate_ids)},
+                        )
+                    if duplicate_ids:
+                        placeholders = ",".join(f":id_{index}" for index in range(len(duplicate_ids)))
+                        connection.execute(
+                            text(f"DELETE FROM link_monitors WHERE id IN ({placeholders})"),
+                            {f"id_{index}": value for index, value in enumerate(duplicate_ids)},
+                        )
+                connection.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} "
+                        f"ON link_monitors({column}) WHERE {column} IS NOT NULL"
+                    )
+                )
 
         if not table_exists("port_inventory_settings"):
             connection.execute(
@@ -377,6 +483,40 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             )
             connection.execute(text("CREATE INDEX ix_port_inventory_entries_node_id ON port_inventory_entries(node_id)"))
 
+        port_setting_columns = table_columns("port_inventory_settings")
+        add_column("port_inventory_settings", port_setting_columns, "node_id", "INTEGER")
+        add_column("port_inventory_settings", port_setting_columns, "range_start", "INTEGER")
+        add_column("port_inventory_settings", port_setting_columns, "range_end", "INTEGER")
+        add_column("port_inventory_settings", port_setting_columns, "created_at", "DATETIME")
+        add_column("port_inventory_settings", port_setting_columns, "updated_at", "DATETIME")
+        connection.execute(text(
+            "DELETE FROM port_inventory_settings WHERE id NOT IN ("
+            "SELECT MIN(id) FROM port_inventory_settings GROUP BY node_id)"
+        ))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_port_inventory_setting_node_id ON port_inventory_settings(node_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_port_inventory_settings_node_id ON port_inventory_settings(node_id)"))
+
+        port_entry_columns = table_columns("port_inventory_entries")
+        add_column("port_inventory_entries", port_entry_columns, "node_id", "INTEGER")
+        add_column("port_inventory_entries", port_entry_columns, "protocol", "VARCHAR(8) DEFAULT 'tcp'")
+        add_column("port_inventory_entries", port_entry_columns, "port", "INTEGER DEFAULT 0")
+        add_column("port_inventory_entries", port_entry_columns, "purpose", "VARCHAR(255) DEFAULT ''")
+        add_column("port_inventory_entries", port_entry_columns, "source", "VARCHAR(32) DEFAULT 'manual'")
+        add_column("port_inventory_entries", port_entry_columns, "detected_process", "VARCHAR(255)")
+        add_column("port_inventory_entries", port_entry_columns, "detected_pid", "VARCHAR(64)")
+        add_column("port_inventory_entries", port_entry_columns, "detected_source", "VARCHAR(255)")
+        add_column("port_inventory_entries", port_entry_columns, "created_at", "DATETIME")
+        add_column("port_inventory_entries", port_entry_columns, "updated_at", "DATETIME")
+        # 旧版本曾保存小写协议；API 现在统一使用大写，先规范化再
+        # 清理重复项，否则 tcp/ TCP 会绕过唯一约束并在台账中重复显示。
+        connection.execute(text(
+            "DELETE FROM port_inventory_entries WHERE id NOT IN ("
+            "SELECT MIN(id) FROM port_inventory_entries GROUP BY node_id, upper(protocol), port)"
+        ))
+        connection.execute(text("UPDATE port_inventory_entries SET protocol = upper(protocol) WHERE protocol IS NOT NULL"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_port_inventory_node_protocol_port ON port_inventory_entries(node_id, protocol, port)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_port_inventory_entries_node_id ON port_inventory_entries(node_id)"))
+
         plan_columns = table_columns("change_plans")
         if plan_columns:
             add_column("change_plans", plan_columns, "status", "VARCHAR(32) DEFAULT 'draft'")
@@ -384,6 +524,8 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("change_plans", plan_columns, "diff", "TEXT DEFAULT ''")
             add_column("change_plans", plan_columns, "payload", "JSON DEFAULT '{}'")
             add_column("change_plans", plan_columns, "confirmed_at", "DATETIME")
+            add_column("change_plans", plan_columns, "created_at", "DATETIME")
+            add_column("change_plans", plan_columns, "updated_at", "DATETIME")
 
         task_columns = table_columns("agent_tasks")
         if task_columns:
@@ -396,6 +538,17 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             add_column("agent_tasks", task_columns, "started_at", "DATETIME")
             add_column("agent_tasks", task_columns, "finished_at", "DATETIME")
             add_column("agent_tasks", task_columns, "deadline_at", "DATETIME")
+            add_column("agent_tasks", task_columns, "dedup_key", "VARCHAR(200)")
+            add_column("agent_tasks", task_columns, "created_at", "DATETIME")
+            add_column("agent_tasks", task_columns, "updated_at", "DATETIME")
+            # 旧库没有由 create_all 创建的部分唯一索引；NULL 历史任务不会冲突。
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_tasks_pending_dedup_key "
+                    "ON agent_tasks(dedup_key) "
+                    "WHERE dedup_key IS NOT NULL AND status = 'pending'"
+                )
+            )
 
         if not table_exists("integration_api_keys"):
             connection.execute(
@@ -423,6 +576,35 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 )
             )
             connection.execute(text("CREATE INDEX ix_integration_api_keys_token_prefix ON integration_api_keys(token_prefix)"))
+
+        # create_all 不会修改已经存在的早期表。这里逐列补齐，尤其是
+        # revoked_at：启动时的清理 SQL 会直接引用它，缺列会让整个 API 无法启动。
+        integration_api_key_columns = table_columns("integration_api_keys")
+        if integration_api_key_columns:
+            add_column("integration_api_keys", integration_api_key_columns, "name", "VARCHAR(120) DEFAULT ''")
+            add_column("integration_api_keys", integration_api_key_columns, "token_prefix", "VARCHAR(80) DEFAULT ''")
+            add_column("integration_api_keys", integration_api_key_columns, "token_hash", "VARCHAR(128) DEFAULT ''")
+            add_column("integration_api_keys", integration_api_key_columns, "token_hint", "VARCHAR(16) DEFAULT ''")
+            add_column("integration_api_keys", integration_api_key_columns, "scopes", "JSON DEFAULT '[]'")
+            add_column("integration_api_keys", integration_api_key_columns, "allowed_node_ids", "JSON DEFAULT '[]'")
+            add_column("integration_api_keys", integration_api_key_columns, "enabled", "BOOLEAN DEFAULT 1")
+            add_column("integration_api_keys", integration_api_key_columns, "expires_at", "DATETIME")
+            add_column("integration_api_keys", integration_api_key_columns, "last_used_at", "DATETIME")
+            add_column("integration_api_keys", integration_api_key_columns, "last_used_ip", "VARCHAR(64)")
+            add_column("integration_api_keys", integration_api_key_columns, "created_by", "VARCHAR(80)")
+            add_column("integration_api_keys", integration_api_key_columns, "revoked_at", "DATETIME")
+            add_column("integration_api_keys", integration_api_key_columns, "created_at", "DATETIME")
+            add_column("integration_api_keys", integration_api_key_columns, "updated_at", "DATETIME")
+            connection.execute(text(
+                "UPDATE integration_api_keys SET token_prefix = 'legacy-' || id "
+                "WHERE token_prefix IS NULL OR token_prefix = ''"
+            ))
+            connection.execute(text(
+                "UPDATE integration_api_keys SET token_prefix = token_prefix || '-' || id "
+                "WHERE id NOT IN (SELECT MIN(id) FROM integration_api_keys GROUP BY token_prefix)"
+            ))
+            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_integration_api_keys_token_prefix ON integration_api_keys(token_prefix)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_integration_api_keys_token_prefix ON integration_api_keys(token_prefix)"))
 
         if not table_exists("looking_glass_queries"):
             connection.execute(
@@ -459,6 +641,63 @@ def ensure_sqlite_point_to_point_constraints() -> None:
             connection.execute(text("CREATE INDEX ix_looking_glass_queries_status ON looking_glass_queries(status)"))
             connection.execute(text("CREATE INDEX ix_looking_glass_queries_request_fingerprint ON looking_glass_queries(request_fingerprint)"))
 
+        looking_glass_query_columns = table_columns("looking_glass_queries")
+        if looking_glass_query_columns:
+            add_column("looking_glass_queries", looking_glass_query_columns, "public_id", "VARCHAR(64) DEFAULT ''")
+            add_column("looking_glass_queries", looking_glass_query_columns, "api_key_id", "INTEGER")
+            add_column("looking_glass_queries", looking_glass_query_columns, "node_id", "INTEGER")
+            add_column("looking_glass_queries", looking_glass_query_columns, "operation", "VARCHAR(80) DEFAULT ''")
+            add_column("looking_glass_queries", looking_glass_query_columns, "request", "JSON DEFAULT '{}'")
+            add_column("looking_glass_queries", looking_glass_query_columns, "request_fingerprint", "VARCHAR(128) DEFAULT ''")
+            add_column("looking_glass_queries", looking_glass_query_columns, "status", "VARCHAR(32) DEFAULT 'queued'")
+            add_column("looking_glass_queries", looking_glass_query_columns, "agent_task_id", "INTEGER")
+            add_column("looking_glass_queries", looking_glass_query_columns, "result", "JSON")
+            add_column("looking_glass_queries", looking_glass_query_columns, "error_code", "VARCHAR(80)")
+            add_column("looking_glass_queries", looking_glass_query_columns, "error_message", "TEXT")
+            add_column("looking_glass_queries", looking_glass_query_columns, "started_at", "DATETIME")
+            add_column("looking_glass_queries", looking_glass_query_columns, "finished_at", "DATETIME")
+            add_column("looking_glass_queries", looking_glass_query_columns, "deadline_at", "DATETIME")
+            add_column("looking_glass_queries", looking_glass_query_columns, "expires_at", "DATETIME")
+            add_column("looking_glass_queries", looking_glass_query_columns, "created_at", "DATETIME")
+            add_column("looking_glass_queries", looking_glass_query_columns, "updated_at", "DATETIME")
+            connection.execute(text(
+                "UPDATE looking_glass_queries SET public_id = 'legacy-' || id "
+                "WHERE public_id IS NULL OR public_id = ''"
+            ))
+            connection.execute(text(
+                "UPDATE looking_glass_queries SET public_id = public_id || '-' || id "
+                "WHERE id NOT IN (SELECT MIN(id) FROM looking_glass_queries GROUP BY public_id)"
+            ))
+            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_looking_glass_queries_public_id ON looking_glass_queries(public_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_looking_glass_queries_public_id ON looking_glass_queries(public_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_looking_glass_queries_api_key_id ON looking_glass_queries(api_key_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_looking_glass_queries_node_id ON looking_glass_queries(node_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_looking_glass_queries_agent_task_id ON looking_glass_queries(agent_task_id)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_looking_glass_queries_status ON looking_glass_queries(status)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_looking_glass_queries_request_fingerprint ON looking_glass_queries(request_fingerprint)"))
+
+        if table_exists("looking_glass_queries"):
+            # 并发的相同 Looking Glass 请求只能创建一个排队/运行中的 Agent 任务；
+            # 已完成记录不参与约束，仍可在缓存窗口后重新查询。
+            connection.execute(
+                text(
+                    "UPDATE looking_glass_queries SET status = 'expired', "
+                    "error_code = 'duplicate_recovered', "
+                    "error_message = 'duplicate active query recovered during database upgrade' "
+                    "WHERE status IN ('queued', 'running') AND id NOT IN ("
+                    "SELECT MIN(id) FROM looking_glass_queries "
+                    "WHERE status IN ('queued', 'running') "
+                    "GROUP BY api_key_id, node_id, request_fingerprint)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_looking_glass_active_fingerprint "
+                    "ON looking_glass_queries(api_key_id, node_id, request_fingerprint) "
+                    "WHERE status IN ('queued', 'running')"
+                )
+            )
+
         if table_exists("integration_api_keys") and table_exists("looking_glass_queries"):
             purge_deleted_looking_glass_tokens(connection)
 
@@ -482,15 +721,6 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS uq_wg_peer_interface_id
                     ON wg_peers(interface_id)
-                    """
-                )
-            )
-        if table_exists("link_monitor_samples"):
-            connection.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_monitor_checked_at
-                    ON link_monitor_samples(monitor_id, checked_at)
                     """
                 )
             )
@@ -544,6 +774,15 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
+        connection_columns = table_columns("connections")
+        add_column("connections", connection_columns, "protocol_type", "VARCHAR(32) DEFAULT 'unknown'")
+        add_column("connections", connection_columns, "name", "VARCHAR(120) DEFAULT ''")
+        add_column("connections", connection_columns, "source", "VARCHAR(32) DEFAULT 'managed-node'")
+        add_column("connections", connection_columns, "managed", "BOOLEAN DEFAULT 1")
+        add_column("connections", connection_columns, "status", "VARCHAR(32) DEFAULT 'stopped'")
+        add_column("connections", connection_columns, "extras", "JSON DEFAULT '{}'")
+        add_column("connections", connection_columns, "created_at", "DATETIME")
+        add_column("connections", connection_columns, "updated_at", "DATETIME")
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_connections_protocol_type ON connections(protocol_type)"))
         connection.execute(
             text(
@@ -568,6 +807,75 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
+        endpoint_columns = table_columns("connection_endpoints")
+        add_column("connection_endpoints", endpoint_columns, "connection_id", "INTEGER")
+        add_column("connection_endpoints", endpoint_columns, "node_id", "INTEGER")
+        add_column("connection_endpoints", endpoint_columns, "role", "VARCHAR(32) DEFAULT 'local'")
+        add_column("connection_endpoints", endpoint_columns, "interface_name", "VARCHAR(32) DEFAULT ''")
+        add_column("connection_endpoints", endpoint_columns, "tunnel_ips", "JSON DEFAULT '[]'")
+        add_column("connection_endpoints", endpoint_columns, "mtu", "INTEGER")
+        add_column("connection_endpoints", endpoint_columns, "routes", "JSON DEFAULT '[]'")
+        add_column("connection_endpoints", endpoint_columns, "runtime_status", "VARCHAR(32) DEFAULT 'stopped'")
+        add_column("connection_endpoints", endpoint_columns, "deployed_config", "TEXT")
+        add_column("connection_endpoints", endpoint_columns, "protocol_config", "JSON DEFAULT '{}'")
+        add_column("connection_endpoints", endpoint_columns, "extras", "JSON DEFAULT '{}'")
+        add_column("connection_endpoints", endpoint_columns, "created_at", "DATETIME")
+        add_column("connection_endpoints", endpoint_columns, "updated_at", "DATETIME")
+        # 旧版本可能已经写入同节点同名的重复端点。先清掉重复端点
+        # 关联的监测样本和监测记录，再删除端点本身；SQLite 开启外键
+        # 校验时直接删除端点会因 link_monitors 外键而让整个启动迁移失败。
+        duplicate_endpoint_ids = [
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT endpoint.id FROM connection_endpoints AS endpoint "
+                    "WHERE endpoint.id NOT IN ("
+                    "SELECT MIN(id) FROM connection_endpoints GROUP BY node_id, interface_name)"
+                )
+            ).fetchall()
+        ]
+        if duplicate_endpoint_ids:
+            placeholders = ",".join(f":endpoint_id_{index}" for index in range(len(duplicate_endpoint_ids)))
+            endpoint_params = {
+                f"endpoint_id_{index}": value for index, value in enumerate(duplicate_endpoint_ids)
+            }
+            duplicate_monitor_ids = [
+                row[0]
+                for row in connection.execute(
+                    text(f"SELECT id FROM link_monitors WHERE connection_endpoint_id IN ({placeholders})"),
+                    endpoint_params,
+                ).fetchall()
+            ] if table_exists("link_monitors") else []
+            if duplicate_monitor_ids and table_exists("link_monitor_samples"):
+                sample_placeholders = ",".join(
+                    f":monitor_id_{index}" for index in range(len(duplicate_monitor_ids))
+                )
+                sample_params = {
+                    f"monitor_id_{index}": value for index, value in enumerate(duplicate_monitor_ids)
+                }
+                connection.execute(
+                    text(f"DELETE FROM link_monitor_samples WHERE monitor_id IN ({sample_placeholders})"),
+                    sample_params,
+                )
+            if duplicate_monitor_ids:
+                monitor_placeholders = ",".join(
+                    f":monitor_id_{index}" for index in range(len(duplicate_monitor_ids))
+                )
+                monitor_params = {
+                    f"monitor_id_{index}": value for index, value in enumerate(duplicate_monitor_ids)
+                }
+                connection.execute(
+                    text(f"DELETE FROM link_monitors WHERE id IN ({monitor_placeholders})"),
+                    monitor_params,
+                )
+            connection.execute(
+                text(f"DELETE FROM connection_endpoints WHERE id IN ({placeholders})"),
+                endpoint_params,
+            )
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_connection_endpoint_node_interface "
+            "ON connection_endpoints(node_id, interface_name)"
+        ))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_connection_endpoints_connection_id ON connection_endpoints(connection_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_connection_endpoints_node_id ON connection_endpoints(node_id)"))
         connection.execute(
@@ -582,6 +890,16 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
+        settings_columns = table_columns("system_settings")
+        add_column("system_settings", settings_columns, "key", "VARCHAR(80)")
+        add_column("system_settings", settings_columns, "value", "TEXT DEFAULT ''")
+        add_column("system_settings", settings_columns, "created_at", "DATETIME")
+        add_column("system_settings", settings_columns, "updated_at", "DATETIME")
+        connection.execute(text(
+            "DELETE FROM system_settings WHERE rowid NOT IN ("
+            "SELECT MIN(rowid) FROM system_settings GROUP BY key)"
+        ))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_system_settings_key ON system_settings(key)"))
         connection.execute(
             text(
                 """
@@ -603,10 +921,21 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
+        link_monitor_columns = table_columns("link_monitors")
+        add_column("link_monitors", link_monitor_columns, "node_id", "INTEGER")
+        add_column("link_monitors", link_monitor_columns, "interface_id", "INTEGER")
+        add_column("link_monitors", link_monitor_columns, "connection_endpoint_id", "INTEGER")
+        add_column("link_monitors", link_monitor_columns, "name", "VARCHAR(80) DEFAULT ''")
+        add_column("link_monitors", link_monitor_columns, "target_host", "VARCHAR(255) DEFAULT ''")
+        add_column("link_monitors", link_monitor_columns, "interval_seconds", "INTEGER DEFAULT 10")
+        add_column("link_monitors", link_monitor_columns, "retention_days", "INTEGER DEFAULT 7")
+        add_column("link_monitors", link_monitor_columns, "enabled", "BOOLEAN DEFAULT 1")
+        add_column("link_monitors", link_monitor_columns, "next_due_at", "DATETIME")
+        add_column("link_monitors", link_monitor_columns, "last_checked_at", "DATETIME")
+        add_column("link_monitors", link_monitor_columns, "created_at", "DATETIME")
+        add_column("link_monitors", link_monitor_columns, "updated_at", "DATETIME")
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_node_id ON link_monitors(node_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_interface_id ON link_monitors(interface_id)"))
-        link_monitor_columns = table_columns("link_monitors")
-        add_column("link_monitors", link_monitor_columns, "connection_endpoint_id", "INTEGER")
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitors_connection_endpoint_id ON link_monitors(connection_endpoint_id)"))
         connection.execute(
             text(
@@ -622,6 +951,12 @@ def ensure_sqlite_point_to_point_constraints() -> None:
                 """
             )
         )
+        link_sample_columns = table_columns("link_monitor_samples")
+        add_column("link_monitor_samples", link_sample_columns, "monitor_id", "INTEGER")
+        add_column("link_monitor_samples", link_sample_columns, "checked_at", "DATETIME")
+        add_column("link_monitor_samples", link_sample_columns, "success", "BOOLEAN DEFAULT 0")
+        add_column("link_monitor_samples", link_sample_columns, "latency_ms", "FLOAT")
+        add_column("link_monitor_samples", link_sample_columns, "error", "TEXT")
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_monitor_id ON link_monitor_samples(monitor_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_link_monitor_samples_checked_at ON link_monitor_samples(checked_at)"))
         if node_columns:

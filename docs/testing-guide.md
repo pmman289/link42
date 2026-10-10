@@ -181,7 +181,7 @@ npm run dev --prefix apps/web -- --host 127.0.0.1 --port 5173
 Playwright 脚本建议覆盖：
 
 - 登录过期后是否立刻回登录页。
-- 节点设置弹窗是否能查看/轮换 token。
+- 节点设置弹窗是否能轮换 token，并确认新 token 只展示一次、旧 token 立即失效。
 - 导入 wg-quick 后是否不会重复出现可导入项。
 - 导入为受管连接时新弹窗是否在最前可操作。
 - Endpoint 控件是否支持下拉选择和直接输入。
@@ -246,6 +246,9 @@ scripts/real-e2e/up.sh
 - 本机直接运行当前源码 Agent。
 - 把当前 `apps/agent` 和 `packages` 打包到远端，并用远端 `python3` 启动 Agent。
 - 等待两个节点 online。
+
+真实 E2E 运行目录会写入专用标记；启动和清理脚本拒绝复用或删除没有
+Link42 标记的非空目录，`state.env` 仅以当前用户可读权限保存临时令牌。
 
 查看状态：
 
