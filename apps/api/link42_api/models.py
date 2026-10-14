@@ -2,12 +2,70 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from .database import Base
 from .secret_store import EncryptedJSON, EncryptedText
+
+
+class IPAMLock(Base):
+    __tablename__ = "ipam_lock"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class IPAMNodeAddress(Base):
+    __tablename__ = "ipam_node_addresses"
+    __table_args__ = (UniqueConstraint("node_id", "address"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    address: Mapped[str] = mapped_column(String(18))
+
+
+class IPAMPool(Base):
+    __tablename__ = "ipam_pools"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    cidr: Mapped[str] = mapped_column(String(18), unique=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    link_prefix: Mapped[int] = mapped_column(Integer, default=30)
+
+
+class IPAMAddress(Base):
+    __tablename__ = "ipam_addresses"
+    ip: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+
+
+class IPAMClaim(Base):
+    """Durable references survive removal of the corresponding configuration."""
+    __tablename__ = "ipam_claims"
+    __table_args__ = (UniqueConstraint("source", "ip"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ip: Mapped[int] = mapped_column(BigInteger, ForeignKey("ipam_addresses.ip"), index=True)
+    prefix: Mapped[int] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(160), index=True)
+    owner: Mapped[str] = mapped_column(String(80), index=True)
+    node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    node_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    interface_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    kind: Mapped[str] = mapped_column(String(24))
+    state: Mapped[str] = mapped_column(String(24), default="assigned")
+    note: Mapped[str] = mapped_column(Text, default="")
+    cleanup_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class IPAMRange(Base):
+    __tablename__ = "ipam_ranges"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(255), unique=True)
+    cidr: Mapped[str] = mapped_column(String(18))
+    start: Mapped[int] = mapped_column(BigInteger, index=True)
+    end: Mapped[int] = mapped_column(BigInteger)
+    kind: Mapped[str] = mapped_column(String(24))
+    owners: Mapped[list[str]] = mapped_column(JSON, default=list)
+    note: Mapped[str] = mapped_column(Text, default="")
 
 
 class TimestampMixin:
@@ -61,6 +119,17 @@ class Node(TimestampMixin, Base):
         cascade="all, delete-orphan",
     )
     tasks: Mapped[list[AgentTask]] = relationship(back_populates="node")
+
+    ipv4_addresses: Mapped[list[IPAMNodeAddress]] = relationship(cascade="all, delete-orphan")
+
+    @property
+    def internal_ipv4s(self) -> list[str]:
+        return [item.address for item in self.ipv4_addresses]
+
+    @internal_ipv4s.setter
+    def internal_ipv4s(self, values: list[str]) -> None:
+        existing = {item.address: item for item in self.ipv4_addresses}
+        self.ipv4_addresses = [existing.get(value) or IPAMNodeAddress(address=value) for value in values]
 
 
 class WireGuardInterface(TimestampMixin, Base):

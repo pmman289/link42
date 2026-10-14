@@ -413,8 +413,24 @@ def _validate_plugin_payload(value: Any, *, depth: int = 0, budget: list[int] | 
     return value
 
 
+def _validate_internal_ipv4s(values: list[str]) -> list[str]:
+    result = []
+    for value in values:
+        address = ipaddress.ip_interface(value.strip())
+        if not isinstance(address, ipaddress.IPv4Interface) or address.network.prefixlen != 32:
+            raise ValueError("节点固定内网地址必须是 IPv4 /32")
+        normalized = str(address)
+        if normalized in result:
+            raise ValueError("节点固定内网地址重复")
+        result.append(normalized)
+    return result
+
+
 class NodeCreate(BaseModel):
     """创建节点请求。"""
+
+    internal_ipv4s: list[str] = Field(default_factory=list, max_length=128)
+    _internal_ipv4s_validator = field_validator("internal_ipv4s")(_validate_internal_ipv4s)
 
     name: str = Field(min_length=1, max_length=80)
     hostname: str | None = Field(default=None, max_length=255)
@@ -459,6 +475,9 @@ class NodeCreate(BaseModel):
 class NodeUpdate(BaseModel):
     """更新节点基础信息请求。"""
 
+    internal_ipv4s: list[str] = Field(default_factory=list, max_length=128)
+    _internal_ipv4s_validator = field_validator("internal_ipv4s")(_validate_internal_ipv4s)
+
     name: str = Field(min_length=1, max_length=80)
     endpoint_ips: list[str] = Field(min_length=1, max_length=32)
     hostname: str | None = Field(default=None, max_length=255)
@@ -502,6 +521,7 @@ class NodeUpdate(BaseModel):
 class NodeRead(BaseModel):
     """节点详情响应。"""
 
+    internal_ipv4s: list[str] = Field(default_factory=list)
     id: int
     name: str
     hostname: str | None
@@ -729,6 +749,8 @@ class ControllerSettingsUpdate(BaseModel):
 class InterfaceCreate(BaseModel):
     """创建单个 WireGuard 接口请求。"""
 
+    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
+
     name: str = Field(min_length=1, max_length=32)
     tunnel_ips: list[str] = Field(default_factory=list, max_length=128)
     listen_port: int | None = None
@@ -770,6 +792,8 @@ class InterfaceCreate(BaseModel):
 
 class ManagedLinkCreate(BaseModel):
     """创建双端受管 WireGuard 连接请求。"""
+
+    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     peer_node_id: int
     local_interface_name: str = Field(min_length=1, max_length=32)
@@ -844,6 +868,8 @@ class ManagedLinkCreate(BaseModel):
 
 class InterfaceUpdate(BaseModel):
     """更新单个 WireGuard 接口请求。"""
+
+    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     name: str = Field(min_length=1, max_length=32)
     tunnel_ips: list[str] = Field(default_factory=list, max_length=128)
@@ -1152,6 +1178,8 @@ class ConnectionRead(BaseModel):
 class GreManagedConnectionCreate(BaseModel):
     """创建受管 GRE 连接请求。"""
 
+    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
+
     protocol_type: str = "gre"
     peer_node_id: int
     local_interface_name: str = Field(min_length=1, max_length=15)
@@ -1250,6 +1278,8 @@ class GreManagedConnectionCreate(BaseModel):
 class GreManagedConnectionUpdate(BaseModel):
     """更新受管 GRE 连接请求。"""
 
+    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
+
     local_interface_name: str = Field(min_length=1, max_length=15)
     peer_interface_name: str = Field(min_length=1, max_length=15)
     local_outer_ip: str
@@ -1336,6 +1366,8 @@ class GreManagedConnectionUpdate(BaseModel):
 
 class GreManualConnectionCreate(BaseModel):
     """创建仅管理当前节点一端的 GRE 连接请求。"""
+
+    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     protocol_type: str = "gre"
     interface_name: str = Field(min_length=1, max_length=15)
@@ -1703,6 +1735,8 @@ class ManagedLinkRead(BaseModel):
 
 class ManagedLinkUpdate(BaseModel):
     """更新双端受管 WireGuard 连接请求。"""
+
+    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     local_interface_name: str = Field(min_length=1, max_length=32)
     peer_interface_name: str = Field(min_length=1, max_length=32)

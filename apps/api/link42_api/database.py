@@ -113,6 +113,11 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     ensure_sqlite_point_to_point_constraints()
+    from . import ipam
+    with Session(engine, autoflush=False) as db:
+        ipam.lock(db)
+        ipam.reconcile(db, {}, validate=False)
+        db.commit()
 
 
 def sqlite_database_path() -> Path | None:

@@ -57,7 +57,8 @@ from link42_common.security import (
 )
 from link42_common.version import AGENT_VERSION, CONTROLLER_VERSION
 
-from . import models, schemas
+from . import models, schemas, ipam
+from .ipam_api import router as ipam_router
 from .config import settings
 from .connection_drivers import connection_driver_for_interface
 from .database import (
@@ -3498,6 +3499,7 @@ def gre_task_payload(endpoint: models.ConnectionEndpoint) -> dict[str, Any]:
     }
     if previous_interface_name and previous_interface_name != endpoint.interface_name:
         payload["previous_interface_name"] = previous_interface_name
+    payload["ipam_owner"] = ipam.config_owner(endpoint)
     return payload
 
 
@@ -3972,6 +3974,7 @@ def create_interface_task(
     }
     if payload_extra:
         payload.update(payload_extra)
+    payload["ipam_owner"] = ipam.config_owner(interface)
     return models.AgentTask(
         node_id=interface.node_id,
         change_plan_id=change_plan_id,
@@ -4477,15 +4480,16 @@ def queue_replace_interface(db: Session, interface: models.WireGuardInterface) -
         payload_extra=stop_payload,
         update_pending_payload=True,
     )
-    if should_delete_node_config_file(interface):
-        delete_payload = {"depends_on_task_id": stop_task.id} if stop_task is not None else None
-        enqueue_interface_task_once(
-            db,
-            interface,
-            driver.tasks.delete_config,
-            payload_extra=delete_payload,
-            update_pending_payload=True,
-        )
+    # Replacement explicitly takes ownership; cleanup must precede the new
+    # deployment even when the old interface was observation-only.
+    delete_payload = {"depends_on_task_id": stop_task.id} if stop_task is not None else None
+    enqueue_interface_task_once(
+        db,
+        interface,
+        driver.tasks.delete_config,
+        payload_extra=delete_payload,
+        update_pending_payload=True,
+    )
     mark_import_candidate_available_for_interface(db, interface)
     delete_link_monitors_where(db, models.LinkMonitor.interface_id == interface.id)
     cancel_draft_interface_change_plans(db, interface.id)
@@ -4914,6 +4918,7 @@ def request_agent_upgrade(
 
 
 @app.post("/api/nodes", response_model=schemas.NodeCreateResult)
+@ipam.transaction
 def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> schemas.NodeCreateResult:
     """创建节点，并返回仅展示一次的 Agent token。"""
     existing = db.scalar(select(models.Node).where(models.Node.name == payload.name))
@@ -4933,6 +4938,7 @@ def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> s
         status="offline",
         agent_token_hash=hash_token(token),
     )
+    node.internal_ipv4s = payload.internal_ipv4s
     db.add(node)
     commit_unique_or_conflict(db, "node name already exists")
     db.refresh(node)
@@ -4941,6 +4947,7 @@ def create_node(payload: schemas.NodeCreate, db: Session = Depends(get_db)) -> s
 
 
 @app.patch("/api/nodes/{node_id}", response_model=schemas.NodeRead)
+@ipam.transaction
 def update_node(
     node_id: int,
     payload: schemas.NodeUpdate,
@@ -4965,6 +4972,8 @@ def update_node(
     node.endpoint_ips = payload.endpoint_ips
     node.topology_endpoint = (payload.topology_endpoint or "").strip() or (payload.endpoint_ips[0] if payload.endpoint_ips else None)
     node.github_proxy_url = payload.github_proxy_url
+    if "internal_ipv4s" in payload.model_fields_set:
+        node.internal_ipv4s = payload.internal_ipv4s
     commit_unique_or_conflict(db, "node name already exists")
     db.refresh(node)
     logger.info("更新节点 node_id=%s name=%s region=%s endpoint_count=%d", node.id, node.name, node.region, len(node.endpoint_ips or []))
@@ -5064,6 +5073,7 @@ def list_node_connections(node_id: int, db: Session = Depends(get_db)) -> list[s
 
 
 @app.post("/api/nodes/{node_id}/connections/managed", response_model=schemas.ConnectionRead)
+@ipam.transaction
 def create_managed_connection(
     node_id: int,
     payload: schemas.GreManagedConnectionCreate,
@@ -5128,6 +5138,7 @@ def create_managed_connection(
 
 
 @app.post("/api/nodes/{node_id}/connections/manual", response_model=schemas.ConnectionRead)
+@ipam.transaction
 def create_manual_connection(
     node_id: int,
     payload: schemas.GreManualConnectionCreate,
@@ -5181,6 +5192,7 @@ def get_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> sc
 
 
 @app.patch("/api/connections/{raw_connection_ref}", response_model=schemas.ConnectionRead)
+@ipam.transaction
 def update_connection(
     raw_connection_ref: str,
     payload: schemas.GreManagedConnectionUpdate,
@@ -5238,6 +5250,7 @@ def update_connection(
 
 
 @app.patch("/api/connections/{raw_connection_ref}/manual", response_model=schemas.ConnectionRead)
+@ipam.transaction
 def update_manual_connection(
     raw_connection_ref: str,
     payload: schemas.GreManualConnectionUpdate,
@@ -5280,6 +5293,7 @@ def update_manual_connection(
 
 
 @app.post("/api/connections/{raw_connection_ref}/start", response_model=schemas.ConnectionRead)
+@ipam.transaction
 def start_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> schemas.ConnectionRead:
     """启动 GRE 连接的全部受管端点。"""
 
@@ -5343,6 +5357,7 @@ def refresh_connection_status(raw_connection_ref: str, db: Session = Depends(get
 
 
 @app.delete("/api/connections/{raw_connection_ref}")
+@ipam.transaction
 def delete_connection(raw_connection_ref: str, db: Session = Depends(get_db)) -> dict[str, str]:
     """删除 GRE 连接记录，并向全部受管端点下发清理任务。"""
 
@@ -5681,6 +5696,7 @@ def reset_topology_layout(db: Session = Depends(get_db)) -> schemas.TopologyRead
 
 
 @app.delete("/api/nodes/{node_id}")
+@ipam.transaction
 def delete_node(node_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
     """删除空节点及其历史数据；仍参与连接的节点必须先清空连接。"""
 
@@ -5706,6 +5722,7 @@ def delete_node(node_id: int, db: Session = Depends(get_db)) -> dict[str, str]:
         execution_options={"synchronize_session": False},
     )
     for model in [
+        models.IPAMNodeAddress,
         models.ImportCandidate,
         models.PortInventoryEntry,
         models.PortInventorySetting,
@@ -5814,6 +5831,7 @@ def install_node_middleware(
 
 @app.post("/api/nodes/{node_id}/wireguard/interfaces", response_model=schemas.InterfaceRead)
 @app.post("/api/nodes/{node_id}/wireguard/configs", response_model=schemas.InterfaceRead)
+@ipam.transaction
 def create_interface(
     node_id: int,
     payload: schemas.InterfaceCreate,
@@ -5848,6 +5866,7 @@ def create_interface(
 
 
 @app.post("/api/nodes/{node_id}/wireguard/managed-links", response_model=schemas.ManagedLinkCreateResult)
+@ipam.transaction
 def create_managed_link(
     node_id: int,
     payload: schemas.ManagedLinkCreate,
@@ -5895,6 +5914,19 @@ def create_managed_link(
     local_private_key, local_public_key = generate_wireguard_keypair()
     peer_private_key, peer_public_key = generate_wireguard_keypair()
     preshared_key = generate_preshared_key()
+
+    # Remove the old records before inserting same-name replacements. Their
+    # addresses remain held by IPAM until the cleanup tasks finish.
+    cleanup_by_node: dict[int, int] = {}
+    for replaced in [replace_local, replace_peer]:
+        if replaced is not None:
+            replaced_node_id, replaced_id = replaced.node_id, replaced.id
+            queue_replace_interface(db, replaced)
+            cleanup_task = get_interface_task(db, replaced_id, WIREGUARD_TASKS.delete_config, ["pending", "running"])
+            if cleanup_task is not None:
+                cleanup_by_node[replaced_node_id] = cleanup_task.id
+    if replace_local or replace_peer:
+        db.flush()
 
     local_interface = models.WireGuardInterface(
         node_id=node_id,
@@ -5969,10 +6001,6 @@ def create_managed_link(
     )
     db.add_all([local_peer, peer_peer])
     flush_unique_or_conflict(db, "wireguard peer already exists")
-    if replace_local:
-        queue_replace_interface(db, replace_local)
-    if replace_peer:
-        queue_replace_interface(db, replace_peer)
     enqueue_middleware_tasks(
         db,
         middleware,
@@ -5983,8 +6011,13 @@ def create_managed_link(
         payload.local_endpoint_port,
         payload.peer_endpoint_port,
     )
-    enqueue_apply_config(db, local_interface)
-    enqueue_apply_config(db, peer_interface)
+    for target in [local_interface, peer_interface]:
+        enqueue_apply_config(db, target)
+        cleanup_id = cleanup_by_node.get(target.node_id)
+        if cleanup_id:
+            apply_task = get_interface_task(db, target.id, WIREGUARD_TASKS.apply_config, ["pending"])
+            if apply_task is not None:
+                apply_task.payload = {**json_object(apply_task.payload), "depends_on_task_id": cleanup_id}
     commit_unique_or_conflict(db, "interface name already exists on node")
     db.refresh(local_interface)
     db.refresh(peer_interface)
@@ -6214,6 +6247,7 @@ def get_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[s
 
 
 @app.patch("/api/wireguard/configs/{interface_id}/managed-link", response_model=schemas.ManagedLinkRead)
+@ipam.transaction
 def update_managed_link(
     interface_id: int,
     payload: schemas.ManagedLinkUpdate,
@@ -6314,6 +6348,7 @@ def update_managed_link(
 
 
 @app.post("/api/wireguard/configs/{interface_id}/managed-link/start", response_model=schemas.ManagedLinkRead)
+@ipam.transaction
 def start_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
     """同时启动受管连接双方。"""
 
@@ -6375,6 +6410,7 @@ def stop_managed_link(interface_id: int, db: Session = Depends(get_db)) -> dict[
 
 
 @app.delete("/api/wireguard/configs/{interface_id}/managed-link")
+@ipam.transaction
 def delete_managed_link(
     interface_id: int,
     db: Session = Depends(get_db),
@@ -6449,6 +6485,7 @@ def delete_managed_link(
 
 @app.patch("/api/wireguard/interfaces/{interface_id}", response_model=schemas.InterfaceRead)
 @app.patch("/api/wireguard/configs/{interface_id}", response_model=schemas.InterfaceRead)
+@ipam.transaction
 def update_interface(
     interface_id: int,
     payload: schemas.InterfaceUpdate,
@@ -6610,6 +6647,7 @@ def refresh_interface_status(interface_id: int, db: Session = Depends(get_db)) -
 
 
 @app.post("/api/wireguard/configs/{interface_id}/start", response_model=schemas.InterfaceRead)
+@ipam.transaction
 def start_interface(interface_id: int, db: Session = Depends(get_db)) -> models.WireGuardInterface:
     """创建启动 WireGuard 接口的 Agent 任务。"""
 
@@ -6657,6 +6695,7 @@ def stop_interface(interface_id: int, db: Session = Depends(get_db)) -> models.W
 
 
 @app.delete("/api/wireguard/configs/{interface_id}")
+@ipam.transaction
 def delete_interface(
     interface_id: int,
     db: Session = Depends(get_db),
@@ -6698,6 +6737,10 @@ def create_change_plan_agent_tasks(
 
     interface_id = task_payload.get("interface_id")
     interface = db.get(models.WireGuardInterface, interface_id) if interface_id else None
+    if interface is not None:
+        task_payload = {**task_payload, "ipam_owner": ipam.config_owner(interface)}
+    else:
+        task_payload = {key: value for key, value in task_payload.items() if key != "ipam_owner"}
     previous_interface_name = str(task_payload.get("previous_interface_name") or "").strip()
     if interface is not None and previous_interface_name and previous_interface_name != task_payload.get("interface_name"):
         driver = connection_driver_for_interface(interface)
@@ -6710,6 +6753,7 @@ def create_change_plan_agent_tasks(
                 "node_id": task_payload["node_id"],
                 "interface_id": interface.id,
                 "interface_name": previous_interface_name,
+                "ipam_owner": ipam.config_owner(interface),
             }
             stop_task = models.AgentTask(
                 node_id=task_payload["node_id"],
@@ -6747,6 +6791,7 @@ def create_change_plan_agent_tasks(
 
 
 @app.post("/api/change-plans/{plan_id}/confirm", response_model=schemas.ChangePlanRead)
+@ipam.transaction
 def confirm_change_plan(plan_id: int, db: Session = Depends(get_db)) -> models.ChangePlan:
     """确认部署计划，并创建等待 Agent 拉取的任务。"""
     plan = db.get(models.ChangePlan, plan_id)
@@ -6954,6 +6999,7 @@ def list_import_candidates(node_id: int, db: Session = Depends(get_db)) -> list[
 
 
 @app.post("/api/nodes/{node_id}/wireguard/import", response_model=schemas.InterfaceRead)
+@ipam.transaction(observe=True)
 def import_candidate(
     node_id: int,
     payload: schemas.ImportRequest,
@@ -7245,6 +7291,7 @@ def agent_poll(payload: schemas.AgentPollRequest, db: Session = Depends(get_db))
 
 
 @app.post("/api/agent/tasks/{task_id}/result")
+@ipam.transaction(observe=True, authorize=lambda params: require_agent(params["db"], params["payload"].node_id, params["payload"].token))
 def agent_task_result(
     task_id: int,
     payload: schemas.AgentTaskResultRequest,
@@ -7420,7 +7467,7 @@ def agent_task_result(
     interface_id = task_payload.get("interface_id")
     if interface_id and reported_status == "succeeded":
         interface = db.get(models.WireGuardInterface, interface_id)
-        if interface is not None:
+        if ipam.task_targets(task, interface):
             driver = connection_driver_for_interface(interface)
             if task.type == driver.tasks.apply_config:
                 # 部署成功后记录节点上的已部署配置，后续 Change Plan diff 才能对比真实基线。
@@ -7448,13 +7495,13 @@ def agent_task_result(
     connection_endpoint_id = task_payload.get("connection_endpoint_id")
     if connection_endpoint_id and reported_status == "failed":
         endpoint = db.get(models.ConnectionEndpoint, connection_endpoint_id)
-        if endpoint is not None and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
+        if ipam.task_targets(task, endpoint) and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
             endpoint.runtime_status = "failed"
             set_endpoint_extra_value(endpoint, "last_error", agent_task_error_summary(reported_result) or "Agent 任务执行失败")
             endpoint.connection.status = gre_connection_status(endpoint.connection)
     if connection_endpoint_id and reported_status == "succeeded":
         endpoint = db.get(models.ConnectionEndpoint, connection_endpoint_id)
-        if endpoint is not None and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
+        if ipam.task_targets(task, endpoint) and endpoint.connection.protocol_type == CONNECTION_TYPE_GRE:
             if task.type == GRE_TASKS.apply_config:
                 # 部署基线来自实际执行的任务快照，而非任务执行期间可能被编辑的端点。
                 deployed_payload = {key: value for key, value in task_payload.items() if key != "depends_on_task_id"}
@@ -7636,4 +7683,5 @@ def agent_link_monitor_result(
     return {"status": "recorded"}
 
 
+app.include_router(ipam_router)
 mount_web_panel()
