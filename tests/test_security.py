@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import asyncio
 import time
 import os
 import subprocess
@@ -192,6 +193,80 @@ def test_request_body_limit_rejects_before_endpoint_reads_body() -> None:
     client = TestClient(limited_app)
     assert client.post("/api/auth/login", content=b"x" * 1024).json() == {"size": 1024}
     assert client.post("/api/auth/login", content=b"x" * (16 * 1024 + 1)).status_code == 413
+
+
+def test_request_body_limit_replays_body_once_then_waits_for_real_disconnect() -> None:
+    """发送静态文件时，后续 receive 必须让出事件循环并等待真实断开。"""
+
+    async def scenario():
+        disconnected = asyncio.Event()
+        messages = iter([
+            {"type": "http.request", "body": b"first", "more_body": True},
+            {"type": "http.request", "body": b"second", "more_body": False},
+        ])
+        async def receive():
+            message = next(messages, None)
+            if message is not None:
+                return message
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def downstream(scope, replay_receive, send):
+            assert await replay_receive() == {"type": "http.request", "body": b"firstsecond", "more_body": False}
+            waiting = asyncio.create_task(replay_receive())
+            try:
+                await asyncio.sleep(0)
+                assert not waiting.done()
+                disconnected.set()
+                assert await asyncio.wait_for(waiting, 1) == {"type": "http.disconnect"}
+            finally:
+                waiting.cancel()
+                await asyncio.gather(waiting, return_exceptions=True)
+
+        async def send(message):
+            raise AssertionError("No response expected in this receive contract test")
+
+        await RequestBodyLimitMiddleware(downstream)({"type": "http", "path": "/", "headers": []}, receive, send)
+
+    asyncio.run(scenario())
+
+
+def test_request_body_limit_serves_static_file_with_legacy_asgi_disconnect_listener(tmp_path) -> None:
+    """用子进程限时验证 ASGI 2.3 静态响应，防止忙循环挂住整个测试进程。"""
+
+    path = tmp_path / "index.html"
+    path.write_text("<html>ready</html>")
+    source = '''
+import asyncio
+import sys
+from starlette.responses import FileResponse
+from link42_api.http_security import RequestBodyLimitMiddleware
+
+async def scenario():
+    response_done = asyncio.Event()
+    delivered = False
+    messages = []
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await response_done.wait()
+        return {"type": "http.disconnect"}
+    async def send(message):
+        messages.append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            response_done.set()
+    response = FileResponse(sys.argv[1])
+    app = RequestBodyLimitMiddleware(response)
+    await app({"type": "http", "method": "GET", "path": "/", "headers": [],
+               "asgi": {"version": "3.0", "spec_version": "2.3"}}, receive, send)
+    assert messages[0]["status"] == 200
+    assert b"".join(message.get("body", b"") for message in messages) == b"<html>ready</html>"
+asyncio.run(scenario())
+'''
+    result = subprocess.run([sys.executable, "-c", source, str(path)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
 
 
 def test_login_failures_are_rate_limited() -> None:

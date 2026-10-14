@@ -65,11 +65,14 @@ class RequestBodyLimitMiddleware:
         delivered = False
 
         async def replay_receive() -> dict[str, Any]:
-            """向下层应用仅回放一次已通过上限检查的请求体。"""
+            """回放一次请求体，随后转发真实的连接事件。"""
 
             nonlocal delivered
             if delivered:
-                return {"type": "http.request", "body": b"", "more_body": False}
+                # Streaming/FileResponse waits here for http.disconnect. A
+                # synthetic empty request would return without yielding and
+                # spin forever on ASGI < 2.4, blocking the whole event loop.
+                return await receive()
             delivered = True
             return {"type": "http.request", "body": bytes(body), "more_body": False}
 
