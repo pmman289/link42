@@ -1,8 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_URL="https://get.pmman.tech/sh/link42-agent.sh"
-RES_BASE_URL="${LINK42_RES_BASE_URL:-https://get.pmman.tech/res/link42}"
+SCRIPT_URL="${LINK42_SERVER_URL:-http://controller:8000}/sh/link42-agent.sh"
 AGENT_VERSION="${LINK42_AGENT_VERSION:-latest}"
 INSTALL_DIR="${LINK42_INSTALL_DIR:-/opt/link42-agent}"
 BIN_PATH="${LINK42_AGENT_BIN:-/usr/local/bin/link42-agent}"
@@ -52,6 +51,43 @@ fail() {
 need_env() {
   eval "value=\${$1:-}"
   [ -n "$value" ] || fail "missing required environment variable: $1"
+}
+
+# POSIX shell 校验，无需先安装 Python；与主控一样仅接受无路径的 HTTP(S) URL。
+configure_download_urls() {
+  controller_url="${LINK42_SERVER_URL%/}"
+  case "$controller_url" in
+    http://*) authority="${controller_url#http://}" ;;
+    https://*) authority="${controller_url#https://}" ;;
+    *) fail "LINK42_SERVER_URL must be an absolute HTTP(S) URL" ;;
+  esac
+  case "$authority" in
+    ''|*[![:graph:]]*|*[\"\'\\/@?#]*) fail "LINK42_SERVER_URL must not contain credentials, a path, query or fragment" ;;
+  esac
+  port=""
+  case "$authority" in
+    \[*\]*)
+      host="${authority%%]*}]"
+      suffix="${authority#*]}"
+      case "$host" in *:*) ;; *) fail "invalid IPv6 controller URL" ;; esac
+      case "$suffix" in '') ;; :?*) port="${suffix#:}" ;; *) fail "invalid controller port" ;; esac
+      ;;
+    *:*)
+      host="${authority%:*}"
+      port="${authority##*:}"
+      case "$host" in ''|*:*|*[\[\]]*) fail "invalid controller host" ;; esac
+      [ -n "$port" ] || fail "invalid controller port"
+      ;;
+    *[\[\]]*) fail "invalid controller host" ;;
+  esac
+  if [ -n "$port" ]; then
+    case "$port" in *[!0-9]*) fail "invalid controller port" ;; esac
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || fail "invalid controller port"
+  fi
+  LINK42_SERVER_URL="$controller_url"
+  SCRIPT_URL="$controller_url/sh/link42-agent.sh"
+  # LINK42_RES_BASE_URL is deprecated and deliberately ignored.
+  RES_BASE_URL="$controller_url/res/link42"
 }
 
 shell_quote() {
@@ -142,6 +178,11 @@ Usage:
   curl -fsSL $SCRIPT_URL | sudo sh -s -- uninstall
 EOF
 }
+
+if [ "$ACTION" = "--help" ] || [ "$ACTION" = "-h" ] || [ "$ACTION" = "help" ]; then
+  run_as_root_hint
+  exit 0
+fi
 
 discover_uninstall_env_file() {
   [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "remove" ] || return
@@ -438,6 +479,7 @@ reject_symlink_path "$GRE_DIR"
 need_env LINK42_SERVER_URL
 need_env LINK42_NODE_ID
 need_env LINK42_AGENT_TOKEN
+configure_download_urls
 
 ARCH="$(uname -m)"
 AGENT_INSTALL_MODE="binary"

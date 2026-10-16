@@ -100,19 +100,9 @@ if [[ -f "$SRC_DIR/manifest.json" ]]; then
     cp "$file" "$OUT_DIR/$(basename "$file")"
   done < <(find "$SRC_DIR" -maxdepth 1 -type f -name 'link42-agent-*' | sort)
 else
-  "$PYTHON_BIN" - <<'PY' > "$OUT_DIR/manifest.json"
-from pathlib import Path
-import re
-
-text = Path("packages/link42_common/version.py").read_text(encoding="utf-8")
-match = re.search(r'AGENT_VERSION\s*=\s*"([^"]+)"', text)
-version = match.group(1) if match else "0.0.0"
-print(f'''{{
-  "latest": "{version}",
-  "minimum_supported": "0.1.0",
-  "releases": {{}}
-}}''')
-PY
+  echo "missing Agent release manifest after build" >&2
+  exit 1
 fi
 
+"$PYTHON_BIN" "$ROOT_DIR/scripts/agent/verify-release-assets.py" "$OUT_DIR"
 echo "$OUT_DIR"

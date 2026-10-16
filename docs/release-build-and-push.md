@@ -199,64 +199,14 @@ docker run -d \
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-## 7. 发布 Agent 安装脚本和外部二进制资源
+## 7. 随主控发布安装资源
 
-前端节点安装命令默认使用：
+主控镜像内置 Agent/UDP2RAW 安装脚本和资源，无需独立静态站点。构建前会校验 manifest、二进制、源码包、摘要及脚本是否齐全；不完整时终止构建。详细部署和迁移方法见 [主控资源部署](agent-public-deployment.md)。
 
-```text
-https://get.pmman.tech/sh/link42-agent.sh
-https://get.pmman.tech/res/link42
-```
+发布脚本会在临时空数据卷容器中运行下载校验，也可手动执行：
 
-详细的静态站点发布、验证、节点安装、卸载和回滚流程见：
-
-```text
-docs/agent-public-deployment.md
-```
-
-需要同步发布：
-
-```text
-deploy/sh/link42-agent.sh
-dist/agent/link42-agent-linux-x64
-dist/agent/link42-agent-linux-x64.sha256
-dist/agent/link42-agent-source.tar.gz
-dist/agent/link42-agent-source.tar.gz.sha256
-dist/agent/<agent_version>/link42-agent-linux-x64
-dist/agent/<agent_version>/link42-agent-linux-x64.sha256
-dist/agent/<agent_version>/link42-agent-source.tar.gz
-dist/agent/<agent_version>/link42-agent-source.tar.gz.sha256
-```
-
-OpenWrt 安装脚本会固定下载：
-
-```text
-https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
-```
-
-如果该文件缺失，OpenWrt 节点安装会在下载阶段报 404。
-
-当前安装脚本下载规则：
-
-- `LINK42_AGENT_VERSION=latest`：
-  - `$LINK42_RES_BASE_URL/link42-agent-linux-x64`
-  - `$LINK42_RES_BASE_URL/link42-agent-source.tar.gz`
-- `LINK42_AGENT_VERSION=0.2.0`：
-  - `$LINK42_RES_BASE_URL/0.2.0/link42-agent-linux-x64`
-  - `$LINK42_RES_BASE_URL/0.2.0/link42-agent-source.tar.gz`
-
-发布到对象存储或静态站点时，目录结构应保持一致：
-
-```text
-res/link42/link42-agent-linux-x64
-res/link42/link42-agent-linux-x64.sha256
-res/link42/link42-agent-source.tar.gz
-res/link42/link42-agent-source.tar.gz.sha256
-res/link42/0.2.0/link42-agent-linux-x64
-res/link42/0.2.0/link42-agent-linux-x64.sha256
-res/link42/0.2.0/link42-agent-source.tar.gz
-res/link42/0.2.0/link42-agent-source.tar.gz.sha256
-sh/link42-agent.sh
+```bash
+python3 scripts/controller/verify-downloads.py http://controller:8000 <agent_version>
 ```
 
 ## 8. 发布后验证
@@ -280,20 +230,20 @@ docker logs link42-test --tail=80
 
 ```bash
 curl -fsS http://127.0.0.1:8000/api/auth/me || true
-curl -fsS http://127.0.0.1:8000/api/agent/releases
+curl -fsS http://127.0.0.1:8000/api/health
 ```
 
-`/api/auth/me` 未登录时返回 401 属于正常现象。`/api/agent/releases` 应返回 manifest。
+`/api/auth/me` 未登录时返回 401 属于正常现象。`/api/agent/releases` 需要登录后读取。
 
 检查公网 Agent 资产，尤其是 OpenWrt 源码包：
 
 ```bash
-curl -fsSI https://get.pmman.tech/res/link42/link42-agent-linux-x64
-curl -fsSI https://get.pmman.tech/res/link42/link42-agent-source.tar.gz
-curl -fsS https://get.pmman.tech/res/link42/link42-agent-source.tar.gz.sha256
+curl -fsS -o /dev/null http://controller:8000/res/link42/link42-agent-linux-x64
+curl -fsS -o /dev/null http://controller:8000/res/link42/link42-agent-source.tar.gz
+curl -fsS http://controller:8000/res/link42/link42-agent-source.tar.gz.sha256
 ```
 
-以上任一命令返回 404 都说明静态站点发布不完整。
+以上任一命令返回 404 都应检查主控镜像及内置发布资源。
 
 清理测试容器：
 

@@ -1,3 +1,4 @@
+import { normalizeControllerUrl } from "./agentInstall";
 import type { FormFieldRule, FormRule, FormValidationIssue, FormValues } from "./formValidation";
 
 type FieldValidator = NonNullable<FormFieldRule["validate"]>;
@@ -60,6 +61,7 @@ function httpUrlRule(label: string): FieldValidator {
   return (value) => {
     try {
       const text = stringValue(value);
+      if (!normalizeControllerUrl(text)) return `${label}只能填写不带路径、查询参数或凭据的 HTTP/HTTPS 地址`;
       const parsed = new URL(text);
       if (!["http:", "https:"].includes(parsed.protocol)) return `${label}必须以 http:// 或 https:// 开头`;
       if (!parsed.hostname || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {

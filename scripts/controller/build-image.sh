@@ -17,6 +17,7 @@ cd "$ROOT_DIR"
 if [[ "${SKIP_PREPARE_AGENT_RELEASES:-0}" != "1" ]]; then
   scripts/agent/prepare-release-assets.sh >/dev/null
 fi
+python3 scripts/agent/verify-release-assets.py dist/controller-agent-releases
 docker build -f "$DOCKERFILE" -t "$IMAGE_NAME" .
 
 printf '%s\n' "Built $IMAGE_NAME"

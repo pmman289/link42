@@ -70,13 +70,13 @@
 - 一键安装脚本：
   - `deploy/sh/link42-agent.sh`
 - 预期安装脚本 URL：
-  - `https://get.pmman.tech/sh/link42-agent.sh`
+  - `http://controller:8000/sh/link42-agent.sh`
 - 预期二进制资源 URL：
-  - `https://get.pmman.tech/res/link42/link42-agent-linux-x64`
+  - `http://controller:8000/res/link42/link42-agent-linux-x64`
 - 前端展示命令形如：
-  - `curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env LINK42_SERVER_URL='http://controller:8000' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh`
+  - `curl -fsSL http://controller:8000/sh/link42-agent.sh | sudo env LINK42_SERVER_URL='http://controller:8000' LINK42_NODE_ID='1' LINK42_AGENT_TOKEN='token' sh`
 - 一键卸载命令：
-  - `curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall`
+  - `curl -fsSL http://controller:8000/sh/link42-agent.sh | sudo sh -s -- uninstall`
 - 安装脚本会尝试安装 `wireguard-tools`，下载 Agent 二进制，并按 systemd 或 OpenRC 注册服务。
 - 卸载脚本会删除 Agent 服务、二进制和 `/etc/link42/agent.env`，不会删除 `/etc/wireguard` 下的配置。
 - OpenWrt/OpenRC 支持仍要谨慎测试；用户提供过 `ssh mrouter` 的家庭路由器环境，但不能破坏上面的现有网络。
@@ -162,3 +162,11 @@ docker start link42
 ```
 
 这只补建目录，不需要删除数据库或重新创建运行卷。权限、磁盘空间或其它退出原因仍应依据具体启动日志排查。
+
+## 安装资源统一由主控提供（0.6.27）
+
+主控和 Web 版本提升至 `0.6.27`，Agent 保持 `0.6.23`，通信协议仍为 `1`。安装脚本、Agent latest/固定版本及摘要、UDP2RAW 独立安装资源均由自己的主控提供，发布流程不再上传独立资源站点。
+
+部署前确认系统设置中的主控地址能被节点访问，反向代理同时转发 `/api/`、`/sh/` 和 `/res/`。旧的脚本和资源 URL 覆盖配置已停用；旧节点继续运行，无需轮换凭据，但之前保存的安装命令、脚本和 UDP2RAW 独立菜单需要重新获取。系统软件源和 mimic 官方下载保留。
+
+完整迁移及下载验证方法见 [主控资源部署](agent-public-deployment.md)。本次通过后端 686 项测试、前端 46 项测试和前端构建，并验证真实镜像在空数据卷上的启动、匿名下载与摘要、登录、设置及升级命令。

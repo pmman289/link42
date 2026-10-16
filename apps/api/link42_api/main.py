@@ -441,7 +441,7 @@ def mount_web_panel() -> None:
     def serve_web_fallback(path: str) -> FileResponse:
         """为前端路由提供 index.html 兜底，同时不接管 API 路径。"""
 
-        if path.startswith(("api/", "third-party-api/")):
+        if path.startswith(("api/", "third-party-api/", "sh/", "res/")):
             raise HTTPException(status_code=404, detail="not found")
         return FileResponse(index_file)
 
@@ -2311,19 +2311,27 @@ def resolve_agent_release_asset_path(asset: dict, *, missing_status: int = 404) 
 def controller_url_for_agent(db: Session) -> str:
     """返回 Agent 访问主控时应使用的 URL。"""
 
-    return (get_setting(db, SETTING_CONTROLLER_URL) or "").rstrip("/")
+    try:
+        return schemas.ControllerSettingsUpdate.validate_controller_url(
+            get_setting(db, SETTING_CONTROLLER_URL) or ""
+        ).rstrip("/")
+    except ValueError:
+        return ""
 
 
-def build_agent_manual_upgrade_command(node: models.Node, target_version: str | None, db: Session) -> str:
+def build_agent_manual_upgrade_command(node: models.Node, target_version: str | None, db: Session) -> str | None:
     """生成旧 Agent 可执行的覆盖安装命令。"""
 
+    controller_url = controller_url_for_agent(db)
+    if not controller_url:
+        return None
     env_values = {
         "LINK42_AGENT_VERSION": target_version or "latest",
-        "LINK42_RES_BASE_URL": settings.agent_res_base_url,
+        "LINK42_SERVER_URL": controller_url,
     }
     env_parts = [f"{key}={shlex.quote(value)}" for key, value in env_values.items()]
     privilege_prefix = "" if str(json_object(node.agent_platform).get("service_manager") or "") == "openwrt-uci" else "sudo "
-    return f"curl -fsSL {shlex.quote(settings.agent_install_script_url)} | {privilege_prefix}env {' '.join(env_parts)} sh"
+    return f"curl -fsSL {shlex.quote(controller_url + '/sh/link42-agent.sh')} | {privilege_prefix}env {' '.join(env_parts)} sh"
 
 
 def build_agent_upgrade_plan(
@@ -2339,14 +2347,53 @@ def build_agent_upgrade_plan(
     selected_version = target_version or manifest.get("latest") or AGENT_VERSION
     release = releases.get(selected_version)
     manual_command = build_agent_manual_upgrade_command(node, selected_version, db)
-    if not selected_version:
+    if not controller_url_for_agent(db):
         return schemas.AgentUpgradePlan(
             node_id=node.id,
             current_version=node.agent_version,
-            target_version=None,
+            target_version=selected_version,
             upgrade_mode="unavailable",
-            reason="没有可用的 Agent 发布版本",
-            manual_command=manual_command,
+            reason="请先在系统设置中配置节点可访问的主控地址",
+            status=node.agent_update_status,
+        )
+    if not isinstance(release, dict):
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="unavailable",
+            reason="主控缺少目标版本 Agent 资产",
+            status=node.agent_update_status,
+        )
+    platform_key, asset = select_agent_release_asset(node, release)
+    if not platform_key or not asset:
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="unavailable",
+            reason="主控没有匹配该节点平台的 Agent 资产",
+            status=node.agent_update_status,
+        )
+    expected_install_mode = "source" if node_uses_openwrt_uci(node) else "binary"
+    if str(asset.get("install_mode") or "binary") != expected_install_mode:
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="unavailable",
+            reason="主控发布资产与节点服务后端不匹配",
+            status=node.agent_update_status,
+        )
+    try:
+        resolve_agent_release_asset_path(asset)
+    except HTTPException:
+        return schemas.AgentUpgradePlan(
+            node_id=node.id,
+            current_version=node.agent_version,
+            target_version=selected_version,
+            upgrade_mode="unavailable",
+            reason="主控缺少目标版本 Agent 资产文件",
             status=node.agent_update_status,
         )
     if not is_node_online(node):
@@ -2376,50 +2423,6 @@ def build_agent_upgrade_plan(
             target_version=selected_version,
             upgrade_mode="manual",
             reason="当前 Agent 不支持自升级",
-            manual_command=manual_command,
-            status=node.agent_update_status,
-        )
-    if not isinstance(release, dict):
-        return schemas.AgentUpgradePlan(
-            node_id=node.id,
-            current_version=node.agent_version,
-            target_version=selected_version,
-            upgrade_mode="manual",
-            reason="主控缺少目标版本 Agent 资产",
-            manual_command=manual_command,
-            status=node.agent_update_status,
-        )
-    platform_key, asset = select_agent_release_asset(node, release)
-    if not platform_key or not asset:
-        return schemas.AgentUpgradePlan(
-            node_id=node.id,
-            current_version=node.agent_version,
-            target_version=selected_version,
-            upgrade_mode="manual",
-            reason="主控没有匹配该节点平台的 Agent 资产",
-            manual_command=manual_command,
-            status=node.agent_update_status,
-        )
-    expected_install_mode = "source" if node_uses_openwrt_uci(node) else "binary"
-    if str(asset.get("install_mode") or "binary") != expected_install_mode:
-        return schemas.AgentUpgradePlan(
-            node_id=node.id,
-            current_version=node.agent_version,
-            target_version=selected_version,
-            upgrade_mode="manual",
-            reason="主控发布资产与节点服务后端不匹配",
-            manual_command=manual_command,
-            status=node.agent_update_status,
-        )
-    try:
-        resolve_agent_release_asset_path(asset)
-    except HTTPException:
-        return schemas.AgentUpgradePlan(
-            node_id=node.id,
-            current_version=node.agent_version,
-            target_version=selected_version,
-            upgrade_mode="manual",
-            reason="主控缺少目标版本 Agent 资产文件",
             manual_command=manual_command,
             status=node.agent_update_status,
         )
@@ -4785,6 +4788,60 @@ def store_site_logo(data: bytes, suffix: str, db: Session) -> schemas.Controller
         )
 
 
+@app.get("/sh/{script_name}", include_in_schema=False)
+def download_install_script(script_name: str) -> FileResponse:
+    """公开安装脚本；固定白名单，同时支持镜像和源码部署。"""
+
+    scripts = {
+        "link42-agent.sh": "deploy/sh/link42-agent.sh",
+        "udp2raw.sh": "udp2raw_sh/udp2raw.sh",
+    }
+    relative_path = scripts.get(script_name)
+    if relative_path is None:
+        raise HTTPException(status_code=404, detail="install script not found")
+    for root in (Path("/opt/link42"), Path(__file__).resolve().parents[3]):
+        path = root / relative_path
+        reject_symlink_components(path.parent)
+        if path.is_symlink():
+            raise HTTPException(status_code=404, detail="install script not found")
+        if path.is_file():
+            return FileResponse(path, media_type="text/plain", headers={"Cache-Control": "no-cache"})
+    raise HTTPException(status_code=404, detail="install script not found")
+
+
+@app.get("/res/link42/{filename}", include_in_schema=False)
+@app.get("/res/link42/{version}/{filename}", include_in_schema=False)
+def download_install_asset(filename: str, version: str | None = None) -> Response:
+    """将安装脚本的稳定文件名映射到经过校验的 release manifest。"""
+
+    is_checksum = filename.endswith(".sha256")
+    asset_name = filename.removesuffix(".sha256") if is_checksum else filename
+    platform = {
+        "link42-agent-linux-x64": "linux-x64",
+        "link42-agent-source.tar.gz": "openwrt-source",
+    }.get(asset_name)
+    if platform is None:
+        raise HTTPException(status_code=404, detail="agent release asset not found")
+    manifest = load_agent_release_manifest()
+    selected_version = manifest.get("latest") if version in {None, "latest"} else version
+    release = (manifest.get("releases") or {}).get(selected_version)
+    asset = (release.get("assets") or {}).get(platform) if isinstance(release, dict) else None
+    if not isinstance(asset, dict):
+        raise HTTPException(status_code=404, detail="agent release asset not found")
+    path = resolve_agent_release_asset_path(asset)
+    headers = {"Cache-Control": "no-cache"}
+    if is_checksum:
+        return Response(f"{asset['sha256']}  {asset_name}\n", media_type="text/plain", headers=headers)
+    return FileResponse(path, filename=asset_name, headers=headers)
+
+
+@app.get("/sh/udp2raw_bin/{asset_name}", include_in_schema=False)
+def download_udp2raw_install_asset(asset_name: str) -> FileResponse:
+    """独立安装入口只公开已随项目打包的白名单二进制。"""
+
+    return FileResponse(resolve_udp2raw_asset_path(asset_name))
+
+
 @app.get("/api/agent/releases", response_model=schemas.AgentReleaseManifest)
 def list_agent_releases() -> schemas.AgentReleaseManifest:
     """返回主控内置的 Agent release manifest。"""
@@ -6927,13 +6984,8 @@ def request_import_scan(node_id: int, db: Session = Depends(get_db)) -> schemas.
     )
 
 
-@app.get("/api/agent/plugins/udp2raw/assets/{asset_name}")
-def get_udp2raw_asset(
-    asset_name: str,
-    request: Request,
-    db: Session = Depends(get_db),
-) -> FileResponse:
-    """为已鉴权 Agent 提供主控内置的 udp2raw 二进制资产。"""
+def resolve_udp2raw_asset_path(asset_name: str) -> Path:
+    """安装入口和 Agent API 共用固定白名单及安全路径解析。"""
 
     allowed = {
         "udp2raw_amd64",
@@ -6949,12 +7001,6 @@ def get_udp2raw_asset(
     }
     if asset_name not in allowed:
         raise HTTPException(status_code=404, detail="udp2raw asset not found")
-    try:
-        node_id = int(request.headers.get("X-Link42-Node-ID", ""))
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail="invalid agent credentials") from exc
-    token = request.headers.get("X-Link42-Agent-Token", "")
-    require_agent(db, node_id, token)
     roots = [
         Path("/opt/link42/plugins/udp2raw/assets"),
         Path(__file__).resolve().parents[3] / "plugins" / "udp2raw" / "assets",
@@ -6968,15 +7014,30 @@ def get_udp2raw_asset(
                 continue
         except OSError:
             continue
-        try:
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return FileResponse(path, headers={"X-Link42-Asset-SHA256": digest.hexdigest()})
-        except OSError:
-            continue
+        return path
     raise HTTPException(status_code=404, detail="udp2raw asset not found")
+
+
+@app.get("/api/agent/plugins/udp2raw/assets/{asset_name}")
+def get_udp2raw_asset(
+    asset_name: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """为已鉴权 Agent 提供主控内置的 udp2raw 二进制资产。"""
+
+    try:
+        node_id = int(request.headers.get("X-Link42-Node-ID", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid agent credentials") from exc
+    token = request.headers.get("X-Link42-Agent-Token", "")
+    require_agent(db, node_id, token)
+    path = resolve_udp2raw_asset_path(asset_name)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return FileResponse(path, headers={"X-Link42-Asset-SHA256": digest.hexdigest()})
 
 
 @app.get("/api/nodes/{node_id}/wireguard/import-candidates", response_model=list[schemas.ImportCandidateRead])

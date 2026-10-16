@@ -4612,7 +4612,11 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
     monkeypatch.setattr(api_main.settings, "agent_release_dir", str(tmp_path))
     monkeypatch.setattr(api_main.settings, "agent_install_script_url", "https://example.com/link42-agent.sh")
     monkeypatch.setattr(api_main.settings, "agent_res_base_url", "https://example.com/res")
-    (tmp_path / "manifest.json").write_text('{"latest":"0.2.0","releases":{}}', encoding="utf-8")
+    (tmp_path / "agent.bin").write_bytes(b"binary")
+    (tmp_path / "manifest.json").write_text(
+        '{"latest":"0.2.0","releases":{"0.2.0":{"assets":{"linux-x64":'
+        '{"path":"agent.bin","sha256":"' + "0" * 64 + '","size":6}}}}}', encoding="utf-8"
+    )
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -4636,7 +4640,10 @@ def test_agent_upgrade_plan_falls_back_to_manual_for_old_agent(monkeypatch, tmp_
     assert plan.reason == "当前 Agent 不支持自升级"
     assert plan.manual_command is not None
     assert "LINK42_AGENT_VERSION=0.2.0" in plan.manual_command
-    assert "LINK42_RES_BASE_URL=https://example.com/res" in plan.manual_command
+    assert "curl -fsSL http://controller:8000/sh/link42-agent.sh" in plan.manual_command
+    assert "LINK42_SERVER_URL=http://controller:8000" in plan.manual_command
+    assert "example.com" not in plan.manual_command
+    assert "LINK42_RES_BASE_URL=" not in plan.manual_command
     assert "LINK42_NODE_ID=" not in plan.manual_command
     assert "LINK42_AGENT_TOKEN=" not in plan.manual_command
 

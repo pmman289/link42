@@ -1,71 +1,33 @@
 # Link42 构建发布脚本
 
-本目录放构建发布入口。发布人员优先使用下面三个脚本：
+主控镜像包含 Web、API、安装脚本以及 Agent/UDP2RAW 资源，所有节点下载均使用自己的主控地址。无需独立静态资源服务器、SSH 上传或额外域名。
 
-```bash
-scripts/agent/publish-public-assets.sh
-scripts/controller/publish-dockerhub.sh
-scripts/release-all.sh
-```
-
-## 发布环境配置
-
-复制示例配置后按环境修改：
+## 发布配置
 
 ```bash
 cp scripts/release.env.example scripts/release.env
 ```
 
-可配置资源服务器和镜像仓库：
+设置 `IMAGE_REPO`，命令行环境变量优先于配置文件。
+
+## 构建与发布
+
+仅构建本地镜像（不推送）：
 
 ```bash
-LINK42_PUBLIC_HOST=aligz
-LINK42_PUBLIC_ROOT=/opt/1panel/www/sites/get.pmman.tech/index
-LINK42_PUBLIC_BASE_URL=https://get.pmman.tech
-IMAGE_REPO=pmman/link42
+IMAGE_NAME=link42:local scripts/controller/build-image.sh
 ```
 
-脚本会自动读取 `scripts/release.env`。命令行环境变量优先级更高：
+构建、验证并推送：
 
 ```bash
-LINK42_PUBLIC_HOST=other-host scripts/agent/publish-public-assets.sh
-```
-
-所有脚本都会自动切换到仓库根目录执行，因此可以从任意当前目录调用。
-
-## 一键全量发布
-
-构建并发布 Agent 静态资源，然后构建并推送主控 Docker 镜像：
-
-```bash
-scripts/release-all.sh
-```
-
-常用参数：
-
-```bash
-IMAGE_TAG=20260630-120000 scripts/release-all.sh
-IMAGE_REPO=pmman/link42 scripts/release-all.sh
-SKIP_AGENT_PUBLIC=1 scripts/release-all.sh
-SKIP_CONTROLLER=1 scripts/release-all.sh
-```
-
-一键发布会先发布资源服务器上的 Agent 产物，再构建主控镜像。主控镜像内置的 Agent release 会复用刚生成的 `dist/agent` 产物。
-
-## 分步发布
-
-只发布 Agent 安装脚本、x64 二进制和 OpenWrt source 包：
-
-```bash
-scripts/agent/publish-public-assets.sh
-```
-
-只构建并推送主控 Docker 镜像：
-
-```bash
+IMAGE_REPO=your-dockerhub-user/link42 IMAGE_TAG=your-tag scripts/release-all.sh
+# 等价的主控发布入口：
 scripts/controller/publish-dockerhub.sh
 ```
 
-服务器限速时，脚本会在上传步骤停留较久，等待即可。
+构建入口会自动准备 Agent 产物并校验脚本、二进制、源码包、manifest 和摘要。即使设置 `SKIP_PREPARE_AGENT_RELEASES=1`，仍执行完整性校验。发布前的临时空卷容器会验证页面、健康检查和匿名资源下载，随后才推送镜像。
 
-主控发布脚本会检查 `dist/agent` 是否落后于当前 Agent 源码；如果落后，会自动重建内置 Agent release，避免镜像里嵌入旧二进制或旧 OpenWrt 源码包。
+旧的独立静态资源发布入口及 `LINK42_PUBLIC_*`、`SKIP_AGENT_PUBLIC` 配置已移除。
+
+安装和迁移方法见 [主控资源部署](../docs/agent-public-deployment.md)。

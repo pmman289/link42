@@ -13,6 +13,7 @@ import { Tree, type NodeRendererProps } from "react-arborist";
 import CreatableSelect from "react-select/creatable";
 import type { SingleValue, StylesConfig } from "react-select";
 import { validateForm } from "./formValidation";
+import { buildAgentInstallCommand, normalizeControllerUrl } from "./agentInstall";
 import { topologyEdgeSummary, topologyEdgeTone } from "./topologyState";
 import { RequestGeneration, StaleRequestError } from "./requestGeneration";
 import {
@@ -1515,17 +1516,7 @@ function endpointSourceLabel(source: EndpointOption["source"]) {
 
 // 生成用户在节点上安装 Agent 的 shell 命令。
 function buildAgentCommand(node: NodeItem, token: string, controllerUrl: string = DEFAULT_CONTROLLER_URL): string {
-  if (!token) return "";
-  const privilegeCommand = nodeServiceManager(node) === "openwrt-uci" ? "env" : "sudo env";
-  return [
-    "curl -fsSL https://get.pmman.tech/sh/link42-agent.sh",
-    "|",
-    privilegeCommand,
-    `LINK42_SERVER_URL=${shellArg(controllerUrl)}`,
-    `LINK42_NODE_ID=${shellArg(String(node.id))}`,
-    `LINK42_AGENT_TOKEN=${shellArg(token)}`,
-    "sh",
-  ].join(" ");
+  return buildAgentInstallCommand(controllerUrl, node.id, token, nodeServiceManager(node) === "openwrt-uci");
 }
 
 // 为 shell 命令参数做单引号转义。
@@ -6101,10 +6092,10 @@ function App() {
                   editingNode,
                   revealedAgentToken?.nodeId === editingNode.id ? revealedAgentToken.token : "",
                   controllerUrl,
-                ) || "轮换令牌后显示 Agent 启动命令。"}
+                ) || (normalizeControllerUrl(controllerUrl) ? "轮换令牌后显示 Agent 启动命令。" : "请先在系统设置中填写节点可访问的完整主控地址。")}
               </pre>
               <div className="actionRow">
-                <button type="button" className="secondary" onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
+                <button type="button" className="secondary" disabled={!normalizeControllerUrl(controllerUrl)} onClick={() => void runAction(copyAgentCommand)}>复制启动命令</button>
                 <button type="button" className="danger" disabled={actionPending(nodeActionKey(editingNode.id, "rotate-token"))} onClick={() => void runAction(rotateNodeToken, nodeActionKey(editingNode.id, "rotate-token"))}>轮换令牌</button>
               </div>
             </section>

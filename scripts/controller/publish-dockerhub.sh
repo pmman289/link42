@@ -124,6 +124,7 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
     exit 1
   }
   printf 'local agent release latest: %s\n' "$release_latest"
+  python3 scripts/controller/verify-downloads.py "http://127.0.0.1:$host_port" "$release_latest"
   cleanup_verify
   trap - EXIT
 fi

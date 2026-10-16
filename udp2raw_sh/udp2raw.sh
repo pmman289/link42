@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-BASE_URL="${UDP2RAW_BASE_URL:-https://get.pmman.tech/sh}"
-BIN_DIR_URL="${UDP2RAW_BIN_DIR_URL:-$BASE_URL/udp2raw_bin}"
+BASE_URL=""
+BIN_DIR_URL=""
 INSTALL_BIN="/usr/local/bin/udp2raw"
 LIBEXEC_DIR="/usr/local/libexec"
 CONFIG_DIR="/etc/udp2raw"
@@ -12,6 +12,42 @@ OPENWRT_INIT="/etc/init.d/udp2raw"
 die() {
     echo "错误：$*" >&2
     exit 1
+}
+
+configure_download_urls() {
+  controller_url="${LINK42_SERVER_URL:-}"
+  controller_url="${controller_url%/}"
+  case "$controller_url" in
+    http://*) authority="${controller_url#http://}" ;;
+    https://*) authority="${controller_url#https://}" ;;
+    *) die "LINK42_SERVER_URL must be an absolute HTTP(S) URL" ;;
+  esac
+  case "$authority" in
+    ''|*[![:graph:]]*|*[\"\'\\/@?#]*) die "LINK42_SERVER_URL must not contain credentials, a path, query or fragment" ;;
+  esac
+  port=""
+  case "$authority" in
+    \[*\]*)
+      host="${authority%%]*}]"
+      suffix="${authority#*]}"
+      case "$host" in *:*) ;; *) die "invalid IPv6 controller URL" ;; esac
+      case "$suffix" in '') ;; :?*) port="${suffix#:}" ;; *) die "invalid controller port" ;; esac
+      ;;
+    *:*)
+      host="${authority%:*}"
+      port="${authority##*:}"
+      case "$host" in ''|*:*|*[\[\]]*) die "invalid controller host" ;; esac
+      [ -n "$port" ] || die "invalid controller port"
+      ;;
+    *[\[\]]*) die "invalid controller host" ;;
+  esac
+  if [ -n "$port" ]; then
+    case "$port" in *[!0-9]*) die "invalid controller port" ;; esac
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || die "invalid controller port"
+  fi
+  LINK42_SERVER_URL="$controller_url"
+  BASE_URL="$controller_url/sh"
+  BIN_DIR_URL="$BASE_URL/udp2raw_bin"
 }
 
 info() {
@@ -117,6 +153,7 @@ service_backend() {
 }
 
 install_udp2raw_bin() {
+    configure_download_urls
     bin_name="$(detect_udp2raw_bin)"
     tmp_file="$(mktemp)"
     trap 'rm -f "$tmp_file"' EXIT INT TERM
@@ -1044,25 +1081,27 @@ edit_raw_file() {
 install_menu_command() {
     target="/usr/local/bin/udp2raw-menu"
     info "覆盖安装 $target"
-    if [ -r "$0" ]; then
-        copy_executable "$0" "$target"
-        return
-    fi
-
+    saved_controller="$(shell_quote "$LINK42_SERVER_URL")"
     mkdir -p "${target%/*}"
     cat > "$target" <<EOF
 #!/bin/sh
-BASE_URL="\${UDP2RAW_BASE_URL:-$BASE_URL}"
-SCRIPT_URL="\${UDP2RAW_SCRIPT_URL:-\$BASE_URL/udp2raw.sh}"
-
+set -eu
+export LINK42_SERVER_URL=$saved_controller
+EOF
+    cat >> "$target" <<'EOF'
+# 保存安装时的主控地址；旧 UDP2RAW_* 下载覆盖变量不再生效。
+script_url="$LINK42_SERVER_URL/sh/udp2raw.sh"
+tmp_script="$(mktemp)"
+trap 'rm -f "$tmp_script"' EXIT HUP INT TERM
 if command -v curl >/dev/null 2>&1; then
-    exec sh -c "url=\\\$1; shift; curl -fsSL \"\\\$url\" | sh -s -- menu \"\\\$@\"" sh "\$SCRIPT_URL" "\$@"
+    curl -fsSL "$script_url" -o "$tmp_script"
 elif command -v wget >/dev/null 2>&1; then
-    exec sh -c "url=\\\$1; shift; wget -qO- \"\\\$url\" | sh -s -- menu \"\\\$@\"" sh "\$SCRIPT_URL" "\$@"
+    wget -qO "$tmp_script" "$script_url"
 else
     echo "错误：需要安装 curl 或 wget" >&2
     exit 1
 fi
+sh "$tmp_script" menu "$@"
 EOF
     chmod 0755 "$target"
 }
@@ -1126,8 +1165,9 @@ usage() {
 
 环境变量：
   UDP2RAW_BIN=udp2raw_amd64
-  UDP2RAW_BASE_URL=$BASE_URL
-  UDP2RAW_BIN_DIR_URL=$BASE_URL/udp2raw_bin
+  LINK42_SERVER_URL=http://controller:8000
+
+下载仅使用上述主控地址；旧 UDP2RAW_* URL 覆盖变量已停用。
 EOF
 }
 

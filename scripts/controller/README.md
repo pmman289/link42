@@ -60,7 +60,7 @@ cp scripts/release.env.example scripts/release.env
 scripts/controller/publish-dockerhub.sh 20260630-120000
 ```
 
-本地容器验证会按当前认证流程登录后检查 `/api/agent/releases`，并确认镜像内置的 Agent latest 可读取。日志里的密码、token 和 secret 会自动打码。
+本地容器验证使用空数据卷启动，检查面板、健康接口，登录后读取 `/api/agent/releases`，并匿名下载主控托管的安装脚本、Agent latest/固定版本及摘要、UDP2RAW 白名单二进制。日志里的密码、token 和 secret 会自动打码。
 
 `build-image.sh`、`push-image.sh` 和 `export-image.sh` 也会读取 `scripts/release.env`，并从仓库根目录执行；命令行环境变量优先级高于配置文件。
 

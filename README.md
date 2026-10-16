@@ -80,11 +80,11 @@ http://192.168.1.10:8000
 3. 到节点机器上执行安装命令。
 4. 等节点变为 online 后，就可以创建或导入 WireGuard 配置。
 
-安装命令大致长这样，实际请以面板生成的为准：
+安装命令大致长这样，将两处主控地址替换为自己的地址，实际请以面板生成的为准。安装脚本与 Agent 资源均由自己的主控提供：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env \
-  LINK42_SERVER_URL='http://主控地址:8000' \
+curl -fsSL http://controller:8000/sh/link42-agent.sh | sudo env \
+  LINK42_SERVER_URL='http://controller:8000' \
   LINK42_NODE_ID='1' \
   LINK42_AGENT_TOKEN='l42agent_xxx' \
   sh
@@ -93,7 +93,7 @@ curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo env \
 Agent 会安装依赖、写入 `/etc/link42/agent.env`，并注册为系统服务。卸载 Agent：
 
 ```bash
-curl -fsSL https://get.pmman.tech/sh/link42-agent.sh | sudo sh -s -- uninstall
+curl -fsSL http://controller:8000/sh/link42-agent.sh | sudo sh -s -- uninstall
 ```
 
 卸载 Agent 不会删除已有 WireGuard 配置。
