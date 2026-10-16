@@ -35,8 +35,10 @@ Link42 是一个用来管理多节点 WireGuard 点对点链路的 Web 面板。
 准备一个主控目录：
 
 ```bash
-sudo mkdir -p /opt/link42
+sudo mkdir -p /opt/link42/data /opt/link42/config
 ```
+
+主控 `0.6.26` 起会自动创建 SQLite 数据库的父目录。较早版本首次挂载空目录时，需先执行上面的建目录命令，否则可能因 `unable to open database file` 退出。已有数据请保留原目录，仅补建缺少的子目录。
 
 启动主控：
 

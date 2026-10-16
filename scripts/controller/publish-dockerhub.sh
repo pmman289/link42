@@ -68,16 +68,19 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
     rm -rf "$verify_tmp"
   }
   trap cleanup_verify EXIT
+  # Disable volume population so this is genuinely empty, like the bind mount
+  # in the installation guide. Image-created data/config directories must not
+  # hide first-startup failures.
   docker run -d \
     --name "$TEST_CONTAINER" \
     -p 127.0.0.1::8000 \
-    -v "$TEST_VOLUME:/link42" \
+    --mount "type=volume,source=$TEST_VOLUME,target=/link42,volume-nocopy" \
     "$IMAGE_NAME" >/dev/null
 
   host_port="$(docker port "$TEST_CONTAINER" 8000/tcp | sed 's/.*://')"
   auth_status=""
   for _ in {1..30}; do
-    auth_status="$(curl -s -o "$verify_tmp/auth-me.out" -w '%{http_code}' "http://127.0.0.1:$host_port/api/auth/me" || true)"
+    auth_status="$(curl -s --connect-timeout 2 --max-time 5 -o "$verify_tmp/auth-me.out" -w '%{http_code}' "http://127.0.0.1:$host_port/api/auth/me" || true)"
     [[ "$auth_status" == "401" ]] && break
     sleep 1
   done
@@ -86,6 +89,12 @@ if [[ "$LOCAL_VERIFY" == "1" ]]; then
     redacted_test_logs >&2 || true
     exit 1
   fi
+
+  # Static responses can expose receive/disconnect bugs that JSON-only checks
+  # miss. Confirm that the event loop still serves health after the panel.
+  link42_log "verifying panel and health after first startup with empty runtime"
+  curl -fsS --connect-timeout 2 --max-time 10 "http://127.0.0.1:$host_port/" -o "$verify_tmp/index.html"
+  curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:$host_port/api/health" -o "$verify_tmp/health.json"
 
   # 初始密码只写入受限文件，不再记录在日志中；从挂载的运行卷读取。
   password=""

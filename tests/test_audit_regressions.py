@@ -8,6 +8,9 @@ from datetime import timezone
 import json
 import multiprocessing
 import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -33,6 +36,43 @@ def session():
     with Session(engine) as db:
         yield db
     engine.dispose()
+
+
+@pytest.mark.parametrize("database_relative_path", ["data/link42.db", "custom/nested/controller.db"])
+def test_fresh_startup_creates_database_directory_in_empty_runtime(tmp_path, database_relative_path):
+    """模拟空宿主机目录覆盖镜像 /link42 后，完整首次启动及重启都应成功。"""
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    path = runtime / database_relative_path
+    config = runtime / "config"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("LINK42_")}
+    project = Path(__file__).resolve().parents[1]
+    env.update({
+        "PYTHONPATH": os.pathsep.join(str(project / directory) for directory in ["apps/api", "apps/agent", "packages"]),
+        "LINK42_DATABASE_URL": f"sqlite:///{path}",
+        "LINK42_CONFIG_DIR": str(config),
+        "LINK42_AGENT_RELEASE_DIR": str(tmp_path / "no-releases"),
+    })
+    script = """
+from link42_api.main import on_startup, SETTING_CONTROLLER_VERSION, get_setting
+from link42_api.database import SessionLocal
+from link42_common.version import CONTROLLER_VERSION
+on_startup()
+with SessionLocal() as db:
+    assert get_setting(db, SETTING_CONTROLLER_VERSION) == CONTROLLER_VERSION
+"""
+    assert list(runtime.iterdir()) == []
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert path.is_file()
+    assert (config / "master.key").is_file()
+    credentials = (config / "initial-admin-password").read_bytes()
+    master_key = (config / "master.key").read_bytes()
+    restarted = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=15)
+    assert restarted.returncode == 0, restarted.stderr
+    assert (config / "master.key").read_bytes() == master_key
+    assert (config / "initial-admin-password").read_bytes() == credentials
 
 
 def test_startup_upgrades_existing_looking_glass_and_connection_tables(monkeypatch):

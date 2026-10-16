@@ -104,6 +104,11 @@ def get_db() -> Generator[Session, None, None]:
 
 def init_db() -> None:
     """初始化数据库表结构。"""
+    # An empty bind mount hides directories created in the image. SQLite can
+    # create the database file, but cannot create its parent directories.
+    database_path = sqlite_database_path()
+    if database_path is not None:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
     # 后续应由 Alembic 管理迁移；第一版先启动时建表，降低本地试用门槛。
     from . import models
     # Importing the module registers every mapped class on Base.metadata;
