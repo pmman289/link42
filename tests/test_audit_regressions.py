@@ -856,9 +856,7 @@ def test_node_delete_preserves_connection_created_after_empty_check(monkeypatch,
     try:
         with Session(engine) as db:
             with pytest.raises(HTTPException) as error:
-                # Exercise the final conditional DELETE independently: the IPAM
-                # wrapper now prevents this injected writer from entering at all.
-                main.delete_node.__wrapped__(node_id, db)
+                main.delete_node(node_id, db)
             assert error.value.status_code == 409
         with Session(engine) as db:
             assert db.get(models.Node, node_id) is not None

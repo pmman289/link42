@@ -125,6 +125,10 @@ def test_udp2raw_public_download_does_not_remove_agent_api_auth(client):
     response = client.get("/sh/udp2raw_bin/udp2raw_amd64")
     assert response.status_code == 200
     assert response.content == (ROOT / "udp2raw_sh/udp2raw_bin/udp2raw_amd64").read_bytes()
+    checksum = client.get("/sh/udp2raw_bin/udp2raw_amd64.sha256")
+    assert checksum.status_code == 200
+    assert checksum.text == f"{hashlib.sha256(response.content).hexdigest()}  udp2raw_amd64\n"
+    assert client.get("/sh/udp2raw_bin/unknown.sha256").status_code == 404
     response = client.get("/api/agent/plugins/udp2raw/assets/udp2raw_amd64")
     assert response.status_code == 401
 
@@ -133,6 +137,7 @@ def test_udp2raw_public_download_does_not_remove_agent_api_auth(client):
     ("deploy/sh/link42-agent.sh", "/sh/link42-agent.sh"),
     ("udp2raw_sh/udp2raw.sh", "/sh/udp2raw.sh"),
     ("udp2raw_sh/udp2raw_bin/udp2raw_amd64", "/sh/udp2raw_bin/udp2raw_amd64"),
+    ("udp2raw_sh/udp2raw_bin/udp2raw_amd64", "/sh/udp2raw_bin/udp2raw_amd64.sha256"),
 ])
 def test_public_scripts_and_udp2raw_reject_symlink_files(client, tmp_path, monkeypatch, relative, url):
     root = tmp_path / "source"
@@ -231,8 +236,15 @@ def test_udp2raw_saved_menu_uses_original_controller(tmp_path):
     curl = fake_bin / "curl"
     capture = tmp_path / "url"
     curl.write_text('''#!/bin/sh
-printf '%s' "$2" > "$CAPTURE"
-printf 'printf "%%s\\n" "$LINK42_SERVER_URL" "$1"' > "$4"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    http://*|https://*) url="$1" ;;
+    -o) shift; output="$1" ;;
+  esac
+  shift
+done
+printf '%s' "$url" > "$CAPTURE"
+printf 'printf "%%s\\n" "$LINK42_SERVER_URL" "$1"' > "$output"
 ''')
     curl.chmod(0o700)
     result = run_shell(f'sh "{menu_path}"', PATH=f"{fake_bin}:{os.environ['PATH']}", CAPTURE=str(capture),
@@ -311,6 +323,7 @@ esac
     curl.chmod(0o700)
     code = definitions + downloader + '''
 stop_existing_service() { :; }
+begin_install_transaction() { :; }
 AGENT_INSTALL_MODE=binary
 AGENT_FILE=link42-agent-linux-x64
 configure_download_urls

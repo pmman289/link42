@@ -38,6 +38,15 @@ require() {
   command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"
 }
 
+# JSON values are encoded as data, including quotes, backslashes and newlines.
+login_json() {
+  "$PYTHON_BIN" -c 'import json,sys; print(json.dumps({"username":"pmman", "password":sys.argv[1]}))' "$1"
+}
+
+node_json() {
+  "$PYTHON_BIN" -c 'import json,sys; name,endpoint=sys.argv[1:]; print(json.dumps({"name":name, "hostname":name, "management_ip":endpoint, "public_ip":endpoint, "endpoint_ips":[endpoint]}))' "$1" "$2"
+}
+
 # 从 JSON 标准输入中读取指定字段。
 json_get() {
   "$PYTHON_BIN" -c 'import json,sys
@@ -170,11 +179,11 @@ main() {
   [[ -n "$password" ]] || fail "initial password file is empty"
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \
-    -d "{\"username\":\"pmman\",\"password\":\"$password\"}" | json_get token)"
+    --data-binary "$(login_json "$password")" | json_get token)"
 
   local local_node remote_node local_token remote_token
-  local_node="$(api POST /api/nodes "{\"name\":\"$LOCAL_NODE_NAME\",\"hostname\":\"$LOCAL_NODE_NAME\",\"management_ip\":\"$LOCAL_ENDPOINT\",\"public_ip\":\"$LOCAL_ENDPOINT\",\"endpoint_ips\":[\"$LOCAL_ENDPOINT\"]}")"
-  remote_node="$(api POST /api/nodes "{\"name\":\"$REMOTE_NODE_NAME\",\"hostname\":\"$REMOTE_NODE_NAME\",\"management_ip\":\"$REMOTE_ENDPOINT\",\"public_ip\":\"$REMOTE_ENDPOINT\",\"endpoint_ips\":[\"$REMOTE_ENDPOINT\"]}")"
+  local_node="$(api POST /api/nodes "$(node_json "$LOCAL_NODE_NAME" "$LOCAL_ENDPOINT")")"
+  remote_node="$(api POST /api/nodes "$(node_json "$REMOTE_NODE_NAME" "$REMOTE_ENDPOINT")")"
   LOCAL_NODE_ID="$(printf '%s' "$local_node" | json_get node.id)"
   REMOTE_NODE_ID="$(printf '%s' "$remote_node" | json_get node.id)"
   local_token="$(printf '%s' "$local_node" | json_get agent_token)"

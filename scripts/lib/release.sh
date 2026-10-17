@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
 
+# 按显式配置、项目虚拟环境、系统 Python 3 的顺序选择解释器。
+link42_python() {
+  if [[ -n "${PYTHON_BIN:-}" ]]; then
+    command -v "$PYTHON_BIN" || { echo "Python not found: $PYTHON_BIN" >&2; return 1; }
+  elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    printf '%s\n' "$ROOT_DIR/.venv/bin/python"
+  else
+    command -v python3 || { echo 'Python 3 is required; set PYTHON_BIN.' >&2; return 1; }
+  fi
+}
+
 # 输出带时间戳的发布日志。
 link42_log() {
   printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"

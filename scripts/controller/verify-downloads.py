@@ -31,8 +31,12 @@ def verify(base_url: str, version: str) -> None:
         "udp2raw_arm", "udp2raw_arm_asm_aes", "udp2raw_mips24kc_le",
         "udp2raw_mips24kc_le_asm_aes", "udp2raw_mips24kc_be", "udp2raw_mips24kc_be_asm_aes",
     ):
-        if not download(f"/sh/udp2raw_bin/{name}").startswith(b"\x7fELF"):
+        data = download(f"/sh/udp2raw_bin/{name}")
+        if not data.startswith(b"\x7fELF"):
             raise ValueError(f"invalid UDP2RAW binary: {name}")
+        checksum = download(f"/sh/udp2raw_bin/{name}.sha256").decode().split()[0]
+        if hashlib.sha256(data).hexdigest() != checksum:
+            raise ValueError(f"UDP2RAW checksum mismatch: {name}")
     print("controller bootstrap downloads and checksums verified")
 
 

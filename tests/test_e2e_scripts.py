@@ -214,7 +214,18 @@ def test_agent_bootstrap_caps_release_and_checksum_downloads():
 
     script = (ROOT / "deploy/sh/link42-agent.sh").read_text()
     assert "MAX_AGENT_DOWNLOAD_SIZE=$((512 * 1024 * 1024))" in script
-    assert 'curl -fL --max-filesize "$MAX_AGENT_DOWNLOAD_SIZE"' in script
+    assert 'download_file "$url" "$tmp_file" "$MAX_AGENT_DOWNLOAD_SIZE"' in script
     assert 'downloaded_size="$(wc -c < "$tmp_file")"' in script
-    assert 'curl -fsL --max-filesize 4096' in script
+    assert 'download_file "$sha_url" "$tmp_sha" 4096' in script
     assert 'checksum_size="$(wc -c < "$tmp_sha")"' in script
+
+
+@pytest.mark.parametrize("script", ["scripts/real-e2e/up.sh", "scripts/smoke-real-local.sh"])
+def test_test_controller_payloads_escape_json_values(tmp_path, script):
+    value = 'quotes" backslash\\ newline\n}; $(echo ignored)'
+    result = shell(script, 'login_json "$TEST_VALUE"\nnode_json "$TEST_VALUE" "$TEST_VALUE"', tmp_path, TEST_VALUE=value)
+    assert result.returncode == 0, result.stderr
+    login, node = map(json.loads, result.stdout.splitlines())
+    assert login == {"username": "pmman", "password": value}
+    assert node["name"] == node["hostname"] == value
+    assert node["endpoint_ips"] == [value]

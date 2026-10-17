@@ -4,12 +4,20 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck disable=SC1091
 . "$ROOT_DIR/scripts/lib/release.sh"
-PYTHON_BIN="${PYTHON_BIN:-"$ROOT_DIR/.venv/bin/python"}"
+PYTHON_BIN="$(link42_python)"
 OUT_DIR="$ROOT_DIR/dist/agent"
 NAME="link42-agent-linux-x64"
 PLATFORM_KEY="${LINK42_AGENT_PLATFORM:-linux-x64-glibc2.31}"
 BUILD_MODE="${LINK42_AGENT_BUILD_MODE:-docker}"
 BUILD_IMAGE="${LINK42_AGENT_BUILD_IMAGE:-python:3.11-slim-bullseye}"
+case "$PLATFORM_KEY" in
+  linux-x64) PLATFORM_SUFFIX="" ;;
+  linux-x64-glibc*)
+    [[ "$PLATFORM_KEY" =~ ^linux-x64-glibc[0-9]+\.[0-9]+$ ]] || { echo 'invalid LINK42_AGENT_PLATFORM' >&2; exit 1; }
+    PLATFORM_SUFFIX="-${PLATFORM_KEY#linux-x64-}"
+    ;;
+  *) echo 'LINK42_AGENT_PLATFORM must describe Linux x64' >&2; exit 1 ;;
+esac
 
 cd "$ROOT_DIR"
 
@@ -32,9 +40,20 @@ write_release_files() {
   local version="$1"
   local binary="$OUT_DIR/$NAME"
   local versioned="$OUT_DIR/$NAME-$version"
-  local platform_versioned="$OUT_DIR/$NAME-glibc2.31-$version"
+  local platform_versioned="$OUT_DIR/$NAME$PLATFORM_SUFFIX-$version"
+  # A label must never promise an older glibc than the ELF actually requires.
+  if [[ -n "$PLATFORM_SUFFIX" ]]; then
+    command -v readelf >/dev/null || { echo 'readelf is required (install binutils)' >&2; return 1; }
+    readelf --version-info "$binary" | "$PYTHON_BIN" -c '
+import re,sys
+target=tuple(map(int,sys.argv[1].split(".")))
+required=[tuple(map(int,v.split("."))) for v in re.findall(r"GLIBC_([0-9]+(?:\.[0-9]+)+)", sys.stdin.read())]
+if required and max(required)>target:
+    raise SystemExit("ELF requires glibc %s, exceeding platform label %s" % (".".join(map(str,max(required))), sys.argv[1]))
+' "${PLATFORM_KEY#linux-x64-glibc}"
+  fi
   cp "$binary" "$versioned"
-  cp "$binary" "$platform_versioned"
+  [[ "$platform_versioned" == "$versioned" ]] || cp "$binary" "$platform_versioned"
   chmod +x "$versioned" "$platform_versioned"
   link42_write_sha256 "$binary"
   link42_write_sha256 "$versioned"

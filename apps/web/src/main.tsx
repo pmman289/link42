@@ -31,7 +31,6 @@ import {
   wireGuardConfigFormRule,
   wireGuardPeerFormRule,
 } from "./formRules";
-import { IPAMPanel, IPv4AllocationControls } from "./ipam";
 import "./styles.css";
 
 type NodeItem = {
@@ -2118,7 +2117,6 @@ function App() {
   const [siteLogoUrl, setSiteLogoUrl] = useState(DEFAULT_SITE_LOGO_URL);
   const [settingsLogoPreviewUrl, setSettingsLogoPreviewUrl] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [ipamOpen, setIpamOpen] = useState(false);
   const [lookingGlassTokens, setLookingGlassTokens] = useState<LookingGlassApiToken[]>([]);
   const [revealedLookingGlassToken, setRevealedLookingGlassToken] = useState<RevealedLookingGlassToken | null>(null);
   const [revealedAgentToken, setRevealedAgentToken] = useState<{ nodeId: number; token: string } | null>(null);
@@ -2435,7 +2433,6 @@ function App() {
     topologyFullscreenOpen
     || topologyResetConfirmOpen
     || settingsOpen
-    || ipamOpen
     || nodeCreateOpen
     || editingNodeId
     || createDialog
@@ -2849,7 +2846,6 @@ function App() {
     setManagedCreateMtu("1420");
     setPeerNodeConfigs([]);
     setSettingsOpen(false);
-    setIpamOpen(false);
     setLookingGlassTokens([]);
     setRevealedLookingGlassToken(null);
     setRevealedAgentToken(null);
@@ -3932,7 +3928,6 @@ function App() {
           return setRevealedAgentToken(null);
         case "node-create-title": return setNodeCreateOpen(false);
         case "settings-title": return setSettingsOpen(false);
-        case "ipam-title": return setIpamOpen(false);
         case "topology-fullscreen-title": return setTopologyFullscreenOpen(false);
       }
     }
@@ -3969,7 +3964,6 @@ function App() {
     };
   }, [
     modalOpen,
-    ipamOpen,
     topologyResetConfirmOpen,
     nodePluginError,
     monitorDialogConfigId,
@@ -4488,7 +4482,6 @@ function App() {
     const payload = {
       name: form.get("name"),
       tunnel_ips: tunnelIps,
-      ipv4_link_pool_id: optionalInt(form.get("ipv4_link_pool_id"), "链路地址池"),
       listen_port: listenPort,
       private_key: form.get("private_key") || null,
       clear_private_key: form.get("clear_private_key") === "on",
@@ -4572,7 +4565,6 @@ function App() {
           local_interface_name: form.get("local_interface_name"),
           peer_interface_name: form.get("peer_interface_name") || form.get("local_interface_name"),
           local_tunnel_ips: localTunnelIps,
-      ipv4_link_pool_id: optionalInt(form.get("ipv4_link_pool_id"), "链路地址池"),
           peer_tunnel_ips: peerTunnelIps,
           local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
           peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
@@ -4702,7 +4694,6 @@ function App() {
       peer_bind_ip: peerBindIp || null,
       peer_remote_ip: peerRemoteIp || null,
       local_tunnel_ips: localTunnelIps,
-      ipv4_link_pool_id: optionalInt(form.get("ipv4_link_pool_id"), "链路地址池"),
       peer_tunnel_ips: peerTunnelIps,
       local_routes: localRoutes,
       peer_routes: peerRoutes,
@@ -4813,7 +4804,6 @@ function App() {
       outer_local_ip: outerLocalIp,
       outer_remote_ip: outerRemoteIp,
       tunnel_ips: tunnelIps,
-      ipv4_link_pool_id: optionalInt(form.get("ipv4_link_pool_id"), "链路地址池"),
       peer_tunnel_ips: peerTunnelIps,
       routes,
       mtu,
@@ -5000,7 +4990,6 @@ function App() {
         local_interface_name: form.get("local_interface_name"),
         peer_interface_name: form.get("peer_interface_name"),
         local_tunnel_ips: localTunnelIps,
-      ipv4_link_pool_id: optionalInt(form.get("ipv4_link_pool_id"), "链路地址池"),
         peer_tunnel_ips: peerTunnelIps,
         local_allowed_ips: localAllowedIps.length ? localAllowedIps : null,
         peer_allowed_ips: peerAllowedIps.length ? peerAllowedIps : null,
@@ -5388,7 +5377,6 @@ function App() {
           >
             {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
           </button>
-          <button type="button" className="iconButton" aria-label="IPv4 地址管理" title="IPv4 地址管理" onClick={() => setIpamOpen(true)}><Network size={18} /></button>
           <button aria-label="设置" type="button" className="iconButton" onClick={() => setSettingsOpen(true)} title="设置">
             <Settings size={18} />
           </button>
@@ -5972,7 +5960,6 @@ function App() {
         </div>
       )}
 
-      {ipamOpen && <IPAMPanel request={api} onClose={() => setIpamOpen(false)} />}
 
       {nodeCreateOpen && (
         <div className="modalBackdrop" role="presentation">
@@ -6001,7 +5988,9 @@ function App() {
                   onDuplicate={(endpoint) => notify("info", `已有该入口地址：${endpoint}`)}
                 />
               </Field>
-              <IPv4AllocationControls request={api} fixedInput />
+              <Field label="固定内网 IPv4（/32，可多条）" hint="仅登记地址；请自行配置节点系统。" wide>
+                <input name="internal_ipv4s" placeholder="10.0.0.1/32" />
+              </Field>
               <Field label="节点地域" hint="用于节点筛选和地域分组，例如 广州、东京、家庭网络；不影响连接配置。">
                 <input name="region" placeholder="广州" />
               </Field>
@@ -6044,7 +6033,9 @@ function App() {
                   onDuplicate={(endpoint) => notify("info", `已有该入口地址：${endpoint}`)}
                 />
               </Field>
-              <IPv4AllocationControls request={api} fixedInput initial={editingNode.internal_ipv4s || []} />
+              <Field label="固定内网 IPv4（/32，可多条）" hint="仅登记地址；请自行配置节点系统。" wide>
+                <input name="internal_ipv4s" defaultValue={(editingNode.internal_ipv4s || []).join(", ")} placeholder="10.0.0.1/32" />
+              </Field>
               <Field label="拓扑展示地址" hint="只控制拓扑节点卡片显示的地址，不参与连接；留空显示第一个入口地址。" wide>
                 <EndpointSelect
                   name="topology_endpoint"
@@ -6230,7 +6221,6 @@ function App() {
               <Field label="接口名称" hint="将在当前节点创建的 WireGuard 接口名，例如 wg0；最多 15 个字符。">
                 <input name="name" placeholder="wg0" required disabled={!selectedNodeOnline} />
               </Field>
-              <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={undefined} />
               <Field label="本端隧道地址" hint="分配给当前 WireGuard 接口的虚拟 IP，例如 10.42.0.1/32 或 fd42::1/64；多个地址用逗号分隔。">
                 <input name="tunnel_ips" placeholder="10.42.0.1/24" disabled={!selectedNodeOnline} />
               </Field>
@@ -6322,7 +6312,6 @@ function App() {
                 </Field>
               </FormSection>
               <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定哪些目标网段通过该接口发送。">
-                <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={undefined} />
               <Field label="本端隧道地址" hint="分配给当前 GRE 接口的虚拟 IP，例如 10.42.8.1/30 或 fd42::1/64；可填写多条。" requiredMark>
                   <textarea name="tunnel_ips" rows={2} placeholder="10.42.9.1/30, fd42:9::1/64" required disabled={!selectedNodeOnline} />
                 </Field>
@@ -6492,7 +6481,6 @@ function App() {
               <Field label="对端接口名称" hint="将在对端节点创建的 WireGuard 接口名；如果双方 Agent 在同一台机器上，两个名称必须不同。">
                 <input name="peer_interface_name" placeholder="wg-node-b" defaultValue={replacePeerConfig?.name || ""} required disabled={!selectedNodeOnline} />
               </Field>
-              <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={managedPeerNodeId} />
               <Field label="本端隧道地址" hint="分配给当前节点 WireGuard 接口的虚拟 IP，例如 10.42.0.1/32 或 fd42::1/64。">
                 <input name="local_tunnel_ips" placeholder="10.42.0.1/32, fd42::1/64" defaultValue={replaceLocalConfig?.tunnel_ips.join(", ") || ""} required disabled={!selectedNodeOnline} />
               </Field>
@@ -6775,7 +6763,6 @@ function App() {
                 </details>
               </FormSection>
               <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定每一端有哪些目标网段通过 GRE 发送。">
-                <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={managedPeerNodeId} />
               <Field label="本端隧道地址" hint="分配给本端 GRE 接口的虚拟 IP，例如 10.42.8.1/30 或 fd42::1/64；可填写多条。" requiredMark>
                   <textarea name="local_tunnel_ips" rows={2} placeholder="10.42.8.1/30, fd42::1/64" required disabled={!nodeSupportsGre(selectedNode)} />
                 </Field>
@@ -7159,7 +7146,6 @@ function App() {
                     </Field>
                   </FormSection>
                   <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定哪些目标网段通过该接口发送。">
-                    <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={undefined} />
               <Field label="本端隧道地址" hint="分配给当前 GRE 接口的虚拟 IP，可填写多个 IPv4/IPv6 CIDR。" requiredMark>
                       <textarea name="tunnel_ips" rows={2} defaultValue={selectedGreLocalEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
                     </Field>
@@ -7276,7 +7262,6 @@ function App() {
                   </details>
                 </FormSection>
                 <FormSection title="隧道地址与路由" hint="隧道地址分配给 GRE 虚拟接口；路由决定每一端有哪些目标网段通过 GRE 发送。">
-                  <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={selectedGrePeerEndpoint?.node_id} />
               <Field label="本端隧道地址" hint="分配给本端 GRE 接口的虚拟 IP，可填写多个 IPv4/IPv6 CIDR。" requiredMark>
                     <textarea name="local_tunnel_ips" rows={2} defaultValue={selectedGreLocalEndpoint.tunnel_ips.join(", ")} required disabled={!selectedGreAllNodesOnline} />
                   </Field>
@@ -7397,7 +7382,6 @@ function App() {
                     <Field label="对端接口名称" hint={`对端节点 ${selectedManagedLinkPeerNode?.name || managedLink.peer_interface.node_id} 上的 WireGuard 接口名，最多 15 个字符。`}>
                       <input name="peer_interface_name" defaultValue={managedLink.peer_interface.name} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={selectedManagedLinkPeerNode?.id} />
               <Field label="本端隧道地址" hint="分配给本端 WireGuard 接口的虚拟 IP；支持多个 IPv4/IPv6 CIDR。">
                       <input name="local_tunnel_ips" defaultValue={managedLink.local_interface.tunnel_ips.join(", ")} required disabled={!selectedNodeOnline} />
                     </Field>
@@ -7557,7 +7541,6 @@ function App() {
                     <Field label="接口名称" hint="当前节点上的 WireGuard 接口名，例如 wg0；修改名称后会在下次部署时清理旧接口。">
                       <input name="name" placeholder="wg0" defaultValue={selectedConfig.name} required disabled={!selectedNodeOnline} />
                     </Field>
-                    <IPv4AllocationControls request={api} nodes={nodes} localNodeId={selectedNodeId} peerNodeId={undefined} />
               <Field label="本端隧道地址" hint="分配给当前 WireGuard 接口的虚拟 IP，例如 10.42.0.1/32 或 fd42::1/64；多个地址用逗号分隔。">
                       <input name="tunnel_ips" placeholder="10.42.0.1/24" defaultValue={selectedConfig.tunnel_ips.join(", ")} disabled={!selectedNodeOnline} />
                     </Field>

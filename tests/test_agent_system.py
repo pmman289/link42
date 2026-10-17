@@ -2653,13 +2653,13 @@ def test_agent_install_script_explicit_env_overrides_existing_env_file() -> None
     assert 'INPUT_LINK42_WIREGUARD_DIR="${LINK42_WIREGUARD_DIR-}"' in script
     assert 'INPUT_LINK42_AGENT_DRY_RUN="${LINK42_AGENT_DRY_RUN-}"' in script
     assert 'INPUT_LINK42_POLL_INTERVAL="${LINK42_POLL_INTERVAL-}"' in script
-    assert '. "$ENV_FILE"' in script
+    assert 'load_env_file "$ENV_FILE"' in script
     assert 'LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"' in script
     assert 'WIREGUARD_DIR="${LINK42_WIREGUARD_DIR:-/etc/wireguard}"' in script
     assert 'DRY_RUN="${LINK42_AGENT_DRY_RUN:-0}"' in script
     assert 'POLL_INTERVAL="${LINK42_POLL_INTERVAL:-5}"' in script
-    assert script.index('INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"') < script.index('. "$ENV_FILE"')
-    assert script.index('. "$ENV_FILE"') < script.index('LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"')
+    install_section = script[script.index('INPUT_LINK42_AGENT_TOKEN="${LINK42_AGENT_TOKEN-}"'):]
+    assert install_section.index('load_env_file "$ENV_FILE"') < install_section.index('LINK42_AGENT_TOKEN="$INPUT_LINK42_AGENT_TOKEN"')
 
 
 def test_agent_install_script_openwrt_stages_and_rolls_back_source() -> None:

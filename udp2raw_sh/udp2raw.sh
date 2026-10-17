@@ -17,6 +17,9 @@ die() {
 configure_download_urls() {
   controller_url="${LINK42_SERVER_URL:-}"
   controller_url="${controller_url%/}"
+  scheme="${controller_url%%:*}"
+  scheme="$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')"
+  controller_url="$scheme:${controller_url#*:}"
   case "$controller_url" in
     http://*) authority="${controller_url#http://}" ;;
     https://*) authority="${controller_url#https://}" ;;
@@ -62,35 +65,38 @@ have_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
-download() {
-    url="$1"
-    output="$2"
-
-    case "$url" in
-        file://*)
-            cp "${url#file://}" "$output"
-            ;;
+download() (
+    dl_url="$1"; dl_output="$2"; dl_limit="${3:-33554432}"
+    # Bound writes even when using BusyBox wget (which has no --max-filesize).
+    ulimit -f "$(((dl_limit + 1023) / 1024))" || die "无法设置下载大小限制"
+    case "$dl_url" in
+        file://*) cp "${dl_url#file://}" "$dl_output" ;;
         *)
             if have_cmd curl; then
-        curl -fsSL "$url" -o "$output"
+                curl -fsSL --connect-timeout 10 --max-time 300 --max-filesize "$dl_limit" "$dl_url" -o "$dl_output" || die "下载失败：$dl_url"
             elif have_cmd wget; then
-        wget -qO "$output" "$url"
+                wget -T 30 -qO "$dl_output" "$dl_url" || die "下载失败：$dl_url"
             else
-        die "需要安装 curl 或 wget"
+                die "需要安装 curl 或 wget"
             fi
             ;;
     esac
-}
+    [ "$(wc -c < "$dl_output")" -le "$dl_limit" ] || die "下载文件超过大小限制"
+)
 
-copy_executable() {
-    src="$1"
-    dst="$2"
-    dst_dir="${dst%/*}"
-
+copy_executable() (
+    src="$1"; dst="$2"; dst_dir="${2%/*}"
     mkdir -p "$dst_dir"
-    cp "$src" "$dst"
-    chmod 0755 "$dst"
-}
+    [ ! -L "$dst" ] || die "安装目标不能是符号链接"
+    staged="$(mktemp "$dst_dir/.udp2raw.XXXXXX")"
+    trap 'rm -f "$staged"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    cp "$src" "$staged"
+    chmod 0755 "$staged"
+    mv -f "$staged" "$dst"
+)
 
 cpu_has_aes() {
     [ -r /proc/cpuinfo ] && grep -qi ' aes ' /proc/cpuinfo
@@ -155,14 +161,28 @@ service_backend() {
 install_udp2raw_bin() {
     configure_download_urls
     bin_name="$(detect_udp2raw_bin)"
-    tmp_file="$(mktemp)"
-    trap 'rm -f "$tmp_file"' EXIT INT TERM
-
-    info "下载 $bin_name"
-    download "$BIN_DIR_URL/$bin_name" "$tmp_file"
-
+    case "$bin_name" in
+        udp2raw_amd64|udp2raw_amd64_hw_aes|udp2raw_x86|udp2raw_x86_asm_aes|udp2raw_arm|udp2raw_arm_asm_aes|udp2raw_mips24kc_le|udp2raw_mips24kc_le_asm_aes|udp2raw_mips24kc_be|udp2raw_mips24kc_be_asm_aes) ;;
+        *) die "不支持的 UDP2RAW 二进制名称" ;;
+    esac
+    download_tmp="$(mktemp -d)"
+    trap 'rm -rf "$download_tmp"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum 校验下载资源"
+    info "下载并校验 $bin_name"
+    download "$BIN_DIR_URL/$bin_name" "$download_tmp/binary"
+    download "$BIN_DIR_URL/$bin_name.sha256" "$download_tmp/checksum" 4096
+    expected="$(awk 'NR == 1 {print $1}' "$download_tmp/checksum" | tr 'A-F' 'a-f')"
+    case "$expected" in ''|*[!0-9a-f]*) die "无效的 SHA256 校验文件" ;; esac
+    [ "${#expected}" -eq 64 ] || die "无效的 SHA256 校验文件"
+    actual="$(sha256sum "$download_tmp/binary" | awk '{print $1}')"
+    [ "$actual" = "$expected" ] || die "UDP2RAW SHA256 校验失败，保留原程序"
     info "覆盖安装 $INSTALL_BIN"
-    copy_executable "$tmp_file" "$INSTALL_BIN"
+    copy_executable "$download_tmp/binary" "$INSTALL_BIN"
+    rm -rf "$download_tmp"
+    trap - EXIT HUP INT TERM
 }
 
 install_wrapper() {
@@ -581,20 +601,20 @@ prompt_required() {
     value=""
     while [ -z "$value" ]; do
         printf "%s: " "$text" >&2
-        read value
+        IFS= read -r value
     done
-    echo "$value"
+    printf '%s\n' "$value"
 }
 
 prompt_default() {
     text="$1"
     default="$2"
     printf "%s [%s]: " "$text" "$default" >&2
-    read value || value=""
+    IFS= read -r value || value=""
     if [ -z "$value" ]; then
-        echo "$default"
+        printf '%s\n' "$default"
     else
-        echo "$value"
+        printf '%s\n' "$value"
     fi
 }
 
@@ -608,7 +628,7 @@ prompt_port() {
             value="$(prompt_required "$text")"
         fi
         if valid_port "$value"; then
-            echo "$value"
+            printf '%s\n' "$value"
             return
         fi
         echo "端口必须是 1-65535 的数字。" >&2
@@ -841,6 +861,12 @@ enable_and_start_rule() {
     fi
 }
 
+validate_rule_options() {
+    printf '%s\n' "$1" | LC_ALL=C grep -Eq '^(\[[a-zA-Z0-9_.:%-]+\]|[a-zA-Z0-9_.:%-]+)$' || die "主机地址格式无效"
+    case "$2" in faketcp|udp|icmp) ;; *) die "raw-mode 必须是 faketcp、udp 或 icmp" ;; esac
+    case "$3" in aes128cbc|xor|none) ;; *) die "cipher-mode 必须是 aes128cbc、xor 或 none" ;; esac
+}
+
 build_server_args() {
     listen_port="$(prompt_port "监听 TCP 端口")"
     target_host="$(prompt_default "目标 UDP 地址" "127.0.0.1")"
@@ -851,7 +877,8 @@ build_server_args() {
     printf "自动添加 iptables 规则 -a？[Y/n]: " >&2
     read auto_rule || auto_rule=y
 
-    args="-s -l0.0.0.0:$listen_port -r$target_host:$target_port -k $(shell_quote "$key") --raw-mode $raw_mode --cipher-mode $cipher_mode"
+    validate_rule_options "$target_host" "$raw_mode" "$cipher_mode"
+    args="-s $(shell_quote "-l0.0.0.0:$listen_port") $(shell_quote "-r$target_host:$target_port") -k $(shell_quote "$key") --raw-mode $(shell_quote "$raw_mode") --cipher-mode $(shell_quote "$cipher_mode")"
     case "$auto_rule" in
         n|N) ;;
         *) args="$args -a" ;;
@@ -869,7 +896,8 @@ build_client_args() {
     printf "自动添加 iptables 规则 -a？[Y/n]: " >&2
     read auto_rule || auto_rule=y
 
-    args="-c -l127.0.0.1:$local_port -r$remote_host:$remote_port -k $(shell_quote "$key") --raw-mode $raw_mode --cipher-mode $cipher_mode"
+    validate_rule_options "$remote_host" "$raw_mode" "$cipher_mode"
+    args="-c $(shell_quote "-l127.0.0.1:$local_port") $(shell_quote "-r$remote_host:$remote_port") -k $(shell_quote "$key") --raw-mode $(shell_quote "$raw_mode") --cipher-mode $(shell_quote "$cipher_mode")"
     case "$auto_rule" in
         n|N) ;;
         *) args="$args -a" ;;
@@ -900,10 +928,10 @@ add_or_edit_rule() {
     echo
     if [ "$mode" = server ]; then
         echo "创建服务端规则：对外监听 TCP，转发到本机/内网 UDP 服务。"
-        args="$(build_server_args)"
+        args="$(build_server_args)" || return 0
     else
         echo "创建客户端规则：本地监听 UDP，连接远程 udp2raw server。"
-        args="$(build_client_args)"
+        args="$(build_client_args)" || return 0
     fi
 
     set_rule "$mode" "$name" "$args"
@@ -1092,11 +1120,14 @@ EOF
 # 保存安装时的主控地址；旧 UDP2RAW_* 下载覆盖变量不再生效。
 script_url="$LINK42_SERVER_URL/sh/udp2raw.sh"
 tmp_script="$(mktemp)"
-trap 'rm -f "$tmp_script"' EXIT HUP INT TERM
+trap 'rm -f "$tmp_script"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$script_url" -o "$tmp_script"
+    (ulimit -f 1024; curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 1048576 "$script_url" -o "$tmp_script")
 elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp_script" "$script_url"
+    (ulimit -f 1024; wget -T 30 -qO "$tmp_script" "$script_url")
 else
     echo "错误：需要安装 curl 或 wget" >&2
     exit 1

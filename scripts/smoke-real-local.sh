@@ -72,6 +72,15 @@ cleanup() {
   rm -f "$DB_PATH"
 }
 
+# JSON values are encoded as data, including quotes, backslashes and newlines.
+login_json() {
+  "$PYTHON_BIN" -c 'import json,sys; print(json.dumps({"username":"pmman", "password":sys.argv[1]}))' "$1"
+}
+
+node_json() {
+  "$PYTHON_BIN" -c 'import json,sys; name,endpoint=sys.argv[1:]; print(json.dumps({"name":name, "hostname":name, "management_ip":endpoint, "public_ip":endpoint, "endpoint_ips":[endpoint]}))' "$1" "$2"
+}
+
 # 从 JSON 标准输入中读取指定字段。
 json_get() {
   "$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); path=sys.argv[1].split("."); value=data
@@ -299,11 +308,11 @@ main() {
   [[ -n "$password" ]] || { echo "initial password file is empty" >&2; return 1; }
   WEB_TOKEN="$(curl -fsS -X POST "$BASE_URL/api/auth/login" \
     -H "content-type: application/json" \
-    -d "{\"username\":\"pmman\",\"password\":\"$password\"}" | json_get token)"
+    --data-binary "$(login_json "$password")" | json_get token)"
 
   local node_a node_b token_a token_b
-  node_a="$(api POST /api/nodes "{\"name\":\"smoke-node-a\",\"endpoint_ips\":[\"$NODE_A_ENDPOINT\"]}")"
-  node_b="$(api POST /api/nodes "{\"name\":\"smoke-node-b\",\"endpoint_ips\":[\"$NODE_B_ENDPOINT\"]}")"
+  node_a="$(api POST /api/nodes "$(node_json smoke-node-a "$NODE_A_ENDPOINT")")"
+  node_b="$(api POST /api/nodes "$(node_json smoke-node-b "$NODE_B_ENDPOINT")")"
   NODE_A_ID="$(printf '%s' "$node_a" | json_get node.id)"
   NODE_B_ID="$(printf '%s' "$node_b" | json_get node.id)"
   token_a="$(printf '%s' "$node_a" | json_get agent_token)"

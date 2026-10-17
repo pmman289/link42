@@ -31,11 +31,14 @@ redacted_test_logs() {
 }
 
 if [[ "$SKIP_VERIFY" != "1" ]]; then
+  PYTHON_BIN="$(link42_python)"
+  export PYTHON_BIN
+  bash scripts/check-shell-syntax.sh
   link42_log "running Python tests"
-  .venv/bin/python -m pytest -q
+  "$PYTHON_BIN" -m pytest -q
 
   link42_log "running Python compile check"
-  .venv/bin/python -m compileall apps/api apps/agent packages tests
+  "$PYTHON_BIN" -m compileall apps/api apps/agent packages tests
 
   link42_log "building web"
   node_major="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || printf '0')"

@@ -749,8 +749,6 @@ class ControllerSettingsUpdate(BaseModel):
 class InterfaceCreate(BaseModel):
     """创建单个 WireGuard 接口请求。"""
 
-    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
-
     name: str = Field(min_length=1, max_length=32)
     tunnel_ips: list[str] = Field(default_factory=list, max_length=128)
     listen_port: int | None = None
@@ -792,8 +790,6 @@ class InterfaceCreate(BaseModel):
 
 class ManagedLinkCreate(BaseModel):
     """创建双端受管 WireGuard 连接请求。"""
-
-    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     peer_node_id: int
     local_interface_name: str = Field(min_length=1, max_length=32)
@@ -868,8 +864,6 @@ class ManagedLinkCreate(BaseModel):
 
 class InterfaceUpdate(BaseModel):
     """更新单个 WireGuard 接口请求。"""
-
-    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     name: str = Field(min_length=1, max_length=32)
     tunnel_ips: list[str] = Field(default_factory=list, max_length=128)
@@ -1178,8 +1172,6 @@ class ConnectionRead(BaseModel):
 class GreManagedConnectionCreate(BaseModel):
     """创建受管 GRE 连接请求。"""
 
-    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
-
     protocol_type: str = "gre"
     peer_node_id: int
     local_interface_name: str = Field(min_length=1, max_length=15)
@@ -1278,8 +1270,6 @@ class GreManagedConnectionCreate(BaseModel):
 class GreManagedConnectionUpdate(BaseModel):
     """更新受管 GRE 连接请求。"""
 
-    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
-
     local_interface_name: str = Field(min_length=1, max_length=15)
     peer_interface_name: str = Field(min_length=1, max_length=15)
     local_outer_ip: str
@@ -1366,8 +1356,6 @@ class GreManagedConnectionUpdate(BaseModel):
 
 class GreManualConnectionCreate(BaseModel):
     """创建仅管理当前节点一端的 GRE 连接请求。"""
-
-    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     protocol_type: str = "gre"
     interface_name: str = Field(min_length=1, max_length=15)
@@ -1735,8 +1723,6 @@ class ManagedLinkRead(BaseModel):
 
 class ManagedLinkUpdate(BaseModel):
     """更新双端受管 WireGuard 连接请求。"""
-
-    ipv4_link_pool_id: int | None = Field(default=None, ge=1)
 
     local_interface_name: str = Field(min_length=1, max_length=32)
     peer_interface_name: str = Field(min_length=1, max_length=32)

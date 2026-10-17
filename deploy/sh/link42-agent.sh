@@ -56,6 +56,9 @@ need_env() {
 # POSIX shell 校验，无需先安装 Python；与主控一样仅接受无路径的 HTTP(S) URL。
 configure_download_urls() {
   controller_url="${LINK42_SERVER_URL%/}"
+  scheme="${controller_url%%:*}"
+  scheme="$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')"
+  controller_url="$scheme:${controller_url#*:}"
   case "$controller_url" in
     http://*) authority="${controller_url#http://}" ;;
     https://*) authority="${controller_url#https://}" ;;
@@ -105,7 +108,17 @@ systemd_exec_quote() {
   systemd_quote "$1" | sed 's/\$/$$/g'
 }
 
+systemd_env_file_path() {
+  # EnvironmentFile= takes one literal absolute path, not a shell word.
+  # Wrapping it in quotes makes systemd treat the leading quote as part of
+  # the filename and ignore the file. Only escape systemd specifiers here.
+  printf '%s' "$1" | sed 's/%/%%/g'
+}
+
 normalize_install_path() {
+  case "$1" in
+    *[[:cntrl:]]*) fail "installation paths must not contain control characters" ;;
+  esac
   # Normalize lexical components before checking destructive cleanup targets.
   # Inspect the original path first so normalization cannot conceal a symlink.
   reject_symlink_path "$1"
@@ -156,6 +169,152 @@ validate_service_name() {
   esac
 }
 
+load_env_file() {
+  # Treat agent.env as data. Only restore known keys; never evaluate shell code.
+  [ -f "$1" ] || return 0
+  [ ! -L "$1" ] || fail "environment file must not be a symbolic link"
+  while IFS= read -r env_line || [ -n "$env_line" ]; do
+    case "$env_line" in 'export '*) env_line="${env_line#export }" ;; esac
+    env_key="${env_line%%=*}"
+    case "$env_key" in
+      LINK42_SERVER_URL|LINK42_NODE_ID|LINK42_AGENT_TOKEN|LINK42_WIREGUARD_DIR|LINK42_GRE_DIR|LINK42_AGENT_DRY_RUN|LINK42_POLL_INTERVAL|LINK42_HTTP_TIMEOUT|LINK42_HEARTBEAT_TIMEOUT|LINK42_POLL_JITTER|LINK42_COMMAND_TIMEOUT|LINK42_LOG_LEVEL|LINK42_INSTALL_DIR|LINK42_AGENT_BIN|LINK42_ENV_DIR|LINK42_UDP2RAW_BIN|LINK42_MIMIC_SYSTEM_CONFIG_DIR) ;;
+      *) continue ;;
+    esac
+    env_value="${env_line#*=}"
+    case "$env_value" in
+      \'*\')
+        env_value="${env_value#\'}"; env_value="${env_value%\'}"
+        env_value="$(printf '%s' "$env_value" | sed "s/'\\\\''/'/g")"
+        ;;
+      \"*\")
+        env_value="${env_value#\"}"; env_value="${env_value%\"}"
+        env_value="$(printf '%s' "$env_value" | sed 's/\\\([\\"$`]\)/\1/g')"
+        ;;
+    esac
+    export "$env_key=$env_value"
+  done < "$1"
+}
+
+
+# File limits apply during transfer for curl AND BusyBox/GNU wget. Using 1 KiB
+# blocks is conservative on POSIX shells whose ulimit -f units are 512 bytes.
+download_file() (
+  download_url="$1"; download_output="$2"; download_limit="$3"
+  ulimit -f "$(((download_limit + 1023) / 1024))" || fail "cannot set download size limit"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --connect-timeout 10 --max-time 300 --max-filesize "$download_limit" "$download_url" -o "$download_output" || fail "download failed: $download_url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -T 30 -O "$download_output" "$download_url" || fail "download failed: $download_url"
+  else
+    fail "curl or wget is required to download the agent"
+  fi
+  [ "$(wc -c < "$download_output")" -le "$download_limit" ] || fail "download exceeds maximum size"
+)
+
+cleanup_install() {
+  cleanup_status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "${ROLLBACK_DIR:-}" ]; then
+    if [ "${INSTALL_COMMITTED:-0}" = 1 ] || rollback_install; then
+      rm -rf "$ROLLBACK_DIR"
+    else
+      log "warning: installation rollback failed; recovery files kept at $ROLLBACK_DIR"
+    fi
+  fi
+  [ -z "${tmp_file:-}" ] || rm -f "$tmp_file"
+  [ -z "${tmp_sha:-}" ] || rm -f "$tmp_sha"
+  [ -z "${staged_source:-}" ] || rm -rf "$staged_source"
+  [ -z "${staged_bin:-}" ] || rm -f "$staged_bin"
+  exit "$cleanup_status"
+}
+
+install_cleanup_traps() {
+  trap cleanup_install EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+begin_install_transaction() {
+  ROLLBACK_DIR="$(mktemp -d "$INSTALL_DIR/.rollback.XXXXXX")"
+  SERVICE_UNIT_PATH="/etc/init.d/$SERVICE_NAME"
+  if [ "$SERVICE_BACKEND" = systemd ]; then
+    SERVICE_UNIT_PATH="/etc/systemd/system/$SERVICE_NAME.service"
+  fi
+  for backup_key in bin env unit loader; do
+    case "$backup_key" in
+      bin) backup_path="$BIN_PATH" ;;
+      env) backup_path="$ENV_FILE" ;;
+      unit) backup_path="$SERVICE_UNIT_PATH" ;;
+      loader) backup_path="$ENV_DIR/load-env.sh" ;;
+    esac
+    reject_symlink_path "$backup_path"
+    if [ -f "$backup_path" ]; then cp -p "$backup_path" "$ROLLBACK_DIR/$backup_key"; fi
+  done
+  SERVICE_WAS_ACTIVE=0
+  SERVICE_WAS_ENABLED=0
+  case "$SERVICE_BACKEND" in
+    systemd)
+      systemctl is-active --quiet "$SERVICE_NAME.service" && SERVICE_WAS_ACTIVE=1
+      systemctl is-enabled --quiet "$SERVICE_NAME.service" && SERVICE_WAS_ENABLED=1
+      ;;
+    openrc)
+      rc-service "$SERVICE_NAME" status >/dev/null 2>&1 && SERVICE_WAS_ACTIVE=1
+      rc-update show default 2>/dev/null | awk -v name="$SERVICE_NAME" '$1 == name { found=1 } END {exit !found}' && SERVICE_WAS_ENABLED=1
+      ;;
+    openwrt-procd)
+      if [ -x "$SERVICE_UNIT_PATH" ]; then
+        "$SERVICE_UNIT_PATH" status >/dev/null 2>&1 && SERVICE_WAS_ACTIVE=1
+        "$SERVICE_UNIT_PATH" enabled >/dev/null 2>&1 && SERVICE_WAS_ENABLED=1
+      fi
+      ;;
+  esac
+  INSTALL_MUTATED=1
+  return 0
+}
+
+rollback_install() {
+  [ "${INSTALL_MUTATED:-0}" = 1 ] || return 0
+  log "installation failed; restoring previous Agent, configuration and service"
+  stop_existing_service
+  case "$SERVICE_BACKEND" in
+    systemd) systemctl disable "$SERVICE_NAME.service" >/dev/null 2>&1 || true ;;
+    openrc) rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true ;;
+    openwrt-procd) "$SERVICE_UNIT_PATH" disable >/dev/null 2>&1 || true ;;
+  esac
+  rollback_source_install || return 1
+  for backup_key in bin env unit loader; do
+    case "$backup_key" in
+      bin) backup_path="$BIN_PATH" ;;
+      env) backup_path="$ENV_FILE" ;;
+      unit) backup_path="$SERVICE_UNIT_PATH" ;;
+      loader) backup_path="$ENV_DIR/load-env.sh" ;;
+    esac
+    if [ -f "$ROLLBACK_DIR/$backup_key" ]; then
+      cp -p "$ROLLBACK_DIR/$backup_key" "$backup_path.rollback-new" || return 1
+      mv -f "$backup_path.rollback-new" "$backup_path" || return 1
+    else
+      rm -f "$backup_path"
+    fi
+  done
+  case "$SERVICE_BACKEND" in
+    systemd)
+      systemctl daemon-reload || return 1
+      if [ "$SERVICE_WAS_ENABLED" = 1 ]; then systemctl enable "$SERVICE_NAME.service" || return 1; fi
+      if [ "$SERVICE_WAS_ACTIVE" = 1 ]; then systemctl start "$SERVICE_NAME.service" || return 1; fi
+      ;;
+    openrc)
+      if [ "$SERVICE_WAS_ENABLED" = 1 ]; then rc-update add "$SERVICE_NAME" default || return 1; fi
+      if [ "$SERVICE_WAS_ACTIVE" = 1 ]; then rc-service "$SERVICE_NAME" start || return 1; fi
+      ;;
+    openwrt-procd)
+      if [ "$SERVICE_WAS_ENABLED" = 1 ]; then "$SERVICE_UNIT_PATH" enable || return 1; fi
+      if [ "$SERVICE_WAS_ACTIVE" = 1 ]; then "$SERVICE_UNIT_PATH" start || return 1; fi
+      ;;
+  esac
+  return 0
+}
+
 is_musl_system() {
   if [ -f /etc/alpine-release ]; then
     return 0
@@ -185,8 +344,10 @@ if [ "$ACTION" = "--help" ] || [ "$ACTION" = "-h" ] || [ "$ACTION" = "help" ]; t
 fi
 
 discover_uninstall_env_file() {
-  [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "remove" ] || return
-  [ -n "$INPUT_LINK42_ENV_DIR" ] && return
+  # Skipping uninstall-only discovery is a successful no-op. A bare return
+  # would inherit the failed comparison and abort installs under set -e.
+  [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "remove" ] || return 0
+  [ -n "$INPUT_LINK42_ENV_DIR" ] && return 0
 
   candidate=""
   unit_file="/etc/systemd/system/$SERVICE_NAME.service"
@@ -199,9 +360,10 @@ discover_uninstall_env_file() {
       \"*\")
         candidate="${candidate#\"}"
         candidate="${candidate%\"}"
-        candidate="$(printf '%s' "$candidate" | sed 's/\\\\\\"/\"/g; s/\\\\\\\\/\\\\/g; s/%%/%/g')"
+        candidate="$(printf '%s' "$candidate" | sed 's/\\\\\\"/\"/g; s/\\\\\\\\/\\\\/g')"
         ;;
     esac
+    candidate="$(printf '%s' "$candidate" | sed 's/%%/%/g')"
   fi
 
   # OpenRC and procd templates embed the shell-quoted environment path.
@@ -235,10 +397,7 @@ discover_uninstall_env_file
 if [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "remove" ]; then
   ENV_FILE="$ENV_DIR/agent.env"
   if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "${ENV_FILE}"
-    set +a
+    load_env_file "$ENV_FILE"
     [ -n "$INPUT_LINK42_INSTALL_DIR" ] || INSTALL_DIR="${LINK42_INSTALL_DIR:-$INSTALL_DIR}"
     [ -n "$INPUT_LINK42_AGENT_BIN" ] || BIN_PATH="${LINK42_AGENT_BIN:-$BIN_PATH}"
     [ -n "$INPUT_LINK42_ENV_DIR" ] || ENV_DIR="${LINK42_ENV_DIR:-$ENV_DIR}"
@@ -381,7 +540,7 @@ uninstall_agent() {
 
   uninstall_middleware
   rm -f "$BIN_PATH"
-  rm -f "$ENV_FILE"
+  rm -f "$ENV_FILE" "$ENV_DIR/load-env.sh"
   rmdir "$ENV_DIR" >/dev/null 2>&1 || true
   rm -rf "$INSTALL_DIR"
   log "uninstalled $SERVICE_NAME"
@@ -415,10 +574,7 @@ INPUT_LINK42_GRE_DIR="${LINK42_GRE_DIR-}"
 INPUT_LINK42_LOG_LEVEL="${LINK42_LOG_LEVEL-}"
 
 if [ -f "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
+  load_env_file "$ENV_FILE"
 fi
 
 if [ -n "$INPUT_LINK42_SERVER_URL" ]; then
@@ -479,6 +635,9 @@ reject_symlink_path "$GRE_DIR"
 need_env LINK42_SERVER_URL
 need_env LINK42_NODE_ID
 need_env LINK42_AGENT_TOKEN
+case "$LINK42_NODE_ID" in ''|*[!0-9]*|0) fail "LINK42_NODE_ID must be a positive integer" ;; esac
+case "$LINK42_NODE_ID" in *[1-9]*) ;; *) fail "LINK42_NODE_ID must be a positive integer" ;; esac
+case "$LINK42_AGENT_TOKEN" in *[[:cntrl:]]*) fail "Agent token must not contain control characters" ;; esac
 configure_download_urls
 
 ARCH="$(uname -m)"
@@ -508,15 +667,28 @@ if [ "$SERVICE_BACKEND" = "none" ]; then
   fail "no supported service manager found; install systemd, OpenRC, or OpenWrt procd first"
 fi
 
+dependency_install_failed() {
+  # A failed mirror must not break an upgrade when usable dependencies exist.
+  if command -v wg >/dev/null 2>&1 && wg --version >/dev/null 2>&1 &&
+     { command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; } &&
+     { [ -r /etc/ssl/certs/ca-certificates.crt ] || [ -r /etc/pki/tls/certs/ca-bundle.crt ]; }; then
+    if [ "$AGENT_INSTALL_MODE" != source ] || python3 -c 'import ssl, encodings.idna' >/dev/null 2>&1; then
+      log "warning: dependency installation failed; using existing system dependencies"
+      return 0
+    fi
+  fi
+  fail "dependency installation failed and required tools are missing; check package repositories and rerun"
+}
+
 install_packages() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y ca-certificates curl wireguard-tools
+    apt-get update || log "warning: apt-get update failed; trying existing package indexes"
+    apt-get install -y ca-certificates curl wireguard-tools || dependency_install_failed
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl wireguard-tools
+    dnf install -y ca-certificates curl wireguard-tools || dependency_install_failed
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl wireguard-tools
+    yum install -y ca-certificates curl wireguard-tools || dependency_install_failed
   elif command -v apk >/dev/null 2>&1; then
     if [ "$AGENT_INSTALL_MODE" = "source" ]; then
       apk add --no-cache ca-certificates curl python3 wireguard-tools
@@ -556,9 +728,9 @@ PY
 download_agent() {
   mkdir -p "$INSTALL_DIR"
   mkdir -p "$(dirname "$BIN_PATH")"
+  install_cleanup_traps
   tmp_file="$(mktemp "${TMPDIR:-/tmp}/link42-agent.XXXXXX")"
   tmp_sha="$(mktemp "${TMPDIR:-/tmp}/link42-agent.sha256.XXXXXX")"
-  trap 'rm -f "$tmp_file" "$tmp_sha"' EXIT HUP INT TERM
 
   if [ "$AGENT_VERSION" = "latest" ]; then
     url="$RES_BASE_URL/$AGENT_FILE"
@@ -567,13 +739,7 @@ download_agent() {
   fi
 
   log "downloading $url"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --max-filesize "$MAX_AGENT_DOWNLOAD_SIZE" "$url" -o "$tmp_file"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -O "$tmp_file" "$url"
-  else
-    fail "curl or wget is required to download the agent"
-  fi
+  download_file "$url" "$tmp_file" "$MAX_AGENT_DOWNLOAD_SIZE"
 
   downloaded_size="$(wc -c < "$tmp_file")"
   case "$downloaded_size" in
@@ -583,11 +749,8 @@ download_agent() {
 
   sha_url="$url.sha256"
   command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required to verify the downloaded agent"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsL --max-filesize 4096 "$sha_url" -o "$tmp_sha" || fail "failed to download agent checksum: $sha_url"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$tmp_sha" "$sha_url" || fail "failed to download agent checksum: $sha_url"
-  fi
+  download_file "$sha_url" "$tmp_sha" 4096 || fail "failed to download agent checksum: $sha_url"
+
   checksum_size="$(wc -c < "$tmp_sha")"
   case "$checksum_size" in
     ''|*[!0-9]*) fail "could not determine agent checksum size" ;;
@@ -652,47 +815,82 @@ PY
       rm -rf "$staged_source"
       fail "downloaded agent version mismatch: expected $AGENT_VERSION, got $staged_version"
     fi
+    begin_install_transaction
     stop_existing_service
     backup_source="$INSTALL_DIR/.src.bak"
     rm -rf "$backup_source"
     if [ -d "$INSTALL_DIR/src" ]; then
       mv "$INSTALL_DIR/src" "$backup_source"
     fi
-    if ! mv "$staged_source" "$INSTALL_DIR/src"; then
-      if [ -d "$backup_source" ]; then
-        mv "$backup_source" "$INSTALL_DIR/src"
-      fi
-      fail "failed to activate downloaded agent source"
-    fi
+    SOURCE_ACTIVATED=1
+    mv "$staged_source" "$INSTALL_DIR/src" || fail "failed to activate downloaded agent source"
     source_env_file="$(shell_quote "$ENV_FILE")"
+    source_env_loader="$(shell_quote "$ENV_DIR/load-env.sh")"
     source_pythonpath="$(shell_quote "$INSTALL_DIR/src/apps/agent:$INSTALL_DIR/src/packages")"
     cat > "$BIN_PATH" <<EOF
 #!/bin/sh
 set -eu
 if [ -f $source_env_file ]; then
-  set -a
-  . $source_env_file
-  set +a
+  . $source_env_loader
+  load_env_file $source_env_file
 fi
 export PYTHONPATH=$source_pythonpath
 exec python3 -m link42_agent.main "\$@"
 EOF
     chmod 0755 "$BIN_PATH"
   else
+    staged_bin="$(mktemp "$(dirname "$BIN_PATH")/.link42-agent.XXXXXX")"
+    install -m 0755 "$tmp_file" "$staged_bin"
+    staged_version="$("$staged_bin" --version)"
+    if [ "$AGENT_VERSION" != latest ] && [ "$staged_version" != "$AGENT_VERSION" ]; then
+      fail "downloaded agent version mismatch: expected $AGENT_VERSION, got $staged_version"
+    fi
+    begin_install_transaction
     stop_existing_service
-    install -m 0755 "$tmp_file" "$BIN_PATH"
+    mv -f "$staged_bin" "$BIN_PATH"
   fi
   rm -f "$tmp_file" "$tmp_sha"
-  trap - EXIT HUP INT TERM
 }
 
 rollback_source_install() {
-  # 服务安装或健康检查失败时恢复覆盖前的 OpenWrt 源码。
-  if [ "$AGENT_INSTALL_MODE" != "source" ] || [ ! -d "$INSTALL_DIR/.src.bak" ]; then
-    return
-  fi
+  [ "${SOURCE_ACTIVATED:-0}" = 1 ] || return 0
   rm -rf "$INSTALL_DIR/src"
-  mv "$INSTALL_DIR/.src.bak" "$INSTALL_DIR/src"
+  if [ -d "$INSTALL_DIR/.src.bak" ]; then
+    mv "$INSTALL_DIR/.src.bak" "$INSTALL_DIR/src" || return 1
+  fi
+  SOURCE_ACTIVATED=0
+}
+
+write_env_loader() {
+  cat > "$ENV_DIR/load-env.sh" <<'LINK42_ENV_LOADER'
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+load_env_file() {
+  # Treat agent.env as data. Only restore known keys; never evaluate shell code.
+  [ -f "$1" ] || return 0
+  [ ! -L "$1" ] || fail "environment file must not be a symbolic link"
+  while IFS= read -r env_line || [ -n "$env_line" ]; do
+    case "$env_line" in 'export '*) env_line="${env_line#export }" ;; esac
+    env_key="${env_line%%=*}"
+    case "$env_key" in
+      LINK42_SERVER_URL|LINK42_NODE_ID|LINK42_AGENT_TOKEN|LINK42_WIREGUARD_DIR|LINK42_GRE_DIR|LINK42_AGENT_DRY_RUN|LINK42_POLL_INTERVAL|LINK42_HTTP_TIMEOUT|LINK42_HEARTBEAT_TIMEOUT|LINK42_POLL_JITTER|LINK42_COMMAND_TIMEOUT|LINK42_LOG_LEVEL|LINK42_INSTALL_DIR|LINK42_AGENT_BIN|LINK42_ENV_DIR|LINK42_UDP2RAW_BIN|LINK42_MIMIC_SYSTEM_CONFIG_DIR) ;;
+      *) continue ;;
+    esac
+    env_value="${env_line#*=}"
+    case "$env_value" in
+      \'*\')
+        env_value="${env_value#\'}"; env_value="${env_value%\'}"
+        env_value="$(printf '%s' "$env_value" | sed "s/'\\\\''/'/g")"
+        ;;
+      \"*\")
+        env_value="${env_value#\"}"; env_value="${env_value%\"}"
+        env_value="$(printf '%s' "$env_value" | sed 's/\\\([\\"$`]\)/\1/g')"
+        ;;
+    esac
+    export "$env_key=$env_value"
+  done < "$1"
+}
+LINK42_ENV_LOADER
+  chmod 0600 "$ENV_DIR/load-env.sh"
 }
 
 write_env_file() {
@@ -718,6 +916,7 @@ write_env_file() {
     printf 'LINK42_MIMIC_SYSTEM_CONFIG_DIR=%s\n' "$(shell_quote "$MIMIC_SYSTEM_CONFIG_DIR")"
   } > "$ENV_FILE"
   chmod 0600 "$ENV_FILE"
+  write_env_loader
 }
 
 stop_existing_service() {
@@ -731,7 +930,7 @@ stop_existing_service() {
 }
 
 install_systemd_service() {
-  systemd_env_file="$(systemd_quote "$ENV_FILE")"
+  systemd_env_file="$(systemd_env_file_path "$ENV_FILE")"
   systemd_bin_path="$(systemd_exec_quote "$BIN_PATH")"
   cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
 [Unit]
@@ -751,11 +950,16 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now "$SERVICE_NAME.service"
+  sleep 2
+  if ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
+    fail "$SERVICE_NAME did not become healthy after installation; inspect journalctl -u $SERVICE_NAME.service"
+  fi
 }
 
 install_openrc_service() {
   service_bin_path="$(shell_quote "$BIN_PATH")"
   service_env_file="$(shell_quote "$ENV_FILE")"
+  service_env_loader="$(shell_quote "$ENV_DIR/load-env.sh")"
   cat > "/etc/init.d/$SERVICE_NAME" <<EOF
 #!/sbin/openrc-run
 name="Link42 Agent"
@@ -774,20 +978,22 @@ depend() {
 start_pre() {
   checkpath -d -m 0755 /run
   if [ -f $service_env_file ]; then
-    set -a
-    . $service_env_file
-    set +a
+    . $service_env_loader
+    load_env_file $service_env_file
   fi
 }
 EOF
   chmod 0755 "/etc/init.d/$SERVICE_NAME"
   rc-update add "$SERVICE_NAME" default
   rc-service "$SERVICE_NAME" restart
+  sleep 2
+  rc-service "$SERVICE_NAME" status >/dev/null 2>&1 || fail "$SERVICE_NAME did not become healthy after installation"
 }
 
 install_openwrt_service() {
   service_bin_path="$(shell_quote "$BIN_PATH")"
   service_env_file="$(shell_quote "$ENV_FILE")"
+  service_env_loader="$(shell_quote "$ENV_DIR/load-env.sh")"
   cat > "/etc/init.d/$SERVICE_NAME" <<EOF
 #!/bin/sh /etc/rc.common
 
@@ -795,12 +1001,12 @@ START=95
 STOP=10
 USE_PROCD=1
 AGENT_ENV_FILE=$service_env_file
+AGENT_ENV_LOADER=$service_env_loader
 
 start_service() {
   [ -f "\$AGENT_ENV_FILE" ] || return 1
-  set -a
-  . "\$AGENT_ENV_FILE"
-  set +a
+  . "\$AGENT_ENV_LOADER"
+  load_env_file "\$AGENT_ENV_FILE"
   procd_open_instance
   procd_set_param env LINK42_SERVER_URL="\$LINK42_SERVER_URL" LINK42_NODE_ID="\$LINK42_NODE_ID" LINK42_AGENT_TOKEN="\$LINK42_AGENT_TOKEN" LINK42_WIREGUARD_DIR="\$LINK42_WIREGUARD_DIR" LINK42_GRE_DIR="\$LINK42_GRE_DIR" LINK42_AGENT_DRY_RUN="\$LINK42_AGENT_DRY_RUN" LINK42_POLL_INTERVAL="\$LINK42_POLL_INTERVAL" LINK42_HTTP_TIMEOUT="\$LINK42_HTTP_TIMEOUT" LINK42_HEARTBEAT_TIMEOUT="\$LINK42_HEARTBEAT_TIMEOUT" LINK42_POLL_JITTER="\$LINK42_POLL_JITTER" LINK42_COMMAND_TIMEOUT="\$LINK42_COMMAND_TIMEOUT" LINK42_LOG_LEVEL="\$LINK42_LOG_LEVEL"
   procd_set_param command $service_bin_path
@@ -836,14 +1042,10 @@ EOF
     service_action=start
   fi
   if ! "/etc/init.d/$SERVICE_NAME" "$service_action"; then
-    rollback_source_install
-    "/etc/init.d/$SERVICE_NAME" restart >/dev/null 2>&1 || true
     fail "failed to restart $SERVICE_NAME after installation"
   fi
   sleep 2
   if ! "/etc/init.d/$SERVICE_NAME" status >/dev/null 2>&1; then
-    rollback_source_install
-    "/etc/init.d/$SERVICE_NAME" restart >/dev/null 2>&1 || true
     fail "$SERVICE_NAME did not become healthy after installation"
   fi
 }
@@ -874,12 +1076,9 @@ fi
 
 installed_version="$("$BIN_PATH" --version)"
 if [ "$AGENT_VERSION" != "latest" ] && [ "$installed_version" != "$AGENT_VERSION" ]; then
-  rollback_source_install
-  if [ "$SERVICE_BACKEND" = "openwrt-procd" ]; then
-    "/etc/init.d/$SERVICE_NAME" restart >/dev/null 2>&1 || true
-  fi
   fail "installed agent version mismatch: expected $AGENT_VERSION, got $installed_version"
 fi
+INSTALL_COMMITTED=1
 rm -rf "$INSTALL_DIR/.src.bak"
 
 log "installed $SERVICE_NAME using $SERVICE_BACKEND"
