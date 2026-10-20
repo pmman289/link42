@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import unicodedata
 from datetime import datetime
 from typing import Any
 
@@ -9,6 +10,20 @@ from .system import run_command
 
 
 PING_TIME_RE = re.compile(r"time[=<]([0-9.]+)\s*ms")
+
+
+def sanitize_error(value: object, max_bytes: int = 500) -> str:
+    """Convert command output into one-line text accepted by the controller."""
+
+    text = str(value or "")
+    text = " ".join(text.split())
+    text = "".join(char for char in text if ord(char) >= 0x20 and ord(char) != 0x7F and not unicodedata.category(char).startswith("C"))
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    marker = " ...[truncated]"
+    head = encoded[: max_bytes - len(marker.encode("utf-8"))].decode("utf-8", errors="ignore")
+    return head + marker
 
 
 def probe_latency(target_host: str, timeout_seconds: float) -> dict[str, Any]:
@@ -24,7 +39,7 @@ def probe_latency(target_host: str, timeout_seconds: float) -> dict[str, Any]:
     completed = run_command(command, allow_failure=True, timeout=float(timeout) + 1.0)
     output = f"{completed.get('stdout', '')}\n{completed.get('stderr', '')}"
     if completed["returncode"] != 0:
-        return result(False, None, output.strip() or "timeout")
+        return result(False, None, sanitize_error(output) or "timeout")
     match = PING_TIME_RE.search(output)
     if not match:
         return result(False, None, "ping output did not include latency")

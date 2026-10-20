@@ -4269,6 +4269,27 @@ def test_probe_latency_parses_ping_time(monkeypatch) -> None:
     assert result["latency_ms"] == 23.4
 
 
+def test_probe_latency_sanitizes_multiline_ping_errors(monkeypatch) -> None:
+    """失败 ping 输出上报前必须去除换行和控制字符。"""
+
+    monkeypatch.setattr(link_monitor.shutil, "which", lambda binary: "/bin/ping")
+    monkeypatch.setattr(
+        link_monitor,
+        "run_command",
+        lambda command, allow_failure, **kwargs: command_result(
+            command,
+            returncode=1,
+            stdout="ping: sendmsg: Required key not available\n\nnext-line\x1b[31m",
+        ),
+    )
+
+    result = link_monitor.probe_latency("10.2.7.137", 1)
+
+    assert result["success"] is False
+    assert result["error"] == "ping: sendmsg: Required key not available next-line[31m"
+    assert all(ord(char) >= 0x20 and ord(char) != 0x7F for char in result["error"])
+
+
 def test_agent_platform_reports_musl_libc(monkeypatch) -> None:
     """验证 OpenWrt/musl 平台不会被误报为 glibc 资产。"""
 

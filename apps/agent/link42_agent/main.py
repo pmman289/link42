@@ -452,7 +452,7 @@ def failed_link_monitor_result(monitor: dict[str, Any], exc: BaseException) -> d
         "checked_at": datetime.utcnow().isoformat(),
         "success": False,
         "latency_ms": None,
-        "error": truncate_task_error(exc, max_bytes=4096),
+        "error": link_monitor.sanitize_error(exc),
     }
 
 
