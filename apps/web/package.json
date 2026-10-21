@@ -1,6 +1,6 @@
 {
   "name": "link42-web",
-  "version": "0.6.28",
+  "version": "0.6.29",
   "private": true,
   "type": "module",
   "scripts": {
@@ -34,7 +34,7 @@
     "@vitejs/plugin-react": "^6.0.3",
     "source-map-js": "^1.2.2",
     "typescript": "^5.9.3",
-    "vite": "^8.1.4",
-    "vitest": "^4.1.10"
+    "vite": "^8.3.5",
+    "vitest": "^4.1.12"
   }
 }

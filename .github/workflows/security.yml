@@ -16,7 +16,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - name: 扫描明文凭据
@@ -32,7 +32,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - name: 检查 Shell 语法
@@ -40,6 +40,8 @@ jobs:
       - name: 后端测试
         run: |
           python -m pip install '.[dev]'
+          python -m pip install pip-audit
+          pip-audit
           python -m pytest -q
       - name: 前端测试与构建
         run: |
