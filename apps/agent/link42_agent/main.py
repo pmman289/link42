@@ -19,7 +19,7 @@ from typing import Any, Union
 from link42_common.version import AGENT_VERSION
 
 from .client import AgentClient, AgentConnectionError, AgentHttpError
-from .config import AgentConfig
+from .config import AgentConfig, MIN_POLL_INTERVAL_SECONDS
 from .config import load_config_from_env
 from .gre import (
     gre_ipv6_runtime_supported,
@@ -43,7 +43,11 @@ from .task_handlers import execute_registered_task
 LOGGER_NAME = "link42.agent"
 logger = logging.getLogger(LOGGER_NAME)
 IDLE_DEBUG_LOG_INTERVAL_SECONDS = 60.0
-SNAPSHOT_CACHE_TTL_SECONDS = 60.0
+# Platform discovery invokes several helpers (including dkms/systemctl on
+# mimic hosts). Repeating it every minute causes avoidable CPU spikes and can
+# overlap with a slow helper; capabilities are still refreshed after upgrades
+# via reset_snapshot_cache().
+SNAPSHOT_CACHE_TTL_SECONDS = 300.0
 MAX_RETRY_BACKOFF_SECONDS = 30.0
 SNAPSHOT_LOG_PLATFORM_KEYS = [
     "os",
@@ -383,7 +387,7 @@ def poll_tasks(client: AgentClient, snapshot: AgentSnapshot) -> list[dict[str, A
 def heartbeat_interval_seconds(config: AgentConfig) -> float:
     """返回长任务期间后台心跳间隔。"""
 
-    return max(1.0, float(config.poll_interval))
+    return max(float(MIN_POLL_INTERVAL_SECONDS), float(config.poll_interval))
 
 
 def start_background_heartbeat(
@@ -413,7 +417,7 @@ def start_background_heartbeat(
 def backoff_seconds(poll_interval: int, consecutive_failures: int) -> float:
     """计算连接失败后的指数退避时间，并限制最大等待。"""
 
-    return min(MAX_RETRY_BACKOFF_SECONDS, max(1.0, float(poll_interval)) * (2 ** min(consecutive_failures, 6)))
+    return min(MAX_RETRY_BACKOFF_SECONDS, max(float(MIN_POLL_INTERVAL_SECONDS), float(poll_interval)) * (2 ** min(consecutive_failures, 6)))
 
 
 def sleep_with_jitter(base_seconds: float, jitter: float) -> float:

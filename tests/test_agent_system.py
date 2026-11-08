@@ -92,6 +92,14 @@ def test_agent_configuration_normalizes_safe_environment(monkeypatch) -> None:
     assert config.poll_jitter == 0.2
 
 
+def test_agent_poll_interval_clamps_busy_loop_value(monkeypatch) -> None:
+    monkeypatch.setenv("LINK42_SERVER_URL", "https://controller.example")
+    monkeypatch.setenv("LINK42_NODE_ID", "1")
+    monkeypatch.setenv("LINK42_AGENT_TOKEN", "token")
+    monkeypatch.setenv("LINK42_POLL_INTERVAL", "2")
+    assert load_config_from_env().poll_interval == 5
+
+
 def test_agent_client_uses_short_heartbeat_timeout(monkeypatch) -> None:
     """心跳不能沿用普通请求的长超时，避免越过主控在线窗口。"""
 

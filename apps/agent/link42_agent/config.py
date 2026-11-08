@@ -8,6 +8,10 @@ from urllib.parse import urlsplit
 
 
 _LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+# A complete poll performs heartbeat, task and link-monitor requests. Values
+# below five seconds create a busy loop on otherwise idle nodes, especially
+# when a controller or reverse proxy answers quickly with empty responses.
+MIN_POLL_INTERVAL_SECONDS = 5
 
 
 def _required_server_url(value: str) -> str:
@@ -97,6 +101,9 @@ def load_config_from_env() -> AgentConfig:
         raise ValueError("LINK42_POLL_INTERVAL must be an integer") from exc
     if not 1 <= poll_interval <= 3600:
         raise ValueError("LINK42_POLL_INTERVAL must be between 1 and 3600 seconds")
+    # Keep old installations with an explicit 1-4 second value working while
+    # preventing them from generating a sustained request/CPU burst.
+    poll_interval = max(MIN_POLL_INTERVAL_SECONDS, poll_interval)
 
     http_timeout = _positive_float_from_env("LINK42_HTTP_TIMEOUT", 10.0)
     heartbeat_timeout = _positive_float_from_env("LINK42_HEARTBEAT_TIMEOUT", 5.0)
